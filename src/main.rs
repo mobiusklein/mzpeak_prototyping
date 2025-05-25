@@ -1,5 +1,5 @@
 
-use std::{fs, io, sync::Arc};
+use std::{env, fs, io, path::PathBuf, sync::Arc};
 use arrow::datatypes::FieldRef;
 use itertools::Itertools;
 use parquet::{basic::ZstdLevel, file::properties::{EnabledStatistics, WriterProperties}};
@@ -9,7 +9,8 @@ use serde_arrow::schema::SchemaLike;
 
 
 fn main() -> io::Result<()> {
-    let mut reader = mzdata::MZReader::open_path("../mzdata/converted/E_20221108_EvoSepOne_3rdGenAurora15cm_CC_40SPD_whisper_scLF1108_M10_S1-A1_1_3103.zlib.mzML")?;
+    let filename = PathBuf::from(env::args().skip(1).next().unwrap());
+    let mut reader = mzdata::MZReader::open_path(&filename)?;
     let entries_iter = reader
         .iter()
         .map(|s| MzPeaksEntry::<MzPeaksMZIMPoint>::from_spectrum(&s)).chunks(1000);
@@ -17,7 +18,10 @@ fn main() -> io::Result<()> {
     let fields = Vec::<FieldRef>::from_type::<MzPeaksEntry<MzPeaksMZIMPoint>>(Default::default()).unwrap();
     let schema = Arc::new(arrow::datatypes::Schema::new(fields.clone()));
 
-    let handle = fs::File::create("E_20221108_EvoSepOne_3rdGenAurora15cm_CC_40SPD_whisper_scLF1108_M10_S1-A1_1_3103.mzpeak")?;
+    let outname = filename.with_extension("mzpeak");
+
+
+    let handle = fs::File::create(outname.file_name().unwrap())?;
     let props = WriterProperties::builder()
         .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
         .set_column_encoding("point.mz".into(), parquet::basic::Encoding::BYTE_STREAM_SPLIT)
