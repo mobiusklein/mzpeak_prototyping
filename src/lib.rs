@@ -1,3 +1,4 @@
+use mzdata::params::Unit;
 use mzdata::prelude::*;
 use mzdata::spectrum::ArrayType;
 use mzdata::{self, spectrum::ScanEvent};
@@ -22,8 +23,8 @@ pub const ION_MOBILITY_SCAN_TERMS: [mzdata::params::CURIE; 4] = [
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct PQParam {
-    pub name: String,
-    pub curie: CURIE,
+    pub name: Option<String>,
+    pub curie: Option<CURIE>,
     pub value: PQParamValue,
     pub unit: Option<CURIE>,
 }
@@ -38,13 +39,13 @@ macro_rules! curie {
     (MS:$acc:literal) => {
         CURIE {
             cv_id: 1,
-            accession: $acc
+            accession: $acc,
         }
     };
     (UO:$acc:literal) => {
         CURIE {
             cv_id: 2,
-            accession: $acc
+            accession: $acc,
         }
     };
 }
@@ -83,6 +84,34 @@ pub struct PQParamValue {
     pub float: Option<f64>,
     pub boolean: Option<bool>,
     pub string: Option<String>,
+}
+
+impl From<mzdata::params::Value> for PQParamValue {
+    fn from(value: mzdata::params::Value) -> Self {
+        let mut this = Self::default();
+        match value {
+            mzdata::params::Value::String(val) => this.string = Some(val),
+            mzdata::params::Value::Float(val) => this.float = Some(val),
+            mzdata::params::Value::Int(val) => this.integer = Some(val),
+            mzdata::params::Value::Buffer(_) => todo!(),
+            mzdata::params::Value::Boolean(val) => this.boolean = Some(val),
+            mzdata::params::Value::Empty => {}
+        }
+        this
+    }
+}
+
+impl From<mzdata::Param> for PQParam {
+    fn from(value: mzdata::Param) -> Self {
+        let curie = value.curie().map(CURIE::from);
+        let val = PQParamValue::from(value.value);
+        Self {
+            name: Some(value.name),
+            curie: curie,
+            value: val,
+            unit: value.unit.to_curie().map(CURIE::from),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
@@ -163,6 +192,12 @@ impl MzPeaksSpectrumEntry {
             base_peak_mz,
             base_peak_intensity,
             total_ion_current: Some(summaries.tic),
+            parameters: spectrum
+                .params()
+                .iter()
+                .cloned()
+                .map(PQParam::from)
+                .collect(),
             ..Default::default()
         }
     }
@@ -177,6 +212,7 @@ pub struct MzPeaksScanEntry {
     pub ion_injection_time: Option<f32>,
     pub ion_mobility_value: Option<f64>,
     pub ion_mobility_type: Option<CURIE>,
+    pub parameters: Vec<PQParam>,
 }
 
 impl MzPeaksScanEntry {
@@ -207,12 +243,13 @@ impl MzPeaksScanEntry {
             filter_string: event.filter_string().map(|s| s.to_string()),
             ion_mobility_value: ion_mobility,
             ion_mobility_type,
+            parameters: event.params().iter().cloned().map(PQParam::from).collect(),
             ..Default::default()
         }
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct IsolationWindow {
     pub target: Option<f32>,
     pub lower_bound: Option<f32>,
@@ -220,16 +257,112 @@ pub struct IsolationWindow {
     pub parameters: Vec<PQParam>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+impl From<&mzdata::spectrum::IsolationWindow> for IsolationWindow {
+    fn from(value: &mzdata::spectrum::IsolationWindow) -> Self {
+        IsolationWindow {
+            target: Some(value.target),
+            lower_bound: Some(value.lower_bound),
+            upper_bound: Some(value.upper_bound),
+            parameters: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct Activation {
     pub parameters: Vec<PQParam>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+impl From<&mzdata::spectrum::Activation> for Activation {
+    fn from(value: &mzdata::spectrum::Activation) -> Self {
+        let mut parameters = Vec::new();
+        for method in value.methods() {
+            let par: mzdata::Param = method.to_param().into();
+            parameters.push(par.into());
+        }
+
+        let energy = mzdata::Param::builder()
+            .name("collision energy")
+            .curie(mzdata::curie!(MS:1000045))
+            .value(value.energy)
+            .unit(Unit::Electronvolt)
+            .build();
+        parameters.push(energy.into());
+        parameters.extend(value.params().iter().cloned().map(PQParam::from));
+
+        Self { parameters }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct MzPeaksPrecursorEntry {
     pub spectrum_index: u64,
+    pub precursor_index: u64,
+    pub selected_ion_count: u32,
     pub isolation_window: IsolationWindow,
     pub activation: Activation,
+}
+
+impl MzPeaksPrecursorEntry {
+    pub fn from_precursor(
+        precursor: &mzdata::spectrum::Precursor,
+        spectrum_index: u64,
+        precursor_index: u64,
+    ) -> Self {
+        Self {
+            spectrum_index,
+            precursor_index,
+            selected_ion_count: precursor.ions.len() as u32,
+            isolation_window: (&precursor.isolation_window).into(),
+            activation: (&precursor.activation).into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+pub struct MZPeaksSelectedIonEntry {
+    pub spectrum_index: u64,
+    pub precursor_index: u64,
+    pub selected_ion_mz: Option<f64>,
+    pub charge_state: Option<i32>,
+    pub intensity: Option<f32>,
+    pub ion_mobility: Option<f64>,
+    pub ion_mobility_type: Option<CURIE>,
+    pub parameters: Vec<PQParam>,
+}
+
+impl MZPeaksSelectedIonEntry {
+    pub fn from_selected_ion(
+        selected_ion: &mzdata::spectrum::SelectedIon,
+        spectrum_index: u64,
+        precursor_index: u64,
+    ) -> Self {
+        let mut ion_mobility_type = None;
+        if selected_ion.has_ion_mobility() {
+            for c in ION_MOBILITY_SCAN_TERMS {
+                if let Some(im_type) = selected_ion.get_param_by_curie(&c) {
+                    ion_mobility_type = im_type.curie().map(CURIE::from);
+                    break;
+                }
+            }
+        }
+        MZPeaksSelectedIonEntry {
+            spectrum_index,
+            precursor_index,
+            selected_ion_mz: Some(selected_ion.mz),
+            charge_state: selected_ion.charge,
+            intensity: Some(selected_ion.intensity),
+            ion_mobility: selected_ion.ion_mobility(),
+            ion_mobility_type,
+            parameters: selected_ion
+                .params()
+                .iter()
+                .cloned()
+                .map(PQParam::from)
+                .collect(),
+            ..Default::default()
+        }
+    }
 }
 
 pub trait MzPeakDataSeries: Serialize + Default + Clone {
@@ -255,13 +388,15 @@ impl MzPeakDataSeries for MzPeaksMZPoint {
     }
 
     fn from_spectrum<T: SpectrumLike>(spectrum: &T, spectrum_index: u64) -> Vec<Self> {
-        spectrum.peaks().iter().map(|p| {
-            Self {
+        spectrum
+            .peaks()
+            .iter()
+            .map(|p| Self {
                 spectrum_index,
                 mz: p.mz,
-                intensity: p.intensity
-            }
-        }).collect()
+                intensity: p.intensity,
+            })
+            .collect()
     }
 }
 
@@ -279,7 +414,11 @@ impl MzPeakDataSeries for MzPeaksMZIMPoint {
     }
 
     fn array_names(&self) -> Vec<ArrayType> {
-        vec![ArrayType::MZArray, ArrayType::IntensityArray, ArrayType::IonMobilityArray]
+        vec![
+            ArrayType::MZArray,
+            ArrayType::IntensityArray,
+            ArrayType::IonMobilityArray,
+        ]
     }
 
     fn from_spectrum<T: SpectrumLike>(spectrum: &T, spectrum_index: u64) -> Vec<Self> {
@@ -287,14 +426,17 @@ impl MzPeakDataSeries for MzPeaksMZIMPoint {
         let (ims, _im_type) = arrays.ion_mobility().unwrap();
         let mzs = arrays.mzs().unwrap();
         let ints = arrays.intensities().unwrap();
-        mzs.iter().copied().zip(ints.iter().copied()).zip(ims.iter().copied()).map(|((mz, intensity), im)| {
-            Self {
+        mzs.iter()
+            .copied()
+            .zip(ints.iter().copied())
+            .zip(ims.iter().copied())
+            .map(|((mz, intensity), im)| Self {
                 spectrum_index,
                 mz,
                 intensity,
-                im
-            }
-        }).collect()
+                im,
+            })
+            .collect()
     }
 }
 
@@ -303,6 +445,8 @@ pub struct MzPeaksEntry<T: MzPeakDataSeries + 'static = MzPeaksMZPoint> {
     pub spectrum: Option<Box<MzPeaksSpectrumEntry>>,
     pub scan: Option<Box<MzPeaksScanEntry>>,
     pub point: Option<T>,
+    pub precursor: Option<Box<MzPeaksPrecursorEntry>>,
+    pub selected_ion: Option<Box<MZPeaksSelectedIonEntry>>,
 }
 
 impl<T: MzPeakDataSeries + 'static> MzPeaksEntry<T> {
@@ -311,21 +455,48 @@ impl<T: MzPeakDataSeries + 'static> MzPeaksEntry<T> {
         let spec_index = spec.index;
 
         let mut entries: Vec<Self> = vec![spec.into()];
-        entries.extend(spectrum
-            .acquisition()
-            .iter()
-            .map(|e| MzPeaksScanEntry::from_scan_event(spec_index, e).into())
+        entries.extend(
+            spectrum
+                .acquisition()
+                .iter()
+                .map(|e| MzPeaksScanEntry::from_scan_event(spec_index, e).into()),
         );
 
         let peaks = T::from_spectrum(spectrum, spec_index);
 
-        entries.extend(peaks.into_iter().map(|p| {
-            Self {
-                point: Some(p),
-                ..Default::default()
-            }
+        entries.extend(peaks.into_iter().map(|p| Self {
+            point: Some(p),
+            ..Default::default()
         }));
 
+        entries
+    }
+
+    pub fn from_spectrum_with_precursors(
+        spectrum: &impl SpectrumLike,
+        precursor_index_ctr: &mut u64,
+    ) -> Vec<Self> {
+        let mut entries = Self::from_spectrum(spectrum);
+
+        if let Some(precursor) = spectrum.precursor() {
+            let prec = MzPeaksPrecursorEntry::from_precursor(
+                precursor,
+                spectrum.index() as u64,
+                *precursor_index_ctr,
+            );
+            entries.push(prec.into());
+            for ion in precursor.ions.iter() {
+                entries.push(
+                    MZPeaksSelectedIonEntry::from_selected_ion(
+                        ion,
+                        spectrum.index() as u64,
+                        *precursor_index_ctr,
+                    )
+                    .into(),
+                );
+            }
+            *precursor_index_ctr += 1;
+        }
         entries
     }
 }
@@ -348,31 +519,54 @@ impl<T: MzPeakDataSeries + 'static> From<MzPeaksScanEntry> for MzPeaksEntry<T> {
     }
 }
 
+impl<T: MzPeakDataSeries + 'static> From<MzPeaksPrecursorEntry> for MzPeaksEntry<T> {
+    fn from(value: MzPeaksPrecursorEntry) -> Self {
+        let mut this = Self::default();
+        this.precursor = Some(Box::new(value));
+        this
+    }
+}
+
+impl<T: MzPeakDataSeries + 'static> From<MZPeaksSelectedIonEntry> for MzPeaksEntry<T> {
+    fn from(value: MZPeaksSelectedIonEntry) -> Self {
+        let mut this = Self::default();
+        this.selected_ion = Some(Box::new(value));
+        this
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io};
-    use itertools::Itertools;
-    use parquet::{basic::ZstdLevel, file::properties::{EnabledStatistics, WriterProperties}};
-    use std::sync::Arc;
     use arrow::datatypes::FieldRef;
+    use itertools::Itertools;
+    use parquet::{
+        basic::ZstdLevel,
+        file::properties::{EnabledStatistics, WriterProperties},
+    };
     use serde_arrow::schema::SchemaLike;
+    use std::sync::Arc;
+    use std::{fs, io};
 
     use super::*;
 
     #[test]
     fn convert() -> io::Result<()> {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
+        let mut precursor_index: u64 = 0;
         let entries: Vec<MzPeaksEntry> = reader
             .iter()
-            .map(|s| MzPeaksEntry::from_spectrum(&s))
+            .map(|s| MzPeaksEntry::from_spectrum_with_precursors(&s, &mut precursor_index))
             .flatten()
             .collect();
         let fields = Vec::<FieldRef>::from_type::<MzPeaksEntry>(Default::default()).unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(fields.clone()));
 
         let handle = fs::File::create("small.mzpeak")?;
-        let props = WriterProperties::builder().set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(9).unwrap())).build();
+        let props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                ZstdLevel::try_new(9).unwrap(),
+            ))
+            .build();
         let mut writer = parquet::arrow::ArrowWriter::try_new(handle, schema, Some(props))?;
         let batch = serde_arrow::to_record_batch(&fields, &entries).unwrap();
         writer.write(&batch)?;
@@ -382,17 +576,27 @@ mod tests {
 
     #[test]
     fn convert_im() -> io::Result<()> {
-        let mut reader = mzdata::MZReader::open_path("../mzdata/converted/E_20221108_EvoSepOne_3rdGenAurora15cm_CC_40SPD_whisper_scLF1108_M10_S1-A1_1_3103.zlib.mzML")?;
+        let mut reader = mzdata::MZReader::open_path(
+            "../mzdata/converted/E_20221108_EvoSepOne_3rdGenAurora15cm_CC_40SPD_whisper_scLF1108_M10_S1-A1_1_3103.zlib.mzML",
+        )?;
+        let mut precursor_index: u64 = 0;
         let entries_iter = reader
             .iter()
-            .map(|s| MzPeaksEntry::<MzPeaksMZIMPoint>::from_spectrum(&s)).chunks(1000);
+            .map(|s| MzPeaksEntry::<MzPeaksMZIMPoint>::from_spectrum_with_precursors(&s, &mut precursor_index))
+            .chunks(1000);
 
-        let fields = Vec::<FieldRef>::from_type::<MzPeaksEntry<MzPeaksMZIMPoint>>(Default::default()).unwrap();
+        let fields =
+            Vec::<FieldRef>::from_type::<MzPeaksEntry<MzPeaksMZIMPoint>>(Default::default())
+                .unwrap();
         let schema = Arc::new(arrow::datatypes::Schema::new(fields.clone()));
 
-        let handle = fs::File::create("E_20221108_EvoSepOne_3rdGenAurora15cm_CC_40SPD_whisper_scLF1108_M10_S1-A1_1_3103.mzpeak")?;
+        let handle = fs::File::create(
+            "E_20221108_EvoSepOne_3rdGenAurora15cm_CC_40SPD_whisper_scLF1108_M10_S1-A1_1_3103.mzpeak",
+        )?;
         let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+            .set_compression(parquet::basic::Compression::ZSTD(
+                ZstdLevel::try_new(3).unwrap(),
+            ))
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
             .set_statistics_enabled(EnabledStatistics::Page)
             .build();

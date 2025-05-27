@@ -3,7 +3,8 @@ use arrow::{
     datatypes::{Float32Type, Float64Type, UInt64Type},
 };
 
-use mzdata::mzpeaks::coordinate::{SimpleInterval, Span1D};
+use clap::Parser;
+use mzdata::mzpeaks::coordinate::{SimpleInterval, Span1D, CoordinateRange};
 use parquet::{
     self,
     arrow::{
@@ -14,21 +15,39 @@ use parquet::{
     },
 };
 use std::{
-    env, fs, io::{self, Seek}
+    fs, io::{self, Seek}
 };
 
 use mzpeak_prototyping::index::{
-    Float64IndexPage, PageIndexType, PointSpectrumIndexPage,
+    PageIndexEntry, PageIndexType, PointSpectrumIndexPage,
     read_point_mz_index,
     read_point_spectrum_index,
     spectrum_index_range_for_time_range,
 };
 
+
+#[derive(clap::Parser)]
+struct App {
+    #[arg()]
+    filename: String,
+
+    #[arg(short, long, default_value="10.0-21.0")]
+    time_range: CoordinateRange<f32>,
+
+    #[arg(short, long, default_value="623.0-625.0")]
+    mz_range: CoordinateRange<f64>,
+
+    #[arg(short, long, default_value="0.8-1.2")]
+    im_range: CoordinateRange<f64>,
+
+}
+
+
 fn main() -> io::Result<()> {
-    let filename = env::args().skip(1).next().unwrap();
+    let args = App::parse();
 
     let mut handle = fs::File::open(
-        filename
+        args.filename
     )?;
 
     let start = std::time::Instant::now();
@@ -39,9 +58,9 @@ fn main() -> io::Result<()> {
     let point_spectrum_index = read_point_spectrum_index(&reader)?;
     let point_mz_index = read_point_mz_index(&reader)?;
 
-    let time_range = SimpleInterval::new(10.0, 21.0);
-    let mz_range = SimpleInterval::new(623.0, 625.0);
-    let im_range = SimpleInterval::new(0.8, 1.2);
+    let time_range = SimpleInterval::new(args.time_range.start.unwrap() as f32, args.time_range.end.unwrap() as f32);
+    let mz_range = SimpleInterval::new(args.mz_range.start.unwrap(), args.mz_range.end.unwrap());
+    let im_range = SimpleInterval::new(args.im_range.start.unwrap(), args.im_range.end.unwrap());
 
     let index_range = spectrum_index_range_for_time_range(&mut handle, time_range)?;
     let query_range_end = std::time::Instant::now();
@@ -55,7 +74,7 @@ fn main() -> io::Result<()> {
         &index_range,
     );
 
-    let mz_selection = Float64IndexPage::build_row_selection_overlaps(&point_mz_index, &mz_range);
+    let mz_selection = PageIndexEntry::<f64>::build_row_selection_overlaps(&point_mz_index, &mz_range);
 
     let projection = ProjectionMask::columns(
         reader.parquet_schema(),
@@ -68,7 +87,6 @@ fn main() -> io::Result<()> {
     );
 
     let reader = reader
-    // .with_batch_size(2usize.pow(20))
     .with_row_selection(
         index_selection.intersection(&mz_selection)
     ).with_projection(projection)

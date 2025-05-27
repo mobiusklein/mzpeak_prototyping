@@ -1,6 +1,6 @@
 use std::{fs, io};
 
-use arrow::datatypes::Float32Type;
+use mzpeaks::prelude::HasProximity;
 #[allow(unused)]
 use parquet::{
     self,
@@ -23,10 +23,14 @@ use parquet::{
 use arrow::{
     self,
     array::{Array, AsArray, BooleanArray, Float64Array, PrimitiveArray, RecordBatch},
-    datatypes::{DataType, Float64Type, UInt64Type},
+    datatypes::{DataType, Float64Type, UInt64Type, Field, FieldRef, Float32Type},
 };
 
 use mzdata::mzpeaks::coordinate::{SimpleInterval, Span1D};
+use serde::{Deserialize, Serialize};
+
+#[allow(unused)]
+use serde_arrow::schema::TracingOptions;
 
 pub fn parquet_column(schema: &SchemaDescriptor, column: &str) -> Option<usize> {
     let mut column_ix: Option<usize> = None;
@@ -38,6 +42,47 @@ pub fn parquet_column(schema: &SchemaDescriptor, column: &str) -> Option<usize> 
     }
     column_ix
 }
+
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct PageIndexEntry<T> {
+    pub row_group_i: usize,
+    pub page_i: usize,
+    pub min: T,
+    pub max: T,
+    pub start_row: i64,
+    pub end_row: i64,
+}
+
+impl<T> PageIndexEntry<T> {
+    pub fn row_len(&self) -> i64 {
+        self.end_row - self.start_row
+    }
+}
+
+impl<T: HasProximity> Span1D for PageIndexEntry<T> {
+    type DimType = T;
+
+    fn start(&self) -> Self::DimType {
+        self.min
+    }
+
+    fn end(&self) -> Self::DimType {
+        self.max
+    }
+}
+
+impl<T: HasProximity> PageIndexType<T> for PageIndexEntry<T> {
+    fn start_row(&self) -> i64 {
+        self.start_row
+    }
+
+    fn end_row(&self) -> i64 {
+        self.end_row
+    }
+}
+
+
 
 pub trait PageIndexType<T> : Span1D<DimType = T> + Sized {
     fn start_row(&self) -> i64;
@@ -83,43 +128,12 @@ pub trait PageIndexType<T> : Span1D<DimType = T> + Sized {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TimeIndexPage {
-    pub row_group_i: usize,
-    pub page_i: usize,
-    pub min: f32,
-    pub max: f32,
-    pub start_row: i64,
-    pub end_row: i64,
-}
 
-impl TimeIndexPage {
-    pub fn row_len(&self) -> i64 {
-        self.end_row - self.start_row
-    }
-}
+pub type TimeIndexPage = PageIndexEntry<f32>;
+pub type PointMZIndexPage = PageIndexEntry<f64>;
+pub type PointIonMobilityIndexPage = PageIndexEntry<f64>;
+pub type PointSpectrumIndexPage = PageIndexEntry<u64>;
 
-impl Span1D for TimeIndexPage {
-    type DimType = f32;
-
-    fn start(&self) -> Self::DimType {
-        self.min
-    }
-
-    fn end(&self) -> Self::DimType {
-        self.max
-    }
-}
-
-impl PageIndexType<f32> for TimeIndexPage {
-    fn start_row(&self) -> i64 {
-        self.start_row
-    }
-
-    fn end_row(&self) -> i64 {
-        self.end_row
-    }
-}
 
 pub fn read_spectrum_time_index(
     reader: &ParquetRecordBatchReaderBuilder<fs::File>,
@@ -212,86 +226,6 @@ pub fn read_spectrum_time_index(
     Ok(pages)
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Float64IndexPage {
-    pub row_group_i: usize,
-    pub page_i: usize,
-    pub min: f64,
-    pub max: f64,
-    pub start_row: i64,
-    pub end_row: i64,
-}
-
-impl Float64IndexPage {
-    pub fn row_len(&self) -> i64 {
-        self.end_row - self.start_row
-    }
-}
-
-impl Span1D for Float64IndexPage {
-    type DimType = f64;
-
-    fn start(&self) -> Self::DimType {
-        self.min
-    }
-
-    fn end(&self) -> Self::DimType {
-        self.max
-    }
-}
-
-impl PageIndexType<f64> for Float64IndexPage {
-    fn start_row(&self) -> i64 {
-        self.start_row
-    }
-
-    fn end_row(&self) -> i64 {
-        self.end_row
-    }
-}
-
-
-pub type PointMZIndexPage = Float64IndexPage;
-pub type PointIonMobilityIndexPage = Float64IndexPage;
-
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PointSpectrumIndexPage {
-    pub row_group_i: usize,
-    pub page_i: usize,
-    pub min: u64,
-    pub max: u64,
-    pub start_row: i64,
-    pub end_row: i64,
-}
-
-impl PointSpectrumIndexPage {
-    pub fn row_len(&self) -> i64 {
-        self.end_row - self.start_row
-    }
-}
-
-impl Span1D for PointSpectrumIndexPage {
-    type DimType = u64;
-
-    fn start(&self) -> Self::DimType {
-        self.min as u64
-    }
-
-    fn end(&self) -> Self::DimType {
-        self.max as u64
-    }
-}
-
-impl PageIndexType<u64> for PointSpectrumIndexPage {
-    fn start_row(&self) -> i64 {
-        self.start_row
-    }
-
-    fn end_row(&self) -> i64 {
-        self.end_row
-    }
-}
 
 pub fn read_point_spectrum_index(
     reader: &ParquetRecordBatchReaderBuilder<fs::File>,
@@ -384,10 +318,44 @@ pub fn read_point_spectrum_index(
     Ok(pages)
 }
 
+
+macro_rules! read_pages {
+    ($rg:ident, $i:ident, $native_index:expr, $vtype:ty, $pages:ident, $total_rows:ident, $offset_list:ident) => {
+        for (page_i, (q, offset)) in $native_index
+            .indexes
+            .iter()
+            .zip($offset_list.page_locations().iter())
+            .enumerate()
+        {
+            if q.min().is_none() {
+                continue;
+            }
+            let min = *q.min().unwrap() as $vtype;
+            let max = *q.max().unwrap() as $vtype;
+            let start_row = offset.first_row_index + $total_rows;
+            let end_row =
+                if let Some(next_loc) = $offset_list.page_locations().get(page_i + 1) {
+                    next_loc.first_row_index + $total_rows
+                } else {
+                    $rg.num_rows() + $total_rows
+                };
+            $pages.push(PageIndexEntry::<$vtype> {
+                row_group_i: $i,
+                page_i: page_i,
+                min,
+                max,
+                start_row,
+                end_row,
+            })
+        }
+    };
+}
+
+
 pub(crate) fn read_f64_page_index(
     reader: &ParquetRecordBatchReaderBuilder<fs::File>,
     column_path: &str
-) -> io::Result<Vec<PointMZIndexPage>> {
+) -> io::Result<Vec<PageIndexEntry<f64>>> {
     let metadata = reader.metadata();
 
     let pq_schema = reader.parquet_schema();
@@ -409,62 +377,10 @@ pub(crate) fn read_f64_page_index(
 
         match idx_list {
             ParquetTypedIndex::FLOAT(native_index) => {
-                for (page_i, (q, offset)) in native_index
-                    .indexes
-                    .iter()
-                    .zip(offset_list.page_locations().iter())
-                    .enumerate()
-                {
-                    if q.min().is_none() {
-                        continue;
-                    }
-                    let min = *q.min().unwrap() as f64;
-                    let max = *q.max().unwrap() as f64;
-                    let start_row = offset.first_row_index + total_rows;
-                    let end_row =
-                        if let Some(next_loc) = offset_list.page_locations().get(page_i + 1) {
-                            next_loc.first_row_index + total_rows
-                        } else {
-                            rg.num_rows() + total_rows
-                        };
-                    pages.push(Float64IndexPage {
-                        row_group_i: i,
-                        page_i: page_i,
-                        min,
-                        max,
-                        start_row,
-                        end_row,
-                    })
-                }
+                read_pages!(rg, i, native_index, f64, pages, total_rows, offset_list);
             }
             ParquetTypedIndex::DOUBLE(native_index) => {
-                for (page_i, (q, offset)) in native_index
-                    .indexes
-                    .iter()
-                    .zip(offset_list.page_locations().iter())
-                    .enumerate()
-                {
-                    if q.min().is_none() {
-                        continue;
-                    }
-                    let min = *q.min().unwrap() as f64;
-                    let max = *q.max().unwrap() as f64;
-                    let start_row = offset.first_row_index + total_rows;
-                    let end_row =
-                        if let Some(next_loc) = offset_list.page_locations().get(page_i + 1) {
-                            next_loc.first_row_index + total_rows
-                        } else {
-                            rg.num_rows() + total_rows
-                        };
-                    pages.push(Float64IndexPage {
-                        row_group_i: i,
-                        page_i: page_i,
-                        min,
-                        max,
-                        start_row,
-                        end_row,
-                    })
-                }
+                read_pages!(rg, i, native_index, f64, pages, total_rows, offset_list);
             }
             _ => {
                 panic!("Wrong type of index!");

@@ -1,24 +1,38 @@
-use std::{io, env};
+use std::io;
 
+use clap::Parser;
 use mzdata::prelude::*;
-use mzpeaks::coordinate::SimpleInterval;
+use mzpeaks::{coordinate::SimpleInterval, CoordinateRange};
 
+#[derive(clap::Parser)]
+struct App {
+    #[arg()]
+    filename: String,
 
+    #[arg(short, long, default_value="10.0-21.0")]
+    time_range: CoordinateRange<f32>,
+
+    #[arg(short, long, default_value="623.0-625.0")]
+    mz_range: CoordinateRange<f64>,
+
+    #[arg(short, long, default_value="0.8-1.2")]
+    im_range: CoordinateRange<f64>,
+
+}
 
 fn main() -> io::Result<()> {
-    let filename = env::args().skip(1).next().unwrap();
-
+    let args = App::parse();
     let mut reader = mzdata::MZReader::open_path(
-        filename
+        args.filename
     )?;
 
     let start = std::time::Instant::now();
 
-    let time_range = SimpleInterval::new(10.0, 21.0);
-    let mz_range = SimpleInterval::new(623.0, 625.0);
-    let im_range = SimpleInterval::new(0.8, 1.2);
+    let time_range = SimpleInterval::new(args.time_range.start.unwrap(), args.time_range.end.unwrap());
+    let mz_range = SimpleInterval::new(args.mz_range.start.unwrap(), args.mz_range.end.unwrap());
+    let im_range = SimpleInterval::new(args.im_range.start.unwrap(), args.im_range.end.unwrap());
 
-    let it = reader.start_from_time(time_range.start)?;
+    let it = reader.start_from_time(time_range.start as f64)?;
     while let Some(spec) = it.next() {
         if let Some(arrays) = spec.arrays.as_ref() {
             let mzs = arrays.mzs()?;
