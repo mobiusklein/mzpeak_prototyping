@@ -1,13 +1,52 @@
-use arrow::datatypes::FieldRef;
-use itertools::Itertools;
-use mzdata::{self, prelude::*};
-use mzpeak_prototyping::*;
-use parquet::{
-    basic::{Encoding, ZstdLevel},
-    file::properties::{EnabledStatistics, WriterProperties, WriterVersion},
+use mzdata::{self, io::MZReaderType, prelude::*};
+use mzpeak_prototyping::{peak_series::ToMzPeaksDataSeries, *};
+use mzpeaks::{
+    CentroidPeak,
+    DeconvolutedPeak,
 };
-use serde_arrow::schema::SchemaLike;
-use std::{env, fs, io, path::PathBuf, sync::{Arc, mpsc::sync_channel}, thread};
+use std::{collections::HashSet, env, fs, io, path::PathBuf, sync::mpsc::sync_channel, thread};
+
+fn sample_array_types<
+    C: CentroidLike + ToMzPeaksDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+    D: DeconvolutedCentroidLike + ToMzPeaksDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+>(
+    reader: &mut MZReaderType<fs::File, C, D>,
+) -> HashSet<std::sync::Arc<arrow::datatypes::Field>> {
+    let n = reader.len();
+    let mut arrays = HashSet::new();
+
+    arrays.extend(C::to_fields().iter().cloned());
+    arrays.extend(D::to_fields().iter().cloned());
+
+    if n == 0 {
+        return arrays;
+    }
+
+    let field_it = [0, 100.min(n - 1), n / 2]
+        .into_iter()
+        .flat_map(|i| {
+            reader.get_spectrum_by_index(i).and_then(|s| {
+                s.raw_arrays().and_then(|map| {
+                    peak_series::array_map_to_schema_arrays(
+                        BufferContext::Spectrum,
+                        map,
+                        map.mzs().map(|a| a.len()).unwrap_or_default(),
+                        0,
+                        "spectrum_index",
+                    )
+                    .ok()
+                })
+            })
+        })
+        .map(|(fields, _arrs)| {
+            let fields: Vec<_> = fields.iter().cloned().collect();
+            fields
+        })
+        .flatten();
+
+    arrays.extend(field_it);
+    arrays
+}
 
 fn main() -> io::Result<()> {
     env_logger::init();
@@ -15,64 +54,49 @@ fn main() -> io::Result<()> {
 
     let start = std::time::Instant::now();
 
-    let mut reader = mzdata::MZReader::open_path(&filename).inspect_err(|e| {
-        eprintln!("Failed to open data file: {e}")
-    })?;
+    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&filename)
+        .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
 
-    let fields =
-        Vec::<FieldRef>::from_type::<MzPeaksEntry<MzPeaksMZIMPoint>>(Default::default()).unwrap();
-    let schema = Arc::new(arrow::datatypes::Schema::new(fields.clone()));
+    let outname = filename.with_extension("mzpeak");
+    let handle = fs::File::create(outname.file_name().unwrap())?;
+    let mut writer = MzPeaksWriter::<fs::File>::builder()
+        .add_spectrum_peak_type::<CentroidPeak>()
+        .add_spectrum_peak_type::<DeconvolutedPeak>()
+        .add_default_chromatogram_fields().buffer_size(5000);
+
+    writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader)
+        .into_iter()
+        .fold(writer, |writer, f| writer.add_spectrum_field(f));
+
+    let mut writer = writer.build(handle);
+
+    writer.add_file_description(reader.file_description());
+
+    for inst in reader.instrument_configurations().values() {
+        writer.add_instrument_configuration(inst);
+    }
+    for sw in reader.softwares() {
+        writer.add_software(sw);
+    }
+    for dp in reader.data_processings() {
+        writer.add_data_processing(dp);
+    }
 
     let (send, recv) = sync_channel(1);
 
     let read_handle = thread::spawn(move || {
-        let mut precursor_index: u64 = 0;
-        let entries_iter = reader
-            .iter()
-            .map(|s| {
-                MzPeaksEntry::<MzPeaksMZIMPoint>::from_spectrum_with_precursors(
-                    &s,
-                    &mut precursor_index,
-                )
-            })
-            .chunks(1000);
-
-        for entry in entries_iter.into_iter() {
-            let entry = entry.flatten().collect_vec();
-            let batch = serde_arrow::to_record_batch(&fields, &entry).unwrap();
-            send.send(batch).unwrap();
+        for entry in reader.into_iter() {
+            send.send(entry).unwrap();
         }
     });
 
-    let outname = filename.with_extension("mzpeak");
-    let handle = fs::File::create(outname.file_name().unwrap())?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::ZSTD(
-            ZstdLevel::try_new(3).unwrap(),
-        ))
-        .set_column_encoding(
-            "point.mz".into(),
-            Encoding::BYTE_STREAM_SPLIT,
-        )
-        .set_column_encoding(
-            "point.intensity".into(),
-            Encoding::BYTE_STREAM_SPLIT,
-        )
-        .set_column_encoding(
-            "point.im".into(),
-            Encoding::BYTE_STREAM_SPLIT,
-        )
-        .set_column_encoding("point.spectrum_index".into(), Encoding::RLE)
-        .set_column_bloom_filter_enabled("spectrum.id".into(), true)
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .build();
-    let mut writer = parquet::arrow::ArrowWriter::try_new(handle, schema, Some(props))?;
-
     let write_handle = thread::spawn(move || {
-        for (i, batch) in recv.into_iter().enumerate() {
-            log::info!("Writing batch {i}");
-            writer.write(&batch).unwrap();
+        for (i, mut batch) in recv.into_iter().enumerate() {
+            if i % 5000 == 0 {
+                log::info!("Writing batch {i}");
+            }
+            batch.peaks = None;
+            writer.write_spectrum(&batch).unwrap();
         }
         writer.finish().unwrap();
     });

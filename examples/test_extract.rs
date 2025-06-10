@@ -19,7 +19,6 @@ use std::{
 };
 
 use mzpeak_prototyping::index::{
-    PageIndexEntry, PageIndexType, PointSpectrumIndexPage,
     read_point_mz_index,
     read_point_spectrum_index,
     spectrum_index_range_for_time_range,
@@ -55,8 +54,8 @@ fn main() -> io::Result<()> {
         handle.try_clone()?,
         ArrowReaderOptions::new().with_page_index(true),
     )?;
-    let point_spectrum_index = read_point_spectrum_index(&reader)?;
-    let point_mz_index = read_point_mz_index(&reader)?;
+    let point_spectrum_index = read_point_spectrum_index(&reader).unwrap();
+    let point_mz_index = read_point_mz_index(&reader).unwrap();
 
     let time_range = SimpleInterval::new(args.time_range.start.unwrap() as f32, args.time_range.end.unwrap() as f32);
     let mz_range = SimpleInterval::new(args.mz_range.start.unwrap(), args.mz_range.end.unwrap());
@@ -69,12 +68,9 @@ fn main() -> io::Result<()> {
     handle.seek(io::SeekFrom::Start(0))?;
 
     let start = std::time::Instant::now();
-    let index_selection = PointSpectrumIndexPage::build_row_selection_overlaps(
-        &point_spectrum_index,
-        &index_range,
-    );
 
-    let mz_selection = PageIndexEntry::<f64>::build_row_selection_overlaps(&point_mz_index, &mz_range);
+    let index_selection = point_spectrum_index.row_selection_overlaps(&index_range);
+    let mz_selection = point_mz_index.row_selection_overlaps(&mz_range);
 
     let projection = ProjectionMask::columns(
         reader.parquet_schema(),
