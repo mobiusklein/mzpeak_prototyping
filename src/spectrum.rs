@@ -1,18 +1,18 @@
-use mzdata::{params::Unit, prelude::*, spectrum::{DataArray, IsolationWindowState, ScanEvent}};
+use mzdata::{params::{ControlledVocabulary, Unit}, prelude::*, spectrum::{DataArray, IsolationWindowState, ScanEvent}};
 use serde::{Deserialize, Serialize};
 
 use crate::{curie, param::{Param, CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID}};
 
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MzPeaksAuxiliaryArray {
+pub struct AuxiliaryArray {
     pub data: Vec<u8>,
     pub data_type: CURIE,
     pub unit: Option<CURIE>,
     pub parameters: Vec<Param>,
 }
 
-impl MzPeaksAuxiliaryArray {
+impl AuxiliaryArray {
     pub fn from_data_array(source: &DataArray) -> Result<Self, mzdata::spectrum::bindata::ArrayRetrievalError> {
         let data = source.decode()?.to_vec();
         let curie = source.dtype().curie().ok_or_else(|| mzdata::spectrum::bindata::ArrayRetrievalError::DataTypeSizeMismatch)?.into();
@@ -29,7 +29,7 @@ impl MzPeaksAuxiliaryArray {
 
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MzPeaksSpectrumEntry {
+pub struct SpectrumEntry {
     pub index: Option<u64>,
     pub id: String,
     pub ms_level: u8,
@@ -56,10 +56,10 @@ pub struct MzPeaksSpectrumEntry {
     pub parameters: Vec<Param>,
 
     pub data_processing_ref: Option<u32>,
-    pub auxiliary_arrays: Vec<MzPeaksAuxiliaryArray>,
+    pub auxiliary_arrays: Vec<AuxiliaryArray>,
 }
 
-impl MzPeaksSpectrumEntry {
+impl SpectrumEntry {
     pub fn from_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(spectrum: &impl SpectrumLike<C, D>) -> Self {
         let summaries = spectrum.peaks().fetch_summaries();
 
@@ -121,7 +121,7 @@ impl MzPeaksSpectrumEntry {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MzPeaksScanEntry {
+pub struct ScanEntry {
     pub spectrum_index: Option<u64>,
     pub scan_start_time: Option<f32>,
     pub preset_scan_configuration: Option<u32>,
@@ -133,7 +133,7 @@ pub struct MzPeaksScanEntry {
     pub parameters: Vec<Param>,
 }
 
-impl MzPeaksScanEntry {
+impl ScanEntry {
     pub fn from_scan_event(spectrum_index: Option<u64>, event: &ScanEvent) -> Self {
         let ion_mobility = event.ion_mobility();
         let ion_mobility_type = match ion_mobility {
@@ -165,6 +165,10 @@ impl MzPeaksScanEntry {
             instrument_configuration_ref: Some(event.instrument_configuration_id),
             ..Default::default()
         }
+    }
+
+    pub fn to_mzdata(&self) {
+
     }
 }
 
@@ -257,7 +261,7 @@ impl From<Activation> for mzdata::spectrum::Activation {
 
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MzPeaksPrecursorEntry {
+pub struct PrecursorEntry {
     pub spectrum_index: Option<u64>,
     pub precursor_index: Option<u64>,
     pub precursor_id: Option<String>,
@@ -266,7 +270,7 @@ pub struct MzPeaksPrecursorEntry {
     pub activation: Activation,
 }
 
-impl MzPeaksPrecursorEntry {
+impl PrecursorEntry {
     pub fn from_precursor(
         precursor: &mzdata::spectrum::Precursor,
         spectrum_index: Option<u64>,
@@ -281,10 +285,18 @@ impl MzPeaksPrecursorEntry {
             activation: (&precursor.activation).into(),
         }
     }
+
+    pub fn to_mzdata(&self) -> mzdata::spectrum::Precursor {
+        let mut prec = mzdata::spectrum::Precursor::default();
+        prec.isolation_window = self.isolation_window.clone().into();
+        prec.activation = self.activation.clone().into();
+        prec.precursor_id = self.precursor_id.clone();
+        prec
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MZPeaksSelectedIonEntry {
+pub struct SelectedIonEntry {
     pub spectrum_index: Option<u64>,
     pub precursor_index: Option<u64>,
     pub selected_ion_mz: Option<f64>,
@@ -295,7 +307,7 @@ pub struct MZPeaksSelectedIonEntry {
     pub parameters: Vec<Param>,
 }
 
-impl MZPeaksSelectedIonEntry {
+impl SelectedIonEntry {
     pub fn from_selected_ion(
         selected_ion: &mzdata::spectrum::SelectedIon,
         spectrum_index: Option<u64>,
@@ -310,7 +322,7 @@ impl MZPeaksSelectedIonEntry {
                 }
             }
         }
-        MZPeaksSelectedIonEntry {
+        SelectedIonEntry {
             spectrum_index,
             precursor_index,
             selected_ion_mz: Some(selected_ion.mz),
@@ -326,5 +338,65 @@ impl MZPeaksSelectedIonEntry {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    pub fn to_mzdata(&self) -> mzdata::spectrum::SelectedIon {
+        let mut si = mzdata::spectrum::SelectedIon::default();
+        si.charge = self.charge_state;
+        si.intensity = self.intensity.unwrap_or_default();
+        si.mz = self.selected_ion_mz.unwrap_or_default();
+
+        for p in self.parameters.iter().cloned() {
+            si.add_param(p.into());
+        }
+
+        if let Some(im) = self.ion_mobility {
+            let im_type: mzdata::params::CURIE =
+                self.ion_mobility_type.unwrap().into();
+            let im_param = mzdata::params::Param::builder();
+            let im_param = match im_type {
+                mzdata::params::CURIE {
+                    controlled_vocabulary: ControlledVocabulary::MS,
+                    accession: 1002476,
+                } => im_param
+                    .curie(im_type)
+                    .name("ion mobility drift time")
+                    .value(im)
+                    .unit(Unit::Millisecond),
+                mzdata::params::CURIE {
+                    controlled_vocabulary: ControlledVocabulary::MS,
+                    accession: 1002815,
+                } => im_param
+                    .curie(im_type)
+                    .name("inverse reduced ion mobility drift time")
+                    .value(im)
+                    .unit(Unit::VoltSecondPerSquareCentimeter),
+                mzdata::params::CURIE {
+                    controlled_vocabulary: ControlledVocabulary::MS,
+                    accession: 1001581,
+                } => im_param
+                    .curie(im_type)
+                    .name("FAIMS compensation voltage")
+                    .value(im)
+                    .unit(Unit::Volt),
+                mzdata::params::CURIE {
+                    controlled_vocabulary: ControlledVocabulary::MS,
+                    accession: 1003371,
+                } => im_param
+                    .curie(im_type)
+                    .name("SELEXION compensation voltage")
+                    .value(im)
+                    .unit(Unit::Volt),
+                _ => todo!("Don't know how to deal with {im_type}"),
+            }
+            .build();
+            si.add_param(im_param);
+        }
+
+        for p in self.parameters.iter().map(|p| p.into()) {
+            si.add_param(p);
+        }
+
+        si
     }
 }

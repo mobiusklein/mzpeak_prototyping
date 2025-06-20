@@ -3,12 +3,12 @@ use mzdata::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CURIE, MZPeaksSelectedIonEntry, MzPeaksPrecursorEntry, MzPeaksScanEntry, MzPeaksSpectrumEntry,
-    Param, peak_series::ToMzPeaksDataSeries,
+    CURIE, SelectedIonEntry, PrecursorEntry, ScanEntry, SpectrumEntry,
+    Param, peak_series::ToMzPeakDataSeries,
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MzPeaksChromatogramEntry {
+pub struct ChromatogramEntry {
     pub index: Option<u64>,
     pub id: String,
     pub polarity: i8,
@@ -18,23 +18,24 @@ pub struct MzPeaksChromatogramEntry {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct MzPeaksEntry {
-    pub spectrum: Option<Box<MzPeaksSpectrumEntry>>,
-    pub scan: Option<Box<MzPeaksScanEntry>>,
-    pub precursor: Option<Box<MzPeaksPrecursorEntry>>,
-    pub selected_ion: Option<Box<MZPeaksSelectedIonEntry>>,
-    pub chromatogram: Option<Box<MzPeaksChromatogramEntry>>,
+pub struct Entry {
+    pub spectrum: Option<Box<SpectrumEntry>>,
+    pub scan: Option<Box<ScanEntry>>,
+    pub precursor: Option<Box<PrecursorEntry>>,
+    pub selected_ion: Option<Box<SelectedIonEntry>>,
+    pub chromatogram: Option<Box<ChromatogramEntry>>,
 }
 
-impl MzPeaksEntry {
+impl Entry {
     pub fn from_spectrum<
-        C: ToMzPeaksDataSeries + CentroidLike,
-        D: ToMzPeaksDataSeries + DeconvolutedCentroidLike,
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
     >(
         spectrum: &impl SpectrumLike<C, D>,
         index: Option<u64>,
+        precursor_index: Option<&mut u64>,
     ) -> Vec<Self> {
-        let mut spec = MzPeaksSpectrumEntry::from_spectrum(spectrum);
+        let mut spec = SpectrumEntry::from_spectrum(spectrum);
         if let Some(index) = index {
             spec.index = Some(index);
         }
@@ -47,27 +48,32 @@ impl MzPeaksEntry {
 
         for (i, event) in spectrum.acquisition().iter().enumerate() {
             if i == 0 {
-                entries[0].scan = Some(MzPeaksScanEntry::from_scan_event(index, event).into());
+                entries[0].scan = Some(ScanEntry::from_scan_event(index, event).into());
             } else {
                 entries.push(Self {
-                    scan: Some(MzPeaksScanEntry::from_scan_event(index, event).into()),
+                    scan: Some(ScanEntry::from_scan_event(index, event).into()),
                     ..Default::default()
                 });
             }
         }
 
         if let Some(precursor) = spectrum.precursor() {
-            let prec = MzPeaksPrecursorEntry::from_precursor(
+            let prec = PrecursorEntry::from_precursor(
                 precursor,
                 Some(spectrum.index() as u64),
-                index,
+                precursor_index.as_ref().map(|v| **v),
+
             );
+            let prec_index = prec.precursor_index;
+            if let Some(pi) = precursor_index {
+                *pi += 1
+            }
             entries[0].precursor = Some(prec.into());
             for (i, ion) in precursor.ions.iter().enumerate() {
-                let part = MZPeaksSelectedIonEntry::from_selected_ion(
+                let part = SelectedIonEntry::from_selected_ion(
                     ion,
                     Some(spectrum.index() as u64),
-                    index,
+                    prec_index,
                 );
                 if i == 0 {
                     entries[0].selected_ion = Some(part.into())
@@ -80,8 +86,8 @@ impl MzPeaksEntry {
     }
 }
 
-impl From<MzPeaksSpectrumEntry> for MzPeaksEntry {
-    fn from(value: MzPeaksSpectrumEntry) -> Self {
+impl From<SpectrumEntry> for Entry {
+    fn from(value: SpectrumEntry) -> Self {
         Self {
             spectrum: Some(Box::new(value)),
             ..Default::default()
@@ -89,8 +95,8 @@ impl From<MzPeaksSpectrumEntry> for MzPeaksEntry {
     }
 }
 
-impl From<MzPeaksScanEntry> for MzPeaksEntry {
-    fn from(value: MzPeaksScanEntry) -> Self {
+impl From<ScanEntry> for Entry {
+    fn from(value: ScanEntry) -> Self {
         Self {
             scan: Some(Box::new(value)),
             ..Default::default()
@@ -98,16 +104,16 @@ impl From<MzPeaksScanEntry> for MzPeaksEntry {
     }
 }
 
-impl From<MzPeaksPrecursorEntry> for MzPeaksEntry {
-    fn from(value: MzPeaksPrecursorEntry) -> Self {
+impl From<PrecursorEntry> for Entry {
+    fn from(value: PrecursorEntry) -> Self {
         let mut this = Self::default();
         this.precursor = Some(Box::new(value));
         this
     }
 }
 
-impl From<MZPeaksSelectedIonEntry> for MzPeaksEntry {
-    fn from(value: MZPeaksSelectedIonEntry) -> Self {
+impl From<SelectedIonEntry> for Entry {
+    fn from(value: SelectedIonEntry) -> Self {
         let mut this = Self::default();
         this.selected_ion = Some(Box::new(value));
         this

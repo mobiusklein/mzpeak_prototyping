@@ -3,9 +3,12 @@ use std::{fmt::Display, str::FromStr};
 use mzdata::params::{ParamDescribed, ParamLike, Unit};
 use serde::{Deserialize, Serialize};
 
+/// Numerical identifier for "Proteomics Standards Initiative Mass Spectrometry Ontology"
 pub const MS_CV_ID: u8 = 1;
+/// Numerical identifier for "Unit Ontology"
 pub const UO_CV_ID: u8 = 2;
 
+/// A list of ion mobility point measures for scans
 pub const ION_MOBILITY_SCAN_TERMS: [mzdata::params::CURIE; 4] = [
     // ion mobility drift time
     mzdata::curie!(MS:1002476),
@@ -17,14 +20,23 @@ pub const ION_MOBILITY_SCAN_TERMS: [mzdata::params::CURIE; 4] = [
     mzdata::curie!(MS:1003371),
 ];
 
+/// A controlled vocabulary or user parameter similar to [`mzdata::params::Param`]
+///
+/// This can be inter-converted with [`mzdata::params::Param`], though it is not a
+/// zero-copy operation.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct Param {
+    /// The name, if given
     pub name: Option<String>,
+    /// The accession code for the term
     pub accession: Option<CURIE>,
+    /// A wide variant value type
     pub value: ParamValueSplit,
+    /// The accession code for the unit
     pub unit: Option<CURIE>,
 }
 
+/// A numerical encoding of a CURIE accession similar to [`mzdata::params::CURIE`]
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CURIE {
     pub cv_id: u8,
@@ -135,6 +147,7 @@ impl CURIE {
     }
 }
 
+// Provide a way to JSON-serialize CURIEs as nullable string
 pub(crate) fn opt_curie_serialize<S>(
     curie: &Option<CURIE>,
     serializer: S,
@@ -148,6 +161,7 @@ where
     }
 }
 
+// Provide a way to JSON-serialize CURIEs as string
 pub(crate) fn curie_serialize<S>(curie: &CURIE, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -155,6 +169,7 @@ where
     serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string())
 }
 
+// Provide a way to JSON-deserialize CURIEs from a nullable string
 pub(crate) fn opt_curie_deserialize<'de, D>(deserializer: D) -> Result<Option<CURIE>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -192,6 +207,8 @@ where
     deserializer.deserialize_any(CURIEVisit {})
 }
 
+
+// Provide a way to JSON-deserialize CURIEs from a string
 pub(crate) fn curie_deserialize<'de, D>(deserializer: D) -> Result<CURIE, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -215,6 +232,11 @@ where
     deserializer.deserialize_str(CURIEVisit {})
 }
 
+/// A wide-variant of [`mzdata::params::Value`] that can hold any strongly typed
+/// parameter value.
+///
+/// The space of the other type variants is still allocated, which makes this structure
+/// inefficient.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct ParamValueSplit {
     pub integer: Option<i64>,
@@ -267,6 +289,8 @@ impl From<mzdata::Param> for Param {
     }
 }
 
+/// A [`serde_json`]-friendly version of [`Param`] that uses
+/// [`serde_json::Value`] instead of [`ParamValueSplit`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MetaParam {
     pub name: Option<String>,
@@ -378,15 +402,16 @@ impl From<Param> for MetaParam {
     }
 }
 
+/// An adaptation of [`mzdata::meta::SourceFile`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MzPeaksSourceFile {
+pub struct SourceFile {
     pub id: String,
     pub location: String,
     pub name: String,
     pub parameters: Vec<MetaParam>,
 }
 
-impl From<&mzdata::meta::SourceFile> for MzPeaksSourceFile {
+impl From<&mzdata::meta::SourceFile> for SourceFile {
     fn from(value: &mzdata::meta::SourceFile) -> Self {
         let mut parameters: Vec<MetaParam> = value
             .params()
@@ -409,13 +434,14 @@ impl From<&mzdata::meta::SourceFile> for MzPeaksSourceFile {
     }
 }
 
+/// An adaptation of [`mzdata::meta::FileDescription`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MzPeaksFileDescription {
+pub struct FileDescription {
     pub contents: Vec<MetaParam>,
-    pub source_files: Vec<MzPeaksSourceFile>,
+    pub source_files: Vec<SourceFile>,
 }
 
-impl From<&mzdata::meta::FileDescription> for MzPeaksFileDescription {
+impl From<&mzdata::meta::FileDescription> for FileDescription {
     fn from(value: &mzdata::meta::FileDescription) -> Self {
         let contents = value
             .contents
@@ -426,7 +452,7 @@ impl From<&mzdata::meta::FileDescription> for MzPeaksFileDescription {
         let source_files = value
             .source_files
             .iter()
-            .map(MzPeaksSourceFile::from)
+            .map(SourceFile::from)
             .collect();
         Self {
             contents,
@@ -435,8 +461,9 @@ impl From<&mzdata::meta::FileDescription> for MzPeaksFileDescription {
     }
 }
 
+/// An adaptation of [`mzdata::meta::Software`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MzPeaksSoftware {
+pub struct Software {
     /// A unique identifier for the software within processing metadata
     pub id: String,
     /// A string denoting a particular software version, but does no guarantee is given for its format
@@ -445,7 +472,7 @@ pub struct MzPeaksSoftware {
     pub parameters: Vec<MetaParam>,
 }
 
-impl From<&mzdata::meta::Software> for MzPeaksSoftware {
+impl From<&mzdata::meta::Software> for Software {
     fn from(value: &mzdata::meta::Software) -> Self {
         Self {
             id: value.id.clone(),
@@ -455,14 +482,15 @@ impl From<&mzdata::meta::Software> for MzPeaksSoftware {
     }
 }
 
+/// An adaptation of [`mzdata::meta::ProcessingMethod`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MzPeaksProcessingMethod {
+pub struct ProcessingMethod {
     pub order: i8,
     pub software_reference: String,
     pub parameters: Vec<MetaParam>,
 }
 
-impl From<&mzdata::meta::ProcessingMethod> for MzPeaksProcessingMethod {
+impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
     fn from(value: &mzdata::meta::ProcessingMethod) -> Self {
         Self {
             order: value.order,
@@ -472,13 +500,14 @@ impl From<&mzdata::meta::ProcessingMethod> for MzPeaksProcessingMethod {
     }
 }
 
+/// An adaptation of [`mzdata::meta::DataProcessing`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct MzPeaksDataProcessing {
+pub struct DataProcessing {
     pub id: String,
-    pub methods: Vec<MzPeaksProcessingMethod>,
+    pub methods: Vec<ProcessingMethod>,
 }
 
-impl From<&mzdata::meta::DataProcessing> for MzPeaksDataProcessing {
+impl From<&mzdata::meta::DataProcessing> for DataProcessing {
     fn from(value: &mzdata::meta::DataProcessing) -> Self {
         Self {
             id: value.id.clone(),
@@ -487,9 +516,10 @@ impl From<&mzdata::meta::DataProcessing> for MzPeaksDataProcessing {
     }
 }
 
+/// An adaptation of [`mzdata::meta::ComponentType`]
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Component {
+pub enum ComponentType {
     /// A mass analyzer
     Analyzer,
     /// A source for ions
@@ -500,23 +530,25 @@ pub enum Component {
     Unknown,
 }
 
+
+/// An adaptation of [`mzdata::meta::Component`]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MzPeaksComponent {
+pub struct Component {
     /// The kind of component this describes
-    pub component_type: Component,
+    pub component_type: ComponentType,
     /// The order in the sequence of components that the analytes interact with
     pub order: u8,
     pub parameters: Vec<MetaParam>,
 }
 
-impl From<&mzdata::meta::Component> for MzPeaksComponent {
+impl From<&mzdata::meta::Component> for Component {
     fn from(value: &mzdata::meta::Component) -> Self {
         Self {
             component_type: match value.component_type {
-                mzdata::meta::ComponentType::Analyzer => Component::Analyzer,
-                mzdata::meta::ComponentType::IonSource => Component::IonSource,
-                mzdata::meta::ComponentType::Detector => Component::Detector,
-                mzdata::meta::ComponentType::Unknown => Component::Unknown,
+                mzdata::meta::ComponentType::Analyzer => ComponentType::Analyzer,
+                mzdata::meta::ComponentType::IonSource => ComponentType::IonSource,
+                mzdata::meta::ComponentType::Detector => ComponentType::Detector,
+                mzdata::meta::ComponentType::Unknown => ComponentType::Unknown,
             },
             order: value.order,
             parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
@@ -524,10 +556,11 @@ impl From<&mzdata::meta::Component> for MzPeaksComponent {
     }
 }
 
+/// An adaptation of [`mzdata::meta::InstrumentConfiguration`]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MzPeaksInstrumentConfiguration {
+pub struct InstrumentConfiguration {
     /// The set of components involved
-    pub components: Vec<MzPeaksComponent>,
+    pub components: Vec<Component>,
     /// A set of parameters that describe the instrument such as the model name or serial number
     pub parameters: Vec<MetaParam>,
     /// A reference to the data acquisition software involved in processing this configuration
@@ -536,13 +569,13 @@ pub struct MzPeaksInstrumentConfiguration {
     pub id: u32,
 }
 
-impl From<&mzdata::meta::InstrumentConfiguration> for MzPeaksInstrumentConfiguration {
+impl From<&mzdata::meta::InstrumentConfiguration> for InstrumentConfiguration {
     fn from(value: &mzdata::meta::InstrumentConfiguration) -> Self {
         Self {
             components: value
                 .components
                 .iter()
-                .map(MzPeaksComponent::from)
+                .map(Component::from)
                 .collect(),
             parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
             software_reference: value.software_reference.clone(),

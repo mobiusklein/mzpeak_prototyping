@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::param::{
     CURIE, curie_deserialize, curie_serialize, opt_curie_deserialize, opt_curie_serialize,
 };
-use crate::spectrum::MzPeaksAuxiliaryArray;
+use crate::spectrum::AuxiliaryArray;
 
 pub fn array_to_arrow_type(dtype: BinaryDataArrayType) -> DataType {
     match dtype {
@@ -46,7 +46,7 @@ pub fn array_map_to_schema_arrays_and_excess(
     spectrum_index: u64,
     index_name: impl Into<String>,
     schema: &Schema,
-) -> Result<(Fields, Vec<ArrayRef>, Vec<MzPeaksAuxiliaryArray>), ArrayRetrievalError> {
+) -> Result<(Fields, Vec<ArrayRef>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
     let mut auxiliary = Vec::new();
@@ -73,7 +73,7 @@ pub fn array_map_to_schema_arrays_and_excess(
         let name = BufferName::new(context, k.clone(), v.dtype()).to_string();
         let fieldref = Arc::new(Field::new(name, dtype, true));
         if schema.field_with_name(fieldref.name()).is_err() {
-            auxiliary.push(MzPeaksAuxiliaryArray::from_data_array(v)?);
+            auxiliary.push(AuxiliaryArray::from_data_array(v)?);
             continue;
         }
         fields.push(fieldref.clone());
@@ -131,7 +131,8 @@ pub fn array_map_to_schema_arrays(
     Ok((fields.into(), arrays))
 }
 
-pub trait ToMzPeaksDataSeries: Sized + BuildArrayMapFrom {
+/// Convert a peak list to a collection of Arrow Arrays
+pub trait ToMzPeakDataSeries: Sized + BuildArrayMapFrom {
     fn to_fields() -> Fields;
     fn to_arrays(spectrum_index: u64, peaks: &[Self]) -> (Fields, Vec<ArrayRef>);
 }
@@ -154,7 +155,7 @@ pub const CHARGE_ARRAY: BufferName = BufferName::new(
     BinaryDataArrayType::Int32,
 );
 
-impl ToMzPeaksDataSeries for CentroidPeak {
+impl ToMzPeakDataSeries for CentroidPeak {
     fn to_fields() -> Fields {
         vec![
             BufferContext::Spectrum.index_field(),
@@ -177,7 +178,7 @@ impl ToMzPeaksDataSeries for CentroidPeak {
     }
 }
 
-impl ToMzPeaksDataSeries for IonMobilityAwareCentroidPeak {
+impl ToMzPeakDataSeries for IonMobilityAwareCentroidPeak {
     fn to_fields() -> Fields {
         vec![
             BufferContext::Spectrum.index_field(),
@@ -206,7 +207,7 @@ impl ToMzPeaksDataSeries for IonMobilityAwareCentroidPeak {
     }
 }
 
-impl ToMzPeaksDataSeries for DeconvolutedPeak {
+impl ToMzPeakDataSeries for DeconvolutedPeak {
     fn to_fields() -> Fields {
         vec![
             BufferContext::Spectrum.index_field(),
@@ -230,7 +231,7 @@ impl ToMzPeaksDataSeries for DeconvolutedPeak {
     }
 }
 
-impl ToMzPeaksDataSeries for IonMobilityAwareDeconvolutedPeak {
+impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
     fn to_fields() -> Fields {
         vec![
             BufferContext::Spectrum.index_field(),
@@ -260,16 +261,7 @@ impl ToMzPeaksDataSeries for IonMobilityAwareDeconvolutedPeak {
     }
 }
 
-pub trait MzPeakDataSeries: Serialize + Default + Clone {
-    fn spectrum_index(&self) -> u64;
-    fn array_names(&self) -> Vec<ArrayType>;
-    fn from_spectrum<T: SpectrumLike>(spectrum: &T, spectrum_index: u64) -> Vec<Self>;
-
-    fn context() -> BufferContext {
-        BufferContext::Spectrum
-    }
-}
-
+/// Whether an data array series is associated with a spectrum or a chromatogram
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferContext {
     Spectrum,
@@ -278,13 +270,18 @@ pub enum BufferContext {
 
 impl BufferContext {
     pub fn index_field(&self) -> FieldRef {
-        Arc::new(Field::new(match self {
-            BufferContext::Spectrum => "spectrum_index",
-            BufferContext::Chromatogram => "chromatogram_index",
-        }, DataType::UInt64, true))
+        Arc::new(Field::new(
+            match self {
+                BufferContext::Spectrum => "spectrum_index",
+                BufferContext::Chromatogram => "chromatogram_index",
+            },
+            DataType::UInt64,
+            true,
+        ))
     }
 }
 
+/// Composite structure for directly naming a data array series
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BufferName {
     context: BufferContext,
@@ -607,7 +604,7 @@ pub(crate) const fn arrow_to_array_type(data_type: &DataType) -> Option<BinaryDa
         DataType::Int64 => Some(BinaryDataArrayType::Int64),
         DataType::Float32 => Some(BinaryDataArrayType::Float32),
         DataType::Float64 => Some(BinaryDataArrayType::Float64),
-        _ => None
+        _ => None,
     }
 }
 
@@ -651,8 +648,12 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
         Self {
             context,
             prefix: value.prefix,
+            name: value
+                .path
+                .rsplit_once(".")
+                .map(|s| s.1.to_string())
+                .unwrap_or_else(|| value.path.to_string()),
             path: value.path,
-            name: value.array_name,
             array_type: array_type_from_accession(value.array_type).unwrap_or(ArrayType::Unknown),
             data_type: array_to_arrow_type(
                 binary_datatype_from_accession(value.data_type).unwrap_or_default(),

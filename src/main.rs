@@ -1,5 +1,5 @@
 use mzdata::{self, io::MZReaderType, prelude::*};
-use mzpeak_prototyping::{peak_series::ToMzPeaksDataSeries, *};
+use mzpeak_prototyping::{peak_series::ToMzPeakDataSeries, *};
 use mzpeaks::{
     CentroidPeak,
     DeconvolutedPeak,
@@ -7,8 +7,8 @@ use mzpeaks::{
 use std::{collections::HashSet, env, fs, io, path::PathBuf, sync::mpsc::sync_channel, thread};
 
 fn sample_array_types<
-    C: CentroidLike + ToMzPeaksDataSeries + BuildFromArrayMap + From<CentroidPeak>,
-    D: DeconvolutedCentroidLike + ToMzPeaksDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+    C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
 >(
     reader: &mut MZReaderType<fs::File, C, D>,
 ) -> HashSet<std::sync::Arc<arrow::datatypes::Field>> {
@@ -58,8 +58,11 @@ fn main() -> io::Result<()> {
         .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
 
     let outname = filename.with_extension("mzpeak");
+
     let handle = fs::File::create(outname.file_name().unwrap())?;
-    let mut writer = MzPeaksWriter::<fs::File>::builder()
+    // let data_handle = fs::File::create(outname.with_extension("data.mzpeak"))?;
+
+    let mut writer = MzPeakWriter::<fs::File>::builder()
         .add_spectrum_peak_type::<CentroidPeak>()
         .add_spectrum_peak_type::<DeconvolutedPeak>()
         .add_default_chromatogram_fields().buffer_size(5000);
@@ -68,6 +71,7 @@ fn main() -> io::Result<()> {
         .into_iter()
         .fold(writer, |writer, f| writer.add_spectrum_field(f));
 
+    // let mut writer = writer.build_split(data_handle, handle);
     let mut writer = writer.build(handle);
 
     writer.add_file_description(reader.file_description());

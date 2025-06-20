@@ -134,6 +134,20 @@ where PageIndexEntry<T>: PageIndexType<T>
         });
     }
 
+    pub fn row_selection_is_not_null(&self) -> RowSelection {
+        let mut selectors = Vec::new();
+        let mut last_row = 0;
+
+        for page in self.iter() {
+            if page.start_row() != last_row {
+                selectors.push(RowSelector::skip((page.start_row() - last_row) as usize));
+            }
+            selectors.push(RowSelector::select(page.row_len() as usize));
+            last_row = page.end_row();
+        }
+        selectors.into()
+    }
+
     pub fn row_selection_contains(&self, query: T) -> RowSelection {
         let mut selectors = Vec::new();
         let mut last_row = 0;
@@ -288,8 +302,8 @@ macro_rules! read_numeric_page_index {
                 $crate::index::ParquetTypedIndex::INT64(native_index) => {
                     read_pages!(rg, i, native_index, $type, pages, total_rows, offset_list);
                 }
-                _ => {
-                    panic!("Wrong type of index!");
+                tp => {
+                    panic!("Wrong type of index! {tp:?}");
                 }
             }
             total_rows += rg.num_rows();

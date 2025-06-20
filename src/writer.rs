@@ -9,20 +9,10 @@ use arrow::{
     datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef},
 };
 use parquet::{
-    arrow::{
-        ArrowSchemaConverter, ArrowWriter,
-        arrow_writer::{
-            ArrowColumnChunk, ArrowColumnWriter, ArrowLeafColumn, ArrowWriterOptions,
-            compute_leaves, get_column_writers,
-        },
-    },
+    arrow::{ArrowSchemaConverter, ArrowWriter, arrow_writer::ArrowWriterOptions},
     basic::{Encoding, ZstdLevel},
-    file::{
-        properties::{EnabledStatistics, WriterProperties, WriterVersion},
-        writer::SerializedFileWriter,
-    },
-    format::KeyValue,
-    schema::types::SchemaDescriptor,
+    file::properties::{EnabledStatistics, WriterProperties, WriterVersion},
+    format::{KeyValue, SortingColumn},
 };
 
 use mzdata::{
@@ -33,13 +23,14 @@ use mzdata::{
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
 use crate::{
-    entry::MzPeaksEntry,
+    archive::ZipArchiveWriter,
+    entry::Entry,
     param::{
-        MzPeaksDataProcessing, MzPeaksFileDescription, MzPeaksInstrumentConfiguration,
-        MzPeaksSoftware,
+        DataProcessing, FileDescription, InstrumentConfiguration,
+        Software,
     },
     peak_series::{
-        ArrayIndex, ArrayIndexEntry, BufferContext, BufferName, ToMzPeaksDataSeries,
+        ArrayIndex, ArrayIndexEntry, BufferContext, BufferName, ToMzPeakDataSeries,
         array_map_to_schema_arrays,
     },
 };
@@ -86,7 +77,7 @@ impl ArrayBuffers {
         RecordBatch::try_new(schema, arrays).unwrap()
     }
 
-    pub fn add<T: ToMzPeaksDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]) {
+    pub fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]) {
         let (fields, chunks) = T::to_arrays(spectrum_index, peaks);
         let mut visited = HashSet::new();
         for (f, arr) in fields.iter().zip(chunks.into_iter()) {
@@ -194,7 +185,7 @@ impl ArrayBuffersBuilder {
         self
     }
 
-    pub fn add_peak_type<T: ToMzPeaksDataSeries>(mut self) -> Self {
+    pub fn add_peak_type<T: ToMzPeakDataSeries>(mut self) -> Self {
         for f in T::to_fields().iter().cloned() {
             self = self.add_field(f);
         }
@@ -219,13 +210,13 @@ impl ArrayBuffersBuilder {
 }
 
 #[derive(Debug)]
-pub struct MzPeaksWriterBuilder {
+pub struct MzPeakWriterBuilder {
     spectrum_arrays: ArrayBuffersBuilder,
     chromatogram_arrays: ArrayBuffersBuilder,
     buffer_size: usize,
 }
 
-impl Default for MzPeaksWriterBuilder {
+impl Default for MzPeakWriterBuilder {
     fn default() -> Self {
         Self {
             spectrum_arrays: ArrayBuffersBuilder::default().prefix("point"),
@@ -235,13 +226,13 @@ impl Default for MzPeaksWriterBuilder {
     }
 }
 
-impl MzPeaksWriterBuilder {
+impl MzPeakWriterBuilder {
     pub fn add_spectrum_field(mut self, f: FieldRef) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_field(f);
         self
     }
 
-    pub fn add_spectrum_peak_type<T: ToMzPeaksDataSeries>(mut self) -> Self {
+    pub fn add_spectrum_peak_type<T: ToMzPeakDataSeries>(mut self) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_peak_type::<T>();
         self
     }
@@ -266,8 +257,22 @@ impl MzPeaksWriterBuilder {
         self
     }
 
-    pub fn build<W: Write + Send>(self, writer: W) -> MzPeaksWriter<W> {
-        MzPeaksWriter::new(
+    pub fn build_split<W: Write + Send>(
+        self,
+        data_writer: W,
+        metadata_writer: W,
+    ) -> MzPeakSplitWriter<W> {
+        MzPeakSplitWriter::new(
+            data_writer,
+            metadata_writer,
+            self.spectrum_arrays,
+            self.chromatogram_arrays,
+            self.buffer_size,
+        )
+    }
+
+    pub fn build<W: Write + Send + Seek>(self, writer: W) -> MzPeakWriter<W> {
+        MzPeakWriter::new(
             writer,
             self.spectrum_arrays,
             self.chromatogram_arrays,
@@ -303,96 +308,27 @@ impl MzPeaksWriterBuilder {
     }
 }
 
-pub struct MzPeaksWriter<W: Write + Send> {
-    writer: ArrowWriter<W>,
-    fields: SchemaRef,
-    #[allow(unused)]
-    parquet_schema: Arc<SchemaDescriptor>,
-    record_buffer: Vec<MzPeaksEntry>,
-    spectrum_buffers: ArrayBuffers,
-    chromatogram_buffers: ArrayBuffers,
-    spectrum_counter: u64,
-    buffer_size: usize,
-
-    file_description: MzPeaksFileDescription,
-    data_processing_list: Vec<MzPeaksDataProcessing>,
-    software_list: Vec<MzPeaksSoftware>,
-    instrument_configurations: Vec<MzPeaksInstrumentConfiguration>,
+#[derive(Debug, Clone, Default)]
+pub struct MzMetadata {
+    pub file_description: FileDescription,
+    pub data_processing_list: Vec<DataProcessing>,
+    pub software_list: Vec<Software>,
+    pub instrument_configurations: Vec<InstrumentConfiguration>,
 }
 
-impl<W: Write + Send> Drop for MzPeaksWriter<W> {
-    fn drop(&mut self) {
-        if !self.record_buffer.is_empty() {
-            self.flush_buffer().unwrap();
-        }
-        if let Err(_) = self.writer.finish() {}
-    }
-}
-
-impl<W: Write + Send> MzPeaksWriter<W> {
-    pub fn builder() -> MzPeaksWriterBuilder {
-        MzPeaksWriterBuilder::default()
-    }
-
+impl MzMetadata {
     pub fn new(
-        writer: W,
-        spectrum_buffers: ArrayBuffersBuilder,
-        chromatogram_buffers: ArrayBuffersBuilder,
-        buffer_size: usize,
+        file_description: FileDescription,
+        data_processing_list: Vec<DataProcessing>,
+        software_list: Vec<Software>,
+        instrument_configurations: Vec<InstrumentConfiguration>,
     ) -> Self {
-        let fields: Vec<FieldRef> =
-            SchemaLike::from_type::<MzPeaksEntry>(TracingOptions::new().allow_null_fields(true))
-                .unwrap();
-        let fields: SchemaRef = Arc::new(Schema::new(fields));
-        let mut spectrum_buffers = spectrum_buffers.build(fields);
-        let chromatogram_buffers = chromatogram_buffers.build(spectrum_buffers.schema);
-        spectrum_buffers.schema = chromatogram_buffers.schema.clone();
-        let fields = chromatogram_buffers.schema.clone();
-
-        let props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::ZSTD(
-                ZstdLevel::try_new(3).unwrap(),
-            ))
-            .set_dictionary_enabled(true)
-            .set_column_encoding(
-                format!("{}.spectrum_index", spectrum_buffers.prefix).into(),
-                Encoding::RLE,
-            )
-            .set_column_bloom_filter_enabled("spectrum.id".into(), true)
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .build();
-
-        let parquet_schema = Arc::new(ArrowSchemaConverter::new().convert(&fields).unwrap());
-
-        // let mut writer = SerializedFileWriter::new(
-        //     writer,
-        //     parquet_schema.root_schema_ptr(),
-        //     Arc::new(props.clone()),
-        // )
-        // .unwrap();
-
-        let mut this = Self {
-            fields: fields.clone(),
-            parquet_schema,
-            writer: ArrowWriter::try_new_with_options(
-                writer,
-                fields,
-                ArrowWriterOptions::new().with_properties(props),
-            )
-            .unwrap(),
-            record_buffer: Vec::new(),
-            spectrum_buffers,
-            chromatogram_buffers,
-            spectrum_counter: 0,
-            buffer_size: buffer_size,
-            file_description: Default::default(),
-            data_processing_list: Vec::new(),
-            instrument_configurations: Vec::new(),
-            software_list: Vec::new(),
-        };
-        this.add_array_metadata();
-        this
+        Self {
+            file_description,
+            data_processing_list,
+            software_list,
+            instrument_configurations,
+        }
     }
 
     pub fn add_file_description(&mut self, value: &mzdata::meta::FileDescription) {
@@ -410,6 +346,299 @@ impl<W: Write + Send> MzPeaksWriter<W> {
     pub fn add_data_processing(&mut self, value: &mzdata::meta::DataProcessing) {
         self.data_processing_list.push(value.into());
     }
+}
+
+macro_rules! implement_mz_metadata {
+    () => {
+        pub fn add_file_description(&mut self, value: &mzdata::meta::FileDescription) {
+            self.mz_metadata.add_file_description(value);
+        }
+
+        pub fn add_instrument_configuration(
+            &mut self,
+            value: &mzdata::meta::InstrumentConfiguration,
+        ) {
+            self.mz_metadata.add_instrument_configuration(value);
+        }
+
+        pub fn add_software(&mut self, value: &mzdata::meta::Software) {
+            self.mz_metadata.add_software(value);
+        }
+
+        pub fn add_data_processing(&mut self, value: &mzdata::meta::DataProcessing) {
+            self.mz_metadata.add_data_processing(value);
+        }
+
+        pub(crate) fn append_metadata(&mut self) {
+            self.append_key_value_metadata(
+                "file_description",
+                Some(serde_json::to_string_pretty(&self.mz_metadata.file_description).unwrap()),
+            );
+            self.append_key_value_metadata(
+                "instrument_configuration_list",
+                Some(
+                    serde_json::to_string_pretty(&self.mz_metadata.instrument_configurations)
+                        .unwrap(),
+                ),
+            );
+            self.append_key_value_metadata(
+                "data_processing_method_list",
+                Some(serde_json::to_string_pretty(&self.mz_metadata.data_processing_list).unwrap()),
+            );
+            self.append_key_value_metadata(
+                "software_list",
+                Some(serde_json::to_string_pretty(&self.mz_metadata.software_list).unwrap()),
+            );
+        }
+    };
+}
+
+pub trait AbstractMzPeakWriter {
+    fn append_key_value_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<Option<String>>,
+    );
+
+    fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry>;
+    fn spectrum_data_buffer_mut(&mut self) -> &mut ArrayBuffers;
+
+    fn check_data_buffer(&mut self) -> io::Result<()>;
+
+    fn spectrum_counter(&self) -> u64;
+    fn spectrum_counter_mut(&mut self) -> &mut u64;
+
+    fn spectrum_precursor_counter(&self) -> u64;
+    fn spectrum_precursor_counter_mut(&mut self) -> &mut u64;
+
+    fn spectrum_to_entries<
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+    >(
+        &mut self,
+        spectrum: &impl SpectrumLike<C, D>,
+    ) -> Vec<Entry> {
+        Entry::from_spectrum(spectrum, Some(self.spectrum_counter()), Some(self.spectrum_precursor_counter_mut()))
+    }
+
+    fn write_spectrum<
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+    >(
+        &mut self,
+        spectrum: &impl SpectrumLike<C, D>,
+    ) -> io::Result<()> {
+        let entries = self.spectrum_to_entries(spectrum);
+        self.spectrum_entry_buffer_mut().extend(entries);
+        self.write_spectrum_peaks(spectrum)?;
+        *self.spectrum_counter_mut() += 1;
+        self.check_data_buffer()?;
+        Ok(())
+    }
+
+    fn write_spectrum_peaks<
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+    >(
+        &mut self,
+        spectrum: &impl SpectrumLike<C, D>,
+    ) -> io::Result<()> {
+        let spectrum_count = self.spectrum_counter();
+        match spectrum.peaks() {
+            mzdata::spectrum::RefPeakDataLevel::Missing => {}
+            mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => {
+                let n_points = spectrum.peaks().len();
+                let (fields, data) = array_map_to_schema_arrays(
+                    crate::BufferContext::Spectrum,
+                    binary_array_map,
+                    n_points,
+                    spectrum_count,
+                    "spectrum_index",
+                )?;
+                self.spectrum_data_buffer_mut()
+                    .add_arrays(fields, data, n_points);
+            }
+            mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) => {
+                self.spectrum_data_buffer_mut()
+                    .add(spectrum_count, peaks.as_slice());
+            }
+            mzdata::spectrum::RefPeakDataLevel::Deconvoluted(peaks) => {
+                self.spectrum_data_buffer_mut()
+                    .add(spectrum_count, peaks.as_slice());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct MzPeakWriter<W: Write + Send + Seek> {
+    archive_writer: Option<ArrowWriter<ZipArchiveWriter<W>>>,
+    spectrum_buffers: ArrayBuffers,
+    #[allow(unused)]
+    chromatogram_buffers: ArrayBuffers,
+    metadata_buffer: Vec<Entry>,
+
+    metadata_fields: SchemaRef,
+
+    spectrum_counter: u64,
+    spectrum_precursor_counter: u64,
+    spectrum_data_point_counter: u64,
+    buffer_size: usize,
+
+    mz_metadata: MzMetadata,
+}
+
+impl<W: Write + Send + Seek> AbstractMzPeakWriter for MzPeakWriter<W> {
+    fn append_key_value_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<Option<String>>,
+    ) {
+        self.archive_writer
+            .as_mut()
+            .unwrap()
+            .append_key_value_metadata(KeyValue::new(key.into(), value));
+    }
+
+    fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry> {
+        &mut self.metadata_buffer
+    }
+
+    fn spectrum_data_buffer_mut(&mut self) -> &mut ArrayBuffers {
+        &mut self.spectrum_buffers
+    }
+
+    fn check_data_buffer(&mut self) -> io::Result<()> {
+        if self.spectrum_counter % (self.buffer_size as u64) == 0 {
+            self.flush_data_arrays()?;
+        }
+        Ok(())
+    }
+
+    fn spectrum_counter(&self) -> u64 {
+        self.spectrum_counter
+    }
+
+    fn spectrum_counter_mut(&mut self) -> &mut u64 {
+        &mut self.spectrum_counter
+    }
+
+    fn spectrum_precursor_counter(&self) -> u64 {
+        self.spectrum_precursor_counter
+    }
+
+    fn spectrum_precursor_counter_mut(&mut self) -> &mut u64 {
+        &mut self.spectrum_precursor_counter
+    }
+}
+
+impl<W: Write + Send + Seek> MzPeakWriter<W> {
+    pub fn builder() -> MzPeakWriterBuilder {
+        MzPeakWriterBuilder::default()
+    }
+
+    fn data_writer_props(data_buffer: &ArrayBuffers) -> WriterProperties {
+        let spectrum_point_prefix = format!("{}.spectrum_index", data_buffer.prefix);
+        let parquet_schema = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&data_buffer.schema)
+                .unwrap(),
+        );
+        let mut sorted = Vec::new();
+        for (i, c) in parquet_schema.columns().iter().enumerate() {
+            match c.path().string().as_ref() {
+                x if x == spectrum_point_prefix => {
+                    sorted.push(SortingColumn::new(i as i32, false, false));
+                }
+                _ => {}
+            }
+        }
+
+        let data_props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                ZstdLevel::try_new(3).unwrap(),
+            ))
+            .set_dictionary_enabled(true)
+            .set_sorting_columns(Some(sorted))
+            .set_column_encoding(spectrum_point_prefix.into(), Encoding::RLE)
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        data_props
+    }
+
+    fn metadata_writer_props(metadata_fields: &SchemaRef) -> WriterProperties {
+        let parquet_schema = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&metadata_fields)
+                .unwrap(),
+        );
+
+        let mut sorted = Vec::new();
+        for (i, c) in parquet_schema.columns().iter().enumerate() {
+            match c.path().string().as_ref() {
+                "spectrum.index" => {
+                    sorted.push(SortingColumn::new(i as i32, false, false));
+                }
+                _ => {}
+            }
+        }
+        let metadata_props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                ZstdLevel::try_new(3).unwrap(),
+            ))
+            .set_dictionary_enabled(true)
+            .set_sorting_columns(Some(sorted))
+            .set_column_bloom_filter_enabled("spectrum.id".into(), true)
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+
+        metadata_props
+    }
+
+    pub fn new(
+        writer: W,
+        spectrum_buffers: ArrayBuffersBuilder,
+        chromatogram_buffers: ArrayBuffersBuilder,
+        buffer_size: usize,
+    ) -> Self {
+        let fields: Vec<FieldRef> =
+            SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
+        let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
+        let spectrum_buffers = spectrum_buffers.build(Arc::new(Schema::empty()));
+        let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()));
+
+        let mut writer = ZipArchiveWriter::new(writer);
+        writer.start_spectrum_data().unwrap();
+
+        let data_props = Self::data_writer_props(&spectrum_buffers);
+
+        let mut this = Self {
+            archive_writer: Some(
+                ArrowWriter::try_new_with_options(
+                    writer,
+                    spectrum_buffers.schema.clone(),
+                    ArrowWriterOptions::new().with_properties(data_props),
+                )
+                .unwrap(),
+            ),
+            metadata_fields,
+            metadata_buffer: Vec::new(),
+            spectrum_buffers,
+            chromatogram_buffers,
+            spectrum_counter: 0,
+            spectrum_precursor_counter: 0,
+            spectrum_data_point_counter: 0,
+            buffer_size: buffer_size,
+            mz_metadata: Default::default(),
+        };
+        this.add_array_metadata();
+        this
+    }
+
+    implement_mz_metadata!();
 
     fn add_array_metadata(&mut self) {
         let mut spectrum_array_index =
@@ -440,91 +669,333 @@ impl<W: Write + Send> MzPeaksWriter<W> {
             spectrum_array_index.to_json(),
         );
 
-        let mut chromatogram_array_index =
-            ArrayIndex::new(self.chromatogram_buffers.prefix.clone(), HashMap::new());
-        if let Ok(sub) = self
-            .chromatogram_buffers
-            .schema
-            .field_with_name(&self.chromatogram_buffers.prefix)
-            .cloned()
-        {
-            if let DataType::Struct(fields) = sub.data_type() {
-                for f in fields.iter() {
-                    if f.name() == "chromatogram_index" {
-                        continue;
-                    }
-                    let buffer_name =
-                        BufferName::from_field(BufferContext::Chromatogram, f.clone()).unwrap();
-                    let aie = ArrayIndexEntry::from_buffer_name(
-                        self.chromatogram_buffers.prefix.clone(),
-                        buffer_name,
-                    );
-                    chromatogram_array_index.insert(aie.array_type.clone(), aie);
-                }
-            }
-        }
-        self.append_key_value_metadata(
-            "chromatogram_array_index".to_string(),
-            chromatogram_array_index.to_json(),
-        );
+        // let mut chromatogram_array_index =
+        //     ArrayIndex::new(self.chromatogram_buffers.prefix.clone(), HashMap::new());
+        // if let Ok(sub) = self
+        //     .chromatogram_buffers
+        //     .schema
+        //     .field_with_name(&self.chromatogram_buffers.prefix)
+        //     .cloned()
+        // {
+        //     if let DataType::Struct(fields) = sub.data_type() {
+        //         for f in fields.iter() {
+        //             if f.name() == "chromatogram_index" {
+        //                 continue;
+        //             }
+        //             let buffer_name =
+        //                 BufferName::from_field(BufferContext::Chromatogram, f.clone()).unwrap();
+        //             let aie = ArrayIndexEntry::from_buffer_name(
+        //                 self.chromatogram_buffers.prefix.clone(),
+        //                 buffer_name,
+        //             );
+        //             chromatogram_array_index.insert(aie.array_type.clone(), aie);
+        //         }
+        //     }
+        // }
+        // self.append_key_value_metadata(
+        //     "chromatogram_array_index".to_string(),
+        //     chromatogram_array_index.to_json(),
+        // );
     }
 
     pub fn write_spectrum<
-        C: ToMzPeaksDataSeries + CentroidLike,
-        D: ToMzPeaksDataSeries + DeconvolutedCentroidLike,
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
     >(
         &mut self,
         spectrum: &impl SpectrumLike<C, D>,
     ) -> io::Result<()> {
-        let entries = MzPeaksEntry::from_spectrum(spectrum, Some(self.spectrum_counter));
+        AbstractMzPeakWriter::write_spectrum(self, spectrum)
+    }
 
-        self.record_buffer.extend(entries);
-        match spectrum.peaks() {
-            mzdata::spectrum::RefPeakDataLevel::Missing => {}
-            mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => {
-                let n_points = spectrum.peaks().len();
-                let (fields, data) = array_map_to_schema_arrays(
-                    crate::BufferContext::Spectrum,
-                    binary_array_map,
-                    n_points,
-                    self.spectrum_counter,
-                    "spectrum_index",
-                )?;
-                self.spectrum_buffers.add_arrays(fields, data, n_points);
-            }
-            mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) => {
-                self.spectrum_buffers
-                    .add(self.spectrum_counter, peaks.as_slice());
-            }
-            mzdata::spectrum::RefPeakDataLevel::Deconvoluted(peaks) => {
-                self.spectrum_buffers
-                    .add(self.spectrum_counter, peaks.as_slice());
-            }
-        }
-
-        self.spectrum_counter += 1;
-
-        if self.record_buffer.len() > self.buffer_size {
-            self.flush_buffer()?;
+    fn flush_data_arrays(&mut self) -> io::Result<()> {
+        for batch in self.spectrum_buffers.drain() {
+            self.spectrum_data_point_counter += batch.num_rows() as u64;
+            self.archive_writer.as_mut().unwrap().write(&batch)?;
         }
         Ok(())
     }
 
-    pub fn flush_buffer(&mut self) -> io::Result<()> {
-        log::debug!("Flushing buffers");
+    fn flush_metadata_records(&mut self) -> io::Result<()> {
         let batch =
-            serde_arrow::to_record_batch(&self.fields.fields(), &self.record_buffer).unwrap();
-        self.writer.write(&batch)?;
-        self.record_buffer.clear();
+            serde_arrow::to_record_batch(&self.metadata_fields.fields(), &self.metadata_buffer)
+                .unwrap();
+        self.archive_writer.as_mut().unwrap().write(&batch)?;
+        self.metadata_buffer.clear();
+        Ok(())
+    }
 
-        for batch in self.spectrum_buffers.drain() {
-            self.writer.write(&batch)?;
+    pub fn finish(
+        &mut self,
+    ) -> Result<(), parquet::errors::ParquetError> {
+        if self.archive_writer.is_some() {
+            self.flush_data_arrays()?;
+            self.append_key_value_metadata("spectrum_count", Some(self.spectrum_counter.to_string()));
+            self.append_key_value_metadata(
+                "spectrum_data_point_count",
+                Some(self.spectrum_data_point_counter.to_string()),
+            );
+
+            let mut writer = self.archive_writer.take().unwrap().into_inner()?;
+
+            writer.start_spectrum_metadata().unwrap();
+            self.archive_writer = Some(ArrowWriter::try_new_with_options(
+                writer,
+                self.metadata_fields.clone(),
+                ArrowWriterOptions::new()
+                    .with_properties(Self::metadata_writer_props(&self.metadata_fields)),
+            )?);
+            self.flush_metadata_records()?;
+            self.append_metadata();
+            self.append_key_value_metadata("spectrum_count", Some(self.spectrum_counter.to_string()));
+            self.append_key_value_metadata(
+                "spectrum_data_point_count",
+                Some(self.spectrum_data_point_counter.to_string()),
+            );
+
+            let writer = self.archive_writer.take().unwrap().into_inner()?;
+            writer.finish().unwrap();
+            Ok(())
+        } else {
+            Err(parquet::errors::ParquetError::EOF("Already closed file".into()))
         }
+    }
+}
 
-        for batch in self.chromatogram_buffers.drain() {
-            self.writer.write(&batch)?;
+impl<W: Write + Send + Seek> Drop for MzPeakWriter<W> {
+    fn drop(&mut self) {
+        if let Err(_) = self.finish() {}
+    }
+}
+
+pub struct MzPeakSplitWriter<W: Write + Send> {
+    data_writer: ArrowWriter<W>,
+    metadata_writer: ArrowWriter<W>,
+
+    spectrum_buffers: ArrayBuffers,
+    #[allow(unused)]
+    chromatogram_buffers: ArrayBuffers,
+    metadata_buffer: Vec<Entry>,
+
+    metadata_fields: SchemaRef,
+
+    spectrum_counter: u64,
+    spectrum_precursor_counter: u64,
+    spectrum_data_point_counter: u64,
+    buffer_size: usize,
+
+    mz_metadata: MzMetadata,
+}
+
+impl<W: Write + Send> Drop for MzPeakSplitWriter<W> {
+    fn drop(&mut self) {
+        if let Err(_) = self.finish() {}
+    }
+}
+
+impl<W: Write + Send> AbstractMzPeakWriter for MzPeakSplitWriter<W> {
+    fn append_key_value_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<Option<String>>,
+    ) {
+        self.append_key_value_metadata(key, value);
+    }
+
+    fn spectrum_counter(&self) -> u64 {
+        self.spectrum_counter
+    }
+
+    fn spectrum_counter_mut(&mut self) -> &mut u64 {
+        &mut self.spectrum_counter
+    }
+
+    fn spectrum_data_buffer_mut(&mut self) -> &mut ArrayBuffers {
+        &mut self.spectrum_buffers
+    }
+
+    fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry> {
+        &mut self.metadata_buffer
+    }
+
+    fn check_data_buffer(&mut self) -> io::Result<()> {
+        if self.spectrum_counter % (self.buffer_size as u64) == 0 {
+            self.flush_data_arrays()?;
         }
         Ok(())
+    }
+
+    fn spectrum_precursor_counter(&self) -> u64 {
+        self.spectrum_precursor_counter
+    }
+
+    fn spectrum_precursor_counter_mut(&mut self) -> &mut u64 {
+        &mut self.spectrum_precursor_counter
+    }
+}
+
+impl<W: Write + Send> MzPeakSplitWriter<W> {
+    fn data_writer_props(data_buffer: &ArrayBuffers) -> WriterProperties {
+        let spectrum_point_prefix = format!("{}.spectrum_index", data_buffer.prefix);
+        let parquet_schema = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&data_buffer.schema)
+                .unwrap(),
+        );
+        let mut sorted = Vec::new();
+        for (i, c) in parquet_schema.columns().iter().enumerate() {
+            match c.path().string().as_ref() {
+                x if x == spectrum_point_prefix => {
+                    sorted.push(SortingColumn::new(i as i32, false, false));
+                }
+                _ => {}
+            }
+        }
+
+        let data_props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                ZstdLevel::try_new(3).unwrap(),
+            ))
+            .set_dictionary_enabled(true)
+            .set_sorting_columns(Some(sorted))
+            .set_column_encoding(spectrum_point_prefix.into(), Encoding::RLE)
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        data_props
+    }
+
+    fn metadata_writer_props(metadata_fields: &SchemaRef) -> WriterProperties {
+        let parquet_schema = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&metadata_fields)
+                .unwrap(),
+        );
+
+        let mut sorted = Vec::new();
+        for (i, c) in parquet_schema.columns().iter().enumerate() {
+            match c.path().string().as_ref() {
+                "spectrum.index" => {
+                    sorted.push(SortingColumn::new(i as i32, false, false));
+                }
+                _ => {}
+            }
+        }
+        let metadata_props = WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(
+                ZstdLevel::try_new(3).unwrap(),
+            ))
+            .set_dictionary_enabled(true)
+            .set_sorting_columns(Some(sorted))
+            .set_column_bloom_filter_enabled("spectrum.id".into(), true)
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+
+        metadata_props
+    }
+
+    pub fn new(
+        data_writer: W,
+        metadata_writer: W,
+        spectrum_buffers: ArrayBuffersBuilder,
+        chromatogram_buffers: ArrayBuffersBuilder,
+        buffer_size: usize,
+    ) -> Self {
+        let fields: Vec<FieldRef> =
+            SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
+        let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
+        let spectrum_buffers = spectrum_buffers.build(Arc::new(Schema::empty()));
+        let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()));
+
+        let data_props = Self::data_writer_props(&spectrum_buffers);
+        let metadata_props = Self::metadata_writer_props(&metadata_fields);
+
+        let mut this = Self {
+            metadata_fields: metadata_fields.clone(),
+            data_writer: ArrowWriter::try_new_with_options(
+                data_writer,
+                spectrum_buffers.schema.clone(),
+                ArrowWriterOptions::new().with_properties(data_props),
+            )
+            .unwrap(),
+            metadata_writer: ArrowWriter::try_new_with_options(
+                metadata_writer,
+                metadata_fields.clone(),
+                ArrowWriterOptions::new().with_properties(metadata_props),
+            )
+            .unwrap(),
+            metadata_buffer: Vec::new(),
+            spectrum_buffers,
+            chromatogram_buffers,
+            spectrum_counter: 0,
+            spectrum_precursor_counter: 0,
+            spectrum_data_point_counter: 0,
+            buffer_size: buffer_size,
+            mz_metadata: Default::default(),
+        };
+        this.add_array_metadata();
+        this
+    }
+
+    implement_mz_metadata!();
+
+    fn add_array_metadata(&mut self) {
+        let mut spectrum_array_index =
+            ArrayIndex::new(self.spectrum_buffers.prefix.clone(), HashMap::new());
+        if let Ok(sub) = self
+            .spectrum_buffers
+            .schema
+            .field_with_name(&self.spectrum_buffers.prefix)
+            .cloned()
+        {
+            if let DataType::Struct(fields) = sub.data_type() {
+                for f in fields.iter() {
+                    if f.name() == "spectrum_index" {
+                        continue;
+                    }
+                    let buffer_name =
+                        BufferName::from_field(BufferContext::Spectrum, f.clone()).unwrap();
+                    let aie = ArrayIndexEntry::from_buffer_name(
+                        self.spectrum_buffers.prefix.clone(),
+                        buffer_name,
+                    );
+                    spectrum_array_index.insert(aie.array_type.clone(), aie);
+                }
+            }
+        }
+        self.data_writer.append_key_value_metadata(KeyValue::new(
+            "spectrum_array_index".to_string(),
+            spectrum_array_index.to_json(),
+        ));
+
+        // let mut chromatogram_array_index =
+        //     ArrayIndex::new(self.chromatogram_buffers.prefix.clone(), HashMap::new());
+        // if let Ok(sub) = self
+        //     .chromatogram_buffers
+        //     .schema
+        //     .field_with_name(&self.chromatogram_buffers.prefix)
+        //     .cloned()
+        // {
+        //     if let DataType::Struct(fields) = sub.data_type() {
+        //         for f in fields.iter() {
+        //             if f.name() == "chromatogram_index" {
+        //                 continue;
+        //             }
+        //             let buffer_name =
+        //                 BufferName::from_field(BufferContext::Chromatogram, f.clone()).unwrap();
+        //             let aie = ArrayIndexEntry::from_buffer_name(
+        //                 self.chromatogram_buffers.prefix.clone(),
+        //                 buffer_name,
+        //             );
+        //             chromatogram_array_index.insert(aie.array_type.clone(), aie);
+        //         }
+        //     }
+        // }
+        // self.append_key_value_metadata(
+        //     "chromatogram_array_index".to_string(),
+        //     chromatogram_array_index.to_json(),
+        // );
     }
 
     pub fn append_key_value_metadata(
@@ -532,32 +1003,53 @@ impl<W: Write + Send> MzPeaksWriter<W> {
         key: impl Into<String>,
         value: impl Into<Option<String>>,
     ) {
-        self.writer
+        self.metadata_writer
             .append_key_value_metadata(KeyValue::new(key.into(), value));
+    }
+
+    pub fn write_spectrum<
+        C: ToMzPeakDataSeries + CentroidLike,
+        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+    >(
+        &mut self,
+        spectrum: &impl SpectrumLike<C, D>,
+    ) -> io::Result<()> {
+        AbstractMzPeakWriter::write_spectrum(self, spectrum)
+    }
+
+    fn flush_data_arrays(&mut self) -> io::Result<()> {
+        for batch in self.spectrum_buffers.drain() {
+            self.spectrum_data_point_counter += batch.num_rows() as u64;
+            self.data_writer.write(&batch)?;
+        }
+
+        // for batch in self.chromatogram_buffers.drain() {
+        //     self.writer.write(&batch)?;
+        // }
+        Ok(())
+    }
+
+    fn flush_metadata_records(&mut self) -> io::Result<()> {
+        let batch =
+            serde_arrow::to_record_batch(&self.metadata_fields.fields(), &self.metadata_buffer)
+                .unwrap();
+        self.metadata_writer.write(&batch)?;
+        self.metadata_buffer.clear();
+        Ok(())
     }
 
     pub fn finish(
         &mut self,
     ) -> Result<parquet::format::FileMetaData, parquet::errors::ParquetError> {
-        if !self.record_buffer.is_empty() {
-            self.flush_buffer()?;
-        }
+        self.flush_data_arrays()?;
+        self.flush_metadata_records()?;
+        self.append_metadata();
+        self.append_key_value_metadata("spectrum_count", Some(self.spectrum_counter.to_string()));
         self.append_key_value_metadata(
-            "file_description",
-            Some(serde_json::to_string_pretty(&self.file_description).unwrap()),
+            "spectrum_data_point_count",
+            Some(self.spectrum_data_point_counter.to_string()),
         );
-        self.append_key_value_metadata(
-            "instrument_configuration_list",
-            Some(serde_json::to_string_pretty(&self.instrument_configurations).unwrap()),
-        );
-        self.append_key_value_metadata(
-            "data_processing_method_list",
-            Some(serde_json::to_string_pretty(&self.data_processing_list).unwrap()),
-        );
-        self.append_key_value_metadata(
-            "software_list",
-            Some(serde_json::to_string_pretty(&self.software_list).unwrap()),
-        );
-        self.writer.finish()
+        self.data_writer.finish()?;
+        self.metadata_writer.finish()
     }
 }
