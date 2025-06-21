@@ -25,10 +25,7 @@ use serde_arrow::schema::{SchemaLike, TracingOptions};
 use crate::{
     archive::ZipArchiveWriter,
     entry::Entry,
-    param::{
-        DataProcessing, FileDescription, InstrumentConfiguration,
-        Software,
-    },
+    param::{DataProcessing, FileDescription, InstrumentConfiguration, Software},
     peak_series::{
         ArrayIndex, ArrayIndexEntry, BufferContext, BufferName, ToMzPeakDataSeries,
         array_map_to_schema_arrays,
@@ -418,7 +415,11 @@ pub trait AbstractMzPeakWriter {
         &mut self,
         spectrum: &impl SpectrumLike<C, D>,
     ) -> Vec<Entry> {
-        Entry::from_spectrum(spectrum, Some(self.spectrum_counter()), Some(self.spectrum_precursor_counter_mut()))
+        Entry::from_spectrum(
+            spectrum,
+            Some(self.spectrum_counter()),
+            Some(self.spectrum_precursor_counter_mut()),
+        )
     }
 
     fn write_spectrum<
@@ -538,33 +539,44 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
         MzPeakWriterBuilder::default()
     }
 
-    fn data_writer_props(data_buffer: &ArrayBuffers) -> WriterProperties {
-        let spectrum_point_prefix = format!("{}.spectrum_index", data_buffer.prefix);
+    fn spectrum_data_writer_props(
+        data_buffer: &ArrayBuffers,
+        index_path: String,
+    ) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
                 .convert(&data_buffer.schema)
                 .unwrap(),
         );
+
         let mut sorted = Vec::new();
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
-                x if x == spectrum_point_prefix => {
+                x if x == index_path => {
                     sorted.push(SortingColumn::new(i as i32, false, false));
                 }
                 _ => {}
             }
         }
 
-        let data_props = WriterProperties::builder()
+        let mut data_props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::ZSTD(
                 ZstdLevel::try_new(3).unwrap(),
             ))
             .set_dictionary_enabled(true)
             .set_sorting_columns(Some(sorted))
-            .set_column_encoding(spectrum_point_prefix.into(), Encoding::RLE)
+            .set_column_encoding(index_path.into(), Encoding::RLE)
             .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .build();
+            .set_statistics_enabled(EnabledStatistics::Page);
+
+        for f in parquet_schema.columns().iter().skip(1) {
+            if f.name().contains("_mz_") {
+                data_props =
+                    data_props.set_column_encoding(f.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+        }
+
+        let data_props = data_props.build();
         data_props
     }
 
@@ -604,8 +616,7 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
         chromatogram_buffers: ArrayBuffersBuilder,
         buffer_size: usize,
     ) -> Self {
-        let fields: Vec<FieldRef> =
-            SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
+        let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
         let spectrum_buffers = spectrum_buffers.build(Arc::new(Schema::empty()));
         let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()));
@@ -613,7 +624,10 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
         let mut writer = ZipArchiveWriter::new(writer);
         writer.start_spectrum_data().unwrap();
 
-        let data_props = Self::data_writer_props(&spectrum_buffers);
+        let data_props = Self::spectrum_data_writer_props(
+            &spectrum_buffers,
+            format!("{}.spectrum_index", spectrum_buffers.prefix),
+        );
 
         let mut this = Self {
             archive_writer: Some(
@@ -725,12 +739,13 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
         Ok(())
     }
 
-    pub fn finish(
-        &mut self,
-    ) -> Result<(), parquet::errors::ParquetError> {
+    pub fn finish(&mut self) -> Result<(), parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
-            self.append_key_value_metadata("spectrum_count", Some(self.spectrum_counter.to_string()));
+            self.append_key_value_metadata(
+                "spectrum_count",
+                Some(self.spectrum_counter.to_string()),
+            );
             self.append_key_value_metadata(
                 "spectrum_data_point_count",
                 Some(self.spectrum_data_point_counter.to_string()),
@@ -747,7 +762,10 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
             )?);
             self.flush_metadata_records()?;
             self.append_metadata();
-            self.append_key_value_metadata("spectrum_count", Some(self.spectrum_counter.to_string()));
+            self.append_key_value_metadata(
+                "spectrum_count",
+                Some(self.spectrum_counter.to_string()),
+            );
             self.append_key_value_metadata(
                 "spectrum_data_point_count",
                 Some(self.spectrum_data_point_counter.to_string()),
@@ -757,7 +775,9 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
             writer.finish().unwrap();
             Ok(())
         } else {
-            Err(parquet::errors::ParquetError::EOF("Already closed file".into()))
+            Err(parquet::errors::ParquetError::EOF(
+                "Already closed file".into(),
+            ))
         }
     }
 }
@@ -902,8 +922,7 @@ impl<W: Write + Send> MzPeakSplitWriter<W> {
         chromatogram_buffers: ArrayBuffersBuilder,
         buffer_size: usize,
     ) -> Self {
-        let fields: Vec<FieldRef> =
-            SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
+        let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
         let spectrum_buffers = spectrum_buffers.build(Arc::new(Schema::empty()));
         let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()));

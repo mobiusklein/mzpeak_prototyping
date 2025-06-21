@@ -23,6 +23,8 @@ use crate::param::{
 };
 use crate::spectrum::AuxiliaryArray;
 
+
+/// Convert `mzdata`'s [`BinaryDataArrayType`] to `arrow`'s [`DataType`]
 pub fn array_to_arrow_type(dtype: BinaryDataArrayType) -> DataType {
     match dtype {
         BinaryDataArrayType::Unknown => DataType::UInt8,
@@ -34,11 +36,8 @@ pub fn array_to_arrow_type(dtype: BinaryDataArrayType) -> DataType {
     }
 }
 
-pub fn spectrum_buffer_name(array_type: ArrayType, dtype: BinaryDataArrayType) -> Arc<Field> {
-    let name = BufferName::new(BufferContext::Spectrum, array_type, dtype).to_string();
-    Arc::new(Field::new(name, array_to_arrow_type(dtype), true))
-}
-
+/// Convert a [`BinaryArrayMap`] to a collection of `arrow`  [`FieldRef`] and [`ArrayRef`] with
+/// unsupported arrays are spilled over as [`AuxiliaryArray`] instances.
 pub fn array_map_to_schema_arrays_and_excess(
     context: BufferContext,
     array_map: &BinaryArrayMap,
@@ -92,6 +91,7 @@ pub fn array_map_to_schema_arrays_and_excess(
     Ok((fields.into(), arrays, auxiliary))
 }
 
+/// Convert a [`BinaryArrayMap`] to a collection of `arrow`  [`FieldRef`] and [`ArrayRef`].
 pub fn array_map_to_schema_arrays(
     context: BufferContext,
     array_map: &BinaryArrayMap,
@@ -562,17 +562,29 @@ impl Display for BufferName {
     }
 }
 
+/// Describes an array that is encoded long-form in the data file
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayIndexEntry {
+    /// Is this a spectrum or chromatogram array?
     pub context: BufferContext,
+    /// The prefix to this field in the schema
     pub prefix: String,
+    /// The complete path to this field from the root of the schema
     pub path: String,
+    /// The name of array, either given by `array_type` or a user-defined name
     pub name: String,
+    /// The kind of physical data stored in the array
     pub data_type: DataType,
+    /// The kind of array being stored semantically
     pub array_type: ArrayType,
+    /// The unit of the values in the array
     pub unit: Unit,
 }
 
+
+/// A JSON-serializable version of [`ArrayIndexEntry`].
+///
+/// They can be inter-converted
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SerializedArrayIndexEntry {
     pub context: String,
@@ -701,9 +713,15 @@ impl ArrayIndexEntry {
     }
 }
 
+
+/// A collection of [`ArrayIndexEntry`] under a specific prefix.
+///
+/// Mimics a subset of [`HashMap`] API
 #[derive(Debug, Default, Clone)]
 pub struct ArrayIndex {
+    /// The prefix to the arrays
     pub prefix: String,
+    /// The collection of array index entries
     pub entries: HashMap<ArrayType, ArrayIndexEntry>,
 }
 
@@ -732,11 +750,13 @@ impl ArrayIndex {
         self.entries.insert(k, v)
     }
 
+    /// Serialize the index to JSON as a string
     pub fn to_json(&self) -> String {
         let serialized: SerializedArrayIndex = self.clone().into();
         serde_json::to_string_pretty(&serialized).unwrap()
     }
 
+    /// Deserialize the index from a JSON string
     pub fn from_json(text: &str) -> Self {
         let serialized: SerializedArrayIndex = serde_json::from_str(text).unwrap();
         serialized.into()
@@ -773,6 +793,10 @@ impl From<ArrayIndex> for SerializedArrayIndex {
     }
 }
 
+/// A serializable version of [`ArrayIndex`]
+///
+/// This structure is intended to be stored in the file-level metadata of
+/// data array file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SerializedArrayIndex {
     pub prefix: String,

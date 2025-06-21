@@ -1,123 +1,91 @@
 use arrow::{
-    array::{AsArray, PrimitiveArray},
-    datatypes::{Float32Type, Float64Type, UInt64Type},
+    array::{AsArray, Float32Array, Float64Array, UInt64Array},
 };
 
 use clap::Parser;
-use mzdata::mzpeaks::coordinate::{SimpleInterval, Span1D, CoordinateRange};
-use parquet::{
-    self,
-    arrow::{
-        ProjectionMask,
-        arrow_reader::{
-            ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-        },
-    },
-};
-use std::{
-    fs, io::{self, Seek}
-};
-
-use mzpeak_prototyping::index::{
-    read_point_mz_index,
-    read_point_spectrum_index,
-    spectrum_index_range_for_time_range,
-};
-
+use mzdata::mzpeaks::coordinate::{CoordinateRange, SimpleInterval, Span1D};
+use std::io;
 
 #[derive(clap::Parser)]
 struct App {
     #[arg()]
     filename: String,
 
-    #[arg(short, long, default_value="10.0-21.0")]
+    #[arg(short, long, default_value = "10.0-21.0")]
     time_range: CoordinateRange<f32>,
 
-    #[arg(short, long, default_value="623.0-625.0")]
+    #[arg(short, long, default_value = "623.0-625.0")]
     mz_range: CoordinateRange<f64>,
 
-    #[arg(short, long, default_value="0.8-1.2")]
+    #[arg(short, long, default_value = "0.8-1.2")]
     im_range: CoordinateRange<f64>,
-
 }
-
 
 fn main() -> io::Result<()> {
     let args = App::parse();
-
-    let mut handle = fs::File::open(
-        args.filename
-    )?;
-
     let start = std::time::Instant::now();
-    let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
-        handle.try_clone()?,
-        ArrowReaderOptions::new().with_page_index(true),
+
+    let mut reader = mzpeak_prototyping::reader::MzPeakReader::new(&args.filename)?;
+
+    let time_range = SimpleInterval::new(
+        args.time_range.start.unwrap_or(0.0) as f32,
+        args.time_range.end.unwrap_or(f64::INFINITY) as f32,
+    );
+
+    let mz_range = SimpleInterval::new(
+        args.mz_range.start.unwrap_or(0.0),
+        args.mz_range.end.unwrap_or(f64::INFINITY),
+    );
+
+    let im_range = SimpleInterval::new(
+        args.im_range.start.unwrap_or(0.0),
+        args.im_range.end.unwrap_or(f64::INFINITY),
+    );
+
+    let (it, time_index) = reader.extract_peaks(
+        time_range,
+        Some(mz_range),
+        None
     )?;
-    let point_spectrum_index = read_point_spectrum_index(&reader).unwrap();
-    let point_mz_index = read_point_mz_index(&reader).unwrap();
 
-    let time_range = SimpleInterval::new(args.time_range.start.unwrap() as f32, args.time_range.end.unwrap() as f32);
-    let mz_range = SimpleInterval::new(args.mz_range.start.unwrap(), args.mz_range.end.unwrap());
-    let im_range = SimpleInterval::new(args.im_range.start.unwrap(), args.im_range.end.unwrap());
-
-    let index_range = spectrum_index_range_for_time_range(&mut handle, time_range)?;
     let query_range_end = std::time::Instant::now();
     eprintln!("{} seconds elapsed reading indices", (query_range_end - start).as_secs_f64());
 
-    handle.seek(io::SeekFrom::Start(0))?;
 
-    let start = std::time::Instant::now();
-
-    let index_selection = point_spectrum_index.row_selection_overlaps(&index_range);
-    let mz_selection = point_mz_index.row_selection_overlaps(&mz_range);
-
-    let projection = ProjectionMask::columns(
-        reader.parquet_schema(),
-        [
-            "point.spectrum_index",
-            "point.mz",
-            "point.intensity",
-            "point.im",
-        ],
-    );
-
-    let reader = reader
-    .with_row_selection(
-        index_selection.intersection(&mz_selection)
-    ).with_projection(projection)
-    .build()?;
-
-    for batch in reader.flatten() {
-        // eprintln!("{}", batch.num_rows());
-        let point = batch.column(0).as_struct();
-        let spectrum_index_array: &PrimitiveArray<UInt64Type> = point.column(0).as_primitive();
-
-        if spectrum_index_array.is_empty() { continue; }
-        if spectrum_index_array.value(spectrum_index_array.len() - 1) < index_range.start {
-            continue;
-        }
-
-        let mz_array: &PrimitiveArray<Float64Type> = point.column(1).as_primitive();
-        let intensity_array: &PrimitiveArray<Float32Type> = point.column(2).as_primitive();
-        let im_array: &PrimitiveArray<Float64Type> = point.column(3).as_primitive();
-        let it = spectrum_index_array.iter().zip(
-            mz_array.iter().zip(
-                intensity_array.iter().zip(
-                    im_array.iter()
-                )
-            )
+    let mut started = false;
+    for batch in it.flatten() {
+        let root = batch.column(0).as_struct();
+        let indices: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
+        let mzs: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
+        let intensities: &Float32Array = root.column(2).as_any().downcast_ref().unwrap();
+        let ims: Option<&Float64Array> = root.column(3).as_any().downcast_ref();
+        let it = indices.iter().flatten().zip(
+            mzs.iter().flatten()
+        ).zip(
+            intensities.iter().flatten()
         );
-
-        for (spectrum_index, (mz, (intensity, im))) in it {
-            if let (Some(spectrum_index), Some(mz), Some(intensity), Some(im)) = (spectrum_index, mz, intensity, im) {
-                if index_range.contains(&spectrum_index) && mz_range.contains(&mz) && im_range.contains(&im) {
-                    println!("{spectrum_index}\t{mz}\t{intensity}\t{im}");
+        if ims.is_some() {
+            for (((index, mz), intensity), im) in it.zip(ims.unwrap().iter().flatten()) {
+                if time_index.contains_key(&index) && mz_range.contains(&mz) && im_range.contains(&im) {
+                    println!("{index}\t{mz}\t{intensity}\t{im}");
+                    started = true;
+                }
+            }
+        } else {
+            for ((index, mz), intensity) in it {
+                if time_index.contains_key(&index) && mz_range.contains(&mz) {
+                    println!("{index}\t{mz}\t{intensity}");
+                    started = true;
                 }
             }
         }
+
+        if started && !time_index.contains_key(&indices.values().last().unwrap()) {
+            break;
+        }
     }
+
     let end = std::time::Instant::now();
-    eprintln!("{} seconds elapsed", (end - start).as_secs_f64());
+    eprintln!("{} seconds elapsed", (end - query_range_end).as_secs_f64());
     Ok(())
 }

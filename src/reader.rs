@@ -22,6 +22,7 @@ use mzdata::{
         ArrayType, BinaryArrayMap, DataArray, ScanEvent, ScanPolarity, SpectrumDescription,
     },
 };
+use mzpeaks::{coordinate::SimpleInterval, prelude::Span1D};
 
 use crate::archive::ZipArchiveReader;
 
@@ -257,6 +258,7 @@ impl MzPeakReader {
         Ok((bundle, query_index))
     }
 
+    /// Read the complete data arrays for the spectrum at `index`
     pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
         let builder = self.handle.spectra_data()?;
 
@@ -578,6 +580,154 @@ impl MzPeakReader {
         }
     }
 
+    pub fn get_spectrum_index_range_for_time_range(
+        &mut self,
+        time_range: SimpleInterval<f32>,
+    ) -> io::Result<(HashMap<u64, f32>, SimpleInterval<u64>)> {
+        let rows = self
+            .query_indices
+            .spectrum_time_index
+            .row_selection_overlaps(&time_range);
+        let builder = self.handle.spectrum_metadata()?;
+
+        let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.time"]);
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let times: &Float32Array = batch
+                .column(0)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+
+            Ok(times
+                .iter()
+                .map(|v| v.map(|v| time_range.contains(&v)))
+                .collect())
+        });
+
+        let proj = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.index", "spectrum.time"]);
+
+        let reader = builder
+            .with_row_selection(rows)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_projection(proj)
+            .build()?;
+
+        let mut min = u64::MAX;
+        let mut max = 0;
+
+        let mut times: HashMap<u64, f32> = HashMap::new();
+
+        for batch in reader.flatten() {
+            let root = batch
+                .column(0)
+                .as_struct();
+            let arr: &UInt64Array =  root
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            let time_arr: &Float32Array = root
+                .column(1)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
+                min = min.min(val);
+                max = max.max(val);
+                times.insert(val, time);
+            }
+        }
+        Ok((times, SimpleInterval::new(min, max)))
+    }
+
+    pub fn extract_peaks(&mut self, time_range: SimpleInterval<f32>, mz_range: Option<SimpleInterval<f64>>, ion_mobility_range: Option<SimpleInterval<f64>>) -> io::Result<(ParquetRecordBatchReader, HashMap<u64, f32>)> {
+        let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
+
+        let mut rows = self.query_indices.spectrum_point_spectrum_index.row_selection_overlaps(&index_range);
+        if let Some(mz_range) = mz_range.as_ref() {
+            rows = rows.intersection(&self.query_indices.spectrum_mz_index.row_selection_overlaps(mz_range));
+        }
+        if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
+            rows = rows.union(&self.query_indices.spectrum_im_index.row_selection_overlaps(&ion_mobility_range));
+        }
+
+        let sidx = format!("{}.spectrum_index", self.metadata.spectrum_array_indices.prefix);
+
+        let mut fields: Vec<&str> = Vec::new();
+
+        fields.push(&sidx);
+
+        if let Some(e) = self.metadata.spectrum_array_indices.get(&ArrayType::MZArray) {
+            fields.push(e.path.as_str())
+        }
+
+        if let Some(e) = self.metadata.spectrum_array_indices.get(&ArrayType::IntensityArray) {
+            fields.push(e.path.as_str())
+        }
+
+        for (k, v) in self.metadata.spectrum_array_indices.iter() {
+            if k.is_ion_mobility() {
+                fields.push(v.path.as_str());
+                break;
+            }
+        }
+
+        let builder = self.handle.spectra_data()?;
+
+        let proj = ProjectionMask::columns(builder.parquet_schema(), fields.iter().copied());
+        let predicate_mask = proj.clone();
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let root = batch.column(0).as_struct();
+            let spectrum_index: &UInt64Array = root
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+
+            let it = spectrum_index.iter().map(|v| {
+                v.map(|v| index_range.contains(&v))
+            });
+
+            match (mz_range, ion_mobility_range) {
+                (None, None) => Ok(it.collect()),
+                (None, Some(ion_mobility_range)) => {
+                    let im_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
+                    let it2 = im_array.iter().map(|v| v.map(|v| ion_mobility_range.contains(&v)));
+                    let it = it.zip(it2).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    Ok(it.collect())
+                },
+                (Some(mz_range), None) => {
+                    let mz_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
+                    let it2 = mz_array.iter().map(|v| v.map(|v| mz_range.contains(&v)));
+                    let it = it.zip(it2).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    Ok(it.collect())
+                },
+                (Some(mz_range), Some(ion_mobility_range)) => {
+                    let mz_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
+                    let im_array: &Float64Array = root.column(2).as_any().downcast_ref().unwrap();
+                    let it2 = mz_array.iter().map(|v| v.map(|v| mz_range.contains(&v)));
+                    let it3 = im_array.iter().map(|v| v.map(|v| ion_mobility_range.contains(&v)));
+                    let it = it.zip(it2).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    let it = it.zip(it3).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    Ok(it.collect())
+                },
+            }
+        });
+
+        let reader: ParquetRecordBatchReader = builder
+            .with_row_selection(rows)
+            .with_projection(proj)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .build()?;
+
+        Ok((reader, time_index))
+    }
+
+    /// Read load descriptive metadata for the spectrum at `index`
     pub fn get_spectrum_metadata(&mut self, index: u64) -> io::Result<SpectrumDescription> {
         let builder = self.handle.spectrum_metadata()?;
 
@@ -824,7 +974,8 @@ impl MzPeakReader {
         Ok(descr)
     }
 
-    pub fn load_all_metadata(&mut self) -> io::Result<Vec<SpectrumDescription>> {
+    /// Load the descriptive metadata for all spectra
+    pub fn load_all_spectrum_metadata(&mut self) -> io::Result<Vec<SpectrumDescription>> {
         let builder = self.handle.spectrum_metadata()?;
 
         let mut rows = self
@@ -1038,7 +1189,7 @@ mod test {
     #[test]
     fn test_small3() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
-        let out = reader.load_all_metadata()?;
+        let out = reader.load_all_spectrum_metadata()?;
         assert_eq!(out.len(), 48);
         eprintln!("{}", out.len());
         Ok(())
@@ -1049,6 +1200,22 @@ mod test {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
         let arrays = reader.get_spectrum_arrays(0)?;
         eprintln!("Read {} points", arrays.mzs()?.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_eic() -> io::Result<()> {
+        let mut reader = MzPeakReader::new("small.mzpeak")?;
+
+        let (it, _time_index) = reader.extract_peaks(
+            (0.3..0.5).into(),
+            Some((800.0..820.0).into()),
+            None
+        )?;
+
+        for batch in it.flatten() {
+            eprintln!("{:?}", batch);
+        }
         Ok(())
     }
 }
