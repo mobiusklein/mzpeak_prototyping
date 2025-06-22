@@ -1,9 +1,6 @@
 use mzdata::{self, io::MZReaderType, prelude::*};
 use mzpeak_prototyping::{peak_series::ToMzPeakDataSeries, *};
-use mzpeaks::{
-    CentroidPeak,
-    DeconvolutedPeak,
-};
+use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use std::{collections::HashSet, env, fs, io, path::PathBuf, sync::mpsc::sync_channel, thread};
 
 fn sample_array_types<
@@ -62,29 +59,19 @@ fn main() -> io::Result<()> {
     let handle = fs::File::create(outname.file_name().unwrap())?;
     // let data_handle = fs::File::create(outname.with_extension("data.mzpeak"))?;
 
-    let mut writer = MzPeakWriter::<fs::File>::builder()
+    let mut writer = MzPeakWriterType::<fs::File>::builder()
         .add_spectrum_peak_type::<CentroidPeak>()
         .add_spectrum_peak_type::<DeconvolutedPeak>()
-        .add_default_chromatogram_fields().buffer_size(5000);
+        .add_default_chromatogram_fields()
+        .buffer_size(5000);
 
     writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader)
         .into_iter()
         .fold(writer, |writer, f| writer.add_spectrum_field(f));
 
-    // let mut writer = writer.build_split(data_handle, handle);
     let mut writer = writer.build(handle);
-
+    writer.copy_metadata_from(&reader);
     writer.add_file_description(reader.file_description());
-
-    for inst in reader.instrument_configurations().values() {
-        writer.add_instrument_configuration(inst);
-    }
-    for sw in reader.softwares() {
-        writer.add_software(sw);
-    }
-    for dp in reader.data_processings() {
-        writer.add_data_processing(dp);
-    }
 
     let (send, recv) = sync_channel(1);
 

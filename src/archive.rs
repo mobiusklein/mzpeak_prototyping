@@ -1,20 +1,17 @@
-#![allow(unused)]
 use std::fs;
 use std::io::{self, prelude::*};
-use std::path::Path;
-use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
 use zip::{
     CompressionMethod,
-    read::{Config, HasZipMetadata, ZipArchive, ZipFileSeek},
+    read::{Config, ZipArchive},
     result::ZipResult,
     write::{SimpleFileOptions, ZipWriter},
 };
 
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ArrowReaderMetadata, ArrowReaderOptions,
     ParquetRecordBatchReaderBuilder,
 };
 
@@ -64,35 +61,35 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
 
     pub fn start_spectrum_data(&mut self) -> ZipResult<()> {
         self.archive_writer
-            .start_file(MzPeakArchiveType::SpectrumDataArrays.to_name(), file_options())?;
+            .start_file(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix(), file_options())?;
         self.state = ArchiveState::SpectrumDataArrays;
         Ok(())
     }
 
     pub fn start_spectrum_metadata(&mut self) -> ZipResult<()> {
         self.archive_writer
-            .start_file(MzPeakArchiveType::SpectrumMetadata.to_name(), file_options())?;
+            .start_file(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix(), file_options())?;
         self.state = ArchiveState::SpectrumMetadata;
         Ok(())
     }
 
     pub fn start_chromatogram_metadata(&mut self) -> ZipResult<()> {
         self.archive_writer
-            .start_file(MzPeakArchiveType::ChromatogramMetadata.to_name(), file_options())?;
+            .start_file(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix(), file_options())?;
         self.state = ArchiveState::ChromatogramMetadata;
         Ok(())
     }
 
     pub fn start_chromatogram_data(&mut self) -> ZipResult<()> {
         self.archive_writer
-            .start_file(MzPeakArchiveType::ChromatogramDataArrays.to_name(), file_options())?;
+            .start_file(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix(), file_options())?;
         self.state = ArchiveState::ChromatogramDataArrays;
         Ok(())
     }
 
     pub fn start_other(&mut self) -> ZipResult<()> {
         self.archive_writer
-            .start_file(MzPeakArchiveType::Other.to_name(), file_options())?;
+            .start_file(MzPeakArchiveType::Other.tag_file_suffix(), file_options())?;
         self.state = ArchiveState::Other;
         Ok(())
     }
@@ -114,13 +111,29 @@ pub enum MzPeakArchiveType {
 }
 
 impl MzPeakArchiveType {
-    pub fn to_name(&self) -> String {
+    pub const fn tag_file_suffix(&self) -> &'static str {
         match self {
-            MzPeakArchiveType::SpectrumMetadata => "spectra_metadata.mzpeak".to_string(),
-            MzPeakArchiveType::SpectrumDataArrays => "spectra_data.mzpeak".to_string(),
-            MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.mzpeak".to_string(),
-            MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.mzpeak".to_string(),
-            MzPeakArchiveType::Other => "other.mzpeak".to_string(),
+            MzPeakArchiveType::SpectrumMetadata => "spectra_metadata.mzpeak",
+            MzPeakArchiveType::SpectrumDataArrays => "spectra_data.mzpeak",
+            MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.mzpeak",
+            MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.mzpeak",
+            MzPeakArchiveType::Other => "",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.ends_with(Self::SpectrumDataArrays.tag_file_suffix()) {
+            Some(Self::SpectrumDataArrays)
+        } else if name.ends_with(Self::SpectrumMetadata.tag_file_suffix()) {
+            Some(Self::SpectrumMetadata)
+        } else if name.ends_with(Self::ChromatogramDataArrays.tag_file_suffix()) {
+            Some(Self::ChromatogramDataArrays)
+        } else if name.ends_with(Self::ChromatogramMetadata.tag_file_suffix()) {
+            Some(Self::ChromatogramMetadata)
+        } else if name.ends_with(Self::Other.tag_file_suffix()) {
+            Some(Self::Other)
+        } else {
+            None
         }
     }
 }
@@ -183,7 +196,7 @@ impl Seek for ArchiveFacetReader {
                 }
                 Ok(self.at)
             }
-            io::SeekFrom::Current(offset) => {
+            io::SeekFrom::Current(_offset) => {
                 todo!()
             }
         }
@@ -251,7 +264,7 @@ impl ZipArchiveReaderSource {
     }
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
-        let mut handle = self.archive_file.try_clone()?;
+        let handle = self.archive_file.try_clone()?;
         let mut archive = ZipArchive::with_config(self.archive_offset.clone(), handle)?;
         let handle = archive.by_index(index)?;
         match handle.compression() {
@@ -373,16 +386,19 @@ impl ZipArchiveReader {
 
 #[cfg(test)]
 mod test {
+    use arrow::array::AsArray;
+
     use super::*;
 
     #[test]
     fn test_base() -> io::Result<()> {
-        let arch = ZipArchiveReader::new(fs::File::open("small.archive.mzpeak")?)?;
+        let arch = ZipArchiveReader::new(fs::File::open("small.mzpeak")?)?;
         let handle = arch.spectrum_metadata()?;
         let reader = handle.with_limit(5).build()?;
         for batch in reader {
             let batch = batch.unwrap();
-            dbg!(&batch.schema());
+            let spec = batch.column(0).as_struct();
+            assert_eq!(spec.column_by_name("index").unwrap().len(), 5);
         }
         Ok(())
     }

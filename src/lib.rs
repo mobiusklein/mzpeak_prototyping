@@ -9,10 +9,8 @@ pub mod writer;
 
 pub mod archive;
 
-pub use peak_series::{
-    BufferContext, BufferName
-};
-
-pub use param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID, Param};
+pub use param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID};
 pub use spectrum::{SpectrumEntry, SelectedIonEntry, PrecursorEntry, ScanEntry};
-pub use writer::MzPeakWriter;
+pub use peak_series::{BufferContext, BufferName, ToMzPeakDataSeries};
+pub use writer::MzPeakWriterType;
+pub use reader::MzPeakReader;

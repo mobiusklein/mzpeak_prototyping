@@ -3,6 +3,7 @@ from pathlib import Path
 import zipfile
 
 from numbers import Number
+from collections.abc import Iterable
 from typing import Generic, TypeVar
 from typing import IO
 
@@ -63,6 +64,7 @@ class MzPeakSpectrumMetadataReader:
     precursor_index_i: int
     selected_ion_i: int
 
+    id_index: pd.Series
     spectra: pd.DataFrame
     scans: pd.DataFrame
     precursors: pd.DataFrame
@@ -120,6 +122,7 @@ class MzPeakSpectrumMetadataReader:
             .set_index("index")
             .dropna(axis=1)
         )
+        self.id_index = self.spectra[["id"]].reset_index().set_index("id")["index"]
 
     def _read_scans(self):
         blocks = []
@@ -166,7 +169,9 @@ class MzPeakSpectrumMetadataReader:
             .dropna(axis=1)
         )
 
-    def __getitem__(self, i):
+    def __getitem__(self, i: int | str):
+        if isinstance(i, str):
+            i = self.id_index[i]
         spec = self.spectra.loc[i].to_dict()
         spec['parameters'] = [normalize_value_of(v) for v in spec['parameters']]
         spec["scans"] = self.scans.loc[i].to_dict()
@@ -175,13 +180,14 @@ class MzPeakSpectrumMetadataReader:
             precursors_of['activation'] = precursors_of["activation"].apply(lambda x: [normalize_value_of(v) for v in x['parameters']])
             try:
                 ions = self.selected_ions.loc[[i]]
-                ions["parameters"] = [normalize_value_of(v) for v in ions["parameters"]]
+                ions["parameters"] = ions["parameters"].apply(lambda x: [normalize_value_of(v) for v in x])
                 precursors_of = precursors_of.merge(ions, on="precursor_index")
             except KeyError:
                 pass
             spec["precursors"] = precursors_of.to_dict()
         except KeyError:
             pass
+        spec['index'] = i
         return spec
 
     def __len__(self):
@@ -308,7 +314,7 @@ class MzPeakSpectrumDataReader:
 
 class MzPeakFile:
     archive: zipfile.ZipFile
-    spectrum_data: pq.ParquetFile
+    spectrum_data: MzPeakSpectrumDataReader
     spectrum_metadata: MzPeakSpectrumMetadataReader
 
     def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
@@ -325,11 +331,32 @@ class MzPeakFile:
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
                     pa.PythonFile(self.archive.open(f))
                 )
+        metadata = {}
+        if self.spectrum_metadata:
+            for k, v in self.spectrum_metadata.meta.metadata.items():
+                k = k.decode("utf8")
+                if k == "ARROW:schema":
+                    continue
+                v = json.loads(v)
+                metadata[k] = v
+        self.file_metadata = metadata
 
-    def __getitem__(self, index: int):
-        meta = self.spectrum_metadata[index]
-        data = self.spectrum_data[index]
-        return meta, data
+    def __getitem__(self, index):
+        if isinstance(index, (int, str)):
+            spec = self.spectrum_metadata[index]
+            index = spec['index']
+            data = self.spectrum_data[index]
+            spec.update(data)
+        elif isinstance(index, Iterable):
+            if not index:
+                return []
+            spec = [self[i] for i in index]
+        elif isinstance(index, slice):
+            start = index.start or 0
+            end = index.stop or len(self)
+            step = index.step or 1
+            spec = self[range(start, end, step)]
+        return spec
 
     def __len__(self):
         return len(self.spectrum_metadata)

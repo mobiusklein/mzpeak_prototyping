@@ -1,8 +1,14 @@
-use mzdata::{params::{ControlledVocabulary, Unit}, prelude::*, spectrum::{DataArray, IsolationWindowState, ScanEvent}};
+use mzdata::{
+    params::{ControlledVocabulary, Unit},
+    prelude::*,
+    spectrum::{DataArray, IsolationWindowState, ScanEvent},
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{curie, param::{Param, CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID}};
-
+use crate::{
+    curie,
+    param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID, Param},
+};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct AuxiliaryArray {
@@ -13,20 +19,25 @@ pub struct AuxiliaryArray {
 }
 
 impl AuxiliaryArray {
-    pub fn from_data_array(source: &DataArray) -> Result<Self, mzdata::spectrum::bindata::ArrayRetrievalError> {
+    pub fn from_data_array(
+        source: &DataArray,
+    ) -> Result<Self, mzdata::spectrum::bindata::ArrayRetrievalError> {
         let data = source.decode()?.to_vec();
-        let curie = source.dtype().curie().ok_or_else(|| mzdata::spectrum::bindata::ArrayRetrievalError::DataTypeSizeMismatch)?.into();
+        let curie = source
+            .dtype()
+            .curie()
+            .ok_or_else(|| mzdata::spectrum::bindata::ArrayRetrievalError::DataTypeSizeMismatch)?
+            .into();
         let unit = source.unit.to_curie().map(|c| c.into());
         let this = Self {
             data,
             data_type: curie,
             unit,
-            parameters: Default::default()
+            parameters: Default::default(),
         };
         Ok(this)
     }
 }
-
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct SpectrumEntry {
@@ -60,7 +71,9 @@ pub struct SpectrumEntry {
 }
 
 impl SpectrumEntry {
-    pub fn from_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(spectrum: &impl SpectrumLike<C, D>) -> Self {
+    pub fn from_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(
+        spectrum: &impl SpectrumLike<C, D>,
+    ) -> Self {
         let summaries = spectrum.peaks().fetch_summaries();
 
         let n_pts = summaries.len();
@@ -109,12 +122,7 @@ impl SpectrumEntry {
             base_peak_mz,
             base_peak_intensity,
             total_ion_current: Some(summaries.tic),
-            parameters: spectrum
-                .params()
-                .iter()
-                .cloned()
-                .map(Param::from)
-                .collect(),
+            parameters: spectrum.params().iter().cloned().map(Param::from).collect(),
             ..Default::default()
         }
     }
@@ -167,9 +175,7 @@ impl ScanEntry {
         }
     }
 
-    pub fn to_mzdata(&self) {
-
-    }
+    pub fn to_mzdata(&self) {}
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
@@ -258,7 +264,6 @@ impl From<Activation> for mzdata::spectrum::Activation {
         this
     }
 }
-
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct PrecursorEntry {
@@ -351,8 +356,7 @@ impl SelectedIonEntry {
         }
 
         if let Some(im) = self.ion_mobility {
-            let im_type: mzdata::params::CURIE =
-                self.ion_mobility_type.unwrap().into();
+            let im_type: mzdata::params::CURIE = self.ion_mobility_type.unwrap().into();
             let im_param = mzdata::params::Param::builder();
             let im_param = match im_type {
                 mzdata::params::CURIE {

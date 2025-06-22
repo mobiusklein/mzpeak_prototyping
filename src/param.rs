@@ -1,6 +1,8 @@
 use std::{fmt::Display, str::FromStr};
 
-use mzdata::params::{ParamDescribed, ParamLike, Unit};
+use mzdata::{
+    params::{ControlledVocabulary, ParamDescribed, ParamLike, Unit},
+};
 use serde::{Deserialize, Serialize};
 
 /// Numerical identifier for "Proteomics Standards Initiative Mass Spectrometry Ontology"
@@ -207,7 +209,6 @@ where
     deserializer.deserialize_any(CURIEVisit {})
 }
 
-
 // Provide a way to JSON-deserialize CURIEs from a string
 pub(crate) fn curie_deserialize<'de, D>(deserializer: D) -> Result<CURIE, D::Error>
 where
@@ -305,6 +306,42 @@ pub struct MetaParam {
         deserialize_with = "opt_curie_deserialize"
     )]
     pub unit: Option<CURIE>,
+}
+
+impl From<MetaParam> for mzdata::Param {
+    fn from(value: MetaParam) -> Self {
+        let mut this = Self::default();
+        this.name = value.name.unwrap_or_default();
+        this.unit = value
+            .unit
+            .map(|acc| Unit::from_curie(&(acc.into())))
+            .unwrap_or_default();
+        if let Some(curie) = value.accession {
+            this.accession = Some(curie.accession);
+            this.controlled_vocabulary = match curie.cv_id {
+                MS_CV_ID => Some(ControlledVocabulary::MS),
+                UO_CV_ID => Some(ControlledVocabulary::UO),
+                _ => None,
+            }
+        }
+        this.value = match value.value {
+            serde_json::Value::Null => mzdata::params::Value::Empty,
+            serde_json::Value::Bool(v) => mzdata::params::Value::Boolean(v),
+            serde_json::Value::Number(number) => {
+                if number.is_f64() {
+                    mzdata::params::Value::Float(number.as_f64().unwrap())
+                } else if number.is_i64() {
+                    mzdata::params::Value::Int(number.as_i64().unwrap())
+                } else {
+                    mzdata::params::Value::Int(number.as_u64().unwrap() as i64)
+                }
+            }
+            serde_json::Value::String(v) => mzdata::params::Value::String(v),
+            serde_json::Value::Array(_) => mzdata::params::Value::String(value.value.to_string()),
+            serde_json::Value::Object(_) => mzdata::params::Value::String(value.value.to_string()),
+        };
+        this
+    }
 }
 
 impl From<mzdata::Param> for MetaParam {
@@ -434,11 +471,54 @@ impl From<&mzdata::meta::SourceFile> for SourceFile {
     }
 }
 
+impl From<SourceFile> for mzdata::meta::SourceFile {
+    fn from(value: SourceFile) -> Self {
+        let mut params = Vec::new();
+        let mut id_format = None;
+        let mut file_format = None;
+        for param in value.parameters {
+            if let Some(curie) = param.accession {
+                if let Some(term) = mzdata::meta::NativeSpectrumIdentifierFormatTerm::from_accession(
+                    curie.accession,
+                ) {
+                    id_format = Some(term.into());
+                } else if let Some(term) =
+                    mzdata::meta::MassSpectrometerFileFormatTerm::from_accession(curie.accession)
+                {
+                    file_format = Some(term.into());
+                } else {
+                    params.push(param.into());
+                }
+            } else {
+                params.push(param.into());
+            }
+        }
+
+        Self {
+            name: value.name,
+            location: value.location,
+            id: value.id,
+            file_format,
+            id_format,
+            params,
+        }
+    }
+}
+
 /// An adaptation of [`mzdata::meta::FileDescription`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileDescription {
     pub contents: Vec<MetaParam>,
     pub source_files: Vec<SourceFile>,
+}
+
+impl From<FileDescription> for mzdata::meta::FileDescription {
+    fn from(value: FileDescription) -> Self {
+        let params: Vec<mzdata::params::Param> =
+            value.contents.into_iter().map(|p| p.into()).collect();
+        let source_files = value.source_files.into_iter().map(|sf| sf.into()).collect();
+        Self::new(params, source_files)
+    }
 }
 
 impl From<&mzdata::meta::FileDescription> for FileDescription {
@@ -449,11 +529,7 @@ impl From<&mzdata::meta::FileDescription> for FileDescription {
             .cloned()
             .map(MetaParam::from)
             .collect();
-        let source_files = value
-            .source_files
-            .iter()
-            .map(SourceFile::from)
-            .collect();
+        let source_files = value.source_files.iter().map(SourceFile::from).collect();
         Self {
             contents,
             source_files,
@@ -470,6 +546,16 @@ pub struct Software {
     pub version: String,
     /// Any associated vocabulary terms, including actual software name and type
     pub parameters: Vec<MetaParam>,
+}
+
+impl From<Software> for mzdata::meta::Software {
+    fn from(value: Software) -> Self {
+        Self::new(
+            value.id,
+            value.version,
+            value.parameters.into_iter().map(|p| p.into()).collect(),
+        )
+    }
 }
 
 impl From<&mzdata::meta::Software> for Software {
@@ -490,6 +576,16 @@ pub struct ProcessingMethod {
     pub parameters: Vec<MetaParam>,
 }
 
+impl From<ProcessingMethod> for mzdata::meta::ProcessingMethod {
+    fn from(value: ProcessingMethod) -> Self {
+        Self {
+            order: value.order,
+            software_reference: value.software_reference,
+            params: value.parameters.into_iter().map(|p| p.into()).collect(),
+        }
+    }
+}
+
 impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
     fn from(value: &mzdata::meta::ProcessingMethod) -> Self {
         Self {
@@ -505,6 +601,15 @@ impl From<&mzdata::meta::ProcessingMethod> for ProcessingMethod {
 pub struct DataProcessing {
     pub id: String,
     pub methods: Vec<ProcessingMethod>,
+}
+
+impl From<DataProcessing> for mzdata::meta::DataProcessing {
+    fn from(value: DataProcessing) -> Self {
+        Self {
+            id: value.id,
+            methods: value.methods.into_iter().map(|p| p.into()).collect(),
+        }
+    }
 }
 
 impl From<&mzdata::meta::DataProcessing> for DataProcessing {
@@ -530,7 +635,6 @@ pub enum ComponentType {
     Unknown,
 }
 
-
 /// An adaptation of [`mzdata::meta::Component`]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Component {
@@ -539,6 +643,21 @@ pub struct Component {
     /// The order in the sequence of components that the analytes interact with
     pub order: u8,
     pub parameters: Vec<MetaParam>,
+}
+
+impl From<Component> for mzdata::meta::Component {
+    fn from(value: Component) -> Self {
+        Self {
+            component_type: match value.component_type {
+                ComponentType::Analyzer => mzdata::meta::ComponentType::Analyzer,
+                ComponentType::IonSource => mzdata::meta::ComponentType::IonSource,
+                ComponentType::Detector => mzdata::meta::ComponentType::Detector,
+                ComponentType::Unknown => mzdata::meta::ComponentType::Unknown,
+            },
+            order: value.order,
+            params: value.parameters.into_iter().map(mzdata::Param::from).collect(),
+        }
+    }
 }
 
 impl From<&mzdata::meta::Component> for Component {
@@ -569,17 +688,54 @@ pub struct InstrumentConfiguration {
     pub id: u32,
 }
 
+impl From<InstrumentConfiguration> for mzdata::meta::InstrumentConfiguration {
+    fn from(value: InstrumentConfiguration) -> Self {
+        Self {
+            components: value.components.into_iter().map(|v| v.into()).collect(),
+            params: value.parameters.into_iter().map(|v| v.into()).collect(),
+            software_reference: value.software_reference,
+            id: value.id,
+        }
+    }
+}
+
 impl From<&mzdata::meta::InstrumentConfiguration> for InstrumentConfiguration {
     fn from(value: &mzdata::meta::InstrumentConfiguration) -> Self {
         Self {
-            components: value
-                .components
-                .iter()
-                .map(Component::from)
-                .collect(),
+            components: value.components.iter().map(Component::from).collect(),
             parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
             software_reference: value.software_reference.clone(),
             id: value.id,
+        }
+    }
+}
+
+
+/// An adaptation of [`mzdata::meta::Sample`]
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sample {
+    pub id: String,
+    pub name: Option<String>,
+    pub parameters: Vec<MetaParam>,
+}
+
+
+impl From<Sample> for mzdata::meta::Sample {
+    fn from(value: Sample) -> Self {
+        Self {
+            params: value.parameters.into_iter().map(|v| v.into()).collect(),
+            name: value.name,
+            id: value.id,
+        }
+    }
+}
+
+impl From<&mzdata::meta::Sample> for Sample {
+    fn from(value: &mzdata::meta::Sample) -> Self {
+        Self {
+            parameters: value.iter_params().cloned().map(MetaParam::from).collect(),
+            name: value.name.clone(),
+            id: value.id.clone(),
         }
     }
 }

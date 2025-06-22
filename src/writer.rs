@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{self, prelude::*},
+    marker::PhantomData,
     sync::Arc,
 };
 
@@ -8,6 +9,7 @@ use arrow::{
     array::{ArrayRef, RecordBatch, StructArray, new_null_array},
     datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef},
 };
+use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
     arrow::{ArrowSchemaConverter, ArrowWriter, arrow_writer::ArrowWriterOptions},
     basic::{Encoding, ZstdLevel},
@@ -16,6 +18,10 @@ use parquet::{
 };
 
 use mzdata::{
+    meta::{
+        DataProcessing, FileDescription, FileMetadataConfig, InstrumentConfiguration,
+        MSDataFileMetadata, MassSpectrometryRun, Sample, Software,
+    },
     params::Unit,
     prelude::*,
     spectrum::{ArrayType, BinaryDataArrayType},
@@ -25,7 +31,11 @@ use serde_arrow::schema::{SchemaLike, TracingOptions};
 use crate::{
     archive::ZipArchiveWriter,
     entry::Entry,
-    param::{DataProcessing, FileDescription, InstrumentConfiguration, Software},
+    param::{
+        DataProcessing as MzDataProcessing, FileDescription as MzFileDescription,
+        InstrumentConfiguration as MzInstrumentConfiguration, Sample as MzSample,
+        Software as MzSoftware,
+    },
     peak_series::{
         ArrayIndex, ArrayIndexEntry, BufferContext, BufferName, ToMzPeakDataSeries,
         array_map_to_schema_arrays,
@@ -268,8 +278,8 @@ impl MzPeakWriterBuilder {
         )
     }
 
-    pub fn build<W: Write + Send + Seek>(self, writer: W) -> MzPeakWriter<W> {
-        MzPeakWriter::new(
+    pub fn build<W: Write + Send + Seek>(self, writer: W) -> MzPeakWriterType<W> {
+        MzPeakWriterType::new(
             writer,
             self.spectrum_arrays,
             self.chromatogram_arrays,
@@ -311,6 +321,8 @@ pub struct MzMetadata {
     pub data_processing_list: Vec<DataProcessing>,
     pub software_list: Vec<Software>,
     pub instrument_configurations: Vec<InstrumentConfiguration>,
+    pub sample_list: Vec<Sample>,
+    pub mass_spectrometry_run: MassSpectrometryRun,
 }
 
 impl MzMetadata {
@@ -319,73 +331,108 @@ impl MzMetadata {
         data_processing_list: Vec<DataProcessing>,
         software_list: Vec<Software>,
         instrument_configurations: Vec<InstrumentConfiguration>,
+        sample_list: Vec<Sample>,
+        mass_spectrometry_run: MassSpectrometryRun,
     ) -> Self {
         Self {
             file_description,
             data_processing_list,
             software_list,
             instrument_configurations,
+            sample_list,
+            mass_spectrometry_run,
         }
-    }
-
-    pub fn add_file_description(&mut self, value: &mzdata::meta::FileDescription) {
-        self.file_description = value.into();
-    }
-
-    pub fn add_instrument_configuration(&mut self, value: &mzdata::meta::InstrumentConfiguration) {
-        self.instrument_configurations.push(value.into());
-    }
-
-    pub fn add_software(&mut self, value: &mzdata::meta::Software) {
-        self.software_list.push(value.into());
-    }
-
-    pub fn add_data_processing(&mut self, value: &mzdata::meta::DataProcessing) {
-        self.data_processing_list.push(value.into());
     }
 }
 
 macro_rules! implement_mz_metadata {
     () => {
         pub fn add_file_description(&mut self, value: &mzdata::meta::FileDescription) {
-            self.mz_metadata.add_file_description(value);
+            *self.mz_metadata.file_description_mut() = value.clone();
         }
 
         pub fn add_instrument_configuration(
             &mut self,
             value: &mzdata::meta::InstrumentConfiguration,
         ) {
-            self.mz_metadata.add_instrument_configuration(value);
+            self.mz_metadata
+                .instrument_configurations_mut()
+                .insert(value.id, value.clone());
         }
 
         pub fn add_software(&mut self, value: &mzdata::meta::Software) {
-            self.mz_metadata.add_software(value);
+            self.mz_metadata.softwares_mut().push(value.clone());
         }
 
         pub fn add_data_processing(&mut self, value: &mzdata::meta::DataProcessing) {
-            self.mz_metadata.add_data_processing(value);
+            self.mz_metadata.data_processings_mut().push(value.clone());
+        }
+
+        pub fn add_sample(&mut self, value: &mzdata::meta::Sample) {
+            self.mz_metadata.samples_mut().push(value.clone())
         }
 
         pub(crate) fn append_metadata(&mut self) {
             self.append_key_value_metadata(
                 "file_description",
-                Some(serde_json::to_string_pretty(&self.mz_metadata.file_description).unwrap()),
-            );
-            self.append_key_value_metadata(
-                "instrument_configuration_list",
                 Some(
-                    serde_json::to_string_pretty(&self.mz_metadata.instrument_configurations)
-                        .unwrap(),
+                    serde_json::to_string_pretty(&MzFileDescription::from(
+                        self.mz_metadata.file_description(),
+                    ))
+                    .unwrap(),
                 ),
             );
+            let tmp: Vec<_> = self
+                .mz_metadata
+                .instrument_configurations()
+                .values()
+                .map(|v| MzInstrumentConfiguration::from(v))
+                .collect();
+            self.append_key_value_metadata(
+                "instrument_configuration_list",
+                Some(serde_json::to_string_pretty(&tmp).unwrap()),
+            );
+
+            let tmp: Vec<_> = self
+                .mz_metadata
+                .data_processings()
+                .iter()
+                .map(|v| MzDataProcessing::from(v))
+                .collect();
             self.append_key_value_metadata(
                 "data_processing_method_list",
-                Some(serde_json::to_string_pretty(&self.mz_metadata.data_processing_list).unwrap()),
+                Some(serde_json::to_string_pretty(&tmp).unwrap()),
             );
+
+            let tmp: Vec<_> = self
+                .mz_metadata
+                .softwares()
+                .iter()
+                .map(|v| MzSoftware::from(v))
+                .collect();
             self.append_key_value_metadata(
                 "software_list",
-                Some(serde_json::to_string_pretty(&self.mz_metadata.software_list).unwrap()),
+                Some(serde_json::to_string_pretty(&tmp).unwrap()),
             );
+
+            let tmp: Vec<_> = self
+                .mz_metadata
+                .samples()
+                .iter()
+                .map(|v| MzSample::from(v))
+                .collect();
+            self.append_key_value_metadata(
+                "sample_list",
+                Some(serde_json::to_string_pretty(&tmp).unwrap()),
+            );
+
+            self.append_key_value_metadata(
+                "run",
+                Some(
+                    serde_json::to_string_pretty(self.mz_metadata.run_description().unwrap())
+                        .unwrap(),
+                ),
+            )
         }
     };
 }
@@ -473,7 +520,11 @@ pub trait AbstractMzPeakWriter {
     }
 }
 
-pub struct MzPeakWriter<W: Write + Send + Seek> {
+pub struct MzPeakWriterType<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries = CentroidPeak,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries = DeconvolutedPeak,
+> {
     archive_writer: Option<ArrowWriter<ZipArchiveWriter<W>>>,
     spectrum_buffers: ArrayBuffers,
     #[allow(unused)]
@@ -487,10 +538,16 @@ pub struct MzPeakWriter<W: Write + Send + Seek> {
     spectrum_data_point_counter: u64,
     buffer_size: usize,
 
-    mz_metadata: MzMetadata,
+    mz_metadata: FileMetadataConfig,
+    _t: PhantomData<(C, D)>,
 }
 
-impl<W: Write + Send + Seek> AbstractMzPeakWriter for MzPeakWriter<W> {
+impl<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> AbstractMzPeakWriter for MzPeakWriterType<W, C, D>
+{
     fn append_key_value_metadata(
         &mut self,
         key: impl Into<String>,
@@ -534,7 +591,21 @@ impl<W: Write + Send + Seek> AbstractMzPeakWriter for MzPeakWriter<W> {
     }
 }
 
-impl<W: Write + Send + Seek> MzPeakWriter<W> {
+impl<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> MSDataFileMetadata for MzPeakWriterType<W, C, D>
+{
+    mzdata::delegate_impl_metadata_trait!(mz_metadata);
+}
+
+impl<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> MzPeakWriterType<W, C, D>
+{
     pub fn builder() -> MzPeakWriterBuilder {
         MzPeakWriterBuilder::default()
     }
@@ -559,7 +630,7 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
             }
         }
 
-        let mut data_props = WriterProperties::builder()
+        let data_props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::ZSTD(
                 ZstdLevel::try_new(3).unwrap(),
             ))
@@ -568,13 +639,6 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
             .set_column_encoding(index_path.into(), Encoding::RLE)
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_statistics_enabled(EnabledStatistics::Page);
-
-        for f in parquet_schema.columns().iter().skip(1) {
-            if f.name().contains("_mz_") {
-                data_props =
-                    data_props.set_column_encoding(f.path().clone(), Encoding::BYTE_STREAM_SPLIT);
-            }
-        }
 
         let data_props = data_props.build();
         data_props
@@ -647,6 +711,7 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
             spectrum_data_point_counter: 0,
             buffer_size: buffer_size,
             mz_metadata: Default::default(),
+            _t: PhantomData,
         };
         this.add_array_metadata();
         this
@@ -713,11 +778,11 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
     }
 
     pub fn write_spectrum<
-        C: ToMzPeakDataSeries + CentroidLike,
-        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        A: ToMzPeakDataSeries + CentroidLike,
+        B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
     >(
         &mut self,
-        spectrum: &impl SpectrumLike<C, D>,
+        spectrum: &impl SpectrumLike<A, B>,
     ) -> io::Result<()> {
         AbstractMzPeakWriter::write_spectrum(self, spectrum)
     }
@@ -782,13 +847,25 @@ impl<W: Write + Send + Seek> MzPeakWriter<W> {
     }
 }
 
-impl<W: Write + Send + Seek> Drop for MzPeakWriter<W> {
+impl<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> Drop for MzPeakWriterType<W, C, D>
+{
     fn drop(&mut self) {
         if let Err(_) = self.finish() {}
     }
 }
 
-pub struct MzPeakSplitWriter<W: Write + Send> {
+
+/// Writer for the MzPeak format that writes the different data types to separate files
+/// in an unarchived format.
+pub struct MzPeakSplitWriter<
+    W: Write + Send,
+    C: CentroidLike + ToMzPeakDataSeries = CentroidPeak,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries = DeconvolutedPeak,
+> {
     data_writer: ArrowWriter<W>,
     metadata_writer: ArrowWriter<W>,
 
@@ -804,16 +881,36 @@ pub struct MzPeakSplitWriter<W: Write + Send> {
     spectrum_data_point_counter: u64,
     buffer_size: usize,
 
-    mz_metadata: MzMetadata,
+    mz_metadata: FileMetadataConfig,
+    _t: PhantomData<(C, D)>,
 }
 
-impl<W: Write + Send> Drop for MzPeakSplitWriter<W> {
+impl<
+    W: Write + Send,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> Drop for MzPeakSplitWriter<W, C, D>
+{
     fn drop(&mut self) {
         if let Err(_) = self.finish() {}
     }
 }
 
-impl<W: Write + Send> AbstractMzPeakWriter for MzPeakSplitWriter<W> {
+impl<
+    W: Write + Send,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> MSDataFileMetadata for MzPeakSplitWriter<W, C, D>
+{
+    mzdata::delegate_impl_metadata_trait!(mz_metadata);
+}
+
+impl<
+    W: Write + Send,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> AbstractMzPeakWriter for MzPeakSplitWriter<W, C, D>
+{
     fn append_key_value_metadata(
         &mut self,
         key: impl Into<String>,
@@ -854,7 +951,12 @@ impl<W: Write + Send> AbstractMzPeakWriter for MzPeakSplitWriter<W> {
     }
 }
 
-impl<W: Write + Send> MzPeakSplitWriter<W> {
+impl<
+    W: Write + Send,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> MzPeakSplitWriter<W, C, D>
+{
     fn data_writer_props(data_buffer: &ArrayBuffers) -> WriterProperties {
         let spectrum_point_prefix = format!("{}.spectrum_index", data_buffer.prefix);
         let parquet_schema = Arc::new(
@@ -952,6 +1054,7 @@ impl<W: Write + Send> MzPeakSplitWriter<W> {
             spectrum_data_point_counter: 0,
             buffer_size: buffer_size,
             mz_metadata: Default::default(),
+            _t: PhantomData,
         };
         this.add_array_metadata();
         this
@@ -1027,11 +1130,11 @@ impl<W: Write + Send> MzPeakSplitWriter<W> {
     }
 
     pub fn write_spectrum<
-        C: ToMzPeakDataSeries + CentroidLike,
-        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        A: ToMzPeakDataSeries + CentroidLike,
+        B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
     >(
         &mut self,
-        spectrum: &impl SpectrumLike<C, D>,
+        spectrum: &impl SpectrumLike<A, B>,
     ) -> io::Result<()> {
         AbstractMzPeakWriter::write_spectrum(self, spectrum)
     }
@@ -1070,5 +1173,50 @@ impl<W: Write + Send> MzPeakSplitWriter<W> {
         );
         self.data_writer.finish()?;
         self.metadata_writer.finish()
+    }
+}
+
+impl<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> SpectrumWriter<C, D> for MzPeakWriterType<W, C, D>
+{
+    fn write<S: SpectrumLike<C, D> + 'static>(&mut self, spectrum: &S) -> io::Result<usize> {
+        self.write_spectrum(spectrum).map(|_| 1)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(w) = self.archive_writer.as_mut() {
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        self.finish()?;
+        Ok(())
+    }
+}
+
+impl<
+    W: Write + Send + Seek,
+    C: CentroidLike + ToMzPeakDataSeries,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
+> SpectrumWriter<C, D> for MzPeakSplitWriter<W, C, D>
+{
+    fn write<S: SpectrumLike<C, D> + 'static>(&mut self, spectrum: &S) -> io::Result<usize> {
+        self.write_spectrum(spectrum).map(|_| 1)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.data_writer.flush()?;
+        self.metadata_writer.flush()?;
+        Ok(())
+    }
+
+    fn close(&mut self) -> io::Result<()> {
+        self.finish()?;
+        Ok(())
     }
 }

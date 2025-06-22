@@ -1,37 +1,24 @@
-use std::{fs, io, sync::Arc};
+use std::{fs, sync::Arc};
 
 use mzpeaks::{coordinate::IntervalTree, prelude::HasProximity};
 use parquet::file::metadata::ParquetMetaData;
-#[allow(unused)]
+
 use parquet::{
     self,
     arrow::{
-        ProjectionMask,
         arrow_reader::{
-            ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
-            RowSelection, RowSelector, statistics::StatisticsConverter,
+            ParquetRecordBatchReaderBuilder,
+            RowSelection, RowSelector,
         },
     },
-    basic::Type as PhysicalType,
     file::{
-        metadata::{ParquetColumnIndex, ParquetOffsetIndex, RowGroupMetaData},
         page_index::index::Index as ParquetTypedIndex,
     },
-    schema::types::{SchemaDescPtr, SchemaDescriptor},
+    schema::types::SchemaDescriptor,
 };
 
-#[allow(unused)]
-use arrow::{
-    self,
-    array::{Array, AsArray, BooleanArray, Float64Array, PrimitiveArray, RecordBatch},
-    datatypes::{DataType, Field, FieldRef, Float32Type, Float64Type, UInt64Type},
-};
-
-use mzdata::mzpeaks::coordinate::{SimpleInterval, Span1D};
+use mzdata::mzpeaks::coordinate::Span1D;
 use serde::{Deserialize, Serialize};
-
-#[allow(unused)]
-use serde_arrow::schema::TracingOptions;
 
 pub fn parquet_column(schema: &SchemaDescriptor, column: &str) -> Option<usize> {
     let mut column_ix: Option<usize> = None;
@@ -415,78 +402,4 @@ pub fn read_point_im_index(
     reader: &ParquetRecordBatchReaderBuilder<fs::File>,
 ) -> Option<PageIndex<f64>> {
     read_f64_page_index(reader, "point.im")
-}
-
-pub fn spectrum_index_range_for_time_range(
-    handle: &mut fs::File,
-    query: SimpleInterval<f32>,
-) -> io::Result<SimpleInterval<u64>> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
-        handle.try_clone()?,
-        ArrowReaderOptions::new().with_page_index(true),
-    )?;
-
-    let index = read_spectrum_time_index(&reader).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Page index not found for spectrum.time",
-        )
-    })?;
-
-    let selection = index.row_selection_overlaps(&query);
-
-    let projection =
-        ProjectionMask::columns(reader.parquet_schema(), ["spectrum.index", "spectrum.time"]);
-    let filter_projection = ProjectionMask::columns(reader.parquet_schema(), ["spectrum.time"]);
-
-    let predicate = move |batch: RecordBatch| {
-        let spec = batch.column(0).as_struct();
-        let col: &PrimitiveArray<Float32Type> = spec.column(0).as_primitive::<Float32Type>();
-        let mask: Vec<bool> = col
-            .iter()
-            .map(|val| val.map(|val| query.contains(&val)).unwrap_or_default())
-            .collect();
-        Ok(BooleanArray::from(mask))
-    };
-
-    let start = std::time::Instant::now();
-    let reader = reader
-        .with_row_selection(selection)
-        .with_projection(projection)
-        .with_row_filter(RowFilter::new(vec![Box::new(ArrowPredicateFn::new(
-            filter_projection,
-            predicate,
-        ))]))
-        .build()?;
-
-    let mut indices = SimpleInterval::new(u64::MAX, u64::MIN);
-    'a: for batch in reader.flatten() {
-        let spec = batch.column(0).as_struct();
-        let idx_arr: &PrimitiveArray<UInt64Type> =
-            spec.column_by_name("index").unwrap().as_primitive();
-        let time_arr: &PrimitiveArray<Float32Type> =
-            spec.column_by_name("time").unwrap().as_primitive();
-        for (val, ti) in idx_arr.iter().zip(time_arr.iter()) {
-            if let (Some(val), Some(ti)) = (val, ti) {
-                if query.contains(&ti) {
-                    if indices.start > val {
-                        indices.start = val;
-                    }
-                    if indices.end < val {
-                        indices.end = val
-                    }
-                    if ti > query.end {
-                        break 'a;
-                    }
-                }
-            }
-        }
-    }
-
-    let end = std::time::Instant::now();
-    eprintln!(
-        "{} seconds elapsed (time index)",
-        (end - start).as_secs_f64()
-    );
-    Ok(indices)
 }

@@ -1,0 +1,10 @@
+[project]
+
+name = "mzpeak"
+version = "0.1.0"
+
+dependencies = [
+    "pyarrow",
+    "pandas",
+    "numpy"
+]

@@ -2,27 +2,33 @@ use std::{
     collections::HashMap,
     fs::File,
     io,
+    marker::PhantomData,
     path::{Path, PathBuf},
 };
 
-#[allow(unused)]
 use arrow::{
     array::{
-        Array, ArrayRef, AsArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int32Array,
-        Int64Array, LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt8Array,
+        Array, AsArray, Float32Array, Float64Array, Int8Array, Int32Array,
+        Int64Array, LargeListArray, LargeStringArray, StructArray, UInt8Array,
         UInt32Array, UInt64Array,
     },
     datatypes::{DataType, FieldRef},
 };
 
 use mzdata::{
+    io::{DetailLevel, OffsetIndex},
+    meta::{self, MSDataFileMetadata},
     params::{ParamDescribed, Unit},
-    prelude::PrecursorSelection,
+    prelude::*,
     spectrum::{
-        ArrayType, BinaryArrayMap, DataArray, ScanEvent, ScanPolarity, SpectrumDescription,
+        ArrayType, BinaryArrayMap, Chromatogram, DataArray, MultiLayerSpectrum, ScanEvent,
+        ScanPolarity, SpectrumDescription, bindata::BuildFromArrayMap,
     },
 };
-use mzpeaks::{coordinate::SimpleInterval, prelude::Span1D};
+use mzpeaks::{
+    CentroidPeak, DeconvolutedCentroidLike, DeconvolutedPeak, coordinate::SimpleInterval,
+    prelude::Span1D,
+};
 
 use crate::archive::ZipArchiveReader;
 
@@ -54,12 +60,14 @@ use crate::{
 };
 
 pub struct MzPeakReaderMetadata {
-    pub file_description: FileDescription,
-    pub instrument_configurations: Vec<InstrumentConfiguration>,
-    pub software_list: Vec<Software>,
-    pub data_processing_list: Vec<DataProcessing>,
+    mz_metadata: meta::FileMetadataConfig,
     pub spectrum_array_indices: ArrayIndex,
     pub chromatogram_array_indices: ArrayIndex,
+    pub spectrum_id_index: OffsetIndex,
+}
+
+impl MSDataFileMetadata for MzPeakReaderMetadata {
+    mzdata::delegate_impl_metadata_trait!(mz_metadata);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -76,15 +84,149 @@ pub struct QueryIndex {
     pub spectrum_im_index: PageIndex<f64>,
 }
 
-pub struct MzPeakReader {
-    #[allow(unused)]
+pub struct MzPeakReaderType<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap = CentroidPeak,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap = DeconvolutedPeak,
+> {
     path: PathBuf,
     handle: ZipArchiveReader,
+    index: usize,
+    detail_level: DetailLevel,
     pub metadata: MzPeakReaderMetadata,
     pub query_indices: QueryIndex,
+    _t: PhantomData<(C, D)>,
 }
 
-impl MzPeakReader {
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> ChromatogramSource for MzPeakReaderType<C, D>
+{
+    fn get_chromatogram_by_id(&mut self, id: &str) -> Option<Chromatogram> {
+        match id {
+            "TIC" => self.tic().ok(),
+            "BPC" => self.bpc().ok(),
+            _ => None,
+        }
+    }
+
+    fn get_chromatogram_by_index(&mut self, index: usize) -> Option<Chromatogram> {
+        match index {
+            0 => self.tic().ok(),
+            1 => self.bpc().ok(),
+            _ => None,
+        }
+    }
+}
+
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> ExactSizeIterator for MzPeakReaderType<C, D>
+{
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> Iterator for MzPeakReaderType<C, D>
+{
+    type Item = MultiLayerSpectrum<C, D>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let x = self.get_spectrum(self.index).ok();
+        self.index += 1;
+        x
+    }
+}
+
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> SpectrumSource<C, D> for MzPeakReaderType<C, D>
+{
+    fn reset(&mut self) {
+        self.index = 0;
+    }
+
+    fn detail_level(&self) -> &mzdata::io::DetailLevel {
+        &self.detail_level
+    }
+
+    fn set_detail_level(&mut self, detail_level: mzdata::io::DetailLevel) {
+        self.detail_level = detail_level
+    }
+
+    fn get_spectrum_by_id(&mut self, id: &str) -> Option<MultiLayerSpectrum<C, D>> {
+        let description = self.get_spectrum_metadata_by_id(id).ok()?;
+        let arrays = self.get_spectrum_arrays(description.index as u64).ok()?;
+        Some(MultiLayerSpectrum::from_arrays_and_description(
+            arrays,
+            description,
+        ))
+    }
+
+    fn get_spectrum_by_index(&mut self, index: usize) -> Option<MultiLayerSpectrum<C, D>> {
+        self.get_spectrum(index).ok()
+    }
+
+    fn get_index(&self) -> &OffsetIndex {
+        &self.metadata.spectrum_id_index
+    }
+
+    fn set_index(&mut self, index: OffsetIndex) {
+        self.metadata.spectrum_id_index = index;
+    }
+}
+
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> RandomAccessSpectrumIterator<C, D> for MzPeakReaderType<C, D>
+{
+    fn start_from_id(&mut self, id: &str) -> Result<&mut Self, SpectrumAccessError> {
+        let s = self
+            .get_spectrum_metadata_by_id(id)
+            .map_err(|e| SpectrumAccessError::IOError(Some(e)))?;
+        self.index = s.index;
+        Ok(self)
+    }
+
+    fn start_from_index(&mut self, index: usize) -> Result<&mut Self, SpectrumAccessError> {
+        self.index = index;
+        Ok(self)
+    }
+
+    fn start_from_time(&mut self, time: f64) -> Result<&mut Self, SpectrumAccessError> {
+        let dl = *self.detail_level();
+        self.set_detail_level(DetailLevel::MetadataOnly);
+        if let Some(spec) = self.get_spectrum_by_time(time) {
+            self.index = spec.index();
+            self.set_detail_level(dl);
+            Ok(self)
+        } else {
+            self.set_detail_level(dl);
+            Err(SpectrumAccessError::SpectrumNotFound)
+        }
+    }
+}
+
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> MSDataFileMetadata for MzPeakReaderType<C, D>
+{
+    mzdata::delegate_impl_metadata_trait!(metadata);
+}
+
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> MzPeakReaderType<C, D>
+{
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path = path.as_ref().into();
         let handle = File::open(&path)?;
@@ -94,11 +236,18 @@ impl MzPeakReader {
 
         let this = Self {
             path,
+            index: 0,
+            detail_level: DetailLevel::Full,
             handle,
             metadata,
             query_indices,
+            _t: Default::default(),
         };
         Ok(this)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn load_indices_from(
@@ -107,11 +256,7 @@ impl MzPeakReader {
         let spectrum_metadata_reader = handle.spectrum_metadata()?;
         let spectrum_data_reader = handle.spectra_data()?;
 
-        let mut file_description: FileDescription = Default::default();
-        let mut instrument_configurations: Vec<InstrumentConfiguration> = Default::default();
-        let mut software_list: Vec<Software> = Default::default();
-        let mut data_processing_list: Vec<DataProcessing> = Default::default();
-
+        let mut mz_metadata = meta::FileMetadataConfig::default();
         let mut spectrum_array_indices: ArrayIndex = Default::default();
         let mut chromatogram_array_indices: ArrayIndex = Default::default();
 
@@ -149,30 +294,64 @@ impl MzPeakReader {
                 }
                 "file_description" => {
                     if let Some(val) = kv.value.as_ref() {
-                        file_description = serde_json::from_str(&val)?;
+                        let file_description: crate::param::FileDescription =
+                            serde_json::from_str(&val)?;
+                        *mz_metadata.file_description_mut() = file_description.into();
                     } else {
                         log::warn!("file description was empty");
                     }
                 }
                 "instrument_configuration_list" => {
                     if let Some(val) = kv.value.as_ref() {
-                        instrument_configurations = serde_json::from_str(&val)?;
+                        let instrument_configurations: Vec<crate::param::InstrumentConfiguration> =
+                            serde_json::from_str(&val)?;
+                        for ic in instrument_configurations {
+                            mz_metadata
+                                .instrument_configurations_mut()
+                                .insert(ic.id, ic.into());
+                        }
                     } else {
                         log::warn!("instrument configurations list was empty for",);
                     }
                 }
                 "data_processing_method_list" => {
                     if let Some(val) = kv.value.as_ref() {
-                        data_processing_list = serde_json::from_str(&val)?;
+                        let data_processing_list: Vec<crate::param::DataProcessing> =
+                            serde_json::from_str(&val)?;
+                        for dp in data_processing_list {
+                            mz_metadata.data_processings_mut().push(dp.into());
+                        }
                     } else {
                         log::warn!("data processing method list was empty");
                     }
                 }
+                "sample_list" => {
+                    if let Some(val) = kv.value.as_ref() {
+                        let meta_list: Vec<crate::param::Sample> = serde_json::from_str(&val)?;
+                        for sw in meta_list {
+                            mz_metadata.samples_mut().push(sw.into());
+                        }
+                    } else {
+                        log::warn!("sample list was empty");
+                    }
+                }
                 "software_list" => {
                     if let Some(val) = kv.value.as_ref() {
-                        software_list = serde_json::from_str(&val)?;
+                        let software_list: Vec<crate::param::Software> =
+                            serde_json::from_str(&val)?;
+                        for sw in software_list {
+                            mz_metadata.softwares_mut().push(sw.into());
+                        }
                     } else {
                         log::warn!("software list was empty");
+                    }
+                }
+                "run" => {
+                    if let Some(val) = kv.value.as_ref() {
+                        let run: meta::MassSpectrometryRun = serde_json::from_str(&val)?;
+                        *mz_metadata.run_description_mut().unwrap() = run;
+                    } else {
+                        log::warn!("run was empty")
                     }
                 }
                 _ => {}
@@ -221,6 +400,32 @@ impl MzPeakReader {
 
         let peak_pq_schema = spectrum_data_reader.parquet_schema();
 
+        let mut spectrum_id_index = OffsetIndex::new("spectrum".into());
+        for batch in handle
+            .spectrum_metadata()?
+            .with_projection(ProjectionMask::columns(
+                pq_schema,
+                ["spectrum.id", "spectrum.index"],
+            ))
+            .build()?
+            .flatten()
+        {
+            let root = batch.column(0).as_struct();
+            let ids = root.column_by_name("id").unwrap().as_string::<i64>();
+            let indices: &UInt64Array = root
+                .column_by_name("index")
+                .unwrap()
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            for (id, idx) in ids.iter().zip(indices.iter()) {
+                if let Some(id) = id {
+                    spectrum_id_index.insert(id, idx.unwrap());
+                }
+            }
+        }
+        spectrum_id_index.init = true;
+
         query_index.spectrum_point_spectrum_index = read_u64_page_index_from(
             &spectrum_data_reader.metadata(),
             &peak_pq_schema,
@@ -247,12 +452,10 @@ impl MzPeakReader {
         }
 
         let bundle = MzPeakReaderMetadata {
-            file_description,
-            instrument_configurations,
-            software_list,
-            data_processing_list,
+            mz_metadata,
             spectrum_array_indices,
             chromatogram_array_indices,
+            spectrum_id_index,
         };
 
         Ok((bundle, query_index))
@@ -409,7 +612,7 @@ impl MzPeakReader {
 
                 let params = params_array.value(pos);
                 let params = params.as_struct();
-                let params: Vec<crate::Param> =
+                let params: Vec<crate::param::Param> =
                     serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
                 event
                     .params_mut()
@@ -566,7 +769,7 @@ impl MzPeakReader {
             crate::curie!(MS:1000527),
             crate::curie!(MS:1000528),
         ];
-        let params: Vec<crate::Param> =
+        let params: Vec<crate::param::Param> =
             serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
 
         for p in params {
@@ -607,7 +810,10 @@ impl MzPeakReader {
                 .collect())
         });
 
-        let proj = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.index", "spectrum.time"]);
+        let proj = ProjectionMask::columns(
+            builder.parquet_schema(),
+            ["spectrum.index", "spectrum.time"],
+        );
 
         let reader = builder
             .with_row_selection(rows)
@@ -621,19 +827,9 @@ impl MzPeakReader {
         let mut times: HashMap<u64, f32> = HashMap::new();
 
         for batch in reader.flatten() {
-            let root = batch
-                .column(0)
-                .as_struct();
-            let arr: &UInt64Array =  root
-                .column(0)
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-            let time_arr: &Float32Array = root
-                .column(1)
-                .as_any()
-                .downcast_ref()
-                .unwrap();
+            let root = batch.column(0).as_struct();
+            let arr: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
+            let time_arr: &Float32Array = root.column(1).as_any().downcast_ref().unwrap();
             for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
                 min = min.min(val);
                 max = max.max(val);
@@ -643,28 +839,57 @@ impl MzPeakReader {
         Ok((times, SimpleInterval::new(min, max)))
     }
 
-    pub fn extract_peaks(&mut self, time_range: SimpleInterval<f32>, mz_range: Option<SimpleInterval<f64>>, ion_mobility_range: Option<SimpleInterval<f64>>) -> io::Result<(ParquetRecordBatchReader, HashMap<u64, f32>)> {
+    pub fn extract_peaks(
+        &mut self,
+        time_range: SimpleInterval<f32>,
+        mz_range: Option<SimpleInterval<f64>>,
+        ion_mobility_range: Option<SimpleInterval<f64>>,
+    ) -> io::Result<(ParquetRecordBatchReader, HashMap<u64, f32>)> {
         let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
 
-        let mut rows = self.query_indices.spectrum_point_spectrum_index.row_selection_overlaps(&index_range);
+        let mut rows = self
+            .query_indices
+            .spectrum_point_spectrum_index
+            .row_selection_overlaps(&index_range);
         if let Some(mz_range) = mz_range.as_ref() {
-            rows = rows.intersection(&self.query_indices.spectrum_mz_index.row_selection_overlaps(mz_range));
+            rows = rows.intersection(
+                &self
+                    .query_indices
+                    .spectrum_mz_index
+                    .row_selection_overlaps(mz_range),
+            );
         }
         if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
-            rows = rows.union(&self.query_indices.spectrum_im_index.row_selection_overlaps(&ion_mobility_range));
+            rows = rows.union(
+                &self
+                    .query_indices
+                    .spectrum_im_index
+                    .row_selection_overlaps(&ion_mobility_range),
+            );
         }
 
-        let sidx = format!("{}.spectrum_index", self.metadata.spectrum_array_indices.prefix);
+        let sidx = format!(
+            "{}.spectrum_index",
+            self.metadata.spectrum_array_indices.prefix
+        );
 
         let mut fields: Vec<&str> = Vec::new();
 
         fields.push(&sidx);
 
-        if let Some(e) = self.metadata.spectrum_array_indices.get(&ArrayType::MZArray) {
+        if let Some(e) = self
+            .metadata
+            .spectrum_array_indices
+            .get(&ArrayType::MZArray)
+        {
             fields.push(e.path.as_str())
         }
 
-        if let Some(e) = self.metadata.spectrum_array_indices.get(&ArrayType::IntensityArray) {
+        if let Some(e) = self
+            .metadata
+            .spectrum_array_indices
+            .get(&ArrayType::IntensityArray)
+        {
             fields.push(e.path.as_str())
         }
 
@@ -682,39 +907,47 @@ impl MzPeakReader {
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
             let root = batch.column(0).as_struct();
-            let spectrum_index: &UInt64Array = root
-                .column(0)
-                .as_any()
-                .downcast_ref()
-                .unwrap();
+            let spectrum_index: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
 
-            let it = spectrum_index.iter().map(|v| {
-                v.map(|v| index_range.contains(&v))
-            });
+            let it = spectrum_index
+                .iter()
+                .map(|v| v.map(|v| index_range.contains(&v)));
 
             match (mz_range, ion_mobility_range) {
                 (None, None) => Ok(it.collect()),
                 (None, Some(ion_mobility_range)) => {
                     let im_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
-                    let it2 = im_array.iter().map(|v| v.map(|v| ion_mobility_range.contains(&v)));
-                    let it = it.zip(it2).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    let it2 = im_array
+                        .iter()
+                        .map(|v| v.map(|v| ion_mobility_range.contains(&v)));
+                    let it = it
+                        .zip(it2)
+                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
                     Ok(it.collect())
-                },
+                }
                 (Some(mz_range), None) => {
                     let mz_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
                     let it2 = mz_array.iter().map(|v| v.map(|v| mz_range.contains(&v)));
-                    let it = it.zip(it2).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    let it = it
+                        .zip(it2)
+                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
                     Ok(it.collect())
-                },
+                }
                 (Some(mz_range), Some(ion_mobility_range)) => {
                     let mz_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
                     let im_array: &Float64Array = root.column(2).as_any().downcast_ref().unwrap();
                     let it2 = mz_array.iter().map(|v| v.map(|v| mz_range.contains(&v)));
-                    let it3 = im_array.iter().map(|v| v.map(|v| ion_mobility_range.contains(&v)));
-                    let it = it.zip(it2).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
-                    let it = it.zip(it3).map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    let it3 = im_array
+                        .iter()
+                        .map(|v| v.map(|v| ion_mobility_range.contains(&v)));
+                    let it = it
+                        .zip(it2)
+                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
+                    let it = it
+                        .zip(it3)
+                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
                     Ok(it.collect())
-                },
+                }
             }
         });
 
@@ -725,6 +958,14 @@ impl MzPeakReader {
             .build()?;
 
         Ok((reader, time_index))
+    }
+
+    pub fn len(&self) -> usize {
+        self.metadata.spectrum_id_index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metadata.spectrum_id_index.is_empty()
     }
 
     /// Read load descriptive metadata for the spectrum at `index`
@@ -823,7 +1064,7 @@ impl MzPeakReader {
         //     SchemaLike::from_type::<CURIE>(TracingOptions::new()).unwrap();
 
         let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::Param>(Default::default()).unwrap();
+            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
 
         let precursor_fields: Vec<FieldRef> =
             SchemaLike::from_type::<PrecursorEntry>(Default::default()).unwrap();
@@ -894,7 +1135,7 @@ impl MzPeakReader {
 
                     let params = params_array.value(pos);
                     let params = params.as_struct();
-                    let params: Vec<crate::Param> =
+                    let params: Vec<crate::param::Param> =
                         serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
                     event
                         .params_mut()
@@ -1070,7 +1311,7 @@ impl MzPeakReader {
         let mut scan_events: Vec<(u64, ScanEvent)> = Vec::new();
 
         let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::Param>(Default::default()).unwrap();
+            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
         let precursor_fields: Vec<FieldRef> =
             SchemaLike::from_type::<PrecursorEntry>(Default::default()).unwrap();
         let selected_ion_fields: Vec<FieldRef> =
@@ -1171,35 +1412,195 @@ impl MzPeakReader {
 
         Ok(descriptions)
     }
+
+    pub fn get_spectrum_metadata_by_id(&mut self, id: &str) -> io::Result<SpectrumDescription> {
+        if let Some(idx) = self.metadata.spectrum_id_index.get(id) {
+            return self.get_spectrum_metadata(idx);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Spectrum id \"{id}\" not found"),
+        ))
+    }
+
+    pub fn get_spectrum(&mut self, index: usize) -> io::Result<MultiLayerSpectrum<C, D>> {
+        let description = self.get_spectrum_metadata(index as u64)?;
+        let arrays = self.get_spectrum_arrays(index as u64)?;
+
+        Ok(MultiLayerSpectrum::from_arrays_and_description(
+            arrays,
+            description,
+        ))
+    }
+
+    pub fn tic(&mut self) -> io::Result<Chromatogram> {
+        let builder = self.handle.spectrum_metadata()?;
+        let rows = self
+            .query_indices
+            .spectrum_index_index
+            .row_selection_is_not_null();
+
+        let proj = ProjectionMask::columns(
+            builder.parquet_schema(),
+            ["spectrum.time", "spectrum.total_ion_current"],
+        );
+
+        let reader = builder
+            .with_projection(proj)
+            .with_row_selection(rows)
+            .build()?;
+        let mut time_array: Vec<u8> = Vec::new();
+        let mut intensity_array: Vec<u8> = Vec::new();
+        for batch in reader.flatten() {
+            let root = batch.column(0).as_struct();
+            let times: &Float32Array = root
+                .column_by_name("time")
+                .unwrap()
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            let ints: &Float32Array = root
+                .column_by_name("total_ion_current")
+                .unwrap()
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            for time in times {
+                let time = time.unwrap() as f64;
+                time_array.extend_from_slice(&time.to_le_bytes());
+            }
+            for int in ints {
+                let int = int.unwrap();
+                intensity_array.extend_from_slice(&int.to_le_bytes());
+            }
+        }
+
+        let mut descr = mzdata::spectrum::ChromatogramDescription::default();
+        descr.id = "TIC".to_string();
+        descr.index = 0;
+        descr.ms_level = None;
+        descr.chromatogram_type = mzdata::spectrum::ChromatogramType::TotalIonCurrentChromatogram;
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut time_array = DataArray::wrap(
+            &ArrayType::TimeArray,
+            mzdata::spectrum::BinaryDataArrayType::Float64,
+            time_array,
+        );
+        time_array.unit = Unit::Minute;
+        arrays.add(time_array);
+
+        let mut intensity_array = DataArray::wrap(
+            &ArrayType::IntensityArray,
+            mzdata::spectrum::BinaryDataArrayType::Float32,
+            intensity_array,
+        );
+        intensity_array.unit = Unit::DetectorCounts;
+        arrays.add(intensity_array);
+
+        let chrom = mzdata::spectrum::Chromatogram::new(descr, arrays);
+        Ok(chrom)
+    }
+
+    pub fn bpc(&mut self) -> io::Result<Chromatogram> {
+        let builder = self.handle.spectrum_metadata()?;
+        let rows = self
+            .query_indices
+            .spectrum_index_index
+            .row_selection_is_not_null();
+
+        let proj = ProjectionMask::columns(
+            builder.parquet_schema(),
+            ["spectrum.time", "spectrum.base_peak_intensity"],
+        );
+
+        let reader = builder
+            .with_projection(proj)
+            .with_row_selection(rows)
+            .build()?;
+        let mut time_array: Vec<u8> = Vec::new();
+        let mut intensity_array: Vec<u8> = Vec::new();
+        for batch in reader.flatten() {
+            let root = batch.column(0).as_struct();
+            let times: &Float32Array = root
+                .column_by_name("time")
+                .unwrap()
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            let ints: &Float32Array = root
+                .column_by_name("base_peak_intensity")
+                .unwrap()
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            for time in times {
+                let time = time.unwrap() as f64;
+                time_array.extend_from_slice(&time.to_le_bytes());
+            }
+            for int in ints {
+                let int = int.unwrap();
+                intensity_array.extend_from_slice(&int.to_le_bytes());
+            }
+        }
+
+        let mut descr = mzdata::spectrum::ChromatogramDescription::default();
+        descr.id = "BPC".to_string();
+        descr.index = 1;
+        descr.ms_level = None;
+        descr.chromatogram_type = mzdata::spectrum::ChromatogramType::TotalIonCurrentChromatogram;
+
+        let mut arrays = BinaryArrayMap::new();
+        let mut time_array = DataArray::wrap(
+            &ArrayType::TimeArray,
+            mzdata::spectrum::BinaryDataArrayType::Float64,
+            time_array,
+        );
+        time_array.unit = Unit::Minute;
+        arrays.add(time_array);
+
+        let mut intensity_array = DataArray::wrap(
+            &ArrayType::IntensityArray,
+            mzdata::spectrum::BinaryDataArrayType::Float32,
+            intensity_array,
+        );
+        intensity_array.unit = Unit::DetectorCounts;
+        arrays.add(intensity_array);
+
+        let chrom = mzdata::spectrum::Chromatogram::new(descr, arrays);
+        Ok(chrom)
+    }
 }
+
+pub type MzPeakReader = MzPeakReaderType<CentroidPeak, DeconvolutedPeak>;
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use mzdata::spectrum::ChromatogramLike;
 
     #[test]
-    fn test_small() -> io::Result<()> {
+    fn test_read_spectrum() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
-        let descr = reader.get_spectrum_metadata(0)?;
-        assert_eq!(descr.index, 0);
-        eprintln!("{descr:?}");
+        let descr = reader.get_spectrum(0)?;
+        assert_eq!(descr.index(), 0);
         Ok(())
     }
 
     #[test]
-    fn test_small3() -> io::Result<()> {
+    fn test_tic() -> io::Result<()> {
+        let mut reader = MzPeakReader::new("small.mzpeak")?;
+        let tic = reader.tic()?;
+        assert_eq!(tic.index(), 0);
+        assert_eq!(tic.time()?.len(), 48);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_all_metadata() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
         let out = reader.load_all_spectrum_metadata()?;
         assert_eq!(out.len(), 48);
-        eprintln!("{}", out.len());
-        Ok(())
-    }
-
-    #[test]
-    fn test_small2() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.mzpeak")?;
-        let arrays = reader.get_spectrum_arrays(0)?;
-        eprintln!("Read {} points", arrays.mzs()?.len());
         Ok(())
     }
 
@@ -1207,11 +1608,12 @@ mod test {
     fn test_eic() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
 
-        let (it, _time_index) = reader.extract_peaks(
-            (0.3..0.5).into(),
-            Some((800.0..820.0).into()),
-            None
-        )?;
+        let (it, _time_index) =
+            reader.extract_peaks(
+                (0.3..0.4).into(),
+                Some((800.0..820.0).into()),
+                None
+            )?;
 
         for batch in it.flatten() {
             eprintln!("{:?}", batch);

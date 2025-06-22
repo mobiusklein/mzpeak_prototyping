@@ -23,7 +23,6 @@ use crate::param::{
 };
 use crate::spectrum::AuxiliaryArray;
 
-
 /// Convert `mzdata`'s [`BinaryDataArrayType`] to `arrow`'s [`DataType`]
 pub fn array_to_arrow_type(dtype: BinaryDataArrayType) -> DataType {
     match dtype {
@@ -581,7 +580,6 @@ pub struct ArrayIndexEntry {
     pub unit: Unit,
 }
 
-
 /// A JSON-serializable version of [`ArrayIndexEntry`].
 ///
 /// They can be inter-converted
@@ -712,7 +710,6 @@ impl ArrayIndexEntry {
         }
     }
 }
-
 
 /// A collection of [`ArrayIndexEntry`] under a specific prefix.
 ///

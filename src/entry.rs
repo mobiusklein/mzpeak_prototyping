@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CURIE, SelectedIonEntry, PrecursorEntry, ScanEntry, SpectrumEntry,
-    Param, peak_series::ToMzPeakDataSeries,
+    param::Param, peak_series::ToMzPeakDataSeries,
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
