@@ -220,6 +220,7 @@ impl parquet::file::reader::ChunkReader for ArchiveFacetReader {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        // log::info!("Read {start}-{}", start + length as u64);
         let mut buffer = Vec::with_capacity(length);
         let mut reader = self.try_clone()?;
         reader.seek(io::SeekFrom::Start(start))?;

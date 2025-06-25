@@ -8,9 +8,7 @@ use std::{
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int8Array, Int32Array,
-        Int64Array, LargeListArray, LargeStringArray, StructArray, UInt8Array,
-        UInt32Array, UInt64Array,
+        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, Int8Array, LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt32Array, UInt64Array, UInt8Array
     },
     datatypes::{DataType, FieldRef},
 };
@@ -51,7 +49,7 @@ use crate::{CURIE, PrecursorEntry, SelectedIonEntry, curie};
 #[allow(unused)]
 use crate::{
     index::{
-        PageIndex, PageIndexEntry, PageIndexType, read_f32_page_index_from,
+        PageIndex, PageIndexEntry, PageIndexType, SpanDynNumeric, read_f32_page_index_from,
         read_f64_page_index_from, read_i32_page_index_from, read_i64_page_index_from,
         read_u8_page_index_from, read_u32_page_index_from, read_u64_page_index_from,
     },
@@ -94,6 +92,8 @@ pub struct MzPeakReaderType<
     detail_level: DetailLevel,
     pub metadata: MzPeakReaderMetadata,
     pub query_indices: QueryIndex,
+    spectrum_metadata_cache: Option<Vec<SpectrumDescription>>,
+    spectrum_row_group_cache: Option<(usize, RecordBatch)>,
     _t: PhantomData<(C, D)>,
 }
 
@@ -137,6 +137,9 @@ impl<
     type Item = MultiLayerSpectrum<C, D>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.spectrum_metadata_cache.is_none() {
+            self.populate_metadata_cache().ok()?;
+        }
         let x = self.get_spectrum(self.index).ok();
         self.index += 1;
         x
@@ -162,7 +165,11 @@ impl<
 
     fn get_spectrum_by_id(&mut self, id: &str) -> Option<MultiLayerSpectrum<C, D>> {
         let description = self.get_spectrum_metadata_by_id(id).ok()?;
-        let arrays = self.get_spectrum_arrays(description.index as u64).ok()?;
+        let arrays = if self.detail_level == DetailLevel::Full {
+            self.get_spectrum_arrays(description.index as u64).ok()?
+        } else {
+            BinaryArrayMap::new()
+        };
         Some(MultiLayerSpectrum::from_arrays_and_description(
             arrays,
             description,
@@ -179,6 +186,13 @@ impl<
 
     fn set_index(&mut self, index: OffsetIndex) {
         self.metadata.spectrum_id_index = index;
+    }
+
+    fn iter(&mut self) -> mzdata::io::SpectrumIterator<C, D, MultiLayerSpectrum<C, D>, Self>
+        where
+            Self: Sized, {
+        if let Err(_) = self.populate_metadata_cache() {}
+        mzdata::io::SpectrumIterator::new(self)
     }
 }
 
@@ -241,9 +255,18 @@ impl<
             handle,
             metadata,
             query_indices,
+            spectrum_metadata_cache: None,
+            spectrum_row_group_cache: None,
             _t: Default::default(),
         };
         Ok(this)
+    }
+
+    pub fn populate_metadata_cache(&mut self) -> io::Result<()> {
+        if self.spectrum_metadata_cache.is_none() {
+            self.spectrum_metadata_cache = Some(self.load_all_spectrum_metadata().inspect_err(|e| log::error!("Failed to load spectrum metadata cache: {e}"))?);
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -461,16 +484,168 @@ impl<
         Ok((bundle, query_index))
     }
 
+    fn load_spectrum_data_row_group(&self, row_group: usize) -> io::Result<RecordBatch> {
+        let builder = self.handle.spectra_data()?;
+        let batch = builder.with_row_groups(vec![row_group]).with_batch_size(usize::MAX).build()?.flatten().next();
+        if let Some(batch) = batch {
+            Ok(batch)
+        } else {
+            Err(parquet::errors::ParquetError::General(format!("Couldn't read row group {row_group}")).into())
+        }
+    }
+
+    fn read_spectrum_data_cache(&mut self, row_group: usize) -> io::Result<RecordBatch> {
+        let cache_hit = if let Some((i, _)) = self.spectrum_row_group_cache.as_ref() {
+            *i == row_group
+        } else {
+            false
+        };
+        if cache_hit {
+            Ok(self.spectrum_row_group_cache.as_ref().map(|(_, rg)| rg.clone()).unwrap())
+        } else {
+            let rg = self.load_spectrum_data_row_group(row_group)?;
+            self.spectrum_row_group_cache = Some((row_group, rg));
+            Ok(self.spectrum_row_group_cache.as_ref().map(|(_, rg)| rg.clone()).unwrap())
+        }
+    }
+
+    fn populate_arrays_from_struct_array(&self, points: &StructArray, bin_map: &mut HashMap<&String, DataArray>) {
+        for (f, arr) in points.fields().iter().zip(points.columns()) {
+            if f.name() == "spectrum_index" {
+                continue;
+            }
+            let store = bin_map.get_mut(f.name()).unwrap();
+
+            macro_rules! extend_array {
+                ($buf:ident) => {
+                    if $buf.null_count() > 0 {
+                        for val in $buf.iter() {
+                            if let Some(val) = val {
+                                store.push(val).unwrap();
+                            }
+                        }
+                    } else {
+                        store.extend($buf.values()).unwrap();
+                    }
+                };
+            }
+
+            match f.data_type() {
+                DataType::Float32 => {
+                    let buf: &Float32Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::Float64 => {
+                    let buf: &Float64Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::Int32 => {
+                    let buf: &Int32Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::Int64 => {
+                    let buf: &Int64Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::UInt8 => {
+                    let buf: &UInt8Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::LargeUtf8 => {}
+                DataType::Utf8 => {}
+                _ => {}
+            }
+        }
+    }
+
+    fn slice_spectrum_data_record_batch_to_arrays_of(&self, batch: &RecordBatch, index: u64) -> io::Result<BinaryArrayMap> {
+        let mut bin_map = HashMap::new();
+        for (k, v) in self.metadata.spectrum_array_indices.iter() {
+            let dtype = crate::peak_series::arrow_to_array_type(&v.data_type).unwrap();
+            bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
+        }
+
+        let points = batch.column(0).as_struct();
+        let indices: &UInt64Array = points.column_by_name("spectrum_index").unwrap().as_any().downcast_ref().unwrap();
+        let mut start = None;
+        let mut end = None;
+
+        for (i, idx) in indices.iter().enumerate() {
+            if idx.unwrap() == index {
+                if start.is_some() {
+                    end = Some(i)
+                } else {
+                    start = Some(i)
+                }
+            }
+        }
+
+        let points = match (start, end) {
+            (Some(start), Some(end)) => {
+                let len = end - start + 1;
+                points.slice(start, len)
+            },
+            (Some(start), None) => {
+                points.slice(start, 1)
+            },
+            _ => {
+                let mut out = BinaryArrayMap::new();
+                for v in bin_map.into_values() {
+                    out.add(v);
+                }
+                return Ok(out)
+            }
+        };
+
+        self.populate_arrays_from_struct_array(&points, &mut bin_map);
+
+
+        let mut out = BinaryArrayMap::new();
+        for v in bin_map.into_values() {
+            out.add(v);
+        }
+        Ok(out)
+    }
+
     /// Read the complete data arrays for the spectrum at `index`
     pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
         let builder = self.handle.spectra_data()?;
 
         let pq_schema = builder.parquet_schema();
 
-        let rows = self
-            .query_indices
-            .spectrum_point_spectrum_index
-            .row_selection_contains(index);
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.query_indices.spectrum_point_spectrum_index.pages_contains(index) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        log::debug!("Reading pages: {pages:?} for index {index}");
+
+        if rg_idx_acc.len() == 1 {
+            let rg = self.read_spectrum_data_cache(rg_idx_acc[0])?;
+            return self.slice_spectrum_data_record_batch_to_arrays_of(&rg, index)
+        }
+
+        log::info!("Reading index {index} from row groups {:?}", rg_idx_acc);
+        let first_row = if !pages.is_empty() {
+            let mut rg_row_skip = 0;
+
+            for i in 0..rg_idx_acc[0] {
+                log::debug!("Skipping row group {i}");
+                let rg = builder.metadata().row_group(i);
+                rg_row_skip += rg.num_rows();
+            }
+            let rg = builder.metadata().row_group(rg_idx_acc[0]);
+            log::info!("{}-{}", rg.file_offset().unwrap(), rg.file_offset().unwrap() + rg.compressed_size());
+            rg_row_skip
+        } else {
+            return Ok(BinaryArrayMap::new())
+        };
+
+        let rows = self.query_indices.spectrum_point_spectrum_index.pages_to_row_selection(pages.iter(), first_row);
 
         let predicate_mask = ProjectionMask::columns(
             builder.parquet_schema(),
@@ -503,6 +678,7 @@ impl<
         );
 
         let reader = builder
+            .with_row_groups(rg_idx_acc)
             .with_row_selection(rows)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .with_projection(proj)
@@ -516,52 +692,7 @@ impl<
 
         for batch in reader.flatten() {
             let points = batch.column(0).as_struct();
-            for (f, arr) in points.fields().iter().zip(points.columns()) {
-                if f.name() == "spectrum_index" {
-                    continue;
-                }
-                let store = bin_map.get_mut(f.name()).unwrap();
-
-                macro_rules! extend_array {
-                    ($buf:ident) => {
-                        if $buf.null_count() > 0 {
-                            for val in $buf.iter() {
-                                if let Some(val) = val {
-                                    store.push(val).unwrap();
-                                }
-                            }
-                        } else {
-                            store.extend($buf.values()).unwrap();
-                        }
-                    };
-                }
-
-                match f.data_type() {
-                    DataType::Float32 => {
-                        let buf: &Float32Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::Float64 => {
-                        let buf: &Float64Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::Int32 => {
-                        let buf: &Int32Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::Int64 => {
-                        let buf: &Int64Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::UInt8 => {
-                        let buf: &UInt8Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::LargeUtf8 => {}
-                    DataType::Utf8 => {}
-                    _ => {}
-                }
-            }
+            self.populate_arrays_from_struct_array(points, &mut bin_map);
         }
 
         let mut out = BinaryArrayMap::new();
@@ -586,12 +717,12 @@ impl<
                 .unwrap();
 
             let time_arr: &Float32Array = scan_arr.column(1).as_any().downcast_ref().unwrap();
-            let _config_arr: &UInt32Array = scan_arr.column(2).as_any().downcast_ref().unwrap();
-            let _filter_string_arr: &LargeStringArray = scan_arr.column(3).as_string();
+            let config_arr: &UInt32Array = scan_arr.column(2).as_any().downcast_ref().unwrap();
+            let filter_string_arr: &LargeStringArray = scan_arr.column(3).as_string();
             let inject_arr: &Float32Array = scan_arr.column(4).as_any().downcast_ref().unwrap();
-            let _ion_mobility_arr: &Float64Array =
+            let ion_mobility_arr: &Float64Array =
                 scan_arr.column(5).as_any().downcast_ref().unwrap();
-            let _ion_mobility_tp_arr = scan_arr.column(6).as_struct();
+            let ion_mobility_tp_arr = scan_arr.column(6).as_struct();
             let instrument_configuration_ref_arr: &UInt32Array =
                 scan_arr.column(7).as_any().downcast_ref().unwrap();
             let params_array: &LargeListArray = scan_arr.column(8).as_list();
@@ -617,6 +748,73 @@ impl<
                 event
                     .params_mut()
                     .extend(params.into_iter().map(|p| p.into()));
+
+                if filter_string_arr.is_valid(pos) {
+                    let filter = filter_string_arr.value(pos);
+                    event.add_param(
+                        mzdata::Param::builder()
+                            .name("filter string")
+                            .curie(mzdata::curie!(MS:1000512))
+                            .value(filter)
+                            .build(),
+                    );
+                }
+
+                if config_arr.is_valid(pos) {
+                    let conf = config_arr.value(pos);
+                    event.add_param(
+                        mzdata::Param::builder()
+                            .name("preset scan configuration")
+                            .curie(mzdata::curie!(MS:1000616))
+                            .value(conf)
+                            .build(),
+                    );
+                }
+
+                if ion_mobility_arr.is_valid(pos) {
+                    let val = ion_mobility_arr.value(pos);
+                    if ion_mobility_tp_arr.is_valid(pos) {
+                        let tp = ion_mobility_tp_arr
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<UInt32Array>()
+                            .unwrap();
+                        let tp = mzdata::params::CURIE::new(
+                            mzdata::params::ControlledVocabulary::MS,
+                            tp.value(pos),
+                        );
+                        let param_builder = mzdata::Param::builder().curie(tp).value(val);
+                        if tp == crate::param::ION_MOBILITY_SCAN_TERMS[0] {
+                            event.add_param(
+                                param_builder
+                                    .name("ion mobility drift time")
+                                    .unit(Unit::Millisecond)
+                                    .build(),
+                            );
+                        } else if tp == crate::param::ION_MOBILITY_SCAN_TERMS[1] {
+                            event.add_param(
+                                param_builder
+                                    .name("inverse reduced ion mobility drift time")
+                                    .unit(Unit::VoltSecondPerSquareCentimeter)
+                                    .build(),
+                            );
+                        } else if tp == crate::param::ION_MOBILITY_SCAN_TERMS[2] {
+                            event.add_param(
+                                param_builder
+                                    .name("FAIMS compensation voltage")
+                                    .unit(Unit::Volt)
+                                    .build(),
+                            );
+                        } else if tp == crate::param::ION_MOBILITY_SCAN_TERMS[3] {
+                            event.add_param(
+                                param_builder
+                                    .name("SELEXION compensation voltage")
+                                    .unit(Unit::Volt)
+                                    .build(),
+                            );
+                        }
+                    }
+                }
 
                 scan_accumulator.push((index.unwrap(), event));
             }
@@ -796,18 +994,8 @@ impl<
         let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.time"]);
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let times: &Float32Array = batch
-                .column(0)
-                .as_struct()
-                .column(0)
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-
-            Ok(times
-                .iter()
-                .map(|v| v.map(|v| time_range.contains(&v)))
-                .collect())
+            let times = batch.column(0).as_struct().column(0);
+            Ok(time_range.contains_dy(times))
         });
 
         let proj = ProjectionMask::columns(
@@ -829,11 +1017,29 @@ impl<
         for batch in reader.flatten() {
             let root = batch.column(0).as_struct();
             let arr: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
-            let time_arr: &Float32Array = root.column(1).as_any().downcast_ref().unwrap();
-            for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
-                min = min.min(val);
-                max = max.max(val);
-                times.insert(val, time);
+            let time_arr = root.column(1);
+            if let Some(time_arr) = time_arr.as_any().downcast_ref::<Float32Array>() {
+                for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
+                    min = min.min(val);
+                    max = max.max(val);
+                    times.insert(val, time);
+                }
+            } else if let Some(time_arr) = time_arr.as_any().downcast_ref::<Float64Array>() {
+                for (val, time) in arr
+                    .iter()
+                    .flatten()
+                    .zip(time_arr.iter().flatten().map(|v| v as f32))
+                {
+                    min = min.min(val);
+                    max = max.max(val);
+                    times.insert(val, time);
+                }
+            } else {
+                return Err(parquet::errors::ParquetError::ArrowError(format!(
+                    "Invalid time array data type: {:?}",
+                    time_arr.data_type()
+                ))
+                .into());
             }
         }
         Ok((times, SimpleInterval::new(min, max)))
@@ -916,30 +1122,31 @@ impl<
             match (mz_range, ion_mobility_range) {
                 (None, None) => Ok(it.collect()),
                 (None, Some(ion_mobility_range)) => {
-                    let im_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
-                    let it2 = im_array
-                        .iter()
-                        .map(|v| v.map(|v| ion_mobility_range.contains(&v)));
+                    let im_array = root.column(1);
+                    let it2 = ion_mobility_range.contains_dy(im_array);
+                    let it2 = it2.iter();
+                    // let it2 = im_array
+                    //     .iter()
+                    //     .map(|v| v.map(|v| ion_mobility_range.contains(&v)));
                     let it = it
                         .zip(it2)
                         .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
                     Ok(it.collect())
                 }
                 (Some(mz_range), None) => {
-                    let mz_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
-                    let it2 = mz_array.iter().map(|v| v.map(|v| mz_range.contains(&v)));
+                    let mz_array = root.column(1);
+                    let it2 = mz_range.contains_dy(mz_array);
+                    let it2 = it2.iter();
                     let it = it
                         .zip(it2)
                         .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
                     Ok(it.collect())
                 }
                 (Some(mz_range), Some(ion_mobility_range)) => {
-                    let mz_array: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
-                    let im_array: &Float64Array = root.column(2).as_any().downcast_ref().unwrap();
-                    let it2 = mz_array.iter().map(|v| v.map(|v| mz_range.contains(&v)));
-                    let it3 = im_array
-                        .iter()
-                        .map(|v| v.map(|v| ion_mobility_range.contains(&v)));
+                    let mz_array = root.column(1);
+                    let im_array = root.column(2);
+                    let it2 = mz_range.contains_dy_iter(mz_array);
+                    let it3 = ion_mobility_range.contains_dy_iter(im_array);
                     let it = it
                         .zip(it2)
                         .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
@@ -970,6 +1177,12 @@ impl<
 
     /// Read load descriptive metadata for the spectrum at `index`
     pub fn get_spectrum_metadata(&mut self, index: u64) -> io::Result<SpectrumDescription> {
+        if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
+            if let Some(descr) =  cache.get(index as usize) {
+                return Ok(descr.clone());
+            }
+        }
+
         let builder = self.handle.spectrum_metadata()?;
 
         let mut rows = self
@@ -1425,7 +1638,11 @@ impl<
 
     pub fn get_spectrum(&mut self, index: usize) -> io::Result<MultiLayerSpectrum<C, D>> {
         let description = self.get_spectrum_metadata(index as u64)?;
-        let arrays = self.get_spectrum_arrays(index as u64)?;
+        let arrays = if self.detail_level == DetailLevel::Full {
+            self.get_spectrum_arrays(index as u64)?
+        } else {
+            BinaryArrayMap::new()
+        };
 
         Ok(MultiLayerSpectrum::from_arrays_and_description(
             arrays,
@@ -1574,6 +1791,8 @@ impl<
 
 pub type MzPeakReader = MzPeakReaderType<CentroidPeak, DeconvolutedPeak>;
 
+
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1584,6 +1803,13 @@ mod test {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
         let descr = reader.get_spectrum(0)?;
         assert_eq!(descr.index(), 0);
+        assert_eq!(descr.peaks().len(), 19913);
+        let descr = reader.get_spectrum(5)?;
+        assert_eq!(descr.index(), 5);
+        assert_eq!(descr.peaks().len(), 650);
+        let descr = reader.get_spectrum(25)?;
+        assert_eq!(descr.index(), 25);
+        assert_eq!(descr.peaks().len(), 789);
         Ok(())
     }
 
@@ -1609,11 +1835,7 @@ mod test {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
 
         let (it, _time_index) =
-            reader.extract_peaks(
-                (0.3..0.4).into(),
-                Some((800.0..820.0).into()),
-                None
-            )?;
+            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None)?;
 
         for batch in it.flatten() {
             eprintln!("{:?}", batch);

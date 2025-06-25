@@ -1,13 +1,14 @@
 use mzdata::{self, io::MZReaderType, prelude::*};
 use mzpeak_prototyping::{peak_series::ToMzPeakDataSeries, *};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
-use std::{collections::HashSet, env, fs, io, path::PathBuf, sync::mpsc::sync_channel, thread};
+use std::{collections::{HashMap, HashSet}, env, fs, io, path::PathBuf, sync::mpsc::sync_channel, thread};
 
 fn sample_array_types<
     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
 >(
     reader: &mut MZReaderType<fs::File, C, D>,
+    overrides: &HashMap<BufferName, BufferName>,
 ) -> HashSet<std::sync::Arc<arrow::datatypes::Field>> {
     let n = reader.len();
     let mut arrays = HashSet::new();
@@ -30,6 +31,7 @@ fn sample_array_types<
                         map.mzs().map(|a| a.len()).unwrap_or_default(),
                         0,
                         "spectrum_index",
+                        overrides
                     )
                     .ok()
                 })
@@ -56,6 +58,8 @@ fn main() -> io::Result<()> {
 
     let outname = filename.with_extension("mzpeak");
 
+    let overrides = HashMap::new();
+
     let handle = fs::File::create(outname.file_name().unwrap())?;
     // let data_handle = fs::File::create(outname.with_extension("data.mzpeak"))?;
 
@@ -65,7 +69,7 @@ fn main() -> io::Result<()> {
         .add_default_chromatogram_fields()
         .buffer_size(5000);
 
-    writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader)
+    writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides)
         .into_iter()
         .fold(writer, |writer, f| writer.add_spectrum_field(f));
 

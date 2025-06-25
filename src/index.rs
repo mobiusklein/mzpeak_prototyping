@@ -1,19 +1,17 @@
 use std::{fs, sync::Arc};
 
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use mzpeaks::coordinate::SimpleInterval;
 use mzpeaks::{coordinate::IntervalTree, prelude::HasProximity};
 use parquet::file::metadata::ParquetMetaData;
 
 use parquet::{
     self,
-    arrow::{
-        arrow_reader::{
-            ParquetRecordBatchReaderBuilder,
-            RowSelection, RowSelector,
-        },
-    },
-    file::{
-        page_index::index::Index as ParquetTypedIndex,
-    },
+    arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+    file::page_index::index::Index as ParquetTypedIndex,
     schema::types::SchemaDescriptor,
 };
 
@@ -70,10 +68,13 @@ impl<T: HasProximity> PageIndexType<T> for PageIndexEntry<T> {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct PageIndex<T: HasProximity>(Vec<PageIndexEntry<T>>) where PageIndexEntry<T>: PageIndexType<T>;
+pub struct PageIndex<T: HasProximity>(Vec<PageIndexEntry<T>>)
+where
+    PageIndexEntry<T>: PageIndexType<T>;
 
 impl<T: HasProximity> IntoIterator for PageIndex<T>
-where PageIndexEntry<T>: PageIndexType<T>
+where
+    PageIndexEntry<T>: PageIndexType<T>,
 {
     type Item = PageIndexEntry<T>;
 
@@ -85,9 +86,13 @@ where PageIndexEntry<T>: PageIndexType<T>
 }
 
 impl<T: HasProximity> PageIndex<T>
-where PageIndexEntry<T>: PageIndexType<T>
+where
+    PageIndexEntry<T>: PageIndexType<T>,
 {
-    pub fn as_interval_tree(&self) -> IntervalTree<T, PageIndexEntry<T>> where T: num_traits::real::Real + core::iter::Sum {
+    pub fn as_interval_tree(&self) -> IntervalTree<T, PageIndexEntry<T>>
+    where
+        T: num_traits::real::Real + core::iter::Sum,
+    {
         IntervalTree::new(self.0.clone())
     }
 
@@ -117,7 +122,10 @@ where PageIndexEntry<T>: PageIndexType<T>
 
     pub fn sort(&mut self) {
         self.0.sort_by(|a, b| {
-            a.min.partial_cmp(&b.min).unwrap().then_with(|| a.max.partial_cmp(&b.max).unwrap())
+            a.min
+                .partial_cmp(&b.min)
+                .unwrap()
+                .then_with(|| a.max.partial_cmp(&b.max).unwrap())
         });
     }
 
@@ -133,6 +141,10 @@ where PageIndexEntry<T>: PageIndexType<T>
             last_row = page.end_row();
         }
         selectors.into()
+    }
+
+    pub fn pages_not_null(&self) -> std::slice::Iter<'_, PageIndexEntry<T>> {
+        self.iter()
     }
 
     pub fn row_selection_contains(&self, query: T) -> RowSelection {
@@ -153,10 +165,11 @@ where PageIndexEntry<T>: PageIndexType<T>
         selectors.into()
     }
 
-    pub fn row_selection_overlaps(
-        &self,
-        query: &impl Span1D<DimType = T>,
-    ) -> RowSelection {
+    pub fn pages_contains(&self, query: T) -> impl Iterator<Item=&PageIndexEntry<T>> {
+        self.iter().filter(move |p| p.contains(&query))
+    }
+
+    pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {
         let mut selectors = Vec::new();
         let mut last_row = 0;
         for page in self.iter() {
@@ -172,52 +185,34 @@ where PageIndexEntry<T>: PageIndexType<T>
         }
         selectors.into()
     }
+
+    pub fn pages_overlaps(&self, query: &impl Span1D<DimType = T>) -> impl Iterator<Item=&PageIndexEntry<T>> {
+        self.iter().filter(move |p| p.overlaps(query))
+    }
+
+    pub fn pages_to_row_selection<'a>(&'a self, it:  impl IntoIterator<Item=&'a PageIndexEntry<T>>, mut last_row: i64) -> RowSelection {
+        let mut selectors = Vec::new();
+        for page in it {
+            if page.start_row() != last_row {
+                selectors.push(RowSelector::skip((page.start_row() - last_row) as usize));
+            }
+            selectors.push(RowSelector::select(page.row_len() as usize));
+            last_row = page.end_row();
+        }
+        selectors.into()
+    }
 }
 
-pub trait PageIndexType<T>: Span1D<DimType = T> + Sized {
+pub trait PageIndexType<T>: Span1D<DimType = T> {
     fn start_row(&self) -> i64;
     fn end_row(&self) -> i64;
 
+    fn page_span(&self) -> SimpleInterval<i64> {
+        SimpleInterval::new(self.start_row(), self.end_row())
+    }
+
     fn row_len(&self) -> i64 {
         self.end_row() - self.start_row()
-    }
-
-    fn build_row_selection_contains(index: &[Self], query: T) -> RowSelection {
-        let mut selectors = Vec::new();
-        let mut last_row = 0;
-        for page in index.iter() {
-            if page.start_row() != last_row {
-                selectors.push(RowSelector::skip((page.start_row() - last_row) as usize));
-            }
-            if page.contains(&query) {
-                selectors.push(RowSelector::select(page.row_len() as usize));
-            } else {
-                selectors.push(RowSelector::skip(page.row_len() as usize))
-            }
-            last_row = page.end_row();
-        }
-
-        selectors.into()
-    }
-
-    fn build_row_selection_overlaps(
-        index: &[Self],
-        query: &impl Span1D<DimType = T>,
-    ) -> RowSelection {
-        let mut selectors = Vec::new();
-        let mut last_row = 0;
-        for page in index.iter() {
-            if page.start_row() != last_row {
-                selectors.push(RowSelector::skip((page.start_row() - last_row) as usize));
-            }
-            if page.overlaps(&query) {
-                selectors.push(RowSelector::select(page.row_len() as usize));
-            } else {
-                selectors.push(RowSelector::skip(page.row_len() as usize))
-            }
-            last_row = page.end_row();
-        }
-        selectors.into()
     }
 }
 
@@ -305,36 +300,67 @@ macro_rules! read_numeric_page_index {
     }};
 }
 
-
-pub fn read_f32_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<f32>> {
+pub fn read_f32_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<f32>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, f32)
 }
 
-pub fn read_f64_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<f64>> {
+pub fn read_f64_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<f64>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, f64)
 }
 
-pub fn read_i32_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<i32>> {
+pub fn read_i32_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<i32>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, i32)
 }
 
-pub fn read_i64_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<i64>> {
+pub fn read_i64_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<i64>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, i64)
 }
 
-pub fn read_u32_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<u32>> {
+pub fn read_u32_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<u32>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, u32)
 }
 
-pub fn read_u64_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<u64>> {
+pub fn read_u64_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<u64>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, u64)
 }
 
-pub fn read_u8_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<u8>> {
+pub fn read_u8_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<u8>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, u8)
 }
 
-pub fn read_i8_page_index_from(metadata: &Arc<ParquetMetaData>, pq_schema: &SchemaDescriptor, column_path: &str) -> Option<PageIndex<i8>> {
+pub fn read_i8_page_index_from(
+    metadata: &Arc<ParquetMetaData>,
+    pq_schema: &SchemaDescriptor,
+    column_path: &str,
+) -> Option<PageIndex<i8>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, i8)
 }
 
@@ -403,3 +429,85 @@ pub fn read_point_im_index(
 ) -> Option<PageIndex<f64>> {
     read_f64_page_index(reader, "point.im")
 }
+
+pub trait SpanDynNumeric: Span1D
+where
+    Self::DimType: num_traits::NumCast,
+{
+    fn contains_dy_iter<'a>(
+        &'a self,
+        array: &'a ArrayRef,
+    ) -> impl Iterator<Item = Option<bool>> + 'a {
+        let n = array.len();
+        let it = 0..n;
+
+        macro_rules! span_dyn_impl {
+            ($raw_ty:ty, $arr_ty:ty) => {{
+                let start = <$raw_ty as num_traits::NumCast>::from(self.start()).unwrap();
+                let end = <$raw_ty as num_traits::NumCast>::from(self.end()).unwrap();
+                let span = SimpleInterval::new(start, end);
+                let array: &$arr_ty = array.as_any().downcast_ref().unwrap();
+                let closure: Box<dyn Fn(usize) -> Option<bool>> = Box::new(move |i| {
+                    if array.is_valid(i) {
+                        Some(span.contains(&array.value(i)))
+                    } else {
+                        None
+                    }
+                });
+                it.map(closure)
+            }};
+        }
+
+        match array.data_type() {
+            arrow::datatypes::DataType::Int8 => {
+                span_dyn_impl!(i8, Int8Array)
+            }
+            arrow::datatypes::DataType::Int16 => {
+                span_dyn_impl!(i16, Int16Array)
+            }
+            arrow::datatypes::DataType::Int32 => span_dyn_impl!(i32, Int32Array),
+            arrow::datatypes::DataType::Int64 => span_dyn_impl!(i64, Int64Array),
+            arrow::datatypes::DataType::UInt8 => span_dyn_impl!(u8, UInt8Array),
+            arrow::datatypes::DataType::UInt16 => span_dyn_impl!(u16, UInt16Array),
+            arrow::datatypes::DataType::UInt32 => span_dyn_impl!(u32, UInt32Array),
+            arrow::datatypes::DataType::UInt64 => span_dyn_impl!(u64, UInt64Array),
+            arrow::datatypes::DataType::Float32 => span_dyn_impl!(f32, Float32Array),
+            arrow::datatypes::DataType::Float64 => span_dyn_impl!(f64, Float64Array),
+            _ => {
+                let f: Box<dyn Fn(usize) -> Option<bool>> = Box::new(|_| None);
+                it.map(f)
+            }
+        }
+    }
+
+    fn contains_dy(&self, array: &ArrayRef) -> BooleanArray {
+        macro_rules! span_dyn_impl {
+            ($raw_ty:ty, $arr_ty:ty) => {{
+                let start = <$raw_ty as num_traits::NumCast>::from(self.start()).unwrap();
+                let end = <$raw_ty as num_traits::NumCast>::from(self.end()).unwrap();
+                let span = SimpleInterval::new(start, end);
+                let array: &$arr_ty = array.as_any().downcast_ref().unwrap();
+                array.iter().map(|v| v.map(|v| span.contains(&v))).collect()
+            }};
+        }
+        match array.data_type() {
+            arrow::datatypes::DataType::Int8 => {
+                span_dyn_impl!(i8, Int8Array)
+            }
+            arrow::datatypes::DataType::Int16 => {
+                span_dyn_impl!(i16, Int16Array)
+            }
+            arrow::datatypes::DataType::Int32 => span_dyn_impl!(i32, Int32Array),
+            arrow::datatypes::DataType::Int64 => span_dyn_impl!(i64, Int64Array),
+            arrow::datatypes::DataType::UInt8 => span_dyn_impl!(u8, UInt8Array),
+            arrow::datatypes::DataType::UInt16 => span_dyn_impl!(u16, UInt16Array),
+            arrow::datatypes::DataType::UInt32 => span_dyn_impl!(u32, UInt32Array),
+            arrow::datatypes::DataType::UInt64 => span_dyn_impl!(u64, UInt64Array),
+            arrow::datatypes::DataType::Float32 => span_dyn_impl!(f32, Float32Array),
+            arrow::datatypes::DataType::Float64 => span_dyn_impl!(f64, Float64Array),
+            _ => BooleanArray::new_null(array.len()),
+        }
+    }
+}
+
+impl<T: Span1D> SpanDynNumeric for T where T::DimType: num_traits::NumCast {}

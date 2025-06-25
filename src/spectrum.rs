@@ -174,8 +174,6 @@ impl ScanEntry {
             ..Default::default()
         }
     }
-
-    pub fn to_mzdata(&self) {}
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]

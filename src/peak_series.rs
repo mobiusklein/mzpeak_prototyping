@@ -44,6 +44,7 @@ pub fn array_map_to_schema_arrays_and_excess(
     spectrum_index: u64,
     index_name: impl Into<String>,
     schema: &Schema,
+    overrides: &HashMap<BufferName, BufferName>
 ) -> Result<(Fields, Vec<ArrayRef>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
@@ -55,6 +56,13 @@ pub fn array_map_to_schema_arrays_and_excess(
     arrays.push(index_array as ArrayRef);
 
     for (k, v) in array_map.iter() {
+        let buffer_name = BufferName::new(context, k.clone(), v.dtype());
+        let buffer_name = if let Some(buffer_name) = overrides.get(&buffer_name) {
+            buffer_name
+        } else {
+            &buffer_name
+        };
+
         let dtype = match v.dtype() {
             BinaryDataArrayType::Unknown => DataType::UInt8,
             BinaryDataArrayType::Float64 => DataType::Float64,
@@ -68,7 +76,9 @@ pub fn array_map_to_schema_arrays_and_excess(
             unimplemented!("Still need to understand usage");
         }
 
-        let name = BufferName::new(context, k.clone(), v.dtype()).to_string();
+        let name = buffer_name.to_string();
+
+
         let fieldref = Arc::new(Field::new(name, dtype, true));
         if schema.field_with_name(fieldref.name()).is_err() {
             auxiliary.push(AuxiliaryArray::from_data_array(v)?);
@@ -76,7 +86,7 @@ pub fn array_map_to_schema_arrays_and_excess(
         }
         fields.push(fieldref.clone());
 
-        let array: ArrayRef = match v.dtype() {
+        let array: ArrayRef = match buffer_name.dtype {
             BinaryDataArrayType::Unknown => Arc::new(UInt8Array::from(v.data.clone())),
             BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(v.to_f64()?.to_vec())),
             BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(v.to_f32()?.to_vec())),
@@ -97,6 +107,7 @@ pub fn array_map_to_schema_arrays(
     primary_array_len: usize,
     spectrum_index: u64,
     index_name: impl Into<String>,
+    overrides: &HashMap<BufferName, BufferName>,
 ) -> Result<(Fields, Vec<ArrayRef>), ArrayRetrievalError> {
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
@@ -108,15 +119,20 @@ pub fn array_map_to_schema_arrays(
 
     for (k, v) in array_map.iter() {
         let buffer_name = BufferName::new(context, k.clone(), v.dtype());
+        let buffer_name = if let Some(buffer_name) = overrides.get(&buffer_name) {
+            buffer_name
+        } else {
+            &buffer_name
+        };
 
         if v.data_len()? != primary_array_len {
             unimplemented!("Still need to understand usage");
         }
 
         let fieldref = buffer_name.to_field();
-        fields.push(fieldref.clone());
+        fields.push(fieldref);
 
-        let array: ArrayRef = match v.dtype() {
+        let array: ArrayRef = match buffer_name.dtype {
             BinaryDataArrayType::Unknown => Arc::new(UInt8Array::from(v.data.clone())),
             BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(v.to_f64()?.to_vec())),
             BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(v.to_f32()?.to_vec())),
@@ -132,8 +148,12 @@ pub fn array_map_to_schema_arrays(
 
 /// Convert a peak list to a collection of Arrow Arrays
 pub trait ToMzPeakDataSeries: Sized + BuildArrayMapFrom {
+    /// Get the definition of Arrow arrays that this will be stored as for populating
+    /// the schema
     fn to_fields() -> Fields;
-    fn to_arrays(spectrum_index: u64, peaks: &[Self]) -> (Fields, Vec<ArrayRef>);
+
+    /// Construct a collection of Arrow arrays from the specified peak list
+    fn to_arrays(spectrum_index: u64, peaks: &[Self], overrides: &HashMap<BufferName, BufferName>) -> (Fields, Vec<ArrayRef>);
 }
 
 pub const MZ_ARRAY: BufferName = BufferName::new(
@@ -164,7 +184,7 @@ impl ToMzPeakDataSeries for CentroidPeak {
         .into()
     }
 
-    fn to_arrays(spectrum_index: u64, peaks: &[Self]) -> (Fields, Vec<ArrayRef>) {
+    fn to_arrays(spectrum_index: u64, peaks: &[Self], overrides: &HashMap<BufferName, BufferName>) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
             BufferContext::Spectrum,
@@ -172,6 +192,7 @@ impl ToMzPeakDataSeries for CentroidPeak {
             peaks.len(),
             spectrum_index,
             "spectrum_index",
+            overrides
         )
         .unwrap()
     }
@@ -193,7 +214,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareCentroidPeak {
         .into()
     }
 
-    fn to_arrays(spectrum_index: u64, peaks: &[Self]) -> (Fields, Vec<ArrayRef>) {
+    fn to_arrays(spectrum_index: u64, peaks: &[Self], overrides: &HashMap<BufferName, BufferName>) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
             BufferContext::Spectrum,
@@ -201,6 +222,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareCentroidPeak {
             peaks.len(),
             spectrum_index,
             "spectrum_index",
+            overrides
         )
         .unwrap()
     }
@@ -217,7 +239,7 @@ impl ToMzPeakDataSeries for DeconvolutedPeak {
         .into()
     }
 
-    fn to_arrays(spectrum_index: u64, peaks: &[Self]) -> (Fields, Vec<ArrayRef>) {
+    fn to_arrays(spectrum_index: u64, peaks: &[Self], overrides: &HashMap<BufferName, BufferName>) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
             BufferContext::Spectrum,
@@ -225,6 +247,7 @@ impl ToMzPeakDataSeries for DeconvolutedPeak {
             peaks.len(),
             spectrum_index,
             "spectrum_index",
+            overrides
         )
         .unwrap()
     }
@@ -247,7 +270,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
         .into()
     }
 
-    fn to_arrays(spectrum_index: u64, peaks: &[Self]) -> (Fields, Vec<ArrayRef>) {
+    fn to_arrays(spectrum_index: u64, peaks: &[Self], overrides: &HashMap<BufferName, BufferName>) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
             BufferContext::Spectrum,
@@ -255,6 +278,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
             peaks.len(),
             spectrum_index,
             "spectrum_index",
+            overrides
         )
         .unwrap()
     }
@@ -319,6 +343,8 @@ impl PartialOrd for BufferName {
     }
 }
 
+/// Convert a [`CURIE`] into an [`ArrayType`], or return `None` if the CURIE
+/// doesn't correspond to an [`ArrayType`] term.
 pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<ArrayType> {
     let accession = mzdata::params::CURIE::from(accession);
     let tp = if accession == ArrayType::MZArray.as_param_const().curie()? {
@@ -399,6 +425,8 @@ pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<Array
     Some(tp)
 }
 
+/// Convert a [`CURIE`] into an [`BinaryDataArrayType`], or return `None` if the CURIE
+/// doesn't correspond to an [`BinaryDataArrayType`] term.
 pub fn binary_datatype_from_accession(accession: crate::CURIE) -> Option<BinaryDataArrayType> {
     let accession = accession.into();
     match accession {
@@ -607,6 +635,7 @@ pub struct SerializedArrayIndexEntry {
     pub unit: Option<CURIE>,
 }
 
+/// Convert an Arrow [`DataType`] to a [`BinaryDataArrayType`]
 pub(crate) const fn arrow_to_array_type(data_type: &DataType) -> Option<BinaryDataArrayType> {
     match data_type {
         DataType::UInt8 => Some(BinaryDataArrayType::ASCII),
@@ -798,4 +827,10 @@ impl From<ArrayIndex> for SerializedArrayIndex {
 pub struct SerializedArrayIndex {
     pub prefix: String,
     pub entries: Vec<SerializedArrayIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BufferOverrideRule {
+    from_buffer: BufferName,
+    to_buffer: BufferName,
 }

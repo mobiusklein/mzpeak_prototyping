@@ -18,13 +18,10 @@ use parquet::{
 };
 
 use mzdata::{
-    meta::{
+    io::MZReaderType, meta::{
         DataProcessing, FileDescription, FileMetadataConfig, InstrumentConfiguration,
         MSDataFileMetadata, MassSpectrometryRun, Sample, Software,
-    },
-    params::Unit,
-    prelude::*,
-    spectrum::{ArrayType, BinaryDataArrayType},
+    }, params::Unit, prelude::*, spectrum::{ArrayType, BinaryDataArrayType}
 };
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
@@ -42,12 +39,57 @@ use crate::{
     },
 };
 
+pub fn sample_array_types<
+    C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+>(
+    reader: &mut MZReaderType<std::fs::File, C, D>,
+    overrides: &HashMap<BufferName, BufferName>,
+) -> HashSet<std::sync::Arc<arrow::datatypes::Field>> {
+    let n = reader.len();
+    let mut arrays = HashSet::new();
+
+    arrays.extend(C::to_fields().iter().cloned());
+    arrays.extend(D::to_fields().iter().cloned());
+
+    if n == 0 {
+        return arrays;
+    }
+
+    let field_it = [0, 100.min(n - 1), n / 2]
+        .into_iter()
+        .flat_map(|i| {
+            reader.get_spectrum_by_index(i).and_then(|s| {
+                s.raw_arrays().and_then(|map| {
+                    array_map_to_schema_arrays(
+                        BufferContext::Spectrum,
+                        map,
+                        map.mzs().map(|a| a.len()).unwrap_or_default(),
+                        0,
+                        "spectrum_index",
+                        overrides,
+                    )
+                    .ok()
+                })
+            })
+        })
+        .map(|(fields, _arrs)| {
+            let fields: Vec<_> = fields.iter().cloned().collect();
+            fields
+        })
+        .flatten();
+
+    arrays.extend(field_it);
+    arrays
+}
+
 #[derive(Debug)]
 pub struct ArrayBuffers {
     pub peak_array_fields: Fields,
     pub schema: SchemaRef,
     pub prefix: String,
     pub array_chunks: HashMap<String, Vec<ArrayRef>>,
+    pub overrides: HashMap<BufferName, BufferName>,
 }
 
 impl ArrayBuffers {
@@ -85,7 +127,7 @@ impl ArrayBuffers {
     }
 
     pub fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]) {
-        let (fields, chunks) = T::to_arrays(spectrum_index, peaks);
+        let (fields, chunks) = T::to_arrays(spectrum_index, peaks, &self.overrides);
         let mut visited = HashSet::new();
         for (f, arr) in fields.iter().zip(chunks.into_iter()) {
             self.array_chunks
@@ -159,6 +201,7 @@ impl ArrayBuffers {
 pub struct ArrayBuffersBuilder {
     prefix: String,
     peak_array_fields: Vec<FieldRef>,
+    overrides: HashMap<BufferName, BufferName>
 }
 
 impl Default for ArrayBuffersBuilder {
@@ -166,6 +209,7 @@ impl Default for ArrayBuffersBuilder {
         Self {
             prefix: "point".to_string(),
             peak_array_fields: Default::default(),
+            overrides: HashMap::new(),
         }
     }
 }
@@ -173,6 +217,33 @@ impl Default for ArrayBuffersBuilder {
 impl ArrayBuffersBuilder {
     pub fn prefix(mut self, value: impl ToString) -> Self {
         self.prefix = value.to_string();
+        self
+    }
+
+    fn deduplicate_fields(&mut self) {
+        let mut acc = Vec::new();
+        for f in self.peak_array_fields.iter() {
+            if !acc.iter().find(|(a, _)| *a == f.name()).is_some() {
+                acc.push((f.name(), f.clone()));
+            }
+        }
+        self.peak_array_fields = acc.into_iter().map(|v| v.1).collect();
+    }
+
+    fn apply_overrides(&mut self) {
+        self.deduplicate_fields();
+        for (k, v) in self.overrides.iter() {
+            let f = k.to_field();
+            if let Some(i) = self.peak_array_fields.iter().position(|p| p.name() == f.name()) {
+                self.peak_array_fields[i] = v.to_field();
+            }
+        }
+        self.deduplicate_fields();
+    }
+
+    pub fn add_override(mut self, from: impl Into<BufferName>, to: impl Into<BufferName>) -> Self {
+        self.overrides.insert(from.into(), to.into());
+        self.apply_overrides();
         self
     }
 
@@ -189,6 +260,7 @@ impl ArrayBuffersBuilder {
         {
             self.peak_array_fields.push(field);
         }
+        self.apply_overrides();
         self
     }
 
@@ -212,6 +284,7 @@ impl ArrayBuffersBuilder {
             schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
             prefix: self.prefix.clone(),
             array_chunks: buffers,
+            overrides: self.overrides.clone(),
         }
     }
 }
@@ -236,6 +309,16 @@ impl Default for MzPeakWriterBuilder {
 impl MzPeakWriterBuilder {
     pub fn add_spectrum_field(mut self, f: FieldRef) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_field(f);
+        self
+    }
+
+    pub fn add_spectrum_override(mut self, from: impl Into<BufferName>, to: impl Into<BufferName>) -> Self {
+        self.spectrum_arrays = self.spectrum_arrays.add_override(from, to);
+        self
+    }
+
+    pub fn add_chromatogram_override(mut self, from: impl Into<BufferName>, to: impl Into<BufferName>) -> Self {
+        self.chromatogram_arrays = self.chromatogram_arrays.add_override(from, to);
         self
     }
 
@@ -502,6 +585,7 @@ pub trait AbstractMzPeakWriter {
                     n_points,
                     spectrum_count,
                     "spectrum_index",
+                    &self.spectrum_data_buffer_mut().overrides
                 )?;
                 self.spectrum_data_buffer_mut()
                     .add_arrays(fields, data, n_points);
@@ -630,7 +714,7 @@ impl<
             }
         }
 
-        let data_props = WriterProperties::builder()
+        let mut data_props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::ZSTD(
                 ZstdLevel::try_new(3).unwrap(),
             ))
@@ -639,6 +723,14 @@ impl<
             .set_column_encoding(index_path.into(), Encoding::RLE)
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_statistics_enabled(EnabledStatistics::Page);
+
+        for (i, c) in parquet_schema.columns().iter().enumerate() {
+            if c.name().contains("_mz_") {
+                log::info!("Shuffling column {i} {}", c.path());
+                data_props = data_props.set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+        }
+
 
         let data_props = data_props.build();
         data_props

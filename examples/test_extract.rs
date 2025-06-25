@@ -56,32 +56,52 @@ fn main() -> io::Result<()> {
     for batch in it.flatten() {
         let root = batch.column(0).as_struct();
         let indices: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
-        let mzs: &Float64Array = root.column(1).as_any().downcast_ref().unwrap();
         let intensities: &Float32Array = root.column(2).as_any().downcast_ref().unwrap();
-        let ims: Option<&Float64Array> = root.column(3).as_any().downcast_ref();
-        let it = indices.iter().flatten().zip(
-            mzs.iter().flatten()
-        ).zip(
-            intensities.iter().flatten()
-        );
-        if ims.is_some() {
-            for (((index, mz), intensity), im) in it.zip(ims.unwrap().iter().flatten()) {
-                if time_index.contains_key(&index) && mz_range.contains(&mz) && im_range.contains(&im) {
-                    println!("{index}\t{mz}\t{intensity}\t{im}");
-                    started = true;
-                }
-            }
-        } else {
-            for ((index, mz), intensity) in it {
-                if time_index.contains_key(&index) && mz_range.contains(&mz) {
-                    println!("{index}\t{mz}\t{intensity}");
-                    started = true;
-                }
-            }
-        }
 
-        if started && !time_index.contains_key(&indices.values().last().unwrap()) {
-            break;
+        macro_rules! iter {
+            ($mzs:expr, $ims:expr, $mz_range:expr, $im_range:expr) => {
+                let it = indices.iter().flatten().zip(
+                    $mzs.iter().flatten()
+                ).zip(
+                    intensities.iter().flatten()
+                );
+                if $ims.is_some() {
+                    for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
+                        if time_index.contains_key(&index) && $mz_range.contains(&mz) && $im_range.contains(&im) {
+                            println!("{index}\t{mz}\t{intensity}\t{im}");
+                            started = true;
+                        }
+                    }
+                } else {
+                    for ((index, mz), intensity) in it {
+                        if time_index.contains_key(&index) && $mz_range.contains(&mz) {
+                            println!("{index}\t{mz}\t{intensity}");
+                            started = true;
+                        }
+                    }
+                }
+
+                if started && !time_index.contains_key(&indices.values().last().unwrap()) {
+                    break;
+                }
+            };
+        }
+        if let Some(mzs) = root.column(1).as_any().downcast_ref::<Float64Array>() {
+            if let Some(ims) = root.column(3).as_any().downcast_ref::<Float64Array>() {
+                iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f64, mz_range.end as f64), SimpleInterval::new(im_range.start as f64, im_range.end as f64));
+            } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
+                iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f64, mz_range.end as f64), SimpleInterval::new(im_range.start as f32, im_range.end as f32));
+            } else {
+                iter!(mzs, Option::<Float64Array>::None, mz_range, im_range);
+            }
+        } else if let Some(mzs) = root.column(1).as_any().downcast_ref::<Float32Array>() {
+            if let Some(ims) = root.column(3).as_any().downcast_ref::<Float64Array>() {
+                iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), SimpleInterval::new(im_range.start as f64, im_range.end as f64));
+            } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
+                iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), SimpleInterval::new(im_range.start as f32, im_range.end as f32));
+            } else {
+                iter!(mzs, Option::<Float64Array>::None, SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), im_range);
+            }
         }
     }
 
