@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io,
     marker::PhantomData,
-    path::{Path, PathBuf},
+    path::{Path, PathBuf}, sync::Arc,
 };
 
 use arrow::{
@@ -57,10 +57,48 @@ use crate::{
     peak_series::{ArrayIndex, SerializedArrayIndex},
 };
 
+fn binary_search_arrow_index(array: &UInt64Array, query: u64, begin: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
+    let mut lo = begin.unwrap_or(0);
+    let n = array.len() as usize;
+    let mut hi = end.unwrap_or(n);
+
+    while hi != lo {
+        let mid = (hi + lo) / 2;
+        let found = array.value(mid);
+        if found == query {
+            let mut i = mid;
+            while i > 0 && array.value(i) == query {
+                i -= 1;
+            }
+            if array.value(i) != query {
+                i += 1;
+            }
+            let begin = i;
+
+            i = mid;
+            while i < n && array.value(i) == query {
+                i += 1;
+            }
+            let end = i;
+
+            return Some((begin, end))
+        }
+        else if hi - lo == 1 {
+            return None
+        } else if found > query {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    None
+}
+
 pub struct MzPeakReaderMetadata {
     mz_metadata: meta::FileMetadataConfig,
-    pub spectrum_array_indices: ArrayIndex,
-    pub chromatogram_array_indices: ArrayIndex,
+    pub spectrum_array_indices: Arc<ArrayIndex>,
+    pub chromatogram_array_indices: Arc<ArrayIndex>,
     pub spectrum_id_index: OffsetIndex,
 }
 
@@ -93,7 +131,7 @@ pub struct MzPeakReaderType<
     pub metadata: MzPeakReaderMetadata,
     pub query_indices: QueryIndex,
     spectrum_metadata_cache: Option<Vec<SpectrumDescription>>,
-    spectrum_row_group_cache: Option<(usize, RecordBatch)>,
+    spectrum_row_group_cache: Option<SpectrumDataCache>,
     _t: PhantomData<(C, D)>,
 }
 
@@ -139,6 +177,9 @@ impl<
     fn next(&mut self) -> Option<Self::Item> {
         if self.spectrum_metadata_cache.is_none() {
             self.populate_metadata_cache().ok()?;
+        }
+        if self.index >= self.len() {
+            return None
         }
         let x = self.get_spectrum(self.index).ok();
         self.index += 1;
@@ -234,6 +275,152 @@ impl<
 > MSDataFileMetadata for MzPeakReaderType<C, D>
 {
     mzdata::delegate_impl_metadata_trait!(metadata);
+}
+
+trait SpectrumDataReader {
+    fn populate_arrays_from_struct_array(&self, points: &StructArray, bin_map: &mut HashMap<&String, DataArray>) {
+        for (f, arr) in points.fields().iter().zip(points.columns()) {
+            if f.name() == "spectrum_index" {
+                continue;
+            }
+            let store = bin_map.get_mut(f.name()).unwrap();
+
+            macro_rules! extend_array {
+                ($buf:ident) => {
+                    if $buf.null_count() > 0 {
+                        for val in $buf.iter() {
+                            if let Some(val) = val {
+                                store.push(val).unwrap();
+                            }
+                        }
+                    } else {
+                        store.extend($buf.values()).unwrap();
+                    }
+                };
+            }
+
+            match f.data_type() {
+                DataType::Float32 => {
+                    let buf: &Float32Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::Float64 => {
+                    let buf: &Float64Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::Int32 => {
+                    let buf: &Int32Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::Int64 => {
+                    let buf: &Int64Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::UInt8 => {
+                    let buf: &UInt8Array = arr.as_primitive();
+                    extend_array!(buf);
+                }
+                DataType::LargeUtf8 => {}
+                DataType::Utf8 => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+struct SpectrumDataCache {
+    row_group: RecordBatch,
+    row_group_index: usize,
+    spectrum_array_indices: Arc<ArrayIndex>,
+    last_query_index: Option<u64>,
+    last_query_span: Option<(usize, usize)>
+}
+
+impl SpectrumDataReader for SpectrumDataCache {}
+impl<C: CentroidLike + BuildFromArrayMap + BuildArrayMapFrom, D: DeconvolutedCentroidLike + BuildFromArrayMap + BuildArrayMapFrom> SpectrumDataReader for MzPeakReaderType<C, D> {}
+
+impl SpectrumDataCache {
+    fn new(row_group: RecordBatch, spectrum_array_indices: Arc<ArrayIndex>, row_group_index: usize, last_query_index: Option<u64>, last_query_span: Option<(usize, usize)>) -> Self {
+        Self { row_group, spectrum_array_indices, row_group_index, last_query_index, last_query_span }
+    }
+
+    fn slice_spectrum_data_record_batch_to_arrays_of(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
+        let mut bin_map = HashMap::new();
+        for (k, v) in self.spectrum_array_indices.iter() {
+            let dtype = crate::peak_series::arrow_to_array_type(&v.data_type).unwrap();
+            bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
+        }
+
+        let mut begin_hint = None;
+        let mut end_hint = None;
+        if let Some(last_query_index) = self.last_query_index {
+            if last_query_index < index {
+                begin_hint = Some(self.last_query_span.unwrap().1);
+            } else if last_query_index > index {
+                end_hint = Some(self.last_query_span.unwrap().1)
+            } else if last_query_index == index {
+                let (a, b) = self.last_query_span.unwrap();
+                begin_hint = Some(a);
+                end_hint = Some(b);
+            }
+        }
+
+        let points = self.row_group.column(0).as_struct();
+        let indices: &UInt64Array = points.column_by_name("spectrum_index").unwrap().as_any().downcast_ref().unwrap();
+        let bounds = binary_search_arrow_index(indices, index, begin_hint, end_hint);
+
+        let start;
+        let end;
+
+        if let Some((bstart, bend)) = bounds {
+            let at = indices.value(bstart);
+            assert_eq!(at, index);
+            let at = indices.value(bend - 1);
+            assert_eq!(at, index);
+            start = Some(bstart);
+            end = Some(bend);
+        } else {
+            panic!("Could not find start and end in binary search");
+            // for (i, idx) in indices.iter().enumerate() {
+            //     if idx.unwrap() == index {
+            //         if start.is_some() {
+            //             end = Some(i + 1)
+            //         } else {
+            //             start = Some(i)
+            //         }
+            //     }
+            // }
+        }
+
+        let points = match (start, end) {
+            (Some(start), Some(end)) => {
+                let len = end - start;
+                self.last_query_span = Some((start, end));
+                self.last_query_index = Some(index);
+                points.slice(start, len)
+            },
+            (Some(start), None) => {
+                self.last_query_span = Some((start, start + 1));
+                self.last_query_index = Some(index);
+                points.slice(start, 1)
+            },
+            _ => {
+                let mut out = BinaryArrayMap::new();
+                for v in bin_map.into_values() {
+                    out.add(v);
+                }
+                return Ok(out)
+            }
+        };
+
+        self.populate_arrays_from_struct_array(&points, &mut bin_map);
+
+        let mut out = BinaryArrayMap::new();
+        for v in bin_map.into_values() {
+            out.add(v);
+        }
+        Ok(out)
+    }
 }
 
 impl<
@@ -476,8 +663,8 @@ impl<
 
         let bundle = MzPeakReaderMetadata {
             mz_metadata,
-            spectrum_array_indices,
-            chromatogram_array_indices,
+            spectrum_array_indices: Arc::new(spectrum_array_indices),
+            chromatogram_array_indices: Arc::new(chromatogram_array_indices),
             spectrum_id_index,
         };
 
@@ -494,117 +681,19 @@ impl<
         }
     }
 
-    fn read_spectrum_data_cache(&mut self, row_group: usize) -> io::Result<RecordBatch> {
-        let cache_hit = if let Some((i, _)) = self.spectrum_row_group_cache.as_ref() {
-            *i == row_group
+    fn read_spectrum_data_cache(&mut self, row_group: usize) -> io::Result<&mut SpectrumDataCache> {
+        let cache_hit = if let Some(cache) = self.spectrum_row_group_cache.as_ref() {
+            cache.row_group_index == row_group
         } else {
             false
         };
         if cache_hit {
-            Ok(self.spectrum_row_group_cache.as_ref().map(|(_, rg)| rg.clone()).unwrap())
+            Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         } else {
             let rg = self.load_spectrum_data_row_group(row_group)?;
-            self.spectrum_row_group_cache = Some((row_group, rg));
-            Ok(self.spectrum_row_group_cache.as_ref().map(|(_, rg)| rg.clone()).unwrap())
+            self.spectrum_row_group_cache = Some(SpectrumDataCache::new(rg, self.metadata.spectrum_array_indices.clone(), row_group, None, None));
+            Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         }
-    }
-
-    fn populate_arrays_from_struct_array(&self, points: &StructArray, bin_map: &mut HashMap<&String, DataArray>) {
-        for (f, arr) in points.fields().iter().zip(points.columns()) {
-            if f.name() == "spectrum_index" {
-                continue;
-            }
-            let store = bin_map.get_mut(f.name()).unwrap();
-
-            macro_rules! extend_array {
-                ($buf:ident) => {
-                    if $buf.null_count() > 0 {
-                        for val in $buf.iter() {
-                            if let Some(val) = val {
-                                store.push(val).unwrap();
-                            }
-                        }
-                    } else {
-                        store.extend($buf.values()).unwrap();
-                    }
-                };
-            }
-
-            match f.data_type() {
-                DataType::Float32 => {
-                    let buf: &Float32Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::Float64 => {
-                    let buf: &Float64Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::Int32 => {
-                    let buf: &Int32Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::Int64 => {
-                    let buf: &Int64Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::UInt8 => {
-                    let buf: &UInt8Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::LargeUtf8 => {}
-                DataType::Utf8 => {}
-                _ => {}
-            }
-        }
-    }
-
-    fn slice_spectrum_data_record_batch_to_arrays_of(&self, batch: &RecordBatch, index: u64) -> io::Result<BinaryArrayMap> {
-        let mut bin_map = HashMap::new();
-        for (k, v) in self.metadata.spectrum_array_indices.iter() {
-            let dtype = crate::peak_series::arrow_to_array_type(&v.data_type).unwrap();
-            bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
-        }
-
-        let points = batch.column(0).as_struct();
-        let indices: &UInt64Array = points.column_by_name("spectrum_index").unwrap().as_any().downcast_ref().unwrap();
-        let mut start = None;
-        let mut end = None;
-
-        for (i, idx) in indices.iter().enumerate() {
-            if idx.unwrap() == index {
-                if start.is_some() {
-                    end = Some(i)
-                } else {
-                    start = Some(i)
-                }
-            }
-        }
-
-        let points = match (start, end) {
-            (Some(start), Some(end)) => {
-                let len = end - start + 1;
-                points.slice(start, len)
-            },
-            (Some(start), None) => {
-                points.slice(start, 1)
-            },
-            _ => {
-                let mut out = BinaryArrayMap::new();
-                for v in bin_map.into_values() {
-                    out.add(v);
-                }
-                return Ok(out)
-            }
-        };
-
-        self.populate_arrays_from_struct_array(&points, &mut bin_map);
-
-
-        let mut out = BinaryArrayMap::new();
-        for v in bin_map.into_values() {
-            out.add(v);
-        }
-        Ok(out)
     }
 
     /// Read the complete data arrays for the spectrum at `index`
@@ -622,24 +711,20 @@ impl<
             }
             pages.push(*page);
         }
-        log::debug!("Reading pages: {pages:?} for index {index}");
 
         if rg_idx_acc.len() == 1 {
             let rg = self.read_spectrum_data_cache(rg_idx_acc[0])?;
-            return self.slice_spectrum_data_record_batch_to_arrays_of(&rg, index)
+            let arrays = rg.slice_spectrum_data_record_batch_to_arrays_of(index)?;
+            return Ok(arrays)
         }
 
-        log::info!("Reading index {index} from row groups {:?}", rg_idx_acc);
         let first_row = if !pages.is_empty() {
             let mut rg_row_skip = 0;
 
             for i in 0..rg_idx_acc[0] {
-                log::debug!("Skipping row group {i}");
                 let rg = builder.metadata().row_group(i);
                 rg_row_skip += rg.num_rows();
             }
-            let rg = builder.metadata().row_group(rg_idx_acc[0]);
-            log::info!("{}-{}", rg.file_offset().unwrap(), rg.file_offset().unwrap() + rg.compressed_size());
             rg_row_skip
         } else {
             return Ok(BinaryArrayMap::new())

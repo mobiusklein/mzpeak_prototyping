@@ -166,7 +166,9 @@ where
     }
 
     pub fn pages_contains(&self, query: T) -> impl Iterator<Item=&PageIndexEntry<T>> {
-        self.iter().filter(move |p| p.contains(&query))
+        self.iter().filter(move |p| {
+            p.contains(&query)
+        })
     }
 
     pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {

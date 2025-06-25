@@ -23,6 +23,9 @@ pub struct App {
     #[arg(short = 'y', long = "intensity-f32")]
     intensity_f32: bool,
 
+    #[arg(short = 'i', long = "intensity-i32")]
+    intensity_i32: bool,
+
     #[arg(short = 'o')]
     outpath: Option<PathBuf>,
 }
@@ -66,6 +69,32 @@ fn main() -> io::Result<()> {
                 BufferContext::Spectrum,
                 ArrayType::IntensityArray,
                 BinaryDataArrayType::Float32,
+            ),
+        );
+    }
+    if args.intensity_i32 {
+        overrides.insert(
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Float32,
+            ),
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Int32,
+            ),
+        );
+        overrides.insert(
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Float64,
+            ),
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Int32,
             ),
         );
     }

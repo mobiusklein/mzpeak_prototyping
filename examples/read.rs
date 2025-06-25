@@ -22,7 +22,7 @@ fn main() -> io::Result<()> {
     let mut i = 0;
     let mut points = 0;
     for spec in reader {
-        if i % 100 == 0 {
+        if i % 1000 == 0 {
             log::info!("Read spectrum {i}");
         }
         i += 1;
