@@ -14,17 +14,22 @@ pub struct App {
     #[arg()]
     filename: PathBuf,
 
-    #[arg(short = 'm', long = "mz-f32")]
+    #[arg(short = 'm', long = "mz-f32", help="Encode the m/z values using float32 instead of float64")]
     mz_f32: bool,
 
-    #[arg(short = 'd', long = "ion-mobility-f32")]
+    #[arg(short = 'd', long = "ion-mobility-f32", help="Encode the ion mobility values using float32 instead of float64")]
     ion_mobility_f32: bool,
 
-    #[arg(short = 'y', long = "intensity-f32")]
+    #[arg(short = 'y', long = "intensity-f32", help="Encode the intensity values using float32")]
     intensity_f32: bool,
 
-    #[arg(short = 'i', long = "intensity-i32")]
+    #[arg(short = 'i',
+          long = "intensity-i32",
+          help="Encode the intensity values as int32 instead of floats which may improve compression at the cost of the decimal component")]
     intensity_i32: bool,
+
+    #[arg(short = 'z', long = "shuffle-mz", help="Shuffle the m/z array, which may improve the compression of profile spectra")]
+    shuffle_mz: bool,
 
     #[arg(short = 'o')]
     outpath: Option<PathBuf>,
@@ -42,7 +47,7 @@ fn main() -> io::Result<()> {
 
     let outname = args
         .outpath
-        .unwrap_or_else(|| filename.with_extension("mzpeak"));
+        .unwrap_or_else(|| filename.with_extension("mzpeak").file_name().unwrap().into());
     let mut overrides = HashMap::new();
     if args.mz_f32 {
         overrides.insert(
@@ -119,14 +124,14 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let handle = fs::File::create(&outname)?;
-    // let data_handle = fs::File::create(outname.with_extension("data.mzpeak"))?;
-
+    let handle = fs::File::create(&outname.file_name().unwrap())?;
     let mut writer = MzPeakWriterType::<fs::File>::builder()
-        .add_spectrum_peak_type::<CentroidPeak>()
-        .add_spectrum_peak_type::<DeconvolutedPeak>()
+        // If we had peak data here, we would want to add these types' arrays
+        // .add_spectrum_peak_type::<CentroidPeak>()
+        // .add_spectrum_peak_type::<DeconvolutedPeak>()
         .add_default_chromatogram_fields()
-        .buffer_size(5000);
+        .buffer_size(5000)
+        .shuffle_mz(args.shuffle_mz);
 
     writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides)
         .into_iter()
@@ -136,7 +141,7 @@ fn main() -> io::Result<()> {
         writer = writer.add_spectrum_override(from.clone(), to.clone());
     }
 
-    let mut writer = writer.build(handle);
+    let mut writer = writer.build(handle, true);
     writer.copy_metadata_from(&reader);
     writer.add_file_description(reader.file_description());
 

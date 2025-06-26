@@ -8,6 +8,7 @@ pub mod reader;
 pub mod writer;
 
 pub mod archive;
+pub mod filter;
 
 pub use param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID};
 pub use spectrum::{SpectrumEntry, SelectedIonEntry, PrecursorEntry, ScanEntry};

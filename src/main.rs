@@ -73,7 +73,7 @@ fn main() -> io::Result<()> {
         .into_iter()
         .fold(writer, |writer, f| writer.add_spectrum_field(f));
 
-    let mut writer = writer.build(handle);
+    let mut writer = writer.build(handle, false);
     writer.copy_metadata_from(&reader);
     writer.add_file_description(reader.file_description());
 
