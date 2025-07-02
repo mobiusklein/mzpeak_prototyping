@@ -1,8 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    io::{self, prelude::*},
-    marker::PhantomData,
-    sync::Arc,
+    cmp::Ordering, collections::{HashMap, HashSet}, io::{self, prelude::*}, marker::PhantomData, sync::Arc
 };
 
 use arrow::{
@@ -29,18 +26,19 @@ use mzdata::{
 };
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
+use crate::filter::estimate_median_delta;
+#[allow(unused)]
 use crate::{
     archive::ZipArchiveWriter,
     entry::Entry,
-    filter::drop_where_column_is_zero,
+    filter::{drop_where_column_is_zero, nullify_at_zero},
     param::{
         DataProcessing as MzDataProcessing, FileDescription as MzFileDescription,
         InstrumentConfiguration as MzInstrumentConfiguration, Sample as MzSample,
         Software as MzSoftware,
     },
     peak_series::{
-        ArrayIndex, ArrayIndexEntry, BufferContext, BufferName, ToMzPeakDataSeries,
-        array_map_to_schema_arrays,
+        array_map_to_schema_arrays, ArrayIndex, ArrayIndexEntry, BufferContext, BufferName, ToMzPeakDataSeries
     },
 };
 
@@ -50,12 +48,9 @@ pub fn sample_array_types<
 >(
     reader: &mut MZReaderType<std::fs::File, C, D>,
     overrides: &HashMap<BufferName, BufferName>,
-) -> HashSet<std::sync::Arc<arrow::datatypes::Field>> {
+) -> Vec<std::sync::Arc<arrow::datatypes::Field>> {
     let n = reader.len();
-    let mut arrays = HashSet::new();
-
-    arrays.extend(C::to_fields().iter().cloned());
-    arrays.extend(D::to_fields().iter().cloned());
+    let mut arrays = Vec::new();
 
     if n == 0 {
         return arrays;
@@ -66,6 +61,7 @@ pub fn sample_array_types<
         .into_iter()
         .flat_map(|i| {
             reader.get_spectrum_by_index(i).and_then(|s| {
+                log::trace!("Sampling arrays from {}", s.id());
                 if s.signal_continuity() == SignalContinuity::Profile {
                     is_profile += 1;
                 }
@@ -87,7 +83,11 @@ pub fn sample_array_types<
             fields
         })
         .flatten();
-    arrays.extend(field_it);
+    for field in field_it {
+        if arrays.iter().find(|f| f.name() == field.name()).is_none() {
+            arrays.push(field);
+        }
+    }
     if is_profile > 0 {
         log::info!("Detected profile spectra");
     }
@@ -176,7 +176,7 @@ impl ArrayBuffers {
         for (f, arr) in fields.iter().zip(arrays) {
             self.array_chunks
                 .get_mut(f.name())
-                .unwrap_or_else(|| panic!("Unexpected field {f:?}"))
+                .unwrap_or_else(|| panic!("Unexpected field {f:?} for {:?}", self.peak_array_fields))
                 .push(arr);
             visited.insert(f.name());
         }
@@ -228,6 +228,14 @@ impl ArrayBuffers {
                                     log::error!("Failed to subset batch: {e}");
                                 }
                             }
+                            // match nullify_at_zero(&batch, i, &[0]) {
+                            //     Ok(b) => {
+                            //         batch = b;
+                            //     },
+                            //     Err(e) => {
+                            //         log::error!("Failed to nullify batch: {e}");
+                            //     }
+                            // }
                         }
                     }
                 }
@@ -315,7 +323,27 @@ impl ArrayBuffersBuilder {
         self
     }
 
-    pub fn build(&self, schema: SchemaRef, mask_zero_intensity_runs: bool) -> ArrayBuffers {
+    pub fn canonicalize_field_order(&mut self) {
+        self.peak_array_fields.sort_by(|a, b| {
+            if a.name() == "spectrum_index" || a.name() == "chromatogram_index" {
+                return Ordering::Less
+            }
+            if b.name() == "spectrum_index" || b.name() == "chromatogram_index" {
+                return Ordering::Greater
+            }
+            let a_name = BufferName::from_field(BufferContext::Spectrum, a.clone());
+            let b_name = BufferName::from_field(BufferContext::Spectrum, b.clone());
+            match (a_name, b_name) {
+                (Some(a), Some(b)) => {a.partial_cmp(&b).unwrap()},
+                (Some(_), _) => {Ordering::Less},
+                (_, Some(_)) => {Ordering::Greater},
+                (_, _) => {a.name().cmp(b.name())}
+            }
+        });
+    }
+
+    pub fn build(mut self, schema: SchemaRef, mask_zero_intensity_runs: bool) -> ArrayBuffers {
+        self.canonicalize_field_order();
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
 
@@ -641,6 +669,7 @@ pub trait AbstractMzPeakWriter {
         &mut self,
         spectrum: &impl SpectrumLike<C, D>,
     ) -> io::Result<()> {
+        log::trace!("Writing spectrum {}", spectrum.id());
         let entries = self.spectrum_to_entries(spectrum);
         self.spectrum_entry_buffer_mut().extend(entries);
         self.write_spectrum_peaks(spectrum)?;
@@ -661,6 +690,10 @@ pub trait AbstractMzPeakWriter {
             mzdata::spectrum::RefPeakDataLevel::Missing => {}
             mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => {
                 let n_points = spectrum.peaks().len();
+                if let Ok(mzs) = binary_array_map.mzs() {
+                    let (median_delta, _deltas) = estimate_median_delta(mzs.iter().copied());
+                    eprintln!("Median of {spectrum_count} = {median_delta}");
+                }
                 let (fields, data) = array_map_to_schema_arrays(
                     crate::BufferContext::Spectrum,
                     binary_array_map,

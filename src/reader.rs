@@ -3,12 +3,15 @@ use std::{
     fs::File,
     io,
     marker::PhantomData,
-    path::{Path, PathBuf}, sync::Arc,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, Int8Array, LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt32Array, UInt64Array, UInt8Array
+        Array, AsArray, Float32Array, Float64Array, Int8Array, Int32Array, Int64Array,
+        LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt32Array,
+        UInt64Array,
     },
     datatypes::{DataType, FieldRef},
 };
@@ -57,7 +60,12 @@ use crate::{
     peak_series::{ArrayIndex, SerializedArrayIndex},
 };
 
-fn binary_search_arrow_index(array: &UInt64Array, query: u64, begin: Option<usize>, end: Option<usize>) -> Option<(usize, usize)> {
+fn binary_search_arrow_index(
+    array: &UInt64Array,
+    query: u64,
+    begin: Option<usize>,
+    end: Option<usize>,
+) -> Option<(usize, usize)> {
     let mut lo = begin.unwrap_or(0);
     let n = array.len() as usize;
     let mut hi = end.unwrap_or(n);
@@ -81,10 +89,9 @@ fn binary_search_arrow_index(array: &UInt64Array, query: u64, begin: Option<usiz
             }
             let end = i;
 
-            return Some((begin, end))
-        }
-        else if hi - lo == 1 {
-            return None
+            return Some((begin, end));
+        } else if hi - lo == 1 {
+            return None;
         } else if found > query {
             hi = mid;
         } else {
@@ -176,10 +183,10 @@ impl<
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.spectrum_metadata_cache.is_none() {
-            self.populate_metadata_cache().ok()?;
+            self.load_all_spectrum_metadata().ok()?;
         }
         if self.index >= self.len() {
-            return None
+            return None;
         }
         let x = self.get_spectrum(self.index).ok();
         self.index += 1;
@@ -230,9 +237,10 @@ impl<
     }
 
     fn iter(&mut self) -> mzdata::io::SpectrumIterator<C, D, MultiLayerSpectrum<C, D>, Self>
-        where
-            Self: Sized, {
-        if let Err(_) = self.populate_metadata_cache() {}
+    where
+        Self: Sized,
+    {
+        if let Err(_) = self.load_all_spectrum_metadata() {}
         mzdata::io::SpectrumIterator::new(self)
     }
 }
@@ -277,8 +285,12 @@ impl<
     mzdata::delegate_impl_metadata_trait!(metadata);
 }
 
-trait SpectrumDataReader {
-    fn populate_arrays_from_struct_array(&self, points: &StructArray, bin_map: &mut HashMap<&String, DataArray>) {
+trait SpectrumDataArrayReader {
+    fn populate_arrays_from_struct_array(
+        &self,
+        points: &StructArray,
+        bin_map: &mut HashMap<&String, DataArray>,
+    ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
             if f.name() == "spectrum_index" {
                 continue;
@@ -333,18 +345,38 @@ struct SpectrumDataCache {
     row_group_index: usize,
     spectrum_array_indices: Arc<ArrayIndex>,
     last_query_index: Option<u64>,
-    last_query_span: Option<(usize, usize)>
+    last_query_span: Option<(usize, usize)>,
 }
 
-impl SpectrumDataReader for SpectrumDataCache {}
-impl<C: CentroidLike + BuildFromArrayMap + BuildArrayMapFrom, D: DeconvolutedCentroidLike + BuildFromArrayMap + BuildArrayMapFrom> SpectrumDataReader for MzPeakReaderType<C, D> {}
+impl SpectrumDataArrayReader for SpectrumDataCache {}
+impl<
+    C: CentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
+    D: DeconvolutedCentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
+> SpectrumDataArrayReader for MzPeakReaderType<C, D>
+{
+}
 
 impl SpectrumDataCache {
-    fn new(row_group: RecordBatch, spectrum_array_indices: Arc<ArrayIndex>, row_group_index: usize, last_query_index: Option<u64>, last_query_span: Option<(usize, usize)>) -> Self {
-        Self { row_group, spectrum_array_indices, row_group_index, last_query_index, last_query_span }
+    fn new(
+        row_group: RecordBatch,
+        spectrum_array_indices: Arc<ArrayIndex>,
+        row_group_index: usize,
+        last_query_index: Option<u64>,
+        last_query_span: Option<(usize, usize)>,
+    ) -> Self {
+        Self {
+            row_group,
+            spectrum_array_indices,
+            row_group_index,
+            last_query_index,
+            last_query_span,
+        }
     }
 
-    fn slice_spectrum_data_record_batch_to_arrays_of(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
+    fn slice_spectrum_data_record_batch_to_arrays_of(
+        &mut self,
+        index: u64,
+    ) -> io::Result<BinaryArrayMap> {
         let mut bin_map = HashMap::new();
         for (k, v) in self.spectrum_array_indices.iter() {
             let dtype = crate::peak_series::arrow_to_array_type(&v.data_type).unwrap();
@@ -366,7 +398,12 @@ impl SpectrumDataCache {
         }
 
         let points = self.row_group.column(0).as_struct();
-        let indices: &UInt64Array = points.column_by_name("spectrum_index").unwrap().as_any().downcast_ref().unwrap();
+        let indices: &UInt64Array = points
+            .column_by_name("spectrum_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap();
         let bounds = binary_search_arrow_index(indices, index, begin_hint, end_hint);
 
         let start;
@@ -398,18 +435,18 @@ impl SpectrumDataCache {
                 self.last_query_span = Some((start, end));
                 self.last_query_index = Some(index);
                 points.slice(start, len)
-            },
+            }
             (Some(start), None) => {
                 self.last_query_span = Some((start, start + 1));
                 self.last_query_index = Some(index);
                 points.slice(start, 1)
-            },
+            }
             _ => {
                 let mut out = BinaryArrayMap::new();
                 for v in bin_map.into_values() {
                     out.add(v);
                 }
-                return Ok(out)
+                return Ok(out);
             }
         };
 
@@ -449,17 +486,24 @@ impl<
         Ok(this)
     }
 
-    pub fn populate_metadata_cache(&mut self) -> io::Result<()> {
+    /// Load the descriptive metadata for all spectra
+    ///
+    /// This method caches the data after its first use.
+    pub fn load_all_spectrum_metadata(&mut self) -> io::Result<Option<&[SpectrumDescription]>> {
         if self.spectrum_metadata_cache.is_none() {
-            self.spectrum_metadata_cache = Some(self.load_all_spectrum_metadata().inspect_err(|e| log::error!("Failed to load spectrum metadata cache: {e}"))?);
+            self.spectrum_metadata_cache = Some(
+                self.load_all_spectrum_metadata_impl()
+                    .inspect_err(|e| log::error!("Failed to load spectrum metadata cache: {e}"))?,
+            );
         }
-        Ok(())
+        Ok(self.spectrum_metadata_cache.as_deref())
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Load the various metadata, indices and reference data
     fn load_indices_from(
         handle: &mut ZipArchiveReader,
     ) -> io::Result<(MzPeakReaderMetadata, QueryIndex)> {
@@ -671,16 +715,28 @@ impl<
         Ok((bundle, query_index))
     }
 
+    /// Read a specific Parquet row group into memory as a single [`RecordBatch`]
+    ///
+    /// This reads from the spectrum data file
     fn load_spectrum_data_row_group(&self, row_group: usize) -> io::Result<RecordBatch> {
         let builder = self.handle.spectra_data()?;
-        let batch = builder.with_row_groups(vec![row_group]).with_batch_size(usize::MAX).build()?.flatten().next();
+        let batch = builder
+            .with_row_groups(vec![row_group])
+            .with_batch_size(usize::MAX)
+            .build()?
+            .flatten()
+            .next();
         if let Some(batch) = batch {
             Ok(batch)
         } else {
-            Err(parquet::errors::ParquetError::General(format!("Couldn't read row group {row_group}")).into())
+            Err(parquet::errors::ParquetError::General(format!(
+                "Couldn't read row group {row_group}"
+            ))
+            .into())
         }
     }
 
+    /// Load the [`SpectrumDataCache`] row group or retrieve the current cache if it matches the request
     fn read_spectrum_data_cache(&mut self, row_group: usize) -> io::Result<&mut SpectrumDataCache> {
         let cache_hit = if let Some(cache) = self.spectrum_row_group_cache.as_ref() {
             cache.row_group_index == row_group
@@ -691,7 +747,13 @@ impl<
             Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         } else {
             let rg = self.load_spectrum_data_row_group(row_group)?;
-            self.spectrum_row_group_cache = Some(SpectrumDataCache::new(rg, self.metadata.spectrum_array_indices.clone(), row_group, None, None));
+            self.spectrum_row_group_cache = Some(SpectrumDataCache::new(
+                rg,
+                self.metadata.spectrum_array_indices.clone(),
+                row_group,
+                None,
+                None,
+            ));
             Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         }
     }
@@ -705,19 +767,26 @@ impl<
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
 
-        for page in self.query_indices.spectrum_point_spectrum_index.pages_contains(index) {
+        for page in self
+            .query_indices
+            .spectrum_point_spectrum_index
+            .pages_contains(index)
+        {
             if !rg_idx_acc.contains(&page.row_group_i) {
                 rg_idx_acc.push(page.row_group_i);
             }
             pages.push(*page);
         }
 
+        // If there is only one row group in the scan, take the fast path through the cache
         if rg_idx_acc.len() == 1 {
             let rg = self.read_spectrum_data_cache(rg_idx_acc[0])?;
             let arrays = rg.slice_spectrum_data_record_batch_to_arrays_of(index)?;
-            return Ok(arrays)
+            return Ok(arrays);
         }
 
+        // Otherwise we must construct a more intricate read plan, first pruning rows and row groups
+        // based upon the pages matched
         let first_row = if !pages.is_empty() {
             let mut rg_row_skip = 0;
 
@@ -727,10 +796,13 @@ impl<
             }
             rg_row_skip
         } else {
-            return Ok(BinaryArrayMap::new())
+            return Ok(BinaryArrayMap::new());
         };
 
-        let rows = self.query_indices.spectrum_point_spectrum_index.pages_to_row_selection(pages.iter(), first_row);
+        let rows = self
+            .query_indices
+            .spectrum_point_spectrum_index
+            .pages_to_row_selection(pages.iter(), first_row);
 
         let predicate_mask = ProjectionMask::columns(
             builder.parquet_schema(),
@@ -1137,6 +1209,7 @@ impl<
         ion_mobility_range: Option<SimpleInterval<f64>>,
     ) -> io::Result<(ParquetRecordBatchReader, HashMap<u64, f32>)> {
         let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
+        let builder = self.handle.spectra_data()?;
 
         let mut rows = self
             .query_indices
@@ -1173,7 +1246,7 @@ impl<
             .spectrum_array_indices
             .get(&ArrayType::MZArray)
         {
-            fields.push(e.path.as_str())
+            fields.push(e.path.as_str());
         }
 
         if let Some(e) = self
@@ -1181,7 +1254,7 @@ impl<
             .spectrum_array_indices
             .get(&ArrayType::IntensityArray)
         {
-            fields.push(e.path.as_str())
+            fields.push(e.path.as_str());
         }
 
         for (k, v) in self.metadata.spectrum_array_indices.iter() {
@@ -1190,8 +1263,6 @@ impl<
                 break;
             }
         }
-
-        let builder = self.handle.spectra_data()?;
 
         let proj = ProjectionMask::columns(builder.parquet_schema(), fields.iter().copied());
         let predicate_mask = proj.clone();
@@ -1263,7 +1334,7 @@ impl<
     /// Read load descriptive metadata for the spectrum at `index`
     pub fn get_spectrum_metadata(&mut self, index: u64) -> io::Result<SpectrumDescription> {
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
-            if let Some(descr) =  cache.get(index as usize) {
+            if let Some(descr) = cache.get(index as usize) {
                 return Ok(descr.clone());
             }
         }
@@ -1513,8 +1584,9 @@ impl<
         Ok(descr)
     }
 
-    /// Load the descriptive metadata for all spectra
-    pub fn load_all_spectrum_metadata(&mut self) -> io::Result<Vec<SpectrumDescription>> {
+    pub(crate) fn load_all_spectrum_metadata_impl(
+        &mut self,
+    ) -> io::Result<Vec<SpectrumDescription>> {
         let builder = self.handle.spectrum_metadata()?;
 
         let mut rows = self
@@ -1876,8 +1948,6 @@ impl<
 
 pub type MzPeakReader = MzPeakReaderType<CentroidPeak, DeconvolutedPeak>;
 
-
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1910,7 +1980,7 @@ mod test {
     #[test]
     fn test_load_all_metadata() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
-        let out = reader.load_all_spectrum_metadata()?;
+        let out = reader.load_all_spectrum_metadata_impl()?;
         assert_eq!(out.len(), 48);
         Ok(())
     }

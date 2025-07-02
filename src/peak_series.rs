@@ -73,7 +73,7 @@ pub fn array_map_to_schema_arrays_and_excess(
         };
 
         if v.data_len()? != primary_array_len {
-            unimplemented!("Still need to understand usage");
+            unimplemented!("Still need to understand usage for uneven arrays: {} had {} points but primary length was {}", buffer_name, v.data_len()?, primary_array_len);
         }
 
         let name = buffer_name.to_string();
@@ -126,7 +126,9 @@ pub fn array_map_to_schema_arrays(
         };
 
         if v.data_len()? != primary_array_len {
-            unimplemented!("Still need to understand usage");
+            unimplemented!(
+                "Still need to understand usage for uneven arrays: {buffer_name}/{k} had {} points but primary length was {}", v.data_len()?, primary_array_len
+            );
         }
 
         let fieldref = buffer_name.to_field();
@@ -319,7 +321,7 @@ impl PartialOrd for BufferName {
             Some(core::cmp::Ordering::Equal) => {}
             ord => return ord,
         }
-        match self.array_type.partial_cmp(&other.array_type) {
+        match array_priority(&self.array_type).partial_cmp(&array_priority(&other.array_type)) {
             Some(core::cmp::Ordering::Equal) => {}
             ord => return ord,
         }
@@ -438,6 +440,46 @@ pub fn binary_datatype_from_accession(accession: crate::CURIE) -> Option<BinaryD
         _ => None,
     }
 }
+
+
+pub const fn array_priority(array_type: &ArrayType) -> u64 {
+    match array_type {
+        ArrayType::MZArray => 1,
+        ArrayType::IntensityArray => 2,
+        ArrayType::ChargeArray => 3,
+        ArrayType::SignalToNoiseArray => 4,
+        ArrayType::TimeArray => 5,
+        ArrayType::WavelengthArray => 6,
+        ArrayType::IonMobilityArray => 7,
+        ArrayType::MeanIonMobilityArray => 8,
+        ArrayType::MeanDriftTimeArray => 9,
+        ArrayType::MeanInverseReducedIonMobilityArray => 10,
+        ArrayType::RawIonMobilityArray => 11,
+        ArrayType::RawDriftTimeArray => 12,
+        ArrayType::RawInverseReducedIonMobilityArray => 13,
+        ArrayType::DeconvolutedIonMobilityArray => 14,
+        ArrayType::DeconvolutedDriftTimeArray => 15,
+        ArrayType::DeconvolutedInverseReducedIonMobilityArray => 16,
+        ArrayType::BaselineArray => 17,
+        ArrayType::ResolutionArray => 18,
+        ArrayType::PressureArray => 19,
+        ArrayType::TemperatureArray => 20,
+        ArrayType::FlowRateArray => 21,
+        ArrayType::NonStandardDataArray { name } => {
+            let b = name.as_bytes();
+            let n = b.len();
+            let mut i: usize = 0;
+            let mut k: u64 = 0;
+            while i < n {
+                k = k.saturating_add(b[i] as u64 * (i as u64 + 1));
+                i += 1;
+            }
+            22u64.saturating_add(k).saturating_add(n as u64)
+        },
+        ArrayType::Unknown => u64::MAX,
+    }
+}
+
 
 impl BufferName {
     pub const fn new(
