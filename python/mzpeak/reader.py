@@ -15,6 +15,8 @@ import pyarrow as pa
 from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
+from .filters import fill_nulls
+
 
 Q = TypeVar("Q", bound=Number)
 
@@ -196,6 +198,11 @@ class MzPeakSpectrumMetadataReader:
     def __repr__(self):
         return f"{self.__class__.__name__}({self.handle})"
 
+    def _get_median_deltas(self):
+        if 'median_delta' in self.spectra:
+            return self.spectra['median_delta'].to_numpy()
+        return None
+
 
 class MzPeakSpectrumDataReader:
     handle: pq.ParquetFile
@@ -203,6 +210,7 @@ class MzPeakSpectrumDataReader:
     point_index_i: int
     array_index: dict[str, dict]
     n_spectra: int
+    _median_delta_series: np.ndarray | None
 
     def __init__(self, handle: pq.ParquetFile):
         if not isinstance(handle, pq.ParquetFile):
@@ -210,6 +218,7 @@ class MzPeakSpectrumDataReader:
         self.handle = handle
         self.meta = self.handle.metadata
         self._infer_schema_idx()
+        self._median_delta_series = None
 
     def _infer_schema_idx(self):
         rg = self.meta.row_group(0)
@@ -224,7 +233,7 @@ class MzPeakSpectrumDataReader:
         }
         self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
 
-    def _clean_batch(self, data: pa.RecordBatch):
+    def _clean_batch(self, data: pa.RecordBatch, median_delta: float | None = None):
         nulls = []
         for i, col in enumerate(data.columns):
             if col.null_count == len(col):
@@ -240,7 +249,20 @@ class MzPeakSpectrumDataReader:
                 if k in data.column_names
             }
         )
-        return {k: np.asarray(v) for k, v in zip(data.column_names, data.columns)}
+        result = {}
+        for k, v in zip(data.column_names, data.columns):
+            if v.null_count:
+                if k == "m/z array" and median_delta is not None and not np.isnan(median_delta):
+                    v = fill_nulls(v, median_delta)
+                elif (
+                    k == "intensity array"
+                    and median_delta is not None
+                    and not np.isnan(median_delta)
+                ):
+                    v = np.asarray(v)
+                    v[np.isnan(v)] = 0.0
+            result[k] = np.asarray(v)
+        return result
 
     def read_data_for_spectrum_range(self, spectrum_index_range: slice | list):
         is_slice = False
@@ -282,6 +304,8 @@ class MzPeakSpectrumDataReader:
         return self._clean_batch(data)
 
     def _read_data_for(self, spectrum_index: int):
+        if self._median_delta_series is not None:
+            median_delta = self._median_delta_series[spectrum_index]
         rgs = []
         for i in range(self.meta.num_row_groups):
             rg = self.meta.row_group(i)
@@ -304,7 +328,7 @@ class MzPeakSpectrumDataReader:
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
             "spectrum_index"
         )
-        return self._clean_batch(data)
+        return self._clean_batch(data, median_delta)
 
     def __getitem__(self, index: int | slice):
         if isinstance(index, slice):
@@ -341,6 +365,9 @@ class MzPeakFile:
                 metadata[k] = v
         self.file_metadata = metadata
 
+        if self.spectrum_data and self.spectrum_metadata:
+            self.spectrum_data._median_delta_series = self.spectrum_metadata._get_median_deltas()
+
     def __getitem__(self, index):
         if isinstance(index, (int, str)):
             spec = self.spectrum_metadata[index]
@@ -357,6 +384,10 @@ class MzPeakFile:
             step = index.step or 1
             spec = self[range(start, end, step)]
         return spec
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
 
     def __len__(self):
         return len(self.spectrum_metadata)

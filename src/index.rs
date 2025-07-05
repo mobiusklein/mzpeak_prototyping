@@ -65,8 +65,16 @@ impl<T: HasProximity> PageIndexType<T> for PageIndexEntry<T> {
     fn end_row(&self) -> i64 {
         self.end_row
     }
+
+    fn row_group(&self) -> usize {
+        self.page_i
+    }
 }
 
+
+/// An abstraction built atop the Parquet Page Index to support point and interval
+/// queries to find which row groups and pages contain values of interest, implying
+/// which rows actually need to be loaded.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PageIndex<T: HasProximity>(Vec<PageIndexEntry<T>>)
 where
@@ -205,14 +213,26 @@ where
     }
 }
 
+
+/// A generic interface to a page index entry.
+///
+/// It requires [`Span1D`] over the type stored in the index.
 pub trait PageIndexType<T>: Span1D<DimType = T> {
+    /// Get the first row the page covers
     fn start_row(&self) -> i64;
+
+    /// Get the last row the page covers
     fn end_row(&self) -> i64;
 
+    /// The row group that this page belongs to
+    fn row_group(&self) -> usize;
+
+    /// Create a [`Span1D`] implementation over the page rows for this entry
     fn page_span(&self) -> SimpleInterval<i64> {
         SimpleInterval::new(self.start_row(), self.end_row())
     }
 
+    /// The number of rows this page spans
     fn row_len(&self) -> i64 {
         self.end_row() - self.start_row()
     }
@@ -302,6 +322,9 @@ macro_rules! read_numeric_page_index {
     }};
 }
 
+
+/// Read a `f32` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_f32_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -310,6 +333,8 @@ pub fn read_f32_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, f32)
 }
 
+/// Read a `f64` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_f64_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -318,6 +343,8 @@ pub fn read_f64_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, f64)
 }
 
+/// Read a `i32` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_i32_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -326,6 +353,8 @@ pub fn read_i32_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, i32)
 }
 
+/// Read a `i64` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_i64_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -334,6 +363,9 @@ pub fn read_i64_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, i64)
 }
 
+
+/// Read a `u32` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_u32_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -342,6 +374,9 @@ pub fn read_u32_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, u32)
 }
 
+
+/// Read a `u64` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_u64_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -350,6 +385,9 @@ pub fn read_u64_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, u64)
 }
 
+
+/// Read a `u8` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_u8_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,
@@ -358,6 +396,9 @@ pub fn read_u8_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, u8)
 }
 
+
+/// Read a `i8` values from the page index for the specified path from
+/// prepared metadata
 pub fn read_i8_page_index_from(
     metadata: &Arc<ParquetMetaData>,
     pq_schema: &SchemaDescriptor,

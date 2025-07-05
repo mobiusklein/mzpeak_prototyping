@@ -31,6 +31,9 @@ pub struct App {
     #[arg(short = 'z', long = "shuffle-mz", help="Shuffle the m/z array, which may improve the compression of profile spectra")]
     shuffle_mz: bool,
 
+    #[arg(short='u', long, help="Null mask out sparse zero intensity peaks")]
+    null_zeros: bool,
+
     #[arg(short = 'o')]
     outpath: Option<PathBuf>,
 }
@@ -132,6 +135,10 @@ fn main() -> io::Result<()> {
         .add_default_chromatogram_fields()
         .buffer_size(5000)
         .shuffle_mz(args.shuffle_mz);
+
+    if args.null_zeros {
+        writer = writer.null_zeros(true)
+    }
 
     writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides)
         .into_iter()

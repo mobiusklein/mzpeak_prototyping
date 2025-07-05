@@ -13,7 +13,7 @@ use arrow::{
         LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt32Array,
         UInt64Array,
     },
-    datatypes::{DataType, FieldRef},
+    datatypes::{DataType, FieldRef, Float32Type, Float64Type},
 };
 
 use mzdata::{
@@ -31,7 +31,7 @@ use mzpeaks::{
     prelude::Span1D,
 };
 
-use crate::archive::ZipArchiveReader;
+use crate::{archive::ZipArchiveReader, filter::fill_nulls_for};
 
 #[allow(unused)]
 use parquet::{
@@ -107,6 +107,7 @@ pub struct MzPeakReaderMetadata {
     pub spectrum_array_indices: Arc<ArrayIndex>,
     pub chromatogram_array_indices: Arc<ArrayIndex>,
     pub spectrum_id_index: OffsetIndex,
+    median_deltas: Vec<Option<f64>>,
 }
 
 impl MSDataFileMetadata for MzPeakReaderMetadata {
@@ -290,6 +291,7 @@ trait SpectrumDataArrayReader {
         &self,
         points: &StructArray,
         bin_map: &mut HashMap<&String, DataArray>,
+        median_delta: Option<f64>,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
             if f.name() == "spectrum_index" {
@@ -297,13 +299,14 @@ trait SpectrumDataArrayReader {
             }
             let store = bin_map.get_mut(f.name()).unwrap();
 
+            let has_nulls = arr.null_count() > 0;
+            let is_mz_array = matches!(store.name, ArrayType::MZArray);
+
             macro_rules! extend_array {
                 ($buf:ident) => {
                     if $buf.null_count() > 0 {
                         for val in $buf.iter() {
-                            if let Some(val) = val {
-                                store.push(val).unwrap();
-                            }
+                            store.push(val.unwrap_or_default()).unwrap();
                         }
                     } else {
                         store.extend($buf.values()).unwrap();
@@ -314,10 +317,28 @@ trait SpectrumDataArrayReader {
             match f.data_type() {
                 DataType::Float32 => {
                     let buf: &Float32Array = arr.as_primitive();
+                    if has_nulls {
+                        if is_mz_array {
+                            if let Some(median_delta) = median_delta {
+                                let interpolated = fill_nulls_for(buf, median_delta as f32);
+                                store.extend(&interpolated).unwrap();
+                                continue;
+                            }
+                        }
+                    }
                     extend_array!(buf);
                 }
                 DataType::Float64 => {
                     let buf: &Float64Array = arr.as_primitive();
+                    if has_nulls {
+                        if is_mz_array {
+                            if let Some(median_delta) = median_delta {
+                                let interpolated = fill_nulls_for(buf, median_delta as f64);
+                                store.extend(&interpolated).unwrap();
+                                continue;
+                            }
+                        }
+                    }
                     extend_array!(buf);
                 }
                 DataType::Int32 => {
@@ -376,6 +397,7 @@ impl SpectrumDataCache {
     fn slice_spectrum_data_record_batch_to_arrays_of(
         &mut self,
         index: u64,
+        median_delta: Option<f64>,
     ) -> io::Result<BinaryArrayMap> {
         let mut bin_map = HashMap::new();
         for (k, v) in self.spectrum_array_indices.iter() {
@@ -450,7 +472,7 @@ impl SpectrumDataCache {
             }
         };
 
-        self.populate_arrays_from_struct_array(&points, &mut bin_map);
+        self.populate_arrays_from_struct_array(&points, &mut bin_map, median_delta);
 
         let mut out = BinaryArrayMap::new();
         for v in bin_map.into_values() {
@@ -472,7 +494,7 @@ impl<
 
         let (metadata, query_indices) = Self::load_indices_from(&mut handle)?;
 
-        let this = Self {
+        let mut this = Self {
             path,
             index: 0,
             detail_level: DetailLevel::Full,
@@ -483,6 +505,9 @@ impl<
             spectrum_row_group_cache: None,
             _t: Default::default(),
         };
+
+        this.metadata.median_deltas = this.load_median_deltas()?;
+
         Ok(this)
     }
 
@@ -710,6 +735,7 @@ impl<
             spectrum_array_indices: Arc::new(spectrum_array_indices),
             chromatogram_array_indices: Arc::new(chromatogram_array_indices),
             spectrum_id_index,
+            median_deltas: Vec::new(),
         };
 
         Ok((bundle, query_index))
@@ -778,10 +804,17 @@ impl<
             pages.push(*page);
         }
 
+        let median_delta_of = self
+            .metadata
+            .median_deltas
+            .get(index as usize)
+            .and_then(|v| *v);
+
         // If there is only one row group in the scan, take the fast path through the cache
         if rg_idx_acc.len() == 1 {
             let rg = self.read_spectrum_data_cache(rg_idx_acc[0])?;
-            let arrays = rg.slice_spectrum_data_record_batch_to_arrays_of(index)?;
+            let arrays =
+                rg.slice_spectrum_data_record_batch_to_arrays_of(index, median_delta_of)?;
             return Ok(arrays);
         }
 
@@ -834,6 +867,8 @@ impl<
             [self.metadata.spectrum_array_indices.prefix.as_str()],
         );
 
+        log::trace!("{index} spread across row groups {rg_idx_acc:?}");
+
         let reader = builder
             .with_row_groups(rg_idx_acc)
             .with_row_selection(rows)
@@ -847,9 +882,11 @@ impl<
             bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
         }
 
-        for batch in reader.flatten() {
+        let batches: Vec<_> = reader.flatten().collect();
+        if !batches.is_empty() {
+            let batch = arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
             let points = batch.column(0).as_struct();
-            self.populate_arrays_from_struct_array(points, &mut bin_map);
+            self.populate_arrays_from_struct_array(points, &mut bin_map, median_delta_of);
         }
 
         let mut out = BinaryArrayMap::new();
@@ -1202,6 +1239,10 @@ impl<
         Ok((times, SimpleInterval::new(min, max)))
     }
 
+    /// Read all signal data within the specified `time_range`, optionally constrained to `mz_range` m/z values and/or
+    /// `ion_mobility_range` IM values.
+    ///
+    ///
     pub fn extract_peaks(
         &mut self,
         time_range: SimpleInterval<f32>,
@@ -1582,6 +1623,53 @@ impl<
             // Does not yet support MSn for n > 2
         }
         Ok(descr)
+    }
+
+    pub(crate) fn load_median_deltas(&mut self) -> io::Result<Vec<Option<f64>>> {
+        let builder = self.handle.spectrum_metadata()?;
+
+        let schema = builder.parquet_schema();
+        let mut index_i = None;
+        let mut median_i = None;
+        for (i, c) in schema.columns().iter().enumerate() {
+            let parts = c.path().parts();
+            if parts == ["spectrum", "index"] {
+                index_i = Some(i);
+            }
+            if parts == ["spectrum", "median_delta"] {
+                median_i = Some(i);
+            }
+        }
+
+        let proj = match (index_i, median_i) {
+            (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
+            _ => return Ok(Vec::new()),
+        };
+
+        let reader = builder.with_projection(proj).build()?;
+        let n = self.len();
+        let mut medians = Vec::new();
+        medians.resize(n, None);
+        for batch in reader.flatten() {
+            let root = batch.column(0).as_struct();
+            let index_array: &UInt64Array = root.column(0).as_primitive();
+
+            if let Some(val_array) = root.column(1).as_primitive_opt::<Float32Type>() {
+                for (i, val) in index_array.iter().zip(val_array) {
+                    if let Some(i) = i {
+                        medians[i as usize] = val.map(|v| v as f64);
+                    }
+                }
+            } else if let Some(val_array) = root.column(1).as_primitive_opt::<Float64Type>() {
+                for (i, val) in index_array.iter().zip(val_array) {
+                    if let Some(i) = i {
+                        medians[i as usize] = val;
+                    }
+                }
+            }
+        }
+
+        Ok(medians)
     }
 
     pub(crate) fn load_all_spectrum_metadata_impl(

@@ -22,6 +22,7 @@ fn main() -> io::Result<()> {
     let mut i = 0;
     let mut points = 0;
     for spec in reader {
+        log::debug!("Read spectrum {i}");
         if i % 5000 == 0 {
             log::info!("Read spectrum {i}");
         }

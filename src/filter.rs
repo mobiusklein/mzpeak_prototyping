@@ -2,12 +2,14 @@ use std::{fmt::Display, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrowPrimitiveType, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, UInt64Array
-    }, buffer::NullBuffer, compute::{kernels::cmp::eq, nullif, take_record_batch}, datatypes::{DataType, Schema}
+        Array, ArrowPrimitiveType, AsArray, BooleanArray, Float32Array, Float64Array, PrimitiveArray, RecordBatch, UInt64Array
+    },
+    buffer::NullBuffer,
+    compute::{nullif, take_record_batch},
+    datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, Schema},
 };
 
 use num_traits::{Float, Num, Zero};
-
 
 pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I) -> Vec<T> {
     let mut last = None;
@@ -25,14 +27,14 @@ pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I) -> Vec<T> {
 
 pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
     let n = deltas.len();
-    let median = if n <= 1 {
+    let median = if n <= 2 {
         deltas.first().copied()
     } else {
         let mid = n / 2;
         if n % 2 == 1 {
             Some(deltas[mid])
         } else {
-            Some(((deltas[mid] + deltas[mid + 1])) / (T::one() + T::one()))
+            Some((deltas[mid] + deltas[mid + 1]) / (T::one() + T::one()))
         }
     };
     median
@@ -49,46 +51,61 @@ pub fn estimate_median_delta<T: Float, I: IntoIterator<Item = T>>(iter: I) -> (T
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NullFillState {
     Unset,
-    /// The coordinate is null, at the start of the interval
+    /// The coordinate is null at the start of the interval
     NullStart(usize),
-    /// The coordinate is null, at the end of the interval
+    /// The coordinate is null at the end of the interval
     NullEnd(usize),
     /// Both coordinates are nulls
     NullBounded(usize, usize),
     Done,
 }
 
-
-struct NullTokenizer<'a, T: ArrowPrimitiveType> {
-    array: &'a PrimitiveArray<T>,
+struct NullTokenizer<'a> {
+    array: &'a NullBuffer,
     i: usize,
     state: NullFillState,
     next_state: NullFillState,
 }
 
-impl<'a, T: ArrowPrimitiveType> NullTokenizer<'a, T> {
-    fn new(array: &'a PrimitiveArray<T>) -> Self {
-        let mut this = Self { array, i: 0, state: NullFillState::Unset, next_state: NullFillState::Unset };
+impl<'a> Iterator for NullTokenizer<'a> {
+    type Item = NullFillState;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let state = self.emit();
+        if !matches!(state, NullFillState::Done) {
+            Some(state)
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> NullTokenizer<'a> {
+    fn new(array: &'a NullBuffer) -> Self {
+        let mut this = Self {
+            array,
+            i: 0,
+            state: NullFillState::Unset,
+            next_state: NullFillState::Unset,
+        };
         this.initialize_state();
         this
     }
 
     fn initialize_state(&mut self) {
         self.i = 0;
+        let start_null = self.is_null();
         self.find_next_null();
-        if self.i != 0 {
+        if !start_null {
             self.state = NullFillState::NullEnd(self.i);
-            if self.is_next_null() {
-                if self.advance() {
-                    let start = self.i;
-                    self.find_next_null();
-                    if self.is_null() {
-                        self.next_state = NullFillState::NullBounded(start, self.i)
-                    } else {
-                        self.next_state = NullFillState::NullStart(start)
-                    }
-                }
+            self.update_next_state();
+        } else {
+            let start = 0;
+            if self.is_null() {
+                self.state = NullFillState::NullBounded(start, self.i);
+                self.update_next_state();
             }
+            // TODO: Do we need to handle the `else` here?
         }
     }
 
@@ -96,7 +113,7 @@ impl<'a, T: ArrowPrimitiveType> NullTokenizer<'a, T> {
         // self.state = self.next_state;
         let prev = self.i;
         self.find_next_null();
-        let diff = self.i - prev;
+        let diff = self.i.saturating_sub(prev);
         if diff == 0 {
             // We are at the end
             self.next_state = NullFillState::Done
@@ -126,125 +143,131 @@ impl<'a, T: ArrowPrimitiveType> NullTokenizer<'a, T> {
     }
 
     fn advance(&mut self) -> bool {
-        if self.i < self.array.len() {
+        if self.i < self.array.len().saturating_sub(1) {
             self.i += 1;
-            return true
+            return true;
         }
         return false;
     }
 
     fn find_next_null(&mut self) {
-        eprintln!("Starting at {}", self.i);
+        self.advance();
+        // eprintln!("Starting at {}", self.i);
         while self.i < self.array.len() && self.is_valid() {
-            self.i += 1;
+            if !self.advance() {
+                break;
+            }
         }
-        eprintln!("Ending at {}", self.i);
-    }
-
-    fn is_next_valid(&self) -> bool {
-        self.array.is_valid(self.i + 1)
-    }
-
-    fn is_next_null(&self) -> bool {
-        self.array.is_null(self.i + 1)
+        // eprintln!("Ending at {}", self.i);
     }
 
     fn emit(&mut self) -> NullFillState {
         let state = self.state;
+        self.state = self.next_state;
         self.update_next_state();
         state
     }
 }
 
-
-pub fn fill_nulls_for<T: ArrowPrimitiveType>(data: &PrimitiveArray<T>, common_delta: T::Native) -> Vec<T::Native> where T::Native : Float + Display {
+pub fn fill_nulls_for<T: ArrowPrimitiveType>(
+    data: &PrimitiveArray<T>,
+    common_delta: T::Native,
+) -> Vec<T::Native>
+where
+    T::Native: Float + Display,
+{
     let Some(nulls) = data.nulls() else {
         let mut buffer: Vec<T::Native> = Vec::with_capacity(data.len());
         for i in 0..data.len() {
             buffer.push(data.value(i));
         }
-        return buffer
+        return buffer;
     };
 
-    let it = nulls.iter().enumerate().filter(|(_i, f)| !*f);
-    let mut last_null = Some(0);
-    let mut buffer: Vec<T::Native> = Vec::with_capacity(data.len());
-    let mut backfill = None;
-    for (i, _is_not_null) in it {
-        if let Some(last_null) = last_null {
-            let diff = i - last_null;
-            eprintln!("{i} | {last_null} | {backfill:?}");
-            if diff == 0 {
-                continue;
-            }
-            if diff == 1 {
-                // run of null, start new frame
-                eprintln!("Null run at {i} ({} @ {})", buffer.last().unwrap(), buffer.len());
-                backfill = Some(buffer.len());
-                buffer.push(T::Native::zero());
-            } else if diff == 2 {
-                eprintln!("Point from {last_null} to {i} ({})", buffer.last().unwrap());
-                buffer.push(data.value(i - 1));
-                buffer.push(*buffer.last().unwrap() + common_delta);
-                if let Some(backfill_idx) = backfill {
-                    // eprintln!("Backfilling {backfill_idx}");
-                    buffer[backfill_idx] = buffer[backfill_idx + 1] - common_delta;
-                    backfill = None;
-                }
-            } else {
-                eprintln!("Filling span from {} to {}", last_null + 1, i);
-                // a span of non-null values
-                for j in (last_null + 1)..i {
-                    buffer.push(data.value(j));
-                }
-                let local_delta = estimate_median_delta(buffer[last_null + 1..].iter().copied()).0;
-                eprintln!("Local delta = {local_delta}");
-                let next_val = data.value(i.saturating_sub(1)) + local_delta;
-                buffer.push(next_val);
-                if let Some(backfill_idx) = backfill {
-                    // eprintln!("Backfilling {backfill_idx}");
-                    buffer[backfill_idx] = buffer[backfill_idx + 1] - local_delta;
-                    backfill = None;
-                }
-            }
-        }
-        last_null = Some(i);
-    }
+    let it = NullTokenizer::new(nulls);
+    let n = data.len();
+    let mut buffer: Vec<T::Native> = Vec::with_capacity(n);
 
-    if let Some(backfill_idx) = backfill {
-        let i = data.len();
-        let diff = i - backfill_idx;
-        eprintln!("Backfilling {backfill_idx}");
-        eprintln!("{i} | {last_null:?} | {backfill:?}");
-
-        backfill = None;
-        if diff == 2 {
-            eprintln!("Point from {backfill_idx} to {i} ({})", buffer.last().unwrap());
-            buffer.push(data.value(i - 1));
-            buffer.push(*buffer.last().unwrap() + common_delta);
-            if let Some(backfill_idx) = backfill {
-                eprintln!("Backfilling {backfill_idx}");
-                buffer[backfill_idx] = buffer[backfill_idx + 1] - common_delta;
-            }
-        } else if diff > 0 {
-            eprintln!("Filling span from {} to {}", backfill_idx + 1, i);
-            // a span of non-null values
-            for j in (backfill_idx + 1)..i {
-                buffer.push(data.value(j));
-            }
-            let local_delta = estimate_median_delta(buffer[backfill_idx + 1..].iter().copied()).0;
-            // eprintln!("Local delta = {local_delta}");
-            let next_val = data.value(i.saturating_sub(1)) + local_delta;
-            buffer.push(next_val);
-            if let Some(backfill_idx) = backfill {
-                eprintln!("Backfilling {backfill_idx}");
-                buffer[backfill_idx] = buffer[backfill_idx + 1] - local_delta;
+    for null_span in it {
+        match null_span {
+            NullFillState::NullStart(start) => {
+                let length = (n - start) - 1;
+                let real_values = data.slice(start + 1, length);
+                if length == 1 {
+                    let val = real_values.value(0);
+                    buffer.push(val - common_delta);
+                    buffer.push(val);
+                } else {
+                    let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
+                    let val0 = real_values.value(0);
+                    buffer.push(val0 - local_delta);
+                    buffer.extend(real_values.iter().flatten());
+                }
+            },
+            NullFillState::NullEnd(end) => {
+                let start = 0;
+                let length = end - start;
+                let real_values = data.slice(start, length);
+                if length == 1 {
+                    let val = real_values.value(0);
+                    buffer.push(val);
+                    buffer.push(val + common_delta);
+                } else {
+                    let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
+                    buffer.extend(real_values.iter().flatten());
+                    buffer.push(*buffer.last().unwrap() + local_delta);
+                }
+            },
+            NullFillState::NullBounded(start, end) => {
+                let length = (end - start) - 1;
+                let real_values = data.slice(start + 1, length);
+                if length == 1 {
+                    let val = real_values.value(0);
+                    buffer.push(val - common_delta);
+                    buffer.push(val);
+                    buffer.push(val + common_delta);
+                } else {
+                    let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
+                    let val0 = real_values.value(0);
+                    buffer.push(val0 - local_delta);
+                    buffer.extend(real_values.iter().flatten());
+                    buffer.push(*buffer.last().unwrap() + local_delta);
+                }
+            },
+            NullFillState::Unset | NullFillState::Done => {
+                unimplemented!("These states should never occur")
             }
         }
     }
     buffer
 }
 
+fn _skip_zero_runs2<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>) -> Vec<u64> where T::Native: Zero + PartialEq + Display {
+    let z = T::Native::zero();
+    let n = array.len();
+    let n1 = n.saturating_sub(1);
+    let mut was_zero = false;
+    let mut acc = Vec::new();
+    for (i, v) in array.iter().enumerate() {
+        if let Some(v) = v {
+            if v == z {
+                if was_zero && ((i < n1 && array.value(i + 1) == z) || i == n1) {
+                    // Skip, do not take values between two zeros
+                } else {
+                    acc.push(i as u64)
+                }
+                was_zero = true;
+            } else {
+                acc.push(i as u64);
+                was_zero = false;
+            }
+        } else {
+            acc.push(i as u64);
+            was_zero = false;
+        }
+    }
+    acc.into()
+}
 
 /// A type-generic filter to find indices where the value isn't in the middle of a run of zeros.
 fn _skip_zero_runs<T: Num + Copy, I: Iterator<Item = Option<T>>>(iter: I) -> Vec<u64> {
@@ -258,7 +281,8 @@ fn _skip_zero_runs<T: Num + Copy, I: Iterator<Item = Option<T>>>(iter: I) -> Vec
                 points.push(i as u64);
             }
         } else {
-            if was_zero {
+
+            if was_zero && points.last().is_some_and(|j| *j != (i as u64) - 1) {
                 points.push(i as u64 - 1);
             }
             was_zero = false;
@@ -270,9 +294,9 @@ fn _skip_zero_runs<T: Num + Copy, I: Iterator<Item = Option<T>>>(iter: I) -> Vec
 
 pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
     if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
-        Some(_skip_zero_runs(array.iter()))
+        Some(_skip_zero_runs2(array))
     } else if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-        Some(_skip_zero_runs(array.iter()))
+        Some(_skip_zero_runs2(array))
     } else {
         None
     }
@@ -290,17 +314,45 @@ pub fn drop_where_column_is_zero(
     }
 }
 
+fn is_zero_pair_mask<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>) -> BooleanArray where T::Native : Zero + PartialEq {
+    let z = T::Native::zero();
+    let n = array.len();
+    let n1 = n.saturating_sub(1);
+    let mut was_zero = false;
+    let mut acc = Vec::new();
+    for (i, v) in array.iter().enumerate() {
+        if let Some(v) = v {
+            if v == z {
+                if was_zero || (i < n1 && array.value(i + 1) == z) {
+                    acc.push(true);
+                } else {
+                    acc.push(false)
+                }
+                was_zero = true;
+            } else {
+                acc.push(false);
+                was_zero = false;
+            }
+        } else {
+            acc.push(false);
+            was_zero = false;
+        }
+    }
+    assert_eq!(acc.len(), n);
+    acc.into()
+}
+
 pub fn nullify_at_zero(
     batch: &RecordBatch,
     column_index: usize,
-    skip_indices: &[usize],
+    target_indices: &[usize],
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
     let target_array = batch.column(column_index);
     let mask = match target_array.data_type() {
-        DataType::Float32 => eq(target_array, &Float32Array::new_scalar(0.0))?,
-        DataType::Float64 => eq(target_array, &Float64Array::new_scalar(0.0))?,
-        DataType::Int32 => eq(target_array, &Int32Array::new_scalar(0))?,
-        DataType::Int64 => eq(target_array, &Int64Array::new_scalar(0))?,
+        DataType::Float32 => is_zero_pair_mask(target_array.as_primitive::<Float32Type>()),
+        DataType::Float64 => is_zero_pair_mask(target_array.as_primitive::<Float64Type>()),
+        DataType::Int32 => is_zero_pair_mask(target_array.as_primitive::<Int32Type>()),
+        DataType::Int64 => is_zero_pair_mask(target_array.as_primitive::<Int64Type>()),
         _ => panic!("Unsupported data type {:?}", target_array.data_type()),
     };
 
@@ -313,7 +365,7 @@ pub fn nullify_at_zero(
         .collect();
 
     for (i, col) in cols.iter_mut().enumerate() {
-        if skip_indices.contains(&i) {
+        if !target_indices.contains(&i) {
             continue;
         }
         *col = nullif(col, &mask)?;
@@ -322,10 +374,28 @@ pub fn nullify_at_zero(
     RecordBatch::try_new(Arc::new(Schema::new(schema)), cols)
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_zero_runs() {
+        let data = Float64Array::from(vec![
+            Some(0.0), // 0
+            Some(101.0), // 1
+            Some(101.01), // 2
+            Some(101.02), // 3
+            Some(0.0), // 4
+            Some(0.0), // 5 This position should drop!
+            Some(0.0), // 6
+            Some(101.5), // 7
+            Some(0.0), // 8
+        ]);
+        let indices = _skip_zero_runs2(&data);
+        assert!(!indices.contains(&5), "index 5 should not be in {indices:?}");
+        eprintln!("{indices:?}");
+    }
+
 
     #[test]
     fn test_null_filling() {
@@ -339,9 +409,14 @@ mod test {
             Some(101.5),
             None,
         ]);
-        let data = data;
-        let filled = fill_nulls_for(&data, 0.02f64);
-        eprintln!("{filled:?}")
+        let mut tokenizer = NullTokenizer::new(data.nulls().unwrap());
+        let a = tokenizer.next().unwrap();
+        assert_eq!(a, NullFillState::NullBounded(0, 4));
+        let b = tokenizer.next().unwrap();
+        assert_eq!(b, NullFillState::NullBounded(5, 7));
+
+        let filled = fill_nulls_for(&data, 0.015);
+        eprintln!("{filled:?}");
     }
 
     #[test]
@@ -355,19 +430,36 @@ mod test {
             None,
             Some(101.5),
         ]);
-        let data = data;
-        // let filled = fill_nulls_for(&data, 0.02f64);
-        // eprintln!("{filled:?}")
-        let mut tokenizer = NullTokenizer::new(&data);
-        loop {
-            let out = tokenizer.emit();
-            match out {
-                NullFillState::Unset => eprintln!("{out:?}"),
-                NullFillState::NullStart(_) => eprintln!("{out:?}"),
-                NullFillState::NullEnd(_) => eprintln!("{out:?}"),
-                NullFillState::NullBounded(_, _) => eprintln!("{out:?}"),
-                NullFillState::Done => break,
-            }
-        }
+        let mut tokenizer = NullTokenizer::new(data.nulls().unwrap());
+
+        let a = tokenizer.next().unwrap();
+        assert_eq!(a, NullFillState::NullBounded(0, 4));
+        let b = tokenizer.next().unwrap();
+        assert_eq!(b, NullFillState::NullStart(5));
+
+        let filled = fill_nulls_for(&data, 0.015);
+        eprintln!("{filled:?}");
+    }
+
+    #[test]
+    fn test_null_filling_no_prefix_suffix() {
+        let data = Float64Array::from(vec![
+            Some(101.0),
+            Some(101.01),
+            Some(101.02),
+            None,
+            None,
+            Some(101.5),
+        ]);
+        let mut tokenizer = NullTokenizer::new(data.nulls().unwrap());
+
+        let a = tokenizer.next().unwrap();
+
+        assert_eq!(a, NullFillState::NullEnd(3));
+        let b = tokenizer.next().unwrap();
+        assert_eq!(b, NullFillState::NullStart(4));
+
+        let filled = fill_nulls_for(&data, 0.015);
+        eprintln!("{filled:?}");
     }
 }

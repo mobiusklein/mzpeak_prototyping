@@ -26,7 +26,7 @@ use mzdata::{
 };
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
-use crate::filter::estimate_median_delta;
+use crate::{filter::estimate_median_delta, peak_series::array_map_to_schema_arrays_and_excess, spectrum::AuxiliaryArray};
 #[allow(unused)]
 use crate::{
     archive::ZipArchiveWriter,
@@ -97,11 +97,13 @@ pub fn sample_array_types<
 #[derive(Debug)]
 pub struct ArrayBuffers {
     pub peak_array_fields: Fields,
+    pub buffer_context: BufferContext,
     pub schema: SchemaRef,
     pub prefix: String,
     pub array_chunks: HashMap<String, Vec<ArrayRef>>,
     pub overrides: HashMap<BufferName, BufferName>,
     pub drop_zero_column: Option<Vec<String>>,
+    pub null_zeros: bool,
     pub is_profile_buffer: Vec<bool>,
 }
 
@@ -206,8 +208,25 @@ impl ArrayBuffers {
             }
         }
 
+        let null_zeros = self.null_zeros;
         let is_profile = core::mem::take(&mut self.is_profile_buffer);
         let schema = SchemaRef::new(Schema::new(self.peak_array_fields.clone()));
+
+        let mut null_targets = Vec::new();
+        if null_zeros {
+            for (i, f) in schema.fields().iter().enumerate() {
+                let is_nullable = if let Some(bname) = BufferName::from_field(self.buffer_context, f.clone()) {
+                    matches!(bname.array_type, ArrayType::MZArray | ArrayType::IntensityArray)
+                } else {
+                    false
+                };
+                if is_nullable {
+                    null_targets.push(i);
+                }
+
+            }
+        }
+
         let drop_zero_columns = self.drop_zero_column.clone();
         chunks
             .into_iter()
@@ -228,14 +247,16 @@ impl ArrayBuffers {
                                     log::error!("Failed to subset batch: {e}");
                                 }
                             }
-                            // match nullify_at_zero(&batch, i, &[0]) {
-                            //     Ok(b) => {
-                            //         batch = b;
-                            //     },
-                            //     Err(e) => {
-                            //         log::error!("Failed to nullify batch: {e}");
-                            //     }
-                            // }
+                            if null_zeros {
+                                match nullify_at_zero(&batch, i, &null_targets) {
+                                    Ok(b) => {
+                                        batch = b;
+                                    },
+                                    Err(e) => {
+                                        log::error!("Failed to nullify batch: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -250,6 +271,7 @@ pub struct ArrayBuffersBuilder {
     prefix: String,
     peak_array_fields: Vec<FieldRef>,
     overrides: HashMap<BufferName, BufferName>,
+    null_zeros: bool,
 }
 
 impl Default for ArrayBuffersBuilder {
@@ -258,6 +280,7 @@ impl Default for ArrayBuffersBuilder {
             prefix: "point".to_string(),
             peak_array_fields: Default::default(),
             overrides: HashMap::new(),
+            null_zeros: false,
         }
     }
 }
@@ -342,7 +365,12 @@ impl ArrayBuffersBuilder {
         });
     }
 
-    pub fn build(mut self, schema: SchemaRef, mask_zero_intensity_runs: bool) -> ArrayBuffers {
+    pub fn null_zeros(mut self, null_zeros: bool) -> Self {
+        self.null_zeros = null_zeros;
+        self
+    }
+
+    pub fn build(mut self, schema: SchemaRef, buffer_context: BufferContext, mask_zero_intensity_runs: bool) -> ArrayBuffers {
         self.canonicalize_field_order();
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
@@ -364,6 +392,7 @@ impl ArrayBuffersBuilder {
             None
         };
         ArrayBuffers {
+            buffer_context,
             peak_array_fields: self.peak_array_fields.clone().into(),
             schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
             prefix: self.prefix.clone(),
@@ -371,6 +400,7 @@ impl ArrayBuffersBuilder {
             overrides: self.overrides.clone(),
             drop_zero_column,
             is_profile_buffer: Vec::new(),
+            null_zeros: self.null_zeros,
         }
     }
 }
@@ -411,6 +441,11 @@ impl MzPeakWriterBuilder {
 
     pub fn shuffle_mz(mut self, shuffle_mz: bool) -> Self {
         self.shuffle_mz = shuffle_mz;
+        self
+    }
+
+    pub fn null_zeros(mut self, null_zeros: bool) -> Self {
+        self.spectrum_arrays = self.spectrum_arrays.null_zeros(null_zeros);
         self
     }
 
@@ -670,9 +705,15 @@ pub trait AbstractMzPeakWriter {
         spectrum: &impl SpectrumLike<C, D>,
     ) -> io::Result<()> {
         log::trace!("Writing spectrum {}", spectrum.id());
-        let entries = self.spectrum_to_entries(spectrum);
+        let (median_delta, aux_arrays) = self.write_spectrum_peaks(spectrum)?;
+        let mut entries = self.spectrum_to_entries(spectrum);
+        if let Some(entry) = entries.first_mut() {
+            if let Some(spec_ent) = entry.spectrum.as_mut() {
+                spec_ent.median_delta = median_delta;
+                spec_ent.auxiliary_arrays.extend(aux_arrays.unwrap_or_default());
+            }
+        }
         self.spectrum_entry_buffer_mut().extend(entries);
-        self.write_spectrum_peaks(spectrum)?;
         *self.spectrum_counter_mut() += 1;
         self.check_data_buffer()?;
         Ok(())
@@ -684,43 +725,52 @@ pub trait AbstractMzPeakWriter {
     >(
         &mut self,
         spectrum: &impl SpectrumLike<C, D>,
-    ) -> io::Result<()> {
+    ) -> io::Result<(Option<f64>, Option<Vec<AuxiliaryArray>>)> {
         let spectrum_count = self.spectrum_counter();
-        match spectrum.peaks() {
-            mzdata::spectrum::RefPeakDataLevel::Missing => {}
+        let (median_delta, aux_arrays) = match spectrum.peaks() {
+            mzdata::spectrum::RefPeakDataLevel::Missing => {
+                (None, None)
+            }
             mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => {
                 let n_points = spectrum.peaks().len();
-                if let Ok(mzs) = binary_array_map.mzs() {
-                    let (median_delta, _deltas) = estimate_median_delta(mzs.iter().copied());
-                    eprintln!("Median of {spectrum_count} = {median_delta}");
-                }
-                let (fields, data) = array_map_to_schema_arrays(
-                    crate::BufferContext::Spectrum,
-                    binary_array_map,
-                    n_points,
-                    spectrum_count,
-                    "spectrum_index",
-                    &self.spectrum_data_buffer_mut().overrides,
-                )?;
+                let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;
+                let median_delta = if is_profile {
+                    if let Ok(mzs) = binary_array_map.mzs() {
+                        let (median_delta, _deltas) = estimate_median_delta(mzs.iter().copied());
+                        Some(median_delta)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                self.spectrum_data_buffer_mut().add_arrays(
+                let buffer = self.spectrum_data_buffer_mut();
+
+                let (fields, data, extra_arrays) = array_map_to_schema_arrays_and_excess(
+                    BufferContext::Spectrum, binary_array_map, n_points, spectrum_count, "spectrum_index", &buffer.peak_array_fields, &buffer.overrides)?;
+
+                buffer.add_arrays(
                     fields,
                     data,
                     n_points,
-                    spectrum.signal_continuity() == SignalContinuity::Profile,
+                    is_profile,
                 );
+                (median_delta, Some(extra_arrays))
             }
             mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) => {
                 self.spectrum_data_buffer_mut()
                     .add(spectrum_count, peaks.as_slice());
+                (None, None)
             }
             mzdata::spectrum::RefPeakDataLevel::Deconvoluted(peaks) => {
                 self.spectrum_data_buffer_mut()
                     .add(spectrum_count, peaks.as_slice());
+                (None, None)
             }
-        }
+        };
 
-        Ok(())
+        Ok((median_delta, aux_arrays))
     }
 }
 
@@ -902,8 +952,8 @@ impl<
         let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
         let spectrum_buffers =
-            spectrum_buffers.build(Arc::new(Schema::empty()), mask_zero_intensity_runs);
-        let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()), false);
+            spectrum_buffers.build(Arc::new(Schema::empty()), BufferContext::Spectrum, mask_zero_intensity_runs);
+        let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()), BufferContext::Chromatogram, false);
 
         let mut writer = ZipArchiveWriter::new(writer);
         writer.start_spectrum_data().unwrap();
@@ -1255,8 +1305,8 @@ impl<
         let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
         let spectrum_buffers =
-            spectrum_buffers.build(Arc::new(Schema::empty()), mask_zero_intensity_runs);
-        let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()), false);
+            spectrum_buffers.build(Arc::new(Schema::empty()), BufferContext::Spectrum, mask_zero_intensity_runs);
+        let chromatogram_buffers = chromatogram_buffers.build(Arc::new(Schema::empty()), BufferContext::Chromatogram, false);
 
         let data_props = Self::data_writer_props(&spectrum_buffers, shuffle_mz);
         let metadata_props = Self::metadata_writer_props(&metadata_fields);

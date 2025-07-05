@@ -3,19 +3,9 @@ use mzdata::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CURIE, SelectedIonEntry, PrecursorEntry, ScanEntry, SpectrumEntry,
-    param::Param, peak_series::ToMzPeakDataSeries,
+    PrecursorEntry, ScanEntry, SelectedIonEntry, SpectrumEntry, peak_series::ToMzPeakDataSeries,
+    spectrum::ChromatogramEntry,
 };
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct ChromatogramEntry {
-    pub index: Option<u64>,
-    pub id: String,
-    pub polarity: i8,
-    pub chromatogram_type: CURIE,
-    pub number_of_data_points: Option<u64>,
-    pub parameters: Vec<Param>,
-}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct Entry {
@@ -23,7 +13,6 @@ pub struct Entry {
     pub scan: Option<Box<ScanEntry>>,
     pub precursor: Option<Box<PrecursorEntry>>,
     pub selected_ion: Option<Box<SelectedIonEntry>>,
-    pub chromatogram: Option<Box<ChromatogramEntry>>,
 }
 
 impl Entry {
@@ -62,7 +51,6 @@ impl Entry {
                 precursor,
                 Some(spectrum.index() as u64),
                 precursor_index.as_ref().map(|v| **v),
-
             );
             let prec_index = prec.precursor_index;
             if let Some(pi) = precursor_index {
@@ -118,4 +106,11 @@ impl From<SelectedIonEntry> for Entry {
         this.selected_ion = Some(Box::new(value));
         this
     }
+}
+
+pub struct ChromatogramMetadataEntry {
+    pub spectrum: Option<Box<ChromatogramEntry>>,
+    pub scan: Option<Box<ScanEntry>>,
+    pub precursor: Option<Box<PrecursorEntry>>,
+    pub selected_ion: Option<Box<SelectedIonEntry>>,
 }
