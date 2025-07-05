@@ -1,7 +1,7 @@
 use mzdata::{
     params::{ControlledVocabulary, Unit},
     prelude::*,
-    spectrum::{DataArray, IsolationWindowState, ScanEvent},
+    spectrum::{DataArray, IsolationWindowState, ScanEvent, bindata::BinaryCompressionType},
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,7 @@ use crate::{
 pub struct AuxiliaryArray {
     pub data: Vec<u8>,
     pub data_type: CURIE,
+    pub compression: CURIE,
     pub unit: Option<CURIE>,
     pub parameters: Vec<Param>,
 }
@@ -22,19 +23,35 @@ impl AuxiliaryArray {
     pub fn from_data_array(
         source: &DataArray,
     ) -> Result<Self, mzdata::spectrum::bindata::ArrayRetrievalError> {
-        let data = source.decode()?.to_vec();
-        let curie = source
-            .dtype()
+        let mut source = source.clone();
+        if source.compression == BinaryCompressionType::Decoded {
+            source.store_compressed(BinaryCompressionType::Zstd)?;
+        }
+        let data = source.data;
+        let data_type = source
+            .dtype
             .curie()
             .ok_or_else(|| mzdata::spectrum::bindata::ArrayRetrievalError::DataTypeSizeMismatch)?
             .into();
         let unit = source.unit.to_curie().map(|c| c.into());
-        let this = Self {
+        let compression = source
+            .compression
+            .as_param()
+            .unwrap()
+            .curie()
+            .unwrap()
+            .into();
+        let mut this = Self {
             data,
-            data_type: curie,
+            data_type,
+            compression,
             unit,
             parameters: Default::default(),
         };
+        if let Some(params) = source.params {
+            this.parameters
+                .extend(params.iter().map(|p| Param::from(p.clone())));
+        }
         Ok(this)
     }
 }
@@ -68,6 +85,7 @@ pub struct SpectrumEntry {
 
     pub data_processing_ref: Option<u32>,
     pub auxiliary_arrays: Vec<AuxiliaryArray>,
+    pub median_delta: Option<f64>,
 }
 
 impl SpectrumEntry {
@@ -401,4 +419,14 @@ impl SelectedIonEntry {
 
         si
     }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+pub struct ChromatogramEntry {
+    pub index: Option<u64>,
+    pub id: String,
+    pub polarity: i8,
+    pub chromatogram_type: CURIE,
+    pub number_of_data_points: Option<u64>,
+    pub parameters: Vec<Param>,
 }
