@@ -85,7 +85,7 @@ pub struct SpectrumEntry {
 
     pub data_processing_ref: Option<u32>,
     pub auxiliary_arrays: Vec<AuxiliaryArray>,
-    pub median_delta: Option<f64>,
+    pub median_delta: Option<Vec<f64>>,
 }
 
 impl SpectrumEntry {

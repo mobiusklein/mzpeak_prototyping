@@ -26,7 +26,7 @@ use mzdata::{
 };
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
-use crate::{filter::estimate_median_delta, peak_series::array_map_to_schema_arrays_and_excess, spectrum::AuxiliaryArray};
+use crate::{filter::select_delta_model, peak_series::array_map_to_schema_arrays_and_excess, spectrum::AuxiliaryArray};
 #[allow(unused)]
 use crate::{
     archive::ZipArchiveWriter,
@@ -725,7 +725,7 @@ pub trait AbstractMzPeakWriter {
     >(
         &mut self,
         spectrum: &impl SpectrumLike<C, D>,
-    ) -> io::Result<(Option<f64>, Option<Vec<AuxiliaryArray>>)> {
+    ) -> io::Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>)> {
         let spectrum_count = self.spectrum_counter();
         let (median_delta, aux_arrays) = match spectrum.peaks() {
             mzdata::spectrum::RefPeakDataLevel::Missing => {
@@ -736,8 +736,17 @@ pub trait AbstractMzPeakWriter {
                 let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;
                 let median_delta = if is_profile {
                     if let Ok(mzs) = binary_array_map.mzs() {
-                        let (median_delta, _deltas) = estimate_median_delta(mzs.iter().copied());
-                        Some(median_delta)
+                        let delta_model = if let Ok(ints) = binary_array_map.intensities() {
+                            let weights: Vec<f64> = ints.iter().map(|i| {
+                                (*i + 1.0).ln().sqrt() as f64
+                            }).collect();
+                            select_delta_model(&mzs, Some(&weights))
+                        } else {
+                            select_delta_model(&mzs, None)
+                        };
+
+                        // let (median_delta, _deltas) = estimate_median_delta(mzs.iter().copied());
+                        Some(delta_model)
                     } else {
                         None
                     }

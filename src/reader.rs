@@ -16,6 +16,7 @@ use arrow::{
     datatypes::{DataType, FieldRef, Float32Type, Float64Type},
 };
 
+use itertools::Itertools;
 use mzdata::{
     io::{DetailLevel, OffsetIndex},
     meta::{self, MSDataFileMetadata},
@@ -31,7 +32,10 @@ use mzpeaks::{
     prelude::Span1D,
 };
 
-use crate::{archive::ZipArchiveReader, filter::fill_nulls_for};
+use crate::{
+    archive::ZipArchiveReader,
+    filter::{RegressionDeltaModel, fill_nulls_for},
+};
 
 #[allow(unused)]
 use parquet::{
@@ -107,7 +111,7 @@ pub struct MzPeakReaderMetadata {
     pub spectrum_array_indices: Arc<ArrayIndex>,
     pub chromatogram_array_indices: Arc<ArrayIndex>,
     pub spectrum_id_index: OffsetIndex,
-    median_deltas: Vec<Option<f64>>,
+    median_deltas: Vec<Option<Vec<f64>>>,
 }
 
 impl MSDataFileMetadata for MzPeakReaderMetadata {
@@ -291,7 +295,7 @@ trait SpectrumDataArrayReader {
         &self,
         points: &StructArray,
         bin_map: &mut HashMap<&String, DataArray>,
-        median_delta: Option<f64>,
+        mut median_delta: Option<Vec<f64>>,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
             if f.name() == "spectrum_index" {
@@ -319,8 +323,17 @@ trait SpectrumDataArrayReader {
                     let buf: &Float32Array = arr.as_primitive();
                     if has_nulls {
                         if is_mz_array {
-                            if let Some(median_delta) = median_delta {
-                                let interpolated = fill_nulls_for(buf, median_delta as f32);
+                            if let Some(median_delta) = median_delta.as_ref() {
+                                let interpolated = fill_nulls_for(
+                                    buf,
+                                    &RegressionDeltaModel::from(
+                                        median_delta
+                                            .iter()
+                                            .copied()
+                                            .map(|v| v as f32)
+                                            .collect_vec(),
+                                    ),
+                                );
                                 store.extend(&interpolated).unwrap();
                                 continue;
                             }
@@ -332,8 +345,9 @@ trait SpectrumDataArrayReader {
                     let buf: &Float64Array = arr.as_primitive();
                     if has_nulls {
                         if is_mz_array {
-                            if let Some(median_delta) = median_delta {
-                                let interpolated = fill_nulls_for(buf, median_delta as f64);
+                            if let Some(median_delta) = median_delta.take() {
+                                let interpolated =
+                                    fill_nulls_for(buf, &RegressionDeltaModel::from(median_delta));
                                 store.extend(&interpolated).unwrap();
                                 continue;
                             }
@@ -397,7 +411,7 @@ impl SpectrumDataCache {
     fn slice_spectrum_data_record_batch_to_arrays_of(
         &mut self,
         index: u64,
-        median_delta: Option<f64>,
+        median_delta: Option<Vec<f64>>,
     ) -> io::Result<BinaryArrayMap> {
         let mut bin_map = HashMap::new();
         for (k, v) in self.spectrum_array_indices.iter() {
@@ -808,7 +822,7 @@ impl<
             .metadata
             .median_deltas
             .get(index as usize)
-            .and_then(|v| *v);
+            .and_then(|v| v.clone());
 
         // If there is only one row group in the scan, take the fast path through the cache
         if rg_idx_acc.len() == 1 {
@@ -1625,7 +1639,7 @@ impl<
         Ok(descr)
     }
 
-    pub(crate) fn load_median_deltas(&mut self) -> io::Result<Vec<Option<f64>>> {
+    pub(crate) fn load_median_deltas(&mut self) -> io::Result<Vec<Option<Vec<f64>>>> {
         let builder = self.handle.spectrum_metadata()?;
 
         let schema = builder.parquet_schema();
@@ -1636,7 +1650,7 @@ impl<
             if parts == ["spectrum", "index"] {
                 index_i = Some(i);
             }
-            if parts == ["spectrum", "median_delta"] {
+            if parts.iter().zip(["spectrum", "median_delta"]).all(|(a, b)| a == b) {
                 median_i = Some(i);
             }
         }
@@ -1654,16 +1668,42 @@ impl<
             let root = batch.column(0).as_struct();
             let index_array: &UInt64Array = root.column(0).as_primitive();
 
-            if let Some(val_array) = root.column(1).as_primitive_opt::<Float32Type>() {
+            if let Some(val_array) = root.column(1).as_list_opt::<i64>() {
+                match val_array.value_type() {
+                    DataType::Float32 => {
+                        for (i, val) in index_array.iter().zip(val_array.iter()) {
+                            if let Some(i) = i {
+                                medians[i as usize] = val.map(|v| -> Vec<f64> {
+                                    v.as_primitive::<Float32Type>()
+                                        .iter()
+                                        .map(|i| i.unwrap() as f64)
+                                        .collect()
+                                });
+                            }
+                        }
+                    }
+                    DataType::Float64 => {
+                        for (i, val) in index_array.iter().zip(val_array.iter()) {
+                            if let Some(i) = i {
+                                medians[i as usize] = val.map(|v| -> Vec<f64> {
+                                    let val = v.as_primitive::<Float64Type>();
+                                    val.values().to_vec()
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if let Some(val_array) = root.column(1).as_primitive_opt::<Float32Type>() {
                 for (i, val) in index_array.iter().zip(val_array) {
                     if let Some(i) = i {
-                        medians[i as usize] = val.map(|v| v as f64);
+                        medians[i as usize] = val.map(|v| vec![v as f64]);
                     }
                 }
             } else if let Some(val_array) = root.column(1).as_primitive_opt::<Float64Type>() {
                 for (i, val) in index_array.iter().zip(val_array) {
                     if let Some(i) = i {
-                        medians[i as usize] = val;
+                        medians[i as usize] = val.map(|v| vec![v]);
                     }
                 }
             }

@@ -165,6 +165,9 @@ fn main() -> io::Result<()> {
             if i % 5000 == 0 {
                 log::info!("Writing batch {i}");
             }
+            if i % 10 == 0 {
+                log::debug!("Writing batch {i}");
+            }
             batch.peaks = None;
             writer.write_spectrum(&batch).unwrap();
         }

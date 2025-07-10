@@ -55,6 +55,11 @@ def normalize_value_of(param: dict):
     return param
 
 
+def _clean_frame(df: pd.DataFrame):
+    columns = df.columns[~df.isna().all(axis=0)]
+    return df[columns]
+
+
 class MzPeakSpectrumMetadataReader:
     handle: pq.ParquetFile
     meta: pq.FileMetaData
@@ -118,11 +123,10 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["spectrum"])
                 spectra.append(bat.filter(bat[0].is_valid()))
-        self.spectra = (
+        self.spectra = _clean_frame(
             pa.record_batch(pa.concat_tables(spectra)["spectrum"].combine_chunks())
             .to_pandas()
             .set_index("index")
-            .dropna(axis=1)
         )
         self.id_index = self.spectra[["id"]].reset_index().set_index("id")["index"]
 
@@ -134,11 +138,10 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["scan"])
                 blocks.append(bat.filter(bat[0].is_valid()))
-        self.scans = (
+        self.scans = _clean_frame(
             pa.record_batch(pa.concat_tables(blocks)["scan"].combine_chunks())
             .to_pandas()
             .set_index("spectrum_index")
-            .dropna(axis=1)
         )
 
     def _read_precursors(self):
@@ -149,11 +152,10 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["precursor"])
                 blocks.append(bat.filter(bat[0].is_valid()))
-        self.precursors = (
+        self.precursors = _clean_frame(
             pa.record_batch(pa.concat_tables(blocks)["precursor"].combine_chunks())
             .to_pandas()
             .set_index("spectrum_index")
-            .dropna(axis=1)
         )
 
     def _read_selected_ions(self):
@@ -164,11 +166,10 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["selected_ion"])
                 blocks.append(bat.filter(bat[0].is_valid()))
-        self.selected_ions = (
+        self.selected_ions = _clean_frame(
             pa.record_batch(pa.concat_tables(blocks)["selected_ion"].combine_chunks())
             .to_pandas()
             .set_index("spectrum_index")
-            .dropna(axis=1)
         )
 
     def __getitem__(self, i: int | str):
@@ -211,6 +212,7 @@ class MzPeakSpectrumDataReader:
     array_index: dict[str, dict]
     n_spectra: int
     _median_delta_series: np.ndarray | None
+    _do_null_filling: bool = True
 
     def __init__(self, handle: pq.ParquetFile):
         if not isinstance(handle, pq.ParquetFile):
@@ -251,13 +253,13 @@ class MzPeakSpectrumDataReader:
         )
         result = {}
         for k, v in zip(data.column_names, data.columns):
-            if v.null_count:
-                if k == "m/z array" and median_delta is not None and not np.isnan(median_delta):
+            if v.null_count and self._do_null_filling:
+                if k == "m/z array" and median_delta is not None and not np.any(np.isnan(median_delta)):
                     v = fill_nulls(v, median_delta)
                 elif (
                     k == "intensity array"
                     and median_delta is not None
-                    and not np.isnan(median_delta)
+                    and not np.any(np.isnan(median_delta))
                 ):
                     v = np.asarray(v)
                     v[np.isnan(v)] = 0.0
@@ -306,6 +308,8 @@ class MzPeakSpectrumDataReader:
     def _read_data_for(self, spectrum_index: int):
         if self._median_delta_series is not None:
             median_delta = self._median_delta_series[spectrum_index]
+        else:
+            median_delta = None
         rgs = []
         for i in range(self.meta.num_row_groups):
             rg = self.meta.row_group(i)
