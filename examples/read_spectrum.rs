@@ -1,5 +1,5 @@
 use std::{io, path::PathBuf, env};
-use mzdata::prelude::*;
+use mzdata::io::mgf::MGFWriter;
 use mzpeak_prototyping::MzPeakReader;
 
 fn main() -> io::Result<()> {
@@ -11,9 +11,10 @@ fn main() -> io::Result<()> {
     let mut reader = MzPeakReader::new(path)?;
     let mut spec = reader.get_spectrum(index)?;
     spec.pick_peaks(1.0).unwrap();
-    eprintln!("{}", spec.id());
-    for peak in spec.peaks().iter() {
-        println!("{}\t{}", peak.mz, peak.intensity);
-    }
+
+    let writer = io::stdout().lock();
+    let mut writer = MGFWriter::new(writer);
+    writer.write(&spec)?;
+    drop(writer);
     Ok(())
 }

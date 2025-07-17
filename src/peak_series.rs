@@ -71,12 +71,13 @@ pub fn array_map_to_schema_arrays_and_excess(
         };
 
         let fieldref = buffer_name.to_field();
-        if schema
-            .iter()
-            .find(|c| c.name() == fieldref.name())
-            .is_none()
+        if !schema.is_empty()
+            && schema
+                .iter()
+                .find(|c| c.name() == fieldref.name())
+                .is_none()
         {
-            log::error!("{fieldref:?} did not map to schema {schema:?}");
+            log::debug!("{fieldref:?} did not map to schema {schema:?}");
             auxiliary.push(AuxiliaryArray::from_data_array(v)?);
             continue;
         }
@@ -115,45 +116,17 @@ pub fn array_map_to_schema_arrays(
     index_name: impl Into<String>,
     overrides: &HashMap<BufferName, BufferName>,
 ) -> Result<(Fields, Vec<ArrayRef>), ArrayRetrievalError> {
-    let mut fields = Vec::new();
-    let mut arrays = Vec::new();
-
-    fields.push(Arc::new(Field::new(index_name, DataType::UInt64, true)));
-
-    let index_array = Arc::new(UInt64Array::from_value(spectrum_index, primary_array_len));
-    arrays.push(index_array as ArrayRef);
-
-    for (k, v) in array_map.iter() {
-        let buffer_name = BufferName::new(context, k.clone(), v.dtype());
-        let buffer_name = if let Some(buffer_name) = overrides.get(&buffer_name) {
-            buffer_name
-        } else {
-            &buffer_name
-        };
-
-        if v.data_len()? != primary_array_len {
-            unimplemented!(
-                "Still need to understand usage for uneven arrays: {buffer_name}/{k} had {} points but primary length was {}",
-                v.data_len()?,
-                primary_array_len
-            );
-        }
-
-        let fieldref = buffer_name.to_field();
-        fields.push(fieldref);
-
-        let array: ArrayRef = match buffer_name.dtype {
-            BinaryDataArrayType::Unknown => Arc::new(UInt8Array::from(v.data.clone())),
-            BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(v.to_f64()?.to_vec())),
-            BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(v.to_f32()?.to_vec())),
-            BinaryDataArrayType::Int64 => Arc::new(Int64Array::from(v.to_i64()?.to_vec())),
-            BinaryDataArrayType::Int32 => Arc::new(Int32Array::from(v.to_i32()?.to_vec())),
-            BinaryDataArrayType::ASCII => Arc::new(ascii_array(&v)),
-        };
-
-        arrays.push(array);
-    }
-    Ok((fields.into(), arrays))
+    let schema = Fields::empty();
+    let (fields, arrays, _aux) = array_map_to_schema_arrays_and_excess(
+        context,
+        array_map,
+        primary_array_len,
+        spectrum_index,
+        index_name,
+        &schema,
+        overrides,
+    )?;
+    return Ok((fields, arrays));
 }
 
 /// Convert a peak list to a collection of Arrow Arrays
@@ -334,6 +307,13 @@ impl BufferContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BufferFormat {
+    Point,
+    Chunk,
+    ChunkSecondary,
+}
+
 /// Composite structure for directly naming a data array series
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BufferName {
@@ -343,14 +323,14 @@ pub struct BufferName {
     pub unit: Unit,
 }
 
-impl PartialOrd for BufferName {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match self.context.partial_cmp(&other.context) {
-            Some(core::cmp::Ordering::Equal) => {}
+impl Ord for BufferName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.context.cmp(&other.context) {
+            core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
-        match array_priority(&self.array_type).partial_cmp(&array_priority(&other.array_type)) {
-            Some(core::cmp::Ordering::Equal) => {}
+        match array_priority(&self.array_type).cmp(&array_priority(&other.array_type)) {
+            core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
 
@@ -362,7 +342,7 @@ impl PartialOrd for BufferName {
             BinaryDataArrayType::Int32 => "i32",
             BinaryDataArrayType::ASCII => "ascii",
         }
-        .partial_cmp(match other.dtype {
+        .cmp(match other.dtype {
             BinaryDataArrayType::Unknown => "unknown",
             BinaryDataArrayType::Float64 => "f64",
             BinaryDataArrayType::Float32 => "f32",
@@ -370,6 +350,12 @@ impl PartialOrd for BufferName {
             BinaryDataArrayType::Int32 => "i32",
             BinaryDataArrayType::ASCII => "ascii",
         })
+    }
+}
+
+impl PartialOrd for BufferName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -526,6 +512,39 @@ impl BufferName {
         self
     }
 
+    pub fn as_field_metadata(&self) -> HashMap<String, String> {
+        [
+                (
+                    "unit".to_string(),
+                    self.unit
+                        .to_curie()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "array_accession".to_string(),
+                    self.array_type
+                        .as_param_const()
+                        .curie()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "data_type_accession".to_string(),
+                    self.dtype
+                        .curie()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "array_name".to_string(),
+                    self.array_type.as_param_const().name().to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect()
+    }
+
     pub fn from_field(context: BufferContext, field: FieldRef) -> Option<Self> {
         let mut array_type = None;
         let mut dtype = None;
@@ -568,38 +587,7 @@ impl BufferName {
     }
 
     pub fn to_field(&self) -> FieldRef {
-        let f = Field::new(self.to_string(), array_to_arrow_type(self.dtype), true).with_metadata(
-            [
-                (
-                    "unit".to_string(),
-                    self.unit
-                        .to_curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "array_accession".to_string(),
-                    self.array_type
-                        .as_param_const()
-                        .curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "data_type_accession".to_string(),
-                    self.dtype
-                        .curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "array_name".to_string(),
-                    self.array_type.as_param_const().name().to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        let f = Field::new(self.to_string(), array_to_arrow_type(self.dtype), true).with_metadata(self.as_field_metadata());
         Arc::new(f)
     }
 }

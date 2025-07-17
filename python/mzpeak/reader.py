@@ -4,7 +4,7 @@ import zipfile
 
 from numbers import Number
 from collections.abc import Iterable
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 from typing import IO
 
 import numpy as np
@@ -176,21 +176,25 @@ class MzPeakSpectrumMetadataReader:
         if isinstance(i, str):
             i = self.id_index[i]
         spec = self.spectra.loc[i].to_dict()
-        spec['parameters'] = [normalize_value_of(v) for v in spec['parameters']]
+        spec["parameters"] = [normalize_value_of(v) for v in spec["parameters"]]
         spec["scans"] = self.scans.loc[i].to_dict()
         try:
             precursors_of = self.precursors.loc[[i]]
-            precursors_of['activation'] = precursors_of["activation"].apply(lambda x: [normalize_value_of(v) for v in x['parameters']])
+            precursors_of["activation"] = precursors_of["activation"].apply(
+                lambda x: [normalize_value_of(v) for v in x["parameters"]]
+            )
             try:
                 ions = self.selected_ions.loc[[i]]
-                ions["parameters"] = ions["parameters"].apply(lambda x: [normalize_value_of(v) for v in x])
+                ions["parameters"] = ions["parameters"].apply(
+                    lambda x: [normalize_value_of(v) for v in x]
+                )
                 precursors_of = precursors_of.merge(ions, on="precursor_index")
             except KeyError:
                 pass
             spec["precursors"] = precursors_of.to_dict()
         except KeyError:
             pass
-        spec['index'] = i
+        spec["index"] = i
         return spec
 
     def __len__(self):
@@ -200,15 +204,89 @@ class MzPeakSpectrumMetadataReader:
         return f"{self.__class__.__name__}({self.handle})"
 
     def _get_median_deltas(self):
-        if 'median_delta' in self.spectra:
-            return self.spectra['median_delta'].to_numpy()
+        if "median_delta" in self.spectra:
+            return self.spectra["median_delta"].to_numpy()
         return None
+
+
+class _SpectrumDataIndex:
+    meta: pq.FileMetaData
+    prefix: str
+    index_i: int
+    init: bool
+
+    def __init__(self, meta: pq.FileMetaData, prefix: str):
+        self.meta = meta
+        self.prefix = prefix
+        self.index_i = 0
+        self.init = False
+        self._infer_schema_idx()
+
+    def _infer_schema_idx(self):
+        rg = self.meta.row_group(0)
+        q = f"{self.prefix}.spectrum_index"
+        for i in range(rg.num_columns):
+            col = rg.column(i)
+            if col.path_in_schema == q:
+                self.index_i = i
+                self.init = True
+
+        index = json.loads(self.meta.metadata[b"spectrum_array_index"])
+        self.array_index = {
+            entry["path"].rsplit(".")[-1]: entry for entry in index["entries"]
+        }
+        self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
+
+    def row_groups_for_index(self, spectrum_index: int):
+        rgs = []
+        if not self.init:
+            return rgs
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.index_i)
+            if col_idx.statistics.has_min_max:
+                if (
+                    col_idx.statistics.min <= spectrum_index
+                    and spectrum_index <= col_idx.statistics.max
+                ):
+                    rgs.append(i)
+                if col_idx.statistics.min > spectrum_index:
+                    break
+            else:
+                break
+        return rgs
+
+    def row_groups_for_spectrum_range(
+        self, spectrum_index_range: slice | list
+    ) -> list[int]:
+        if isinstance(spectrum_index_range, slice):
+            start = spectrum_index_range.start or 0
+            end = spectrum_index_range.stop or self.n_spectra
+        else:
+            start = min(spectrum_index_range)
+            end = max(spectrum_index_range)
+
+        span = Span(start, end)
+        rgs = []
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.point_index_i)
+            if col_idx.statistics.has_min_max:
+                other = Span(col_idx.statistics.min, col_idx.statistics.max)
+                if span.overlaps(other):
+                    rgs.append(i)
+                if other.start > span.end:
+                    break
+            else:
+                break
+        return rgs
 
 
 class MzPeakSpectrumDataReader:
     handle: pq.ParquetFile
     meta: pq.FileMetaData
-    point_index_i: int
+    _point_index: _SpectrumDataIndex
+    _chunk_index: _SpectrumDataIndex
     array_index: dict[str, dict]
     n_spectra: int
     _median_delta_series: np.ndarray | None
@@ -219,6 +297,8 @@ class MzPeakSpectrumDataReader:
             handle = pq.ParquetFile(handle)
         self.handle = handle
         self.meta = self.handle.metadata
+        self._point_index = _SpectrumDataIndex(self.meta, "point")
+        self._chunk_index = _SpectrumDataIndex(self.meta, "chunk")
         self._infer_schema_idx()
         self._median_delta_series = None
 
@@ -235,7 +315,9 @@ class MzPeakSpectrumDataReader:
         }
         self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
 
-    def _clean_batch(self, data: pa.RecordBatch, median_delta: float | None = None):
+    def _clean_point_batch(
+        self, data: pa.RecordBatch, median_delta: float | None = None
+    ):
         nulls = []
         for i, col in enumerate(data.columns):
             if col.null_count == len(col):
@@ -254,7 +336,11 @@ class MzPeakSpectrumDataReader:
         result = {}
         for k, v in zip(data.column_names, data.columns):
             if v.null_count and self._do_null_filling:
-                if k == "m/z array" and median_delta is not None and not np.any(np.isnan(median_delta)):
+                if (
+                    k == "m/z array"
+                    and median_delta is not None
+                    and not np.any(np.isnan(median_delta))
+                ):
                     v = fill_nulls(v, median_delta)
                 elif (
                     k == "intensity array"
@@ -267,6 +353,13 @@ class MzPeakSpectrumDataReader:
         return result
 
     def read_data_for_spectrum_range(self, spectrum_index_range: slice | list):
+        prefix = "point"
+        rgs = self._point_index.row_groups_for_spectrum_range(spectrum_index_range)
+        if not rgs:
+            rgs = self._chunk_index.row_groups_for_spectrum_range(spectrum_index_range)
+            if rgs:
+                prefix = "chunk"
+
         is_slice = False
         if isinstance(spectrum_index_range, slice):
             start = spectrum_index_range.start or 0
@@ -276,20 +369,83 @@ class MzPeakSpectrumDataReader:
             start = min(spectrum_index_range)
             end = max(spectrum_index_range)
 
-        span = Span(start, end)
-        rgs = []
-        for i in range(self.meta.num_row_groups):
-            rg = self.meta.row_group(i)
-            col_idx = rg.column(self.point_index_i)
-            if col_idx.statistics.has_min_max:
-                other = Span(col_idx.statistics.min, col_idx.statistics.max)
-                if span.overlaps(other):
-                    rgs.append(i)
-                if other.start > span.end:
-                    break
-            else:
-                break
+        if prefix == "point":
+            return self._read_point_range(
+                start, end, spectrum_index_range, is_slice, rgs
+            )
+        elif prefix == "chunk":
+            return self._read_chunk_range(
+                start, end, spectrum_index_range, is_slice, rgs
+            )
+        else:
+            raise NotImplementedError(prefix)
 
+    def _expand_chunks(
+        self, chunks: list[dict[str, Any]], axis_prefix: str = "spectrum_mz_f64"
+    ) -> dict[str, np.ndarray]:
+        n = 0
+        for chunk in chunks:
+            # The +1 is to account for the starting point
+            n += len(chunk[f"{axis_prefix}_chunk_values"]) + 1
+        if n == 0:
+            return {axis_prefix: np.array([])}
+
+        arrays_of = {}
+        for k, v in chunks[0].items():
+            if k in ("spectrum_index", "chunk_encoding") or k.startswith(axis_prefix):
+                continue
+            arrays_of[k] = np.zeros(n, dtype=np.asarray(v.values).dtype)
+
+        main_axis_array = np.zeros(n)
+        offset = 0
+        for chunk in chunks:
+            start = chunk[f"{axis_prefix}_chunk_start"].as_py()
+            steps = chunk[f"{axis_prefix}_chunk_values"]
+            chunk_size = len(steps) + 1
+            main_axis_array[offset : offset + chunk_size] = start
+            main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(steps.values)
+
+            for k, v in chunk.items():
+                if k in ("spectrum_index", "chunk_encoding") or k.startswith(
+                    axis_prefix
+                ):
+                    continue
+                arrays_of[k][offset : offset + chunk_size] = np.asarray(v.values)
+
+            offset += chunk_size
+        arrays_of[axis_prefix] = main_axis_array
+
+        rename_map = {
+            k: v["array_name"] for k, v in self.array_index.items() if k in arrays_of
+        }
+        for k, v in rename_map.items():
+            arrays_of[v] = arrays_of.pop(k)
+        return arrays_of
+
+    def _read_point(
+        self,
+        spectrum_index: int,
+        rgs: list[int],
+        median_delta: float | list[float] | None,
+    ):
+        block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
+        block = pc.filter(
+            block, pc.equal(pc.struct_field(block, "spectrum_index"), spectrum_index)
+        )
+
+        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
+            "spectrum_index"
+        )
+        return self._clean_point_batch(data, median_delta)
+
+    def _read_point_range(
+        self,
+        start: int,
+        end: int,
+        spectrum_index_range: list[int] | slice,
+        is_slice: bool,
+        rgs: list[int],
+    ):
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
         idx_col = pc.struct_field(block, "spectrum_index")
 
@@ -303,36 +459,86 @@ class MzPeakSpectrumDataReader:
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
             "spectrum_index"
         )
-        return self._clean_batch(data)
+        return self._clean_point_batch(data)
+
+    def _read_chunk(self, spectrum_index: int, rgs: list[int]):
+        chunks = []
+        for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
+            batch = batch["chunk"]
+            batch = pc.filter(
+                batch,
+                pc.equal(pc.struct_field(batch, "spectrum_index"), spectrum_index),
+            )
+            if len(batch) == 0:
+                if chunks:
+                    break
+                else:
+                    continue
+            if isinstance(batch, pa.ChunkedArray):
+                chunks.extend(batch.chunks)
+            else:
+                chunks.append(batch)
+        chunks = pa.chunked_array(chunks)
+        return self._expand_chunks(chunks)
+
+    def _read_chunk_range(
+        self,
+        start: int,
+        end: int,
+        spectrum_index_range: list[int] | slice,
+        is_slice: bool,
+        rgs: list[int],
+    ):
+        chunks = []
+        for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
+            batch = batch["chunk"]
+            idx_col = pc.struct_field(batch, "spectrum_index")
+            batch_end = pc.max(idx_col)
+            if batch_end < start:
+                continue
+            if is_slice:
+                mask = pc.and_(
+                    pc.less_equal(idx_col, end), pc.greater_equal(idx_col, start)
+                )
+            else:
+                mask = pc.is_in(idx_col, pa.array(spectrum_index_range))
+            batch = pc.filter(
+                batch,
+                mask,
+            )
+            if len(batch) == 0:
+                if batch_end > end:
+                    break
+                else:
+                    continue
+            if isinstance(batch, pa.ChunkedArray):
+                chunks.extend(batch.chunks)
+            else:
+                chunks.append(batch)
+        chunks = pa.chunked_array(chunks)
+        return self._expand_chunks(chunks)
 
     def _read_data_for(self, spectrum_index: int):
         if self._median_delta_series is not None:
             median_delta = self._median_delta_series[spectrum_index]
         else:
             median_delta = None
-        rgs = []
-        for i in range(self.meta.num_row_groups):
-            rg = self.meta.row_group(i)
-            col_idx = rg.column(self.point_index_i)
-            if col_idx.statistics.has_min_max:
-                if (
-                    col_idx.statistics.min <= spectrum_index
-                    and spectrum_index <= col_idx.statistics.max
-                ):
-                    rgs.append(i)
-                if col_idx.statistics.min > spectrum_index:
-                    break
-            else:
-                break
-        block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
-        block = pc.filter(
-            block, pc.equal(pc.struct_field(block, "spectrum_index"), spectrum_index)
-        )
 
-        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
-            "spectrum_index"
-        )
-        return self._clean_batch(data, median_delta)
+        prefix = "point"
+        rgs = self._point_index.row_groups_for_index(spectrum_index)
+        if not rgs:
+            rgs = self._chunk_index.row_groups_for_index(spectrum_index)
+            if rgs:
+                prefix = "chunk"
+        if prefix == "point":
+            return self._read_point(spectrum_index, rgs, median_delta)
+        elif prefix == "chunk":
+            return self._read_chunk(
+                spectrum_index,
+                rgs,
+            )
+        else:
+            raise NotImplementedError(prefix)
 
     def __getitem__(self, index: int | slice):
         if isinstance(index, slice):
@@ -370,12 +576,14 @@ class MzPeakFile:
         self.file_metadata = metadata
 
         if self.spectrum_data and self.spectrum_metadata:
-            self.spectrum_data._median_delta_series = self.spectrum_metadata._get_median_deltas()
+            self.spectrum_data._median_delta_series = (
+                self.spectrum_metadata._get_median_deltas()
+            )
 
     def __getitem__(self, index):
         if isinstance(index, (int, str)):
             spec = self.spectrum_metadata[index]
-            index = spec['index']
+            index = spec["index"]
             data = self.spectrum_data[index]
             spec.update(data)
         elif isinstance(index, Iterable):
