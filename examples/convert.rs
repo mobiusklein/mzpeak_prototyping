@@ -23,6 +23,7 @@ use std::{
 // CLI Interface for standalone usage
 // ============================================================================
 
+#[allow(dead_code)]
 fn main() -> io::Result<()> {
     env_logger::init();
     let args = ConvertArgs::parse();
