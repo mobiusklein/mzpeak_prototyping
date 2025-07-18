@@ -8,7 +8,7 @@ from mzpeak import MzPeakFile
 @click.argument("column_path")
 def main(path: str, column_path: str):
     archive = MzPeakFile(path)
-    if column_path.startswith("point"):
+    if column_path.startswith(("point", 'chunk')):
         meta = archive.spectrum_data.meta
     else:
         meta = archive.spectrum_metadata.meta
@@ -19,7 +19,7 @@ def main(path: str, column_path: str):
         rg = meta.row_group(i)
         for j in range(meta.num_columns):
             col_idx = rg.column(j)
-            if col_idx.path_in_schema == column_path:
+            if col_idx.path_in_schema == column_path or (col_idx.path_in_schema == column_path + '.list.item'):
                 z += col_idx.total_compressed_size
                 zu += col_idx.total_uncompressed_size
                 break

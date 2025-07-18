@@ -7,7 +7,7 @@ from mzpeak import MzPeakFile
 @click.argument('table')
 def main(path: str, table: str):
     archive = MzPeakFile(path)
-    if table == 'point':
+    if table in ('point', 'points', 'chunk', 'chunks'):
         handle = archive.spectrum_data.handle
     else:
         handle = archive.spectrum_metadata.handle

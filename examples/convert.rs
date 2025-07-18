@@ -5,7 +5,7 @@ use mzdata::{
     prelude::*,
     spectrum::{ArrayType, BinaryDataArrayType},
 };
-use mzpeak_prototyping::{writer::sample_array_types, *};
+use mzpeak_prototyping::{writer::sample_array_types_from_file_reader, *};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use std::{
     collections::HashMap,
@@ -62,6 +62,12 @@ pub struct ConvertArgs {
 
     #[arg(short = 'o', help="Output file path")]
     pub outpath: Option<PathBuf>,
+
+    #[arg(short, long, default_value_t=5000, help="The number of spectra to buffer between writes")]
+    pub buffer_size: usize,
+
+    #[arg(short, long, help="Use the chunked encoding instead of the flat peak array layout")]
+    pub chunked_encoding: bool
 }
 
 pub fn run_convert(args: ConvertArgs) -> io::Result<()> {
@@ -84,6 +90,13 @@ pub fn run_convert(args: ConvertArgs) -> io::Result<()> {
 }
 
 pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -> io::Result<()> {
+    
+    //if filename.to_string_lossy() == "-" {
+    //
+    //}
+
+
+
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input_path)
         .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
 
@@ -94,20 +107,22 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         .add_spectrum_peak_type::<CentroidPeak>()
         .add_spectrum_peak_type::<DeconvolutedPeak>()
         .add_default_chromatogram_fields()
-        .buffer_size(5000)
+        .buffer_size(args.buffer_size)
         .shuffle_mz(args.shuffle_mz);
 
     if args.null_zeros {
         writer = writer.null_zeros(true);
     }
 
-    writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides)
+    writer = sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides, args.chunked_encoding)
         .into_iter()
         .fold(writer, |writer, f| writer.add_spectrum_field(f));
 
     for (from, to) in overrides.iter() {
         writer = writer.add_spectrum_override(from.clone(), to.clone());
     }
+    writer = writer.chunked_encoding(args.chunked_encoding);
+
 
     let mut writer = writer.build(handle, true);
     writer.copy_metadata_from(&reader);

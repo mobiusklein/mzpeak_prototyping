@@ -1,5 +1,6 @@
 pub mod index;
 pub mod peak_series;
+pub mod chunk_series;
 pub mod param;
 pub mod spectrum;
 pub mod entry;

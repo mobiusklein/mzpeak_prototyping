@@ -14,34 +14,20 @@ use mzdata::mzsignal::PeakPicker;
 use mzdata::{self, io::MZReader, prelude::*, spectrum::SignalContinuity};
 use mzpeak_prototyping::MzPeakReader;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Histogram {
-    edges: Vec<f64>,
-    counts: Vec<u64>,
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+struct PeakError {
+    spectrum_index: usize,
+    spec_mz: f64,
+    diff: f64,
+    numpress_diff: f64,
 }
 
-impl Histogram {
-    fn from_range(start: f64, end: f64, step: f64) -> Self {
-        let edges = mzdata::mzsignal::gridspace(start, end, step);
-        let counts = vec![0; edges.len()];
-        Self { edges, counts }
-    }
-
-    fn add(&mut self, val: f64) {
-        match self.edges.binary_search_by(|probe| probe.total_cmp(&val)) {
-            Ok(i) => {
-                self.counts[i] += 1;
-            }
-            Err(i) => {
-                if i < self.edges.len() {
-                    self.counts[i] += 1;
-                } else {
-                    self.counts[self.edges.len() - 1] += 1;
-                }
-            }
-        }
+impl PeakError {
+    fn new(spectrum_index: usize, spec_mz: f64, diff: f64, numpress_diff: f64) -> Self {
+        Self { spectrum_index, spec_mz, diff, numpress_diff }
     }
 }
+
 
 #[derive(Parser)]
 struct App {
@@ -51,6 +37,17 @@ struct App {
     ref_filename: PathBuf,
     #[arg()]
     outfile: PathBuf,
+}
+
+fn numpress_peaks(raw_arrays: &mzdata::spectrum::BinaryArrayMap) -> Vec<mzdata::mzsignal::FittedPeak> {
+    let mut raw_mzs = raw_arrays.get(&mzdata::spectrum::ArrayType::MZArray).unwrap().clone();
+    raw_mzs.store_compressed(mzdata::spectrum::bindata::BinaryCompressionType::NumpressLinear).unwrap();
+    let raw_mzs = raw_mzs.to_f64().unwrap();
+    let intensities = raw_arrays.intensities().unwrap();
+    let picker = PeakPicker::default();
+    let mut peaks = Vec::new();
+    picker.discover_peaks(&raw_mzs, &intensities, &mut peaks).unwrap();
+    peaks
 }
 
 fn main() -> io::Result<()> {
@@ -63,7 +60,7 @@ fn main() -> io::Result<()> {
     let mut n_peaks = 0;
 
     let fields: Vec<arrow::datatypes::FieldRef> =
-        serde_arrow::schema::SchemaLike::from_type::<Histogram>(Default::default()).unwrap();
+        serde_arrow::schema::SchemaLike::from_type::<PeakError>(Default::default()).unwrap();
     let schema = Arc::new(arrow::datatypes::Schema::new(fields.clone()));
     let mut writer = ArrowWriter::try_new(fs::File::create(&args.outfile)?, schema.clone(), None)?;
 
@@ -107,7 +104,7 @@ fn main() -> io::Result<()> {
     });
 
     let cmpr = thread::spawn(move || -> io::Result<()> {
-        let mut errors = Histogram::from_range(-1e-5, 1e-5, 1e-12);
+        let mut errors = Vec::new();
         for (i, ((spec, spec_peaks), (ref_spec, ref_peaks))) in mp_recv.into_iter().zip(ref_recv.into_iter()).enumerate() {
             if i % 1000 == 0 {
                 log::info!(
@@ -118,6 +115,9 @@ fn main() -> io::Result<()> {
             if spec.signal_continuity() != SignalContinuity::Profile {
                 continue;
             }
+
+            let raw_arrays: &mzdata::spectrum::BinaryArrayMap = ref_spec.raw_arrays().unwrap();
+            let numpress_peaks = numpress_peaks(raw_arrays);
 
             // let spec_peaks = spec.peaks.as_ref().unwrap();
             // let ref_peaks = ref_spec.peaks.as_ref().unwrap();
@@ -135,8 +135,9 @@ fn main() -> io::Result<()> {
                 ref_peaks.len()
             );
 
-            for (up, rp) in spec_peaks.iter().zip(ref_peaks.iter()) {
-                errors.add(rp.mz - up.mz);
+            for ((up, rp), np) in spec_peaks.iter().zip(ref_peaks.iter()).zip(numpress_peaks.iter()) {
+                let e = PeakError::new(spec.index(), rp.mz, rp.mz - up.mz, rp.mz - np.mz);
+                errors.push(e);
                 if (rp.mz - up.mz).abs() > 0.001 {
                     println!(
                         "{}: {up:?} vs {rp:?} differ by {}",
@@ -145,9 +146,18 @@ fn main() -> io::Result<()> {
                     );
                 }
             }
+
+            if errors.len() > 10_000 {
+                let batch = serde_arrow::to_record_batch(&fields, &errors).unwrap();
+                writer.write(&batch)?;
+                errors.clear();
+            }
         }
-        let batch = serde_arrow::to_record_batch(&fields, &[errors]).unwrap();
-        writer.write(&batch)?;
+        if !errors.is_empty() {
+            let batch = serde_arrow::to_record_batch(&fields, &errors).unwrap();
+            writer.write(&batch)?;
+            errors.clear();
+        }
         writer.finish()?;
         Ok(())
     });

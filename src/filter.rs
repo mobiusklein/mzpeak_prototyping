@@ -459,8 +459,38 @@ where
     buffer
 }
 
+pub(crate) fn _skip_zero_runs_iter<T: ArrowPrimitiveType, I: Iterator<Item=Option<T::Native>>>(iter: I, n: usize) -> Vec<u64> where T::Native: Zero + PartialEq {
+    let z = T::Native::zero();
+    let n1 = n.saturating_sub(1);
+    let mut was_zero = false;
+    let mut acc = Vec::new();
+    let mut iter = iter.peekable();
+    let mut i = 0;
+    while let Some(v) = iter.next() {
+        if let Some(v) = v {
+            if v == z {
+                if (was_zero || acc.is_empty()) && ((i < n1 && iter.peek().unwrap().unwrap() == z) || i == n1)
+                {
+                    // Skip, do not take values between two zeros
+                } else {
+                    acc.push(i as u64)
+                }
+                was_zero = true;
+            } else {
+                acc.push(i as u64);
+                was_zero = false;
+            }
+        } else {
+            acc.push(i as u64);
+            was_zero = false;
+        }
+        i += 1;
+    }
+    acc.into()
+}
+
 /// A type-generic filter to find indices where the value isn't in the middle of a run of zeros.
-fn _skip_zero_runs_gen<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>) -> Vec<u64>
+pub(crate) fn _skip_zero_runs_gen<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>) -> Vec<u64>
 where
     T::Native: Zero + PartialEq,
 {

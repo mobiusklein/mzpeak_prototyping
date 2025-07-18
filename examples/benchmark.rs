@@ -61,6 +61,12 @@ pub struct BenchmarkArgs {
 
     #[arg(short='u', long, help="Null mask out sparse zero intensity peaks")]
     pub null_zeros: bool,
+
+    #[arg(short, long, default_value_t=5000, help="The number of spectra to buffer between writes")]
+    pub buffer_size: usize,
+
+    #[arg(short, long, help="Use the chunked encoding instead of the flat peak array layout")]
+    pub chunked_encoding: bool,
 }
 
 #[derive(Debug)]
@@ -92,6 +98,8 @@ pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
         shuffle_mz: args.shuffle_mz,
         null_zeros: args.null_zeros,
         outpath: None, // Will be set per file
+        buffer_size: args.buffer_size,
+        chunked_encoding: args.chunked_encoding,
     };
     
     // Discover files
@@ -278,6 +286,8 @@ pub fn process_single_file(
         shuffle_mz: convert_args.shuffle_mz,
         null_zeros: convert_args.null_zeros,
         outpath: Some(output_path.clone()),
+        buffer_size: convert_args.buffer_size,
+        chunked_encoding: convert_args.chunked_encoding,
     };
     let conversion_result = convert_file(&file_path, &output_path, &file_convert_args);
     let end = Instant::now();
