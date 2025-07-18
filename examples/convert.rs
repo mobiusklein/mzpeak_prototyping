@@ -23,11 +23,20 @@ use std::{
 // CLI Interface for standalone usage
 // ============================================================================
 
+#[derive(Parser, Debug, Clone)]
+pub struct ConvertCli {
+    /// Input file path
+    pub filename: PathBuf,
+
+    #[command(flatten)]
+    pub convert_args: ConvertArgs,
+}
+
 #[allow(dead_code)]
 fn main() -> io::Result<()> {
     env_logger::init();
-    let args = ConvertArgs::parse();
-    run_convert(args)
+    let cli = ConvertCli::parse();
+    run_convert(&cli.filename, cli.convert_args)
 }
 
 
@@ -37,9 +46,6 @@ fn main() -> io::Result<()> {
 
 #[derive(Parser, Debug, Clone)]
 pub struct ConvertArgs {
-    /// Input file path
-    pub filename: PathBuf,
-
     #[arg(short = 'm', long = "mz-f32", help="Encode the m/z values using float32 instead of float64")]
     pub mz_f32: bool,
 
@@ -70,14 +76,14 @@ pub struct ConvertArgs {
     pub chunked_encoding: bool
 }
 
-pub fn run_convert(args: ConvertArgs) -> io::Result<()> {
+pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
     let start = Instant::now();
     
     let outpath = args.outpath.as_ref().map(|p| p.clone()).unwrap_or_else(|| {
-        args.filename.with_extension("mzpeak")
+        filename.with_extension("mzpeak")
     });
     
-    convert_file(&args.filename, &outpath, &args)?;
+    convert_file(filename, &outpath, &args)?;
     
     let end = Instant::now();
     eprintln!("{:0.2} seconds elapsed", (end - start).as_secs_f64());

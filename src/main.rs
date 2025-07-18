@@ -10,7 +10,7 @@ mod examples {
         include!("../examples/benchmark.rs");
     }
 }
-use examples::convert::{ConvertArgs, run_convert as convert_run_convert};
+use examples::convert::{ConvertCli, run_convert as convert_run_convert};
 use examples::benchmark::{BenchmarkArgs, run_benchmark as benchmark_run_benchmark};
 
 #[derive(Parser)]
@@ -24,7 +24,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Convert a single mass spectrometry file to mzpeak format
-    Convert(ConvertArgs),
+    Convert(ConvertCli),
     /// Benchmark conversion of all supported files in a directory
     Benchmark(BenchmarkArgs),
 }
@@ -36,7 +36,7 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Convert(args) => convert_run_convert(args),
+        Commands::Convert(cli_args) => convert_run_convert(&cli_args.filename, cli_args.convert_args),
         Commands::Benchmark(args) => benchmark_run_benchmark(args),
     }
 }

@@ -29,7 +29,7 @@ pub struct BenchmarkArgs {
     /// Directory to scan for mass spectrometry files
     pub directory: PathBuf,
 
-    #[arg(short = 'o', long = "output-csv", help="Path to save benchmark results CSV")]
+    #[arg(short = 'O', long = "output-csv", help="Path to save benchmark results CSV")]
     pub output_csv: Option<PathBuf>,
 
     #[arg(short = 't', long = "threads", help="Number of threads to use (default: number of CPU cores)")]
@@ -42,31 +42,8 @@ pub struct BenchmarkArgs {
     pub no_progress: bool,
 
     // Include all conversion options
-    #[arg(short = 'm', long = "mz-f32", help="Encode the m/z values using float32 instead of float64")]
-    pub mz_f32: bool,
-
-    #[arg(short = 'd', long = "ion-mobility-f32", help="Encode the ion mobility values using float32 instead of float64")]
-    pub ion_mobility_f32: bool,
-
-    #[arg(short = 'y', long = "intensity-f32", help="Encode the intensity values using float32")]
-    pub intensity_f32: bool,
-
-    #[arg(short = 'i',
-          long = "intensity-i32",
-          help="Encode the intensity values as int32 instead of floats which may improve compression at the cost of the decimal component")]
-    pub intensity_i32: bool,
-
-    #[arg(short = 'z', long = "shuffle-mz", help="Shuffle the m/z array, which may improve the compression of profile spectra")]
-    pub shuffle_mz: bool,
-
-    #[arg(short='u', long, help="Null mask out sparse zero intensity peaks")]
-    pub null_zeros: bool,
-
-    #[arg(short, long, default_value_t=5000, help="The number of spectra to buffer between writes")]
-    pub buffer_size: usize,
-
-    #[arg(short, long, help="Use the chunked encoding instead of the flat peak array layout")]
-    pub chunked_encoding: bool,
+    #[command(flatten)]
+    convert_args: ConvertArgs,
 }
 
 #[derive(Debug)]
@@ -87,19 +64,6 @@ pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
         TempDir::new_in(temp_dir)?
     } else {
         TempDir::new()?
-    };
-    
-    let convert_args = ConvertArgs {
-        filename: PathBuf::new(), // Will be set per file
-        mz_f32: args.mz_f32,
-        ion_mobility_f32: args.ion_mobility_f32,
-        intensity_f32: args.intensity_f32,
-        intensity_i32: args.intensity_i32,
-        shuffle_mz: args.shuffle_mz,
-        null_zeros: args.null_zeros,
-        outpath: None, // Will be set per file
-        buffer_size: args.buffer_size,
-        chunked_encoding: args.chunked_encoding,
     };
     
     // Discover files
@@ -126,8 +90,8 @@ pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
     };
     
     // Process files in parallel
-    let results = process_files_parallel(files, temp_dir.path(), &convert_args, threads, progress.as_ref())?;
-    
+    let results = process_files_parallel(files, temp_dir.path(), &args.convert_args, threads, progress.as_ref())?;
+
     // Write CSV output
     let output_path = args.output_csv.unwrap_or_else(|| PathBuf::from("benchmark_results.csv"));
     write_csv_results(&results, &output_path)?;
@@ -277,19 +241,7 @@ pub fn process_single_file(
     
     // Time the conversion
     let start = Instant::now();
-    let file_convert_args = ConvertArgs {
-        filename: file_path.clone(),
-        mz_f32: convert_args.mz_f32,
-        ion_mobility_f32: convert_args.ion_mobility_f32,
-        intensity_f32: convert_args.intensity_f32,
-        intensity_i32: convert_args.intensity_i32,
-        shuffle_mz: convert_args.shuffle_mz,
-        null_zeros: convert_args.null_zeros,
-        outpath: Some(output_path.clone()),
-        buffer_size: convert_args.buffer_size,
-        chunked_encoding: convert_args.chunked_encoding,
-    };
-    let conversion_result = convert_file(&file_path, &output_path, &file_convert_args);
+    let conversion_result = convert_file(&file_path, &output_path, &convert_args);
     let end = Instant::now();
     let time_taken = (end - start).as_secs_f64();
     
