@@ -1,20 +1,26 @@
 use clap::{Parser, Subcommand};
 use csv::Writer;
 use indicatif::{ProgressBar, ProgressStyle};
-use mzdata::{self, io::{MZReaderType, MassSpectrometryFormat, infer_format}, prelude::*, spectrum::{ArrayType, BinaryDataArrayType}};
-use mzpeak_prototyping::{writer::sample_array_types, *};
-use mzpeaks::{CentroidPeak, DeconvolutedPeak};
+use mzdata::{self, io::{MassSpectrometryFormat, infer_format}};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
     panic::{self, AssertUnwindSafe},
-    sync::{mpsc::sync_channel, Arc, Mutex},
+    sync::{Arc, Mutex},
     thread,
     time::Instant
 };
 use tempfile::TempDir;
 use walkdir::WalkDir;
+
+// Import the convert functionality from examples
+mod examples {
+    pub mod convert {
+        include!("../examples/convert.rs");
+    }
+}
+use examples::convert::{ConvertArgs, run_convert as convert_run_convert, convert_file};
 
 #[derive(Parser)]
 #[command(name = "mzpeak_prototyping")]
@@ -30,35 +36,6 @@ enum Commands {
     Convert(ConvertArgs),
     /// Benchmark conversion of all supported files in a directory
     Benchmark(BenchmarkArgs),
-}
-
-#[derive(Parser)]
-struct ConvertArgs {
-    /// Input file path
-    filename: PathBuf,
-
-    #[arg(short = 'm', long = "mz-f32", help="Encode the m/z values using float32 instead of float64")]
-    mz_f32: bool,
-
-    #[arg(short = 'd', long = "ion-mobility-f32", help="Encode the ion mobility values using float32 instead of float64")]
-    ion_mobility_f32: bool,
-
-    #[arg(short = 'y', long = "intensity-f32", help="Encode the intensity values using float32")]
-    intensity_f32: bool,
-
-    #[arg(short = 'i',
-          long = "intensity-i32",
-          help="Encode the intensity values as int32 instead of floats which may improve compression at the cost of the decimal component")]
-    intensity_i32: bool,
-
-    #[arg(short = 'z', long = "shuffle-mz", help="Shuffle the m/z array, which may improve the compression of profile spectra")]
-    shuffle_mz: bool,
-
-    #[arg(short='u', long, help="Null mask out sparse zero intensity peaks")]
-    null_zeros: bool,
-
-    #[arg(short = 'o', help="Output file path")]
-    outpath: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -100,15 +77,6 @@ struct BenchmarkArgs {
     null_zeros: bool,
 }
 
-#[derive(Debug, Clone)]
-struct ConvertOptions {
-    mz_f32: bool,
-    ion_mobility_f32: bool,
-    intensity_f32: bool,
-    intensity_i32: bool,
-    shuffle_mz: bool,
-    null_zeros: bool,
-}
 
 #[derive(Debug)]
 struct BenchmarkResult {
@@ -125,37 +93,9 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Convert(args) => run_convert(args),
+        Commands::Convert(args) => convert_run_convert(args),
         Commands::Benchmark(args) => run_benchmark(args),
     }
-}
-
-fn run_convert(args: ConvertArgs) -> io::Result<()> {
-    let start = Instant::now();
-    
-    let options = ConvertOptions {
-        mz_f32: args.mz_f32,
-        ion_mobility_f32: args.ion_mobility_f32,
-        intensity_f32: args.intensity_f32,
-        intensity_i32: args.intensity_i32,
-        shuffle_mz: args.shuffle_mz,
-        null_zeros: args.null_zeros,
-    };
-    
-    let outpath = args.outpath.unwrap_or_else(|| {
-        args.filename.with_extension("mzpeak")
-    });
-    
-    convert_file(&args.filename, &outpath, &options)?;
-    
-    let end = Instant::now();
-    eprintln!("{:0.2} seconds elapsed", (end - start).as_secs_f64());
-    
-    let stat = fs::metadata(&outpath)?;
-    let size = stat.len() as f64 / 1e9;
-    eprintln!("{} was {size:0.3}GB", outpath.display());
-    
-    Ok(())
 }
 
 fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
@@ -169,13 +109,15 @@ fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
         TempDir::new()?
     };
     
-    let options = ConvertOptions {
+    let convert_args = ConvertArgs {
+        filename: PathBuf::new(), // Will be set per file
         mz_f32: args.mz_f32,
         ion_mobility_f32: args.ion_mobility_f32,
         intensity_f32: args.intensity_f32,
         intensity_i32: args.intensity_i32,
         shuffle_mz: args.shuffle_mz,
         null_zeros: args.null_zeros,
+        outpath: None, // Will be set per file
     };
     
     // Discover files
@@ -202,7 +144,7 @@ fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
     };
     
     // Process files in parallel
-    let results = process_files_parallel(files, temp_dir.path(), &options, threads, progress.as_ref())?;
+    let results = process_files_parallel(files, temp_dir.path(), &convert_args, threads, progress.as_ref())?;
     
     // Write CSV output
     let output_path = args.output_csv.unwrap_or_else(|| PathBuf::from("benchmark_results.csv"));
@@ -228,8 +170,7 @@ fn discover_supported_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     
     for entry in WalkDir::new(directory) {
         let entry = entry?;
-        let path = entry.path();
-        
+        let path = entry.path();        
         // Try to infer format using mzdata
         if is_supported_format(path) {
             supported_files.push(path.to_path_buf());
@@ -242,11 +183,7 @@ fn discover_supported_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
 fn is_supported_format(path: &Path) -> bool {
     // Use mzdata's format inference
     match infer_format(path) {
-        Ok((format, _)) => {
-            // Debug: Print file name and detected format
-            log::debug!("File: {:?}, Format: {:?}", path.file_name().unwrap_or_default(), format);
-            format != MassSpectrometryFormat::Unknown
-        },
+        Ok((format, _)) => format != MassSpectrometryFormat::Unknown,
         Err(_) => false, // Can't read file or determine format
     }
 }
@@ -254,7 +191,7 @@ fn is_supported_format(path: &Path) -> bool {
 fn process_files_parallel(
     files: Vec<PathBuf>,
     temp_dir: &Path,
-    options: &ConvertOptions,
+    convert_args: &ConvertArgs,
     max_threads: usize,
     progress: Option<&ProgressBar>,
 ) -> io::Result<Vec<BenchmarkResult>> {
@@ -266,7 +203,7 @@ fn process_files_parallel(
     for _ in 0..max_threads {
         let work_queue = Arc::clone(&work_queue);
         let results = Arc::clone(&results);
-        let options = options.clone();
+        let convert_args = convert_args.clone();
         let temp_dir = temp_dir.to_path_buf();
         let progress = progress.map(|p| p.clone());
         
@@ -280,7 +217,7 @@ fn process_files_parallel(
                 match file_path {
                     Some(path) => {
                         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                            process_single_file(path.clone(), &temp_dir, &options)
+                            process_single_file(path.clone(), &temp_dir, &convert_args)
                         }));
                         
                         let benchmark_result = match result {
@@ -332,7 +269,7 @@ fn process_files_parallel(
 fn process_single_file(
     file_path: PathBuf,
     temp_dir: &Path,
-    options: &ConvertOptions,
+    convert_args: &ConvertArgs,
 ) -> BenchmarkResult {
     let filename = file_path.file_name()
         .unwrap_or_default()
@@ -358,7 +295,17 @@ fn process_single_file(
     
     // Time the conversion
     let start = Instant::now();
-    let conversion_result = convert_file(&file_path, &output_path, options);
+    let file_convert_args = ConvertArgs {
+        filename: file_path.clone(),
+        mz_f32: convert_args.mz_f32,
+        ion_mobility_f32: convert_args.ion_mobility_f32,
+        intensity_f32: convert_args.intensity_f32,
+        intensity_i32: convert_args.intensity_i32,
+        shuffle_mz: convert_args.shuffle_mz,
+        null_zeros: convert_args.null_zeros,
+        outpath: Some(output_path.clone()),
+    };
+    let conversion_result = convert_file(&file_path, &output_path, &file_convert_args);
     let end = Instant::now();
     let time_taken = (end - start).as_secs_f64();
     
@@ -396,165 +343,6 @@ fn process_single_file(
     }
 }
 
-fn convert_file(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> io::Result<()> {
-    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(input_path)
-        .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
-
-    let overrides = create_type_overrides(options);
-
-    let handle = fs::File::create(output_path)?;
-    let mut writer = MzPeakWriterType::<fs::File>::builder()
-        .add_spectrum_peak_type::<CentroidPeak>()
-        .add_spectrum_peak_type::<DeconvolutedPeak>()
-        .add_default_chromatogram_fields()
-        .buffer_size(5000)
-        .shuffle_mz(options.shuffle_mz);
-
-    if options.null_zeros {
-        writer = writer.null_zeros(true);
-    }
-
-    writer = sample_array_types::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides)
-        .into_iter()
-        .fold(writer, |writer, f| writer.add_spectrum_field(f));
-
-    for (from, to) in overrides.iter() {
-        writer = writer.add_spectrum_override(from.clone(), to.clone());
-    }
-
-    let mut writer = writer.build(handle, true);
-    writer.copy_metadata_from(&reader);
-    writer.add_file_description(reader.file_description());
-
-    let (send, recv) = sync_channel(1);
-
-    let read_handle = thread::spawn(move || {
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            for entry in reader.into_iter() {
-                if send.send(entry).is_err() {
-                    break; // Receiver dropped
-                }
-            }
-        }));
-        if result.is_err() {
-            eprintln!("Reader thread panicked");
-        }
-    });
-
-    let write_handle = thread::spawn(move || {
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            for (i, mut batch) in recv.into_iter().enumerate() {
-                if i % 5000 == 0 {
-                    log::info!("Writing batch {i}");
-                }
-                batch.peaks = None;
-                writer.write_spectrum(&batch)?;
-            }
-            writer.finish()
-        }));
-        match result {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => eprintln!("Writer thread error: {}", e),
-            Err(_) => eprintln!("Writer thread panicked"),
-        }
-    });
-
-    if let Err(e) = read_handle.join() {
-        eprintln!("Failed to join reader thread: {:?}", e);
-        return Err(io::Error::new(io::ErrorKind::Other, "Reader thread failed"));
-    }
-    
-    if let Err(e) = write_handle.join() {
-        eprintln!("Failed to join writer thread: {:?}", e);
-        return Err(io::Error::new(io::ErrorKind::Other, "Writer thread failed"));
-    }
-
-    Ok(())
-}
-
-fn create_type_overrides(options: &ConvertOptions) -> HashMap<BufferName, BufferName> {
-    let mut overrides = HashMap::new();
-    
-    if options.mz_f32 {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::MZArray,
-                BinaryDataArrayType::Float64,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::MZArray,
-                BinaryDataArrayType::Float32,
-            ),
-        );
-    }
-    
-    if options.intensity_f32 {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float64,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-            ),
-        );
-    }
-    
-    if options.intensity_i32 {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Int32,
-            ),
-        );
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float64,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Int32,
-            ),
-        );
-    }
-    
-    if options.ion_mobility_f32 {
-        for t in [
-            ArrayType::MeanInverseReducedIonMobilityArray,
-            ArrayType::RawDriftTimeArray,
-            ArrayType::RawIonMobilityArray,
-        ] {
-            overrides.insert(
-                BufferName::new(
-                    BufferContext::Spectrum,
-                    t.clone(),
-                    BinaryDataArrayType::Float64,
-                ),
-                BufferName::new(
-                    BufferContext::Spectrum,
-                    t.clone(),
-                    BinaryDataArrayType::Float32,
-                ),
-            );
-        }
-    }
-    
-    overrides
-}
 
 fn write_csv_results(results: &[BenchmarkResult], output_path: &Path) -> io::Result<()> {
     let mut writer = Writer::from_path(output_path)?;
