@@ -11,6 +11,30 @@ path = "src/main.rs"
 name = "convert"
 path = "examples/convert.rs"
 
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs
+
+[[example]]
+name = "peak_mass_error_check"
+path = "examples/peak_mass_error_check.rs"
+
+[[example]]
+name = "read_spectrum"
+path = "examples/read_spectrum.rs"
+
+[[example]]
+name = "read"
+path = "examples/read.rs"
+
+[[example]]
+name = "test_extract_refs"
+path = "examples/test_extract_ref.rs"
+
+[[example]]
+name = "test extract"
+path = "test_extract.rs"
+
 [features]
 
 thermo = ["mzdata/thermo"]
