@@ -13,7 +13,7 @@ path = "examples/convert.rs"
 
 [[example]]
 name = "benchmark"
-path = "examples/benchmark.rs
+path = "examples/benchmark.rs"
 
 [[example]]
 name = "peak_mass_error_check"
