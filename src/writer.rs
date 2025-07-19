@@ -12,8 +12,8 @@ use arrow::{
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
-    arrow::{ArrowSchemaConverter, ArrowWriter, arrow_writer::ArrowWriterOptions},
-    basic::{Encoding, ZstdLevel},
+    arrow::{arrow_writer::ArrowWriterOptions, ArrowSchemaConverter, ArrowWriter},
+    basic::{Compression, Encoding, ZstdLevel},
     file::properties::{EnabledStatistics, WriterProperties, WriterVersion},
     format::{KeyValue, SortingColumn},
 };
@@ -167,6 +167,39 @@ pub trait ArrayBufferWriter {
     }
 
     fn overrides(&self) -> &HashMap<BufferName, BufferName>;
+
+    fn as_array_index(&self) -> ArrayIndex {
+        let mut spectrum_array_index: ArrayIndex =
+            ArrayIndex::new(self.prefix().to_string(), HashMap::new());
+        if let Ok(sub) = self
+            .schema()
+            .field_with_name(&self.prefix())
+            .cloned()
+        {
+            if let DataType::Struct(fields) = sub.data_type() {
+                for f in fields.iter() {
+                    if f.name() == "spectrum_index" {
+                        continue;
+                    }
+                    if let Some(buffer_name) =
+                        BufferName::from_field(BufferContext::Spectrum, f.clone())
+                    {
+                        let aie = ArrayIndexEntry::from_buffer_name(
+                            self.prefix().to_string(),
+                            buffer_name,
+                        );
+                        spectrum_array_index.insert(aie.array_type.clone(), aie);
+                    } else {
+                        if f.name().ends_with("_chunk_end") || f.name().ends_with("_chunk_start") || f.name() != "chunk_encoding" {
+                            continue;
+                        }
+                        log::warn!("Failed to construct metadata index for {f:#?}");
+                    }
+                }
+            }
+        }
+        spectrum_array_index
+    }
 }
 
 #[derive(Debug)]
@@ -774,6 +807,7 @@ pub struct MzPeakWriterBuilder {
     buffer_size: usize,
     shuffle_mz: bool,
     chunked_encoding: bool,
+    compression: Compression
 }
 
 impl Default for MzPeakWriterBuilder {
@@ -784,11 +818,17 @@ impl Default for MzPeakWriterBuilder {
             buffer_size: 5_000,
             shuffle_mz: false,
             chunked_encoding: false,
+            compression: Compression::ZSTD(ZstdLevel::default())
         }
     }
 }
 
 impl MzPeakWriterBuilder {
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
+
     pub fn add_spectrum_field(mut self, f: FieldRef) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_field(f);
         self
@@ -882,6 +922,7 @@ impl MzPeakWriterBuilder {
             mask_zero_intensity_runs,
             self.shuffle_mz,
             self.chunked_encoding,
+            self.compression,
         )
     }
 
@@ -1288,6 +1329,7 @@ impl<
         index_path: String,
         shuffle_mz: bool,
         use_chunked_encoding: bool,
+        compression: Compression,
     ) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
@@ -1306,9 +1348,7 @@ impl<
         }
 
         let mut data_props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::ZSTD(
-                ZstdLevel::try_new(3).unwrap(),
-            ))
+            .set_compression(compression)
             .set_dictionary_enabled(true)
             .set_sorting_columns(Some(sorted))
             .set_column_encoding(index_path.into(), Encoding::RLE)
@@ -1373,6 +1413,7 @@ impl<
         mask_zero_intensity_runs: bool,
         shuffle_mz: bool,
         use_chunked_encoding: bool,
+        compression: Compression,
     ) -> Self {
         let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
@@ -1408,6 +1449,7 @@ impl<
             format!("{}.spectrum_index", spectrum_buffers.prefix()),
             shuffle_mz,
             use_chunked_encoding,
+            compression,
         );
 
         let mut this = Self {
@@ -1438,33 +1480,7 @@ impl<
     implement_mz_metadata!();
 
     fn add_array_metadata(&mut self) {
-        let mut spectrum_array_index: ArrayIndex =
-            ArrayIndex::new(self.spectrum_buffers.prefix().to_string(), HashMap::new());
-        if let Ok(sub) = self
-            .spectrum_buffers
-            .schema()
-            .field_with_name(&self.spectrum_buffers.prefix())
-            .cloned()
-        {
-            if let DataType::Struct(fields) = sub.data_type() {
-                for f in fields.iter() {
-                    if f.name() == "spectrum_index" {
-                        continue;
-                    }
-                    if let Some(buffer_name) =
-                        BufferName::from_field(BufferContext::Spectrum, f.clone())
-                    {
-                        let aie = ArrayIndexEntry::from_buffer_name(
-                            self.spectrum_buffers.prefix().to_string(),
-                            buffer_name,
-                        );
-                        spectrum_array_index.insert(aie.array_type.clone(), aie);
-                    } else {
-                        log::warn!("Failed to construct metadata index for {f:#?}");
-                    }
-                }
-            }
-        }
+        let spectrum_array_index: ArrayIndex = self.spectrum_buffers.as_array_index();
         self.append_key_value_metadata(
             "spectrum_array_index".to_string(),
             spectrum_array_index.to_json(),

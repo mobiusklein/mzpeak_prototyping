@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{borrow::Cow, fmt::Debug};
 
@@ -307,11 +308,35 @@ impl BufferContext {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferFormat {
+    #[default]
     Point,
-    Chunk,
-    ChunkSecondary,
+    Chunked,
+    ChunkedSecondary,
+}
+
+impl FromStr for BufferFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "point" => Ok(Self::Point),
+            "chunk_values" => Ok(Self::Chunked),
+            "secondary_chunk" => Ok(Self::ChunkedSecondary),
+            _ => Err(format!("{s} not recognized as a buffer format")),
+        }
+    }
+}
+
+impl Display for BufferFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BufferFormat::Point => f.write_str("point"),
+            BufferFormat::Chunked => f.write_str("chunk_values"),
+            BufferFormat::ChunkedSecondary => f.write_str("secondary_chunk"),
+        }
+    }
 }
 
 /// Composite structure for directly naming a data array series
@@ -321,6 +346,7 @@ pub struct BufferName {
     pub array_type: ArrayType,
     pub dtype: BinaryDataArrayType,
     pub unit: Unit,
+    pub buffer_format: BufferFormat,
 }
 
 impl Ord for BufferName {
@@ -504,7 +530,28 @@ impl BufferName {
             array_type,
             dtype,
             unit: Unit::Unknown,
+            buffer_format: BufferFormat::Point,
         }
+    }
+
+    pub const fn new_with_buffer_format(
+        context: BufferContext,
+        array_type: ArrayType,
+        dtype: BinaryDataArrayType,
+        buffer_format: BufferFormat,
+    ) -> Self {
+        Self {
+            context,
+            array_type,
+            dtype,
+            unit: Unit::Unknown,
+            buffer_format,
+        }
+    }
+
+    pub const fn with_format(mut self, buffer_format: BufferFormat) -> Self {
+        self.buffer_format = buffer_format;
+        self
     }
 
     pub const fn with_unit(mut self, unit: Unit) -> Self {
@@ -514,35 +561,39 @@ impl BufferName {
 
     pub fn as_field_metadata(&self) -> HashMap<String, String> {
         [
-                (
-                    "unit".to_string(),
-                    self.unit
-                        .to_curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "array_accession".to_string(),
-                    self.array_type
-                        .as_param_const()
-                        .curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "data_type_accession".to_string(),
-                    self.dtype
-                        .curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "array_name".to_string(),
-                    self.array_type.as_param_const().name().to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect()
+            (
+                "unit".to_string(),
+                self.unit
+                    .to_curie()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "array_accession".to_string(),
+                self.array_type
+                    .as_param_const()
+                    .curie()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "data_type_accession".to_string(),
+                self.dtype
+                    .curie()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "array_name".to_string(),
+                self.array_type.as_param_const().name().to_string(),
+            ),
+            (
+                "buffer_format".to_string(),
+                self.buffer_format.to_string(),
+            )
+        ]
+        .into_iter()
+        .collect()
     }
 
     pub fn from_field(context: BufferContext, field: FieldRef) -> Option<Self> {
@@ -550,20 +601,36 @@ impl BufferName {
         let mut dtype = None;
         let mut unit = Unit::Unknown;
         let mut name = None;
+        let mut buffer_format = BufferFormat::Point;
         for (k, v) in field.metadata().iter() {
             match k.as_str() {
                 "unit" => {
                     unit = Unit::from_accession(v);
                 }
                 "array_accession" => {
-                    array_type = array_type_from_accession(v.parse().ok()?);
+                    array_type = array_type_from_accession(
+                        v.parse()
+                            .inspect_err(|e| {
+                                log::error!("Failed to parse array type accession: {e}")
+                            })
+                            .ok()?,
+                    );
                 }
                 "data_type_accession" => {
-                    let accession: crate::CURIE = v.parse().ok()?;
+                    let accession: crate::CURIE = v
+                        .parse()
+                        .inspect_err(|e| log::error!("Failed to parse data type accession: {e}"))
+                        .ok()?;
                     dtype = binary_datatype_from_accession(accession);
                 }
                 "array_name" => {
                     name = Some(v.to_string());
+                }
+                "buffer_format" => {
+                    buffer_format = v
+                        .parse()
+                        .inspect_err(|e| log::error!("Failed to parse buffer format: {e}"))
+                        .ok()?;
                 }
                 _ => {}
             }
@@ -576,6 +643,7 @@ impl BufferName {
                     context,
                     dtype,
                     unit,
+                    buffer_format,
                 };
                 if let ArrayType::NonStandardDataArray { name } = &mut this.array_type {
                     *name = array_name.into();
@@ -586,8 +654,14 @@ impl BufferName {
         }
     }
 
+    pub fn from_data_array(context: BufferContext, data_array: &DataArray) -> Self {
+        let name = Self::new(context, data_array.name.clone(), data_array.dtype());
+        name
+    }
+
     pub fn to_field(&self) -> FieldRef {
-        let f = Field::new(self.to_string(), array_to_arrow_type(self.dtype), true).with_metadata(self.as_field_metadata());
+        let f = Field::new(self.to_string(), array_to_arrow_type(self.dtype), true)
+            .with_metadata(self.as_field_metadata());
         Arc::new(f)
     }
 }

@@ -1,5 +1,6 @@
 #![allow(unused)]
 use std::collections::HashMap;
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use bytemuck::Pod;
 use num_traits::{Float, NumCast};
 
-use crate::peak_series::{BufferContext, BufferName, MZ_ARRAY, array_to_arrow_type};
+use crate::peak_series::{array_to_arrow_type, BufferContext, BufferFormat, BufferName, MZ_ARRAY};
 use crate::{CURIE, curie};
 
 pub fn chunk_every_k<T: Float>(data: &[T], k: T) -> Vec<SimpleInterval<usize>> {
@@ -69,9 +70,16 @@ pub fn delta_encode<T: Float + Pod>(
     (start, end, acc)
 }
 
+pub fn delta_decode<T: Float + Pod + AddAssign>(it: &[T], start_value: T, accumulator: &mut DataArray) {
+    let mut state = start_value;
+    accumulator.push(state);
+    for val in it.iter().copied() {
+        state += val;
+        accumulator.push(state).unwrap();
+    }
+}
 
-
-const DELTA_ENCODE: CURIE = curie!(MS:1003089);
+pub const DELTA_ENCODE: CURIE = curie!(MS:1003089);
 
 #[derive(Debug, Clone)]
 pub struct ArrayChunk {
@@ -194,6 +202,7 @@ impl ArrayChunk {
             serde_arrow::schema::SchemaLike::from_type::<CURIE>(Default::default()).unwrap();
         let base_name = BufferName::new(buffer_context, self.chunk_values.name.clone(), self.chunk_values.dtype());
         let base_name = overrides.get(&base_name).unwrap_or(&base_name);
+        let base_name = base_name.clone().with_format(BufferFormat::Chunked);
         let field_meta = base_name.as_field_metadata();
         let mut fields_of = vec![
             Field::new(series_index_name, DataType::UInt64, true),
@@ -217,14 +226,14 @@ impl ArrayChunk {
         let mut subfields = Vec::new();
         for (array_type, arr) in self.arrays.iter() {
             let name = BufferName::new(buffer_context, array_type.clone(), arr.dtype());
-            let name = overrides.get(&name).cloned().unwrap_or(name);
+            let name = overrides.get(&name).cloned().unwrap_or(name).with_format(BufferFormat::ChunkedSecondary);
             let f = Field::new(
                 name.to_string(),
                 DataType::LargeList(
                     Field::new("item", array_to_arrow_type(name.dtype), true).into(),
                 ),
                 true,
-            ).with_metadata(name.to_field().metadata().clone());
+            ).with_metadata(name.as_field_metadata());
             subfields.push((name, f));
         }
         subfields.sort_by(|a, b| a.0.cmp(&b.0));

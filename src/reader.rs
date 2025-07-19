@@ -9,7 +9,7 @@ use std::{
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int8Array, Int32Array, Int64Array,
+        Array, ArrayRef, AsArray, Float32Array, Float64Array, Int8Array, Int32Array, Int64Array,
         LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt32Array,
         UInt64Array,
     },
@@ -33,8 +33,11 @@ use mzpeaks::{
 };
 
 use crate::{
+    BufferName,
     archive::ZipArchiveReader,
+    chunk_series::{DELTA_ENCODE, delta_decode},
     filter::{RegressionDeltaModel, fill_nulls_for},
+    peak_series::BufferFormat,
 };
 
 #[allow(unused)]
@@ -119,6 +122,64 @@ impl MSDataFileMetadata for MzPeakReaderMetadata {
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct SpectrumPointIndex {
+    pub spectrum_index: PageIndex<u64>,
+    pub mz_index: PageIndex<f64>,
+    pub im_index: PageIndex<f64>,
+}
+
+impl SpectrumPointIndex {
+    pub fn new(
+        spectrum_index: PageIndex<u64>,
+        mz_index: PageIndex<f64>,
+        im_index: PageIndex<f64>,
+    ) -> Self {
+        Self {
+            spectrum_index,
+            mz_index,
+            im_index,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spectrum_index.is_empty()
+    }
+
+    pub fn is_populated(&self) -> bool {
+        !self.spectrum_index.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SpectrumChunkIndex {
+    pub spectrum_index: PageIndex<u64>,
+    pub start_mz_index: PageIndex<f64>,
+    pub end_mz_index: PageIndex<f64>,
+}
+
+impl SpectrumChunkIndex {
+    pub fn new(
+        spectrum_index: PageIndex<u64>,
+        start_mz_index: PageIndex<f64>,
+        end_mz_index: PageIndex<f64>,
+    ) -> Self {
+        Self {
+            spectrum_index,
+            start_mz_index,
+            end_mz_index,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spectrum_index.is_empty()
+    }
+
+    pub fn is_populated(&self) -> bool {
+        !self.spectrum_index.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct QueryIndex {
     pub spectrum_time_index: PageIndex<f32>,
     pub spectrum_index_index: PageIndex<u64>,
@@ -127,9 +188,8 @@ pub struct QueryIndex {
     pub precursor_index: PageIndex<u64>,
     pub selected_ion_index: PageIndex<u64>,
 
-    pub spectrum_point_spectrum_index: PageIndex<u64>,
-    pub spectrum_mz_index: PageIndex<f64>,
-    pub spectrum_im_index: PageIndex<f64>,
+    pub spectrum_point_index: SpectrumPointIndex,
+    pub spectrum_chunk_index: SpectrumChunkIndex,
 }
 
 pub struct MzPeakReaderType<
@@ -145,6 +205,270 @@ pub struct MzPeakReaderType<
     spectrum_metadata_cache: Option<Vec<SpectrumDescription>>,
     spectrum_row_group_cache: Option<SpectrumDataCache>,
     _t: PhantomData<(C, D)>,
+}
+
+#[derive(Debug)]
+pub struct SpectrumChunkReader<T: parquet::file::reader::ChunkReader + 'static> {
+    builder: ParquetRecordBatchReaderBuilder<T>,
+}
+
+impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
+    pub fn new(builder: ParquetRecordBatchReaderBuilder<T>) -> Self {
+        Self { builder }
+    }
+
+    fn decode_chunks<I: Iterator<Item = RecordBatch>>(reader: I) -> io::Result<BinaryArrayMap> {
+        let mut buffers: HashMap<BufferName, Vec<ArrayRef>> = HashMap::new();
+        let mut main_axis_buffers = Vec::new();
+        let mut main_axis_starts = Vec::new();
+        let mut main_axis = None;
+        let mut bin_map = BinaryArrayMap::new();
+        for batch in reader {
+            let root = batch.column(0).as_struct();
+            let mut chunk_encodings: Vec<CURIE> = Vec::new();
+            for (f, arr) in root.fields().iter().zip(root.columns()) {
+                match f.name().as_str() {
+                    "spectrum_index" => {
+                        continue;
+                    }
+                    "chunk_encoding" => {
+                        let arr = arr.as_struct();
+                        chunk_encodings =
+                            serde_arrow::from_arrow(arr.fields(), arr.columns()).unwrap();
+                    }
+                    s if s.ends_with("chunk_start") => {
+                        main_axis_starts.push(arr.clone());
+                    }
+                    s if s.ends_with("chunk_end") => {
+                        continue;
+                    }
+                    _ => {
+                        if let Some(name) =
+                            BufferName::from_field(crate::BufferContext::Spectrum, f.clone())
+                        {
+                            match name.buffer_format {
+                                BufferFormat::Chunked => {
+                                    main_axis_buffers.push((name, arr.clone()));
+                                }
+                                BufferFormat::ChunkedSecondary | BufferFormat::Point => {
+                                    buffers.entry(name).or_default().push(arr.clone());
+                                }
+                            }
+                        } else {
+                            log::warn!("{f:?} failed to map to a chunk buffer");
+                        }
+                    }
+                }
+            }
+            let total_size: usize = main_axis_buffers.iter().map(|(_, v)| v.len() + 1).sum();
+            for (encoding, ((name, chunk_values), chunk_starts)) in chunk_encodings
+                .into_iter()
+                .zip(main_axis_buffers.drain(..).zip(main_axis_starts.drain(..)))
+            {
+                if main_axis.is_none() {
+                    main_axis = Some(DataArray::from_name_type_size(
+                        &name.array_type,
+                        name.dtype,
+                        total_size * name.dtype.size_of(),
+                    ))
+                }
+                match encoding {
+                    DELTA_ENCODE => {
+                        let chunk_values = chunk_values.as_list::<i64>();
+                        if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
+                            for (chunk_vals, start) in chunk_values.iter().zip(starts.iter()) {
+                                let chunk_vals = chunk_vals.unwrap();
+                                let start = start.unwrap();
+                                if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float64Type>()
+                                {
+                                    delta_decode(
+                                        chunk_vals.values(),
+                                        start,
+                                        main_axis.as_mut().unwrap(),
+                                    );
+                                }
+                                if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float32Type>()
+                                {
+                                    delta_decode(
+                                        chunk_vals.values(),
+                                        start as f32,
+                                        main_axis.as_mut().unwrap(),
+                                    );
+                                } else {
+                                    panic!(
+                                        "Failed to decode chunk of type {chunk_vals:?} for {name}"
+                                    );
+                                }
+                            }
+                        } else if let Some(starts) = chunk_starts.as_primitive_opt::<Float32Type>()
+                        {
+                            for (chunk_vals, start) in chunk_values.iter().zip(starts.iter()) {
+                                let chunk_vals = chunk_vals.unwrap();
+                                let start = start.unwrap();
+                                if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float64Type>()
+                                {
+                                    delta_decode(
+                                        chunk_vals.values(),
+                                        start as f64,
+                                        main_axis.as_mut().unwrap(),
+                                    );
+                                }
+                                if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float32Type>()
+                                {
+                                    delta_decode(
+                                        chunk_vals.values(),
+                                        start,
+                                        main_axis.as_mut().unwrap(),
+                                    );
+                                } else {
+                                    panic!(
+                                        "Failed to decode chunk of type {chunk_vals:?} for {name}"
+                                    );
+                                }
+                            }
+                        };
+                    }
+                    _ => {
+                        panic!("Unknown chunk encoding: {encoding}")
+                    }
+                }
+            }
+        }
+        if main_axis.is_none() {
+            return Ok(bin_map);
+        }
+
+        let main_axis = main_axis.unwrap();
+        let n = main_axis.data_len()?;
+        bin_map.add(main_axis);
+
+        for (name, chunks) in buffers {
+            let mut store = DataArray::from_name_type_size(
+                &name.array_type,
+                name.dtype,
+                name.dtype.size_of() * n,
+            );
+            macro_rules! extend_array {
+                ($buf:ident) => {
+                    if $buf.null_count() > 0 {
+                        for val in $buf.iter() {
+                            store.push(val.unwrap_or_default()).unwrap();
+                        }
+                    } else {
+                        store.extend($buf.values()).unwrap();
+                    }
+                };
+            }
+            for arr in chunks {
+                match arr.data_type() {
+                    DataType::Float32 => {
+                        let buf: &Float32Array = arr.as_primitive();
+                        extend_array!(buf);
+                    }
+                    DataType::Float64 => {
+                        let buf: &Float64Array = arr.as_primitive();
+                        extend_array!(buf);
+                    }
+                    DataType::Int32 => {
+                        let buf: &Int32Array = arr.as_primitive();
+                        extend_array!(buf);
+                    }
+                    DataType::Int64 => {
+                        let buf: &Int64Array = arr.as_primitive();
+                        extend_array!(buf);
+                    }
+                    DataType::UInt8 => {
+                        let buf: &UInt8Array = arr.as_primitive();
+                        extend_array!(buf);
+                    }
+                    DataType::LargeUtf8 => {}
+                    DataType::Utf8 => {}
+                    dt => {
+                        panic!("Unsupported array type: {dt:?}");
+                    }
+                }
+            }
+            bin_map.add(store);
+        }
+        Ok(bin_map)
+    }
+
+    pub fn read_chunks_for_spectrum(
+        self,
+        query: u64,
+        query_indices: &QueryIndex,
+        _spectrum_array_indices: &ArrayIndex,
+    ) -> io::Result<BinaryArrayMap> {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in query_indices
+            .spectrum_chunk_index
+            .spectrum_index
+            .pages_contains(query)
+        {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+
+        // Otherwise we must construct a more intricate read plan, first pruning rows and row groups
+        // based upon the pages matched
+        let first_row = if !pages.is_empty() {
+            let mut rg_row_skip = 0;
+
+            for i in 0..rg_idx_acc[0] {
+                let rg = self.builder.metadata().row_group(i);
+                rg_row_skip += rg.num_rows();
+            }
+            rg_row_skip
+        } else {
+            return Ok(Default::default());
+        };
+
+        let rows = query_indices
+            .spectrum_point_index
+            .spectrum_index
+            .pages_to_row_selection(pages.iter(), first_row);
+
+        let predicate_mask =
+            ProjectionMask::columns(self.builder.parquet_schema(), ["chunk.spectrum_index"]);
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let spectrum_index: &UInt64Array = batch
+                .column(0)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+
+            let it = spectrum_index
+                .iter()
+                .map(|val| val.is_some_and(|val| val == query));
+
+            Ok(it.map(Some).collect())
+        });
+
+        let proj = ProjectionMask::columns(&self.builder.parquet_schema(), ["chunk"]);
+
+        log::trace!("{query} @ chunk spread across row groups {rg_idx_acc:?}");
+
+        let reader = self
+            .builder
+            .with_row_groups(rg_idx_acc)
+            .with_row_selection(rows)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_projection(proj)
+            .build()?;
+
+        Self::decode_chunks(reader.flatten())
+    }
 }
 
 impl<
@@ -719,28 +1043,56 @@ impl<
         }
         spectrum_id_index.init = true;
 
-        query_index.spectrum_point_spectrum_index = read_u64_page_index_from(
-            &spectrum_data_reader.metadata(),
-            &peak_pq_schema,
-            &format!("{}.spectrum_index", spectrum_array_indices.prefix),
-        )
-        .unwrap_or_default();
+        if spectrum_array_indices.prefix == "point" {
+            query_index.spectrum_point_index.spectrum_index = read_u64_page_index_from(
+                &spectrum_data_reader.metadata(),
+                &peak_pq_schema,
+                &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+            )
+            .unwrap_or_default();
+        } else if spectrum_array_indices.prefix == "chunk" {
+            query_index.spectrum_point_index.spectrum_index = read_u64_page_index_from(
+                &spectrum_data_reader.metadata(),
+                &peak_pq_schema,
+                &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+            )
+            .unwrap_or_default();
+        } else {
+            log::error!("Prefix {} not recognized", spectrum_array_indices.prefix)
+        }
 
         for (arr, entry) in spectrum_array_indices.iter() {
-            if matches!(arr, ArrayType::MZArray) {
-                query_index.spectrum_mz_index = read_f64_page_index_from(
-                    &spectrum_data_reader.metadata(),
-                    &peak_pq_schema,
-                    &entry.path,
-                )
-                .unwrap_or_default();
-            } else if arr.is_ion_mobility() {
-                query_index.spectrum_im_index = read_f64_page_index_from(
-                    &spectrum_data_reader.metadata(),
-                    &peak_pq_schema,
-                    &entry.path,
-                )
-                .unwrap_or_default();
+            if entry.prefix == "point" {
+                if matches!(arr, ArrayType::MZArray) {
+                    query_index.spectrum_point_index.mz_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &entry.path,
+                    )
+                    .unwrap_or_default();
+                } else if arr.is_ion_mobility() {
+                    query_index.spectrum_point_index.im_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &entry.path,
+                    )
+                    .unwrap_or_default();
+                }
+            } else if entry.prefix == "chunk" {
+                if matches!(arr, ArrayType::MZArray) {
+                    query_index.spectrum_chunk_index.start_mz_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &format!("{}_chunk_start", entry.path),
+                    )
+                    .unwrap_or_default();
+                    query_index.spectrum_chunk_index.end_mz_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &format!("{}_chunk_end", entry.path),
+                    )
+                    .unwrap_or_default();
+                }
             }
         }
 
@@ -801,6 +1153,13 @@ impl<
     /// Read the complete data arrays for the spectrum at `index`
     pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
         let builder = self.handle.spectra_data()?;
+        if self.query_indices.spectrum_chunk_index.is_populated() {
+            return SpectrumChunkReader::new(builder).read_chunks_for_spectrum(
+                index,
+                &self.query_indices,
+                &self.metadata.spectrum_array_indices,
+            );
+        }
 
         let pq_schema = builder.parquet_schema();
 
@@ -809,7 +1168,8 @@ impl<
 
         for page in self
             .query_indices
-            .spectrum_point_spectrum_index
+            .spectrum_point_index
+            .spectrum_index
             .pages_contains(index)
         {
             if !rg_idx_acc.contains(&page.row_group_i) {
@@ -848,7 +1208,8 @@ impl<
 
         let rows = self
             .query_indices
-            .spectrum_point_spectrum_index
+            .spectrum_point_index
+            .spectrum_index
             .pages_to_row_selection(pages.iter(), first_row);
 
         let predicate_mask = ProjectionMask::columns(
@@ -1268,13 +1629,15 @@ impl<
 
         let mut rows = self
             .query_indices
-            .spectrum_point_spectrum_index
+            .spectrum_point_index
+            .spectrum_index
             .row_selection_overlaps(&index_range);
         if let Some(mz_range) = mz_range.as_ref() {
             rows = rows.intersection(
                 &self
                     .query_indices
-                    .spectrum_mz_index
+                    .spectrum_point_index
+                    .mz_index
                     .row_selection_overlaps(mz_range),
             );
         }
@@ -1282,7 +1645,8 @@ impl<
             rows = rows.union(
                 &self
                     .query_indices
-                    .spectrum_im_index
+                    .spectrum_point_index
+                    .im_index
                     .row_selection_overlaps(&ion_mobility_range),
             );
         }
@@ -1650,7 +2014,11 @@ impl<
             if parts == ["spectrum", "index"] {
                 index_i = Some(i);
             }
-            if parts.iter().zip(["spectrum", "median_delta"]).all(|(a, b)| a == b) {
+            if parts
+                .iter()
+                .zip(["spectrum", "median_delta"])
+                .all(|(a, b)| a == b)
+            {
                 median_i = Some(i);
             }
         }

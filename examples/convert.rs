@@ -7,6 +7,7 @@ use mzdata::{
 };
 use mzpeak_prototyping::{writer::sample_array_types_from_file_reader, *};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
+use parquet::basic::ZstdLevel;
 use std::{collections::HashMap, fs, io, path::PathBuf, sync::mpsc::sync_channel, thread};
 
 #[derive(Debug, Parser)]
@@ -14,34 +15,64 @@ pub struct App {
     #[arg()]
     filename: PathBuf,
 
-    #[arg(short = 'm', long = "mz-f32", help="Encode the m/z values using float32 instead of float64")]
+    #[arg(
+        short = 'm',
+        long = "mz-f32",
+        help = "Encode the m/z values using float32 instead of float64"
+    )]
     mz_f32: bool,
 
-    #[arg(short = 'd', long = "ion-mobility-f32", help="Encode the ion mobility values using float32 instead of float64")]
+    #[arg(
+        short = 'd',
+        long = "ion-mobility-f32",
+        help = "Encode the ion mobility values using float32 instead of float64"
+    )]
     ion_mobility_f32: bool,
 
-    #[arg(short = 'y', long = "intensity-f32", help="Encode the intensity values using float32")]
+    #[arg(
+        short = 'y',
+        long = "intensity-f32",
+        help = "Encode the intensity values using float32"
+    )]
     intensity_f32: bool,
 
-    #[arg(short = 'i',
-          long = "intensity-i32",
-          help="Encode the intensity values as int32 instead of floats which may improve compression at the cost of the decimal component")]
+    #[arg(
+        short = 'i',
+        long = "intensity-i32",
+        help = "Encode the intensity values as int32 instead of floats which may improve compression at the cost of the decimal component"
+    )]
     intensity_i32: bool,
 
-    #[arg(short = 'z', long = "shuffle-mz", help="Shuffle the m/z array, which may improve the compression of profile spectra")]
+    #[arg(
+        short = 'z',
+        long = "shuffle-mz",
+        help = "Shuffle the m/z array, which may improve the compression of profile spectra"
+    )]
     shuffle_mz: bool,
 
-    #[arg(short='u', long, help="Null mask out sparse zero intensity peaks")]
+    #[arg(short = 'u', long, help = "Null mask out sparse zero intensity peaks")]
     null_zeros: bool,
 
     #[arg(short = 'o')]
     outpath: Option<PathBuf>,
 
-    #[arg(short, long, default_value_t=5000, help="The number of spectra to buffer between writes")]
+    #[arg(
+        short,
+        long,
+        default_value_t = 5000,
+        help = "The number of spectra to buffer between writes"
+    )]
     buffer_size: usize,
 
-    #[arg(short, long, help="Use the chunked encoding instead of the flat peak array layout")]
-    chunked_encoding: bool
+    #[arg(
+        short,
+        long,
+        help = "Use the chunked encoding instead of the flat peak array layout"
+    )]
+    chunked_encoding: bool,
+
+    #[arg(short = 'k', long, default_value_t = 3, help="The Zstd compression level to use. Defaults to 3, but ranges from 1-22")]
+    compression_level: i32,
 }
 
 fn main() -> io::Result<()> {
@@ -51,18 +82,16 @@ fn main() -> io::Result<()> {
 
     let start = std::time::Instant::now();
 
-    if filename.to_string_lossy() == "-" {
-
-    }
-
-
-
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&filename)
         .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
 
-    let outname = args
-        .outpath
-        .unwrap_or_else(|| filename.with_extension("mzpeak").file_name().unwrap().into());
+    let outname = args.outpath.unwrap_or_else(|| {
+        filename
+            .with_extension("mzpeak")
+            .file_name()
+            .unwrap()
+            .into()
+    });
     let mut overrides = HashMap::new();
     if args.mz_f32 {
         overrides.insert(
@@ -146,15 +175,22 @@ fn main() -> io::Result<()> {
         // .add_spectrum_peak_type::<DeconvolutedPeak>()
         .add_default_chromatogram_fields()
         .buffer_size(args.buffer_size)
+        .compression(parquet::basic::Compression::ZSTD(
+            ZstdLevel::try_new(args.compression_level).unwrap(),
+        ))
         .shuffle_mz(args.shuffle_mz);
 
     if args.null_zeros {
         writer = writer.null_zeros(true)
     }
 
-    writer = sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(&mut reader, &overrides, args.chunked_encoding)
-        .into_iter()
-        .fold(writer, |writer, f| writer.add_spectrum_field(f));
+    writer = sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
+        &mut reader,
+        &overrides,
+        args.chunked_encoding,
+    )
+    .into_iter()
+    .fold(writer, |writer, f| writer.add_spectrum_field(f));
 
     for (from, to) in overrides.iter() {
         writer = writer.add_spectrum_override(from.clone(), to.clone());
