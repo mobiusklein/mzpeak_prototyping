@@ -554,6 +554,10 @@ impl BufferName {
         self
     }
 
+    pub fn as_data_array(&self, size: usize) -> DataArray {
+        DataArray::from_name_type_size(&self.array_type, self.dtype, size * self.dtype.size_of())
+    }
+
     pub const fn with_unit(mut self, unit: Unit) -> Self {
         self.unit = unit;
         self
@@ -587,10 +591,7 @@ impl BufferName {
                 "array_name".to_string(),
                 self.array_type.as_param_const().name().to_string(),
             ),
-            (
-                "buffer_format".to_string(),
-                self.buffer_format.to_string(),
-            )
+            ("buffer_format".to_string(), self.buffer_format.to_string()),
         ]
         .into_iter()
         .collect()
@@ -736,6 +737,7 @@ pub struct ArrayIndexEntry {
     pub array_type: ArrayType,
     /// The unit of the values in the array
     pub unit: Unit,
+    pub buffer_format: BufferFormat,
 }
 
 /// A JSON-serializable version of [`ArrayIndexEntry`].
@@ -763,6 +765,8 @@ pub struct SerializedArrayIndexEntry {
         deserialize_with = "opt_curie_deserialize"
     )]
     pub unit: Option<CURIE>,
+    #[serde(default)]
+    pub buffer_format: String,
 }
 
 /// Convert an Arrow [`DataType`] to a [`BinaryDataArrayType`]
@@ -802,6 +806,7 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
                 _ => value.array_type.as_param_const().name().to_string(),
             },
             unit: value.unit.to_curie().map(|c| c.into()),
+            buffer_format: value.buffer_format.to_string(),
         }
     }
 }
@@ -831,6 +836,10 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
                 .unit
                 .map(|x| Unit::from_curie(&x.into()))
                 .unwrap_or_default(),
+            buffer_format: value
+                .buffer_format
+                .parse::<BufferFormat>()
+                .unwrap_or(BufferFormat::Point),
         }
     }
 }
@@ -844,6 +853,7 @@ impl ArrayIndexEntry {
         data_type: DataType,
         array_type: ArrayType,
         unit: Unit,
+        buffer_format: BufferFormat,
     ) -> Self {
         Self {
             context,
@@ -853,6 +863,7 @@ impl ArrayIndexEntry {
             data_type,
             array_type,
             unit,
+            buffer_format,
         }
     }
 
@@ -866,7 +877,17 @@ impl ArrayIndexEntry {
             name: buffer_name.to_string(),
             array_type: buffer_name.array_type,
             unit: buffer_name.unit,
+            buffer_format: buffer_name.buffer_format,
         }
+    }
+
+    pub fn as_buffer_name(&self) -> BufferName {
+        BufferName::new_with_buffer_format(
+            self.context,
+            self.array_type.clone(),
+            arrow_to_array_type(&self.data_type).unwrap(),
+            self.buffer_format,
+        )
     }
 }
 

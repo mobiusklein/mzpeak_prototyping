@@ -279,3 +279,30 @@ class NullTokenizer:
     def __iter__(self):
         while val := self.emit():
             yield val
+
+
+def find_zero_runs(arr: list) -> list[int]:
+    n = len(arr)
+    n1 = n - 1
+    was_zero = False
+    acc = []
+    i = 0
+    while i < n:
+        v = arr[i]
+        if v is not None:
+            if v == 0:
+                if (was_zero or (len(acc) == 0)) and (
+                    (i < n1 and arr[i + 1] == 0) or i == n1
+                ):
+                    pass
+                else:
+                    acc.append(i)
+                was_zero = True
+            else:
+                acc.append(i)
+                was_zero = False
+        else:
+            acc.append(i)
+            was_zero = False
+        i += 1
+    return np.array(acc)

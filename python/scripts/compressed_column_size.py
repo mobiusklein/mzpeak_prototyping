@@ -27,7 +27,9 @@ def main(path: str, column_path: str):
             raise click.ClickException(
                 f"Column {column_path} was not found in {meta.schema}"
             )
-    print(f"Compressed Size: {humanize.naturalsize(z, format='%.3f')}")
+    print(
+        f"Compressed Size: {humanize.naturalsize(z, format='%.3f')} over {meta.num_row_groups} row groups"
+    )
     print(f"Decompressed Size: {humanize.naturalsize(zu, format='%.3f')}")
 
 if __name__ == '__main__':

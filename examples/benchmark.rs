@@ -15,9 +15,7 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 // Import convert functionality - include it directly for standalone usage
-mod convert {
-    include!("convert.rs");
-}
+mod convert;
 use convert::{ConvertArgs, convert_file};
 
 // ============================================================================
@@ -57,26 +55,29 @@ pub struct BenchmarkResult {
 
 pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
     let start = Instant::now();
-    
+
     // Setup
-    let threads = args.threads.unwrap_or_else(num_cpus::get);
+    let threads = args.threads.unwrap_or_else(|| {
+        let c = thread::available_parallelism().unwrap_or_else(|_| 1usize.try_into().unwrap());
+        c.into()
+    });
     let temp_dir = if let Some(temp_dir) = &args.temp_dir {
         TempDir::new_in(temp_dir)?
     } else {
         TempDir::new()?
     };
-    
+
     // Discover files
     eprintln!("Scanning directory for supported mass spectrometry files...");
     let files = discover_supported_files(&args.directory)?;
-    
+
     if files.is_empty() {
         eprintln!("No supported mass spectrometry files found in {}", args.directory.display());
         return Ok(());
     }
-    
+
     eprintln!("Found {} supported files", files.len());
-    
+
     // Setup progress bar
     let progress = if args.no_progress {
         None
@@ -88,41 +89,41 @@ pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
             .progress_chars("#>-"));
         Some(pb)
     };
-    
+
     // Process files in parallel
     let results = process_files_parallel(files, temp_dir.path(), &args.convert_args, threads, progress.as_ref())?;
 
     // Write CSV output
     let output_path = args.output_csv.unwrap_or_else(|| PathBuf::from("benchmark_results.csv"));
     write_csv_results(&results, &output_path)?;
-    
+
     let end = Instant::now();
     let total_time = (end - start).as_secs_f64();
-    
+
     eprintln!("\nBenchmark completed in {:.2} seconds", total_time);
     eprintln!("Results written to {}", output_path.display());
     eprintln!("Processed {} files with {} threads", results.len(), threads);
-    
+
     // Summary stats
     let successful = results.iter().filter(|r| r.status == "success").count();
     let failed = results.len() - successful;
     eprintln!("Success: {}, Failed: {}", successful, failed);
-    
+
     Ok(())
 }
 
 pub fn discover_supported_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     let mut supported_files = Vec::new();
-    
+
     for entry in WalkDir::new(directory) {
         let entry = entry?;
-        let path = entry.path();        
+        let path = entry.path();
         // Try to infer format using mzdata
         if is_supported_format(path) {
             supported_files.push(path.to_path_buf());
         }
     }
-    
+
     Ok(supported_files)
 }
 
@@ -143,7 +144,7 @@ pub fn process_files_parallel(
 ) -> io::Result<Vec<BenchmarkResult>> {
     let results = Arc::new(Mutex::new(Vec::new()));
     let work_queue = Arc::new(Mutex::new(files.into_iter().collect::<VecDeque<_>>()));
-    
+
     // Spawn worker threads
     let mut handles = Vec::new();
     for _ in 0..max_threads {
@@ -152,20 +153,20 @@ pub fn process_files_parallel(
         let convert_args = convert_args.clone();
         let temp_dir = temp_dir.to_path_buf();
         let progress = progress.map(|p| p.clone());
-        
+
         let handle = thread::spawn(move || {
             loop {
                 let file_path = {
                     let mut queue = work_queue.lock().unwrap();
                     queue.pop_front()
                 };
-                
+
                 match file_path {
                     Some(path) => {
                         let result = panic::catch_unwind(AssertUnwindSafe(|| {
                             process_single_file(path.clone(), &temp_dir, &convert_args)
                         }));
-                        
+
                         let benchmark_result = match result {
                             Ok(result) => result,
                             Err(_) => {
@@ -184,7 +185,7 @@ pub fn process_files_parallel(
                                 }
                             }
                         };
-                        
+
                         results.lock().unwrap().push(benchmark_result);
                         if let Some(ref pb) = progress {
                             pb.inc(1);
@@ -196,18 +197,18 @@ pub fn process_files_parallel(
         });
         handles.push(handle);
     }
-    
+
     // Wait for all workers to complete
     for handle in handles {
         if let Err(e) = handle.join() {
             eprintln!("Worker thread failed: {:?}", e);
         }
     }
-    
+
     if let Some(pb) = progress {
         pb.finish_with_message("Done!");
     }
-    
+
     let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
     Ok(results)
 }
@@ -221,7 +222,7 @@ pub fn process_single_file(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    
+
     // Get original file size
     let original_size = match fs::metadata(&file_path) {
         Ok(metadata) => metadata.len(),
@@ -235,16 +236,16 @@ pub fn process_single_file(
             };
         }
     };
-    
+
     // Create output path in temp directory
     let output_path = temp_dir.join(format!("{}.mzpeak", filename));
-    
+
     // Time the conversion
     let start = Instant::now();
     let conversion_result = convert_file(&file_path, &output_path, &convert_args);
     let end = Instant::now();
     let time_taken = (end - start).as_secs_f64();
-    
+
     match conversion_result {
         Ok(()) => {
             // Get final file size
@@ -252,10 +253,10 @@ pub fn process_single_file(
                 Ok(metadata) => metadata.len(),
                 Err(_) => 0,
             };
-            
+
             // Clean up the converted file
             let _ = fs::remove_file(&output_path);
-            
+
             BenchmarkResult {
                 filename,
                 original_size,
@@ -267,7 +268,7 @@ pub fn process_single_file(
         Err(e) => {
             // Clean up any partial file
             let _ = fs::remove_file(&output_path);
-            
+
             BenchmarkResult {
                 filename,
                 original_size,
@@ -281,10 +282,10 @@ pub fn process_single_file(
 
 pub fn write_csv_results(results: &[BenchmarkResult], output_path: &Path) -> io::Result<()> {
     let mut writer = Writer::from_path(output_path)?;
-    
+
     // Write header
     writer.write_record(&["filename", "originalsize", "finalsize", "timetaken", "status"])?;
-    
+
     // Write results
     for result in results {
         writer.write_record(&[
@@ -295,7 +296,7 @@ pub fn write_csv_results(results: &[BenchmarkResult], output_path: &Path) -> io:
             &result.status,
         ])?;
     }
-    
+
     writer.flush()?;
     Ok(())
 }

@@ -4,10 +4,11 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayBuilder, ArrayRef, Float32Array, Float32Builder, Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, LargeBinaryArray, LargeListBuilder, StructArray, StructBuilder, UInt32Builder, UInt64Array, UInt64Builder, UInt8Array, UInt8Builder
+    Array, ArrayBuilder, ArrayRef, AsArray, Float32Array, Float32Builder, Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, LargeBinaryArray, LargeListBuilder, StructArray, StructBuilder, UInt32Builder, UInt64Array, UInt64Builder, UInt8Array, UInt8Builder
 };
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Float32Type, Float64Type, Schema};
 use mzdata::params::Unit;
+use mzdata::spectrum::bindata::BinaryCompressionType;
 use mzdata::{
     prelude::*,
     spectrum::{
@@ -50,6 +51,8 @@ pub fn chunk_every_k<T: Float>(data: &[T], k: T) -> Vec<SimpleInterval<usize>> {
     chunks
 }
 
+
+
 pub fn delta_encode<T: Float + Pod>(
     data: &[T],
     name: &ArrayType,
@@ -79,7 +82,102 @@ pub fn delta_decode<T: Float + Pod + AddAssign>(it: &[T], start_value: T, accumu
     }
 }
 
+pub const NO_COMPRESSION: CURIE = curie!(MS:1000576);
 pub const DELTA_ENCODE: CURIE = curie!(MS:1003089);
+pub const NUMPRESS_LINEAR: CURIE = curie!(MS:1002312);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChunkingStrategy {
+    Basic { chunk_size: f64, },
+    Delta { chunk_size: f64, },
+    NumpressLinear { chunk_size: f64, },
+}
+
+impl ChunkingStrategy {
+    pub fn as_curie(&self) -> CURIE {
+        match self {
+            Self::Basic { chunk_size } => NO_COMPRESSION,
+            Self::Delta { chunk_size } => DELTA_ENCODE,
+            Self::NumpressLinear { chunk_size } => NUMPRESS_LINEAR,
+        }
+    }
+
+    pub fn chunk_size(&self) -> f64 {
+        match self {
+            ChunkingStrategy::Basic { chunk_size } => *chunk_size,
+            ChunkingStrategy::Delta { chunk_size } => *chunk_size,
+            ChunkingStrategy::NumpressLinear { chunk_size } => *chunk_size,
+        }
+    }
+
+    pub fn encode<T: Float + Pod>(&self, data: &[T], name: &ArrayType, dtype: &BinaryDataArrayType) -> (f64, f64, DataArray) {
+        match self {
+            ChunkingStrategy::Basic { chunk_size } => {
+                let mut acc = DataArray::from_name_type_size(name, *dtype, dtype.size_of() * data.len());
+                acc.extend(data).unwrap();
+                let start = data.first().copied().unwrap_or_else(|| T::zero());
+                let end = data.last().copied().unwrap_or_else(|| T::zero());
+                (start.to_f64().unwrap(), end.to_f64().unwrap(), acc)
+            },
+            ChunkingStrategy::Delta { chunk_size } => {
+                delta_encode(data, name, dtype)
+            },
+            ChunkingStrategy::NumpressLinear { chunk_size } => {
+                let mut acc = DataArray::from_name_type_size(name, *dtype, dtype.size_of() * data.len());
+                acc.extend(data).unwrap();
+                acc.store_compressed(BinaryCompressionType::NumpressLinear);
+                let start = data.first().copied().unwrap_or_else(|| T::zero());
+                let end = data.last().copied().unwrap_or_else(|| T::zero());
+                (start.to_f64().unwrap(), end.to_f64().unwrap(), acc)
+            },
+        }
+    }
+
+    pub fn decode_arrow(&self, array: &ArrayRef, start_value: f64, accumulator: &mut DataArray) {
+        match self {
+            ChunkingStrategy::Basic { chunk_size } => {
+                match array.data_type() {
+                    DataType::Float32 => {
+                        let it = array.as_primitive::<Float32Type>();
+                        accumulator.extend(it.values()).unwrap();
+                    }
+                    DataType::Float64 => {
+                        let it = array.as_primitive::<Float64Type>();
+                        accumulator.extend(it.values()).unwrap();
+                    }
+                    _ => panic!("Data type {:?} is not supported by basic decoding", array.data_type())
+                }
+            },
+            ChunkingStrategy::Delta { chunk_size } => {
+                match array.data_type() {
+                    DataType::Float32 => {
+                        let it = array.as_primitive::<Float32Type>();
+                        delta_decode(it.values(), start_value as f32, accumulator);
+                    }
+                    DataType::Float64 => {
+                        let it = array.as_primitive::<Float64Type>();
+                        delta_decode(it.values(), start_value, accumulator);
+                    }
+                    _ => panic!("Data type {:?} is not supported by chunk decoding", array.data_type())
+                }
+            },
+            ChunkingStrategy::NumpressLinear { chunk_size } => {
+                match array.data_type() {
+                    DataType::Float64 => {
+                        let it = array.as_primitive::<Float64Type>();
+                        todo!("Still working on numpress decoding")
+                    }
+                    _ => panic!("Data type {:?} is not supported by numpress linear decoding", array.data_type())
+                }
+            },
+        }
+    }
+
+    fn decode<T: Float + Pod + AddAssign>(&self, it: &[T], start_value: T, accumulator: &mut DataArray) {
+
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct ArrayChunk {
@@ -87,7 +185,7 @@ pub struct ArrayChunk {
     pub chunk_start: f64,
     pub chunk_end: f64,
     pub chunk_values: DataArray,
-    pub chunk_encoding: CURIE,
+    pub chunk_encoding: ChunkingStrategy,
     pub arrays: BinaryArrayMap,
 }
 
@@ -97,7 +195,7 @@ impl ArrayChunk {
         chunk_start: f64,
         chunk_end: f64,
         chunk_values: DataArray,
-        chunk_encoding: CURIE,
+        chunk_encoding: ChunkingStrategy,
         arrays: BinaryArrayMap,
     ) -> Self {
         Self {
@@ -154,8 +252,9 @@ impl ArrayChunk {
             }
             b.append(true);
             let mut cb = this_builder.field_builder::<StructBuilder>(4).unwrap();
-            cb.field_builder::<UInt8Builder>(0).unwrap().append_value(chunk.chunk_encoding.cv_id);
-            cb.field_builder::<UInt32Builder>(1).unwrap().append_value(chunk.chunk_encoding.accession);
+            let curie_of = chunk.chunk_encoding.as_curie();
+            cb.field_builder::<UInt8Builder>(0).unwrap().append_value(curie_of.cv_id);
+            cb.field_builder::<UInt32Builder>(1).unwrap().append_value(curie_of.accession);
             cb.append(true);
             for (i, f) in this_schema.fields().iter().enumerate().skip(5) {
                 let buf_name = BufferName::from_field(buffer_context, f.clone()).unwrap();
@@ -203,6 +302,7 @@ impl ArrayChunk {
         let base_name = BufferName::new(buffer_context, self.chunk_values.name.clone(), self.chunk_values.dtype());
         let base_name = overrides.get(&base_name).unwrap_or(&base_name);
         let base_name = base_name.clone().with_format(BufferFormat::Chunked);
+
         let field_meta = base_name.as_field_metadata();
         let mut fields_of = vec![
             Field::new(series_index_name, DataType::UInt64, true),
@@ -243,11 +343,11 @@ impl ArrayChunk {
         Schema::new(fields_of)
     }
 
-    pub fn from_arrays_delta<K: NumCast>(
+    pub fn from_arrays(
         series_index: u64,
         main_axis: BufferName,
         arrays: &BinaryArrayMap,
-        k: K,
+        chunk_encoding: ChunkingStrategy,
         excluded_arrays: Option<&[BufferName]>,
     ) -> Result<Vec<Self>, ArrayRetrievalError> {
         let mut chunks = Vec::new();
@@ -257,7 +357,7 @@ impl ArrayChunk {
 
         macro_rules! chunked_delta {
             ($data:expr) => {
-                let steps = chunk_every_k(&$data, NumCast::from(k).unwrap());
+                let steps = chunk_every_k(&$data, NumCast::from(chunk_encoding.chunk_size()).unwrap());
                 for step in steps {
                     let seg = &$data[step.start..step.end];
                     let (start, end, deltas) =
@@ -280,7 +380,7 @@ impl ArrayChunk {
                         start,
                         end,
                         deltas,
-                        DELTA_ENCODE,
+                        ChunkingStrategy::Delta { chunk_size: NumCast::from(chunk_encoding.chunk_size()).unwrap() },
                         parts,
                     ));
                 }
@@ -318,7 +418,7 @@ mod test {
             ArrayType::MZArray,
             BinaryDataArrayType::Float32,
         );
-        let chunks = ArrayChunk::from_arrays_delta(0, target, arrays, 50.0, None)?;
+        let chunks = ArrayChunk::from_arrays(0, target, arrays, ChunkingStrategy::Delta { chunk_size: 50.0 }, None)?;
         let schema = chunks[0].to_schema("spectrum_index", BufferContext::Spectrum, &HashMap::new());
         let arrow_arrays = ArrayChunk::to_arrays(&chunks, "spectrum_index", BufferContext::Spectrum, &schema, &HashMap::new())?;
         Ok(())

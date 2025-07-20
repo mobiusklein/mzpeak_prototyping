@@ -33,11 +33,7 @@ use mzpeaks::{
 };
 
 use crate::{
-    BufferName,
-    archive::ZipArchiveReader,
-    chunk_series::{DELTA_ENCODE, delta_decode},
-    filter::{RegressionDeltaModel, fill_nulls_for},
-    peak_series::BufferFormat,
+    archive::ZipArchiveReader, chunk_series::{delta_decode, DELTA_ENCODE, NO_COMPRESSION}, filter::{fill_nulls_for, RegressionDeltaModel}, peak_series::BufferFormat, BufferName
 };
 
 #[allow(unused)]
@@ -217,7 +213,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         Self { builder }
     }
 
-    fn decode_chunks<I: Iterator<Item = RecordBatch>>(reader: I) -> io::Result<BinaryArrayMap> {
+    pub fn decode_chunks<I: Iterator<Item = RecordBatch>>(reader: I, spectrum_array_indices: &ArrayIndex) -> io::Result<BinaryArrayMap> {
         let mut buffers: HashMap<BufferName, Vec<ArrayRef>> = HashMap::new();
         let mut main_axis_buffers = Vec::new();
         let mut main_axis_starts = Vec::new();
@@ -273,6 +269,49 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                     ))
                 }
                 match encoding {
+                    NO_COMPRESSION => {
+                        let chunk_values = chunk_values.as_list::<i64>();
+                        if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
+                            for (chunk_vals, start) in chunk_values.iter().zip(starts.iter()) {
+                                let chunk_vals = chunk_vals.unwrap();
+                                let _start = start.unwrap();
+                                if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float64Type>()
+                                {
+                                    main_axis.as_mut().unwrap().extend(chunk_vals.values())?;
+                                }
+                                else if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float32Type>()
+                                {
+                                    main_axis.as_mut().unwrap().extend(chunk_vals.values())?;
+                                } else {
+                                    panic!(
+                                        "Failed to decode chunk of type {chunk_vals:?} for {name}"
+                                    );
+                                }
+                            }
+                        } else if let Some(starts) = chunk_starts.as_primitive_opt::<Float32Type>()
+                        {
+                            for (chunk_vals, start) in chunk_values.iter().zip(starts.iter()) {
+                                let chunk_vals = chunk_vals.unwrap();
+                                let _start = start.unwrap();
+                                if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float64Type>()
+                                {
+                                    main_axis.as_mut().unwrap().extend(chunk_vals.values())?;
+                                }
+                                else if let Some(chunk_vals) =
+                                    chunk_vals.as_primitive_opt::<Float32Type>()
+                                {
+                                    main_axis.as_mut().unwrap().extend(chunk_vals.values())?;
+                                } else {
+                                    panic!(
+                                        "Failed to decode chunk of type {chunk_vals:?} for {name}"
+                                    );
+                                }
+                            }
+                        };
+                    }
                     DELTA_ENCODE => {
                         let chunk_values = chunk_values.as_list::<i64>();
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
@@ -288,7 +327,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                         main_axis.as_mut().unwrap(),
                                     );
                                 }
-                                if let Some(chunk_vals) =
+                                else if let Some(chunk_vals) =
                                     chunk_vals.as_primitive_opt::<Float32Type>()
                                 {
                                     delta_decode(
@@ -316,7 +355,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                         main_axis.as_mut().unwrap(),
                                     );
                                 }
-                                if let Some(chunk_vals) =
+                                else if let Some(chunk_vals) =
                                     chunk_vals.as_primitive_opt::<Float32Type>()
                                 {
                                     delta_decode(
@@ -333,12 +372,15 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                         };
                     }
                     _ => {
-                        panic!("Unknown chunk encoding: {encoding}")
+                        panic!("Unknown or unsupported chunk encoding: {encoding}")
                     }
                 }
             }
         }
         if main_axis.is_none() {
+            for k in spectrum_array_indices.entries.values() {
+                bin_map.add(k.as_buffer_name().as_data_array(0));
+            }
             return Ok(bin_map);
         }
 
@@ -364,31 +406,45 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                 };
             }
             for arr in chunks {
-                match arr.data_type() {
-                    DataType::Float32 => {
-                        let buf: &Float32Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::Float64 => {
-                        let buf: &Float64Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::Int32 => {
-                        let buf: &Int32Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::Int64 => {
-                        let buf: &Int64Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::UInt8 => {
-                        let buf: &UInt8Array = arr.as_primitive();
-                        extend_array!(buf);
-                    }
-                    DataType::LargeUtf8 => {}
-                    DataType::Utf8 => {}
-                    dt => {
-                        panic!("Unsupported array type: {dt:?}");
+                if let Some(arr) = arr.as_list_opt::<i64>() {
+                    match arr.value_type() {
+                        DataType::Float32 => {
+                            for arr in arr.iter().flatten() {
+                                let buf: &Float32Array = arr.as_primitive();
+                                extend_array!(buf);
+                            }
+                        }
+                        DataType::Float64 => {
+                            for arr in arr.iter().flatten() {
+                                let buf: &Float64Array = arr.as_primitive();
+                                extend_array!(buf);
+                            }
+                        }
+                        DataType::Int32 => {
+                            for arr in arr.iter().flatten() {
+                                let buf: &Int32Array = arr.as_primitive();
+                                extend_array!(buf);
+                            }
+                        }
+                        DataType::Int64 => {
+                            for arr in arr.iter().flatten() {
+                                let buf: &Int64Array = arr.as_primitive();
+                                extend_array!(buf);
+                            }
+                        }
+                        DataType::UInt8 => {
+                            for arr in arr.iter().flatten() {
+                                let buf: &UInt8Array = arr.as_primitive();
+                                extend_array!(buf);
+                            }
+                        }
+                        DataType::LargeUtf8 => {
+                            todo!("String arrays not supported yet")
+                        }
+                        DataType::Utf8 => {}
+                        dt => {
+                            panic!("Unsupported array type: {dt:?}");
+                        }
                     }
                 }
             }
@@ -401,7 +457,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         self,
         query: u64,
         query_indices: &QueryIndex,
-        _spectrum_array_indices: &ArrayIndex,
+        spectrum_array_indices: &ArrayIndex,
     ) -> io::Result<BinaryArrayMap> {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
@@ -428,7 +484,11 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             }
             rg_row_skip
         } else {
-            return Ok(Default::default());
+            let mut bin_map = BinaryArrayMap::new();
+            for k in spectrum_array_indices.entries.values() {
+                bin_map.add(k.as_buffer_name().as_data_array(0));
+            }
+            return Ok(bin_map);
         };
 
         let rows = query_indices
@@ -467,7 +527,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             .with_projection(proj)
             .build()?;
 
-        Self::decode_chunks(reader.flatten())
+        Self::decode_chunks(reader.flatten(), spectrum_array_indices)
     }
 }
 
@@ -1051,7 +1111,7 @@ impl<
             )
             .unwrap_or_default();
         } else if spectrum_array_indices.prefix == "chunk" {
-            query_index.spectrum_point_index.spectrum_index = read_u64_page_index_from(
+            query_index.spectrum_chunk_index.spectrum_index = read_u64_page_index_from(
                 &spectrum_data_reader.metadata(),
                 &peak_pq_schema,
                 &format!("{}.spectrum_index", spectrum_array_indices.prefix),
@@ -1096,6 +1156,9 @@ impl<
             }
         }
 
+        log::trace!("Point index initialized?: {}", query_index.spectrum_point_index.spectrum_index.len());
+        log::trace!("Chunk index initialized?: {}", query_index.spectrum_chunk_index.spectrum_index.len());
+
         let bundle = MzPeakReaderMetadata {
             mz_metadata,
             spectrum_array_indices: Arc::new(spectrum_array_indices),
@@ -1111,6 +1174,7 @@ impl<
     ///
     /// This reads from the spectrum data file
     fn load_spectrum_data_row_group(&self, row_group: usize) -> io::Result<RecordBatch> {
+        log::trace!("Loading row group {row_group}");
         let builder = self.handle.spectra_data()?;
         let batch = builder
             .with_row_groups(vec![row_group])
@@ -1136,6 +1200,7 @@ impl<
             false
         };
         if cache_hit {
+            log::trace!("Spectrum data cache hit {row_group}");
             Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         } else {
             let rg = self.load_spectrum_data_row_group(row_group)?;
@@ -1154,6 +1219,7 @@ impl<
     pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
         let builder = self.handle.spectra_data()?;
         if self.query_indices.spectrum_chunk_index.is_populated() {
+            log::trace!("Using chunk strategy for reading spectrum {index}");
             return SpectrumChunkReader::new(builder).read_chunks_for_spectrum(
                 index,
                 &self.query_indices,

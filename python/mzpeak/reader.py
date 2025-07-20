@@ -1,11 +1,11 @@
 import json
-from pathlib import Path
 import zipfile
 
+from pathlib import Path
 from numbers import Number
 from collections.abc import Iterable
-from typing import Any, Generic, TypeVar
-from typing import IO
+from typing import Any, Generic, Iterator, TypeVar, IO
+from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -282,6 +282,77 @@ class _SpectrumDataIndex:
         return rgs
 
 
+class BufferFormat(Enum):
+    Point = 1
+    Chunk = 2
+
+
+class _ChunkIterator:
+    it: Iterator[pa.RecordBatch]
+    batch: pa.StructArray
+    current_index: int
+    index_column: str
+
+    def __init__(self, it: Iterator[pa.StructArray], current_index: int=None, index_column: str = "spectrum_index"):
+        self.it = it
+        self.buffer = []
+        self.batch = None
+        self.current_index = current_index
+        self.index_column = index_column
+        self._read_next_chunk()
+
+    def _infer_starting_index(self):
+        return pc.min(pc.struct_field(self.batch, self.index_column)).as_py()
+
+    def __next__(self):
+        batch = self._extract_next()
+        i = self.current_index
+        self.current_index += 1
+        return i, batch
+
+    def __iter__(self):
+        return self
+
+    def _read_next_chunk(self):
+        # print(f"Reading next batch looking for {self.current_index}")
+        batch = next(self.it).column(0)
+        lowest_index = pc.min(pc.struct_field(batch, self.index_column)).as_py()
+        if (self.current_index is not None and lowest_index > self.current_index) or self.current_index is None:
+            self.current_index = lowest_index
+        # print(f"New batch starts with {lowest_index}")
+        self.batch = batch
+
+    def _extract_next(self):
+        mask = pc.equal(pc.struct_field(self.batch, self.index_column), self.current_index)
+        indices = np.where(mask)[0]
+        if len(indices) == 0:
+            n = len(self.batch)
+            chunk = self.batch.slice(0, 0)
+        else:
+            start = indices[0]
+            n = len(indices)
+
+            chunk = self.batch.slice(start, n)
+
+        if n == len(self.batch):
+            self._read_next_chunk()
+            rest = self._extract_next()
+            chunk = pa.concat_arrays([chunk, rest])
+        else:
+            self.batch = self.batch.slice(n)
+        return chunk
+
+    def seek(self, index: int):
+        if index < self.current_index:
+            raise ValueError("Cannot rewind iterator")
+        if index == self.current_index:
+            return self
+        else:
+            while self.current_index != index:
+                next(self)
+            return self
+
+
 class MzPeakSpectrumDataReader:
     handle: pq.ParquetFile
     meta: pq.FileMetaData
@@ -353,12 +424,12 @@ class MzPeakSpectrumDataReader:
         return result
 
     def read_data_for_spectrum_range(self, spectrum_index_range: slice | list):
-        prefix = "point"
+        prefix = BufferFormat.Point
         rgs = self._point_index.row_groups_for_spectrum_range(spectrum_index_range)
         if not rgs:
             rgs = self._chunk_index.row_groups_for_spectrum_range(spectrum_index_range)
             if rgs:
-                prefix = "chunk"
+                prefix = BufferFormat.Chunk
 
         is_slice = False
         if isinstance(spectrum_index_range, slice):
@@ -369,11 +440,11 @@ class MzPeakSpectrumDataReader:
             start = min(spectrum_index_range)
             end = max(spectrum_index_range)
 
-        if prefix == "point":
+        if prefix == BufferFormat.Point:
             return self._read_point_range(
                 start, end, spectrum_index_range, is_slice, rgs
             )
-        elif prefix == "chunk":
+        elif prefix == BufferFormat.Chunk:
             return self._read_chunk_range(
                 start, end, spectrum_index_range, is_slice, rgs
             )
@@ -463,14 +534,14 @@ class MzPeakSpectrumDataReader:
 
     def _read_chunk(self, spectrum_index: int, rgs: list[int]):
         chunks = []
-        for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
-            batch = batch["chunk"]
+        it = _ChunkIterator(self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]))
+        for idx, batch in it:
             batch = pc.filter(
                 batch,
                 pc.equal(pc.struct_field(batch, "spectrum_index"), spectrum_index),
             )
             if len(batch) == 0:
-                if chunks:
+                if chunks or idx > spectrum_index:
                     break
                 else:
                     continue
@@ -524,15 +595,15 @@ class MzPeakSpectrumDataReader:
         else:
             median_delta = None
 
-        prefix = "point"
+        prefix = BufferFormat.Point
         rgs = self._point_index.row_groups_for_index(spectrum_index)
         if not rgs:
             rgs = self._chunk_index.row_groups_for_index(spectrum_index)
             if rgs:
-                prefix = "chunk"
-        if prefix == "point":
+                prefix = BufferFormat.Chunk
+        if prefix == BufferFormat.Point:
             return self._read_point(spectrum_index, rgs, median_delta)
-        elif prefix == "chunk":
+        elif prefix == BufferFormat.Chunk:
             return self._read_chunk(
                 spectrum_index,
                 rgs,
@@ -544,6 +615,78 @@ class MzPeakSpectrumDataReader:
         if isinstance(index, slice):
             return self.read_data_for_spectrum_range(index)
         return self._read_data_for(index)
+
+    def buffer_format(self):
+        if self._point_index.init:
+            return BufferFormat.Point
+        elif self._chunk_index.init:
+            return BufferFormat.Chunk
+        else:
+            raise ValueError("Could not infer buffer format")
+
+
+class MzPeakFileIter:
+    archive: "MzPeakFile"
+    index: int
+    buffer_format: BufferFormat
+    data_iter: _ChunkIterator
+    peeked: tuple[int, pa.StructArray] | None
+
+    def __init__(self, archive: "MzPeakFile"):
+        self.archive = archive
+        self.index = 0
+        self.buffer_format = archive.spectrum_data.buffer_format()
+        self.data_iter = None
+        self.peeked = None
+        self._make_data_iter()
+
+    def _make_data_iter(self):
+        if self.buffer_format == BufferFormat.Point:
+            it = self.archive.spectrum_data.handle.iter_batches(columns=["point"])
+            self.data_iter = _ChunkIterator(it, self.index)
+        elif self.buffer_format == BufferFormat.Chunk:
+            it = self.archive.spectrum_data.handle.iter_batches(128, columns=['chunk'])
+            self.data_iter = _ChunkIterator(it, self.index)
+        else:
+            raise ValueError(self.buffer_format)
+
+    def _format_data_buffer(self, index: int, buffers: pa.StructArray):
+        if self.buffer_format == BufferFormat.Point:
+            return self.archive.spectrum_data._clean_point_batch(
+                buffers, self.archive.spectrum_data._median_delta_series[index] if self.archive.spectrum_data._median_delta_series is not None else None
+            )
+        elif self.buffer_format == BufferFormat.Chunk:
+            return self.archive.spectrum_data._expand_chunks(buffers)
+        else:
+            raise ValueError(self.buffer_format)
+
+    def __iter__(self):
+        return self
+
+    def seek(self, index: int):
+        self.index = index
+        self.data_iter.seek(index)
+
+    def __next__(self):
+        meta = self.archive.spectrum_metadata[self.index]
+        if self.peeked:
+            if self.peeked[0] == self.index:
+                index, data = self.peeked
+                self.peeked = None
+            else:
+                index, data = next(self.data_iter)
+        else:
+            index, data = next(self.data_iter)
+        if index == self.index:
+            data = self._format_data_buffer(index, data)
+            meta.update(data)
+        else:
+            self.peeked = (index, data)
+        self.index += 1
+        return meta
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.index}, {self.archive})"
 
 
 class MzPeakFile:
@@ -580,6 +723,9 @@ class MzPeakFile:
                 self.spectrum_metadata._get_median_deltas()
             )
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.archive.filename!r})"
+
     def __getitem__(self, index):
         if isinstance(index, (int, str)):
             spec = self.spectrum_metadata[index]
@@ -598,8 +744,7 @@ class MzPeakFile:
         return spec
 
     def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
+        return MzPeakFileIter(self)
 
     def __len__(self):
         return len(self.spectrum_metadata)

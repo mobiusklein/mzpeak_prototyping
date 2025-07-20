@@ -459,6 +459,7 @@ where
     buffer
 }
 
+#[inline]
 pub(crate) fn _skip_zero_runs_iter<T: ArrowPrimitiveType, I: Iterator<Item=Option<T::Native>>>(iter: I, n: usize) -> Vec<u64> where T::Native: Zero + PartialEq {
     let z = T::Native::zero();
     let n1 = n.saturating_sub(1);
