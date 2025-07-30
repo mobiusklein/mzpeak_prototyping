@@ -31,23 +31,44 @@ pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) 
 
 pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
     let n = deltas.len();
-    let median = if n <= 2 {
-        deltas.first().copied()
+    
+    if n == 0 {
+        log::warn!("Empty array passed to median function");
+        return None;
+    }
+    
+    let median = if n == 1 {
+        Some(deltas[0])
+    } else if n == 2 {
+        Some((deltas[0] + deltas[1]) / (T::one() + T::one()))
     } else {
         let mid = n / 2;
         if n % 2 == 1 {
             Some(deltas[mid])
         } else {
-            Some((deltas[mid] + deltas[mid + 1]) / (T::one() + T::one()))
+            Some((deltas[mid - 1] + deltas[mid]) / (T::one() + T::one()))
         }
     };
+    
     median
 }
 
 pub fn estimate_median_delta<T: Float, I: IntoIterator<Item = T>>(iter: I) -> (T, Vec<T>) {
     let deltas = collect_deltas(iter, true);
+    
+    if deltas.is_empty() {
+        log::warn!("Empty deltas array in estimate_median_delta");
+        return (T::zero(), deltas);
+    }
+    
     let median_of = median(&deltas).unwrap_or_else(|| T::zero());
     let delta_below: Vec<T> = deltas.iter().copied().filter(|v| *v <= median_of).collect();
+    
+    if delta_below.is_empty() {
+        log::warn!("Empty delta_below array in estimate_median_delta");
+        return (median_of, deltas);
+    }
+    
     let median_of = median(&delta_below).unwrap_or_else(|| T::zero());
     (median_of, deltas)
 }
@@ -90,14 +111,38 @@ where
         let v = qr.q().transpose() * chol_w_y;
         let r = qr.r();
 
-        let sol = r.solve_upper_triangular(&v).unwrap();
+        log::debug!("QR decomposition: r shape: {:?}, v shape: {:?}", r.shape(), v.shape());
+        log::debug!("QR decomposition: x_data len: {}, dx_data len: {}, rank: {}", x_data.len(), dx_data.len(), rank);
+        
+        let sol = match r.solve_upper_triangular(&v) {
+            Some(solution) => solution,
+            None => {
+                log::error!("solve_upper_triangular returned None. Possible singular matrix or numerical instability.");
+                log::error!("Input data sizes - x_data: {}, dx_data: {}, weights: {}",
+                    x_data.len(),
+                    dx_data.len(),
+                    chol_weights.map_or(0, |w| w.len()));
+                return Err("Failed to solve linear system: matrix may be singular");
+            }
+        };
         Ok(sol.data.into())
     } else {
         let qr = xmat.qr();
 
         let v = qr.q().transpose() * y;
         let r = qr.r();
-        let sol = r.solve_upper_triangular(&v).unwrap();
+        
+        log::debug!("QR decomposition (no weights): r shape: {:?}, v shape: {:?}", r.shape(), v.shape());
+        log::debug!("QR decomposition (no weights): x_data len: {}, dx_data len: {}, rank: {}", x_data.len(), dx_data.len(), rank);
+        
+        let sol = match r.solve_upper_triangular(&v) {
+            Some(solution) => solution,
+            None => {
+                log::error!("solve_upper_triangular (no weights) returned None. Possible singular matrix or numerical instability.");
+                log::error!("Input data sizes - x_data: {}, dx_data: {}", x_data.len(), dx_data.len());
+                return Err("Failed to solve linear system: matrix may be singular");
+            }
+        };
         Ok(sol.data.into())
     }
 }
@@ -128,12 +173,25 @@ where
     if mz_array.len() > 10_000 {
         log::debug!("Fitting model with {} data points", mz_array.len());
     }
-    let reg_model = RegressionDeltaModel::fit(
-        &mz_array[1..],
-        &deltas,
-        T::from(1.0).unwrap(),
-        weights.map(|w| &w[1..]),
-    );
+    // Try to fit a regression model, but fall back to constant model if it fails
+    // Try to fit a regression model, but handle potential errors
+    let reg_model = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        RegressionDeltaModel::fit(
+            &mz_array[1..],
+            &deltas,
+            T::from(1.0).unwrap(),
+            weights.map(|w| &w[1..]),
+        )
+    })) {
+        Ok(model) => model,
+        Err(_) => {
+            log::warn!("Regression model fitting failed. Falling back to constant model.");
+            log::warn!("Input data sizes - mz_array: {}, deltas: {}", mz_array.len(), deltas.len());
+            // Return the constant model as a fallback
+            return constant_model.to_float64_array().values().to_vec();
+        }
+    };
+    
     let e_reg = reg_model.mean_squared_error(mz_array, &deltas);
     if e_const < (e_reg / T::from(10.0).unwrap()) {
         log::trace!("Using constant model");
@@ -183,6 +241,11 @@ impl<T: Float + AddAssign + NumCast> MZDeltaModel<T> for ConstantDeltaModel<T> {
     }
 
     fn fit(_mz_array: &[T], deltas: &[T], _threshold: T, _weights: Option<&[T]>) -> Self {
+        if deltas.is_empty() {
+            log::warn!("Empty deltas array in ConstantDeltaModel::fit");
+            return Self { delta: T::zero() };
+        }
+        
         let (delta, _) = estimate_median_delta(deltas.iter().copied());
         Self { delta }
     }
@@ -238,8 +301,22 @@ where
                 sel_mzs.push(*mz);
                 sel_weights.push(*weight);
             }
-            let x = fit_delta_model(&sel_mzs, &sel_deltas, Some(&sel_weights), 2).unwrap();
-            Self::from(x)
+            
+            // Check if we have enough data points
+            if sel_mzs.len() < 3 {
+                log::warn!("Not enough data points for regression model: {}", sel_mzs.len());
+                // Return a default model with zeros
+                return Self::from(vec![T::zero(); 3]);
+            }
+            
+            match fit_delta_model(&sel_mzs, &sel_deltas, Some(&sel_weights), 2) {
+                Ok(x) => Self::from(x),
+                Err(e) => {
+                    log::warn!("Failed to fit delta model with weights: {}", e);
+                    // Return a default model with zeros
+                    Self::from(vec![T::zero(); 3])
+                }
+            }
         } else {
             let (sel_deltas, sel_mzs): (Vec<_>, Vec<_>) = deltas
                 .iter()
@@ -247,8 +324,22 @@ where
                 .zip(mz_array.iter().copied())
                 .filter(|(d, _m)| *d <= threshold)
                 .collect();
-            let x = fit_delta_model(&sel_mzs, &sel_deltas, None, 2).unwrap();
-            Self::from(x)
+                
+            // Check if we have enough data points
+            if sel_mzs.len() < 3 {
+                log::warn!("Not enough data points for regression model: {}", sel_mzs.len());
+                // Return a default model with zeros
+                return Self::from(vec![T::zero(); 3]);
+            }
+            
+            match fit_delta_model(&sel_mzs, &sel_deltas, None, 2) {
+                Ok(x) => Self::from(x),
+                Err(e) => {
+                    log::warn!("Failed to fit delta model without weights: {}", e);
+                    // Return a default model with zeros
+                    Self::from(vec![T::zero(); 3])
+                }
+            }
         }
     }
 
