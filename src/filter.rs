@@ -10,6 +10,7 @@ use arrow::{
     datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, Schema},
 };
 
+use mzdata::{prelude::ByteArrayView, spectrum::{bindata::ArrayRetrievalError, DataArray}};
 use num_traits::{Float, NumCast, One, Zero};
 
 pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) -> Vec<T> {
@@ -529,6 +530,45 @@ pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
         Some(_skip_zero_runs_gen(array))
     } else {
         None
+    }
+}
+
+pub(crate) fn take_data_array(array: &DataArray, indices: &[u64]) -> Result<DataArray, ArrayRetrievalError> {
+    match array.dtype {
+        mzdata::spectrum::BinaryDataArrayType::Unknown => Err(ArrayRetrievalError::DataTypeSizeMismatch),
+        mzdata::spectrum::BinaryDataArrayType::Float64 => {
+            let vals = array.to_f64()?;
+            let mut subset = DataArray::from_name_type_size(&array.name, array.dtype, indices.len() * array.dtype.size_of());
+            for i in indices.iter().map(|i| (*i) as usize) {
+                subset.push(vals[i])?;
+            }
+            Ok(subset)
+        },
+        mzdata::spectrum::BinaryDataArrayType::Float32 => {
+            let vals = array.to_f32()?;
+            let mut subset = DataArray::from_name_type_size(&array.name, array.dtype, indices.len() * array.dtype.size_of());
+            for i in indices.iter().map(|i| (*i) as usize) {
+                subset.push(vals[i])?;
+            }
+            Ok(subset)
+        },
+        mzdata::spectrum::BinaryDataArrayType::Int64 => {
+            let vals = array.to_i64()?;
+            let mut subset = DataArray::from_name_type_size(&array.name, array.dtype, indices.len() * array.dtype.size_of());
+            for i in indices.iter().map(|i| (*i) as usize) {
+                subset.push(vals[i])?;
+            }
+            Ok(subset)
+        },
+        mzdata::spectrum::BinaryDataArrayType::Int32 => {
+            let vals= array.to_i32()?;
+            let mut subset = DataArray::from_name_type_size(&array.name, array.dtype, indices.len() * array.dtype.size_of());
+            for i in indices.iter().map(|i| (*i) as usize) {
+                subset.push(vals[i])?;
+            }
+            Ok(subset)
+        },
+        mzdata::spectrum::BinaryDataArrayType::ASCII => Err(ArrayRetrievalError::DataTypeSizeMismatch),
     }
 }
 

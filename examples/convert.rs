@@ -3,9 +3,11 @@ use mzdata::{
     self,
     io::MZReaderType,
     prelude::*,
-    spectrum::{ArrayType, BinaryDataArrayType},
+    spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity},
 };
-use mzpeak_prototyping::{writer::sample_array_types_from_file_reader, *};
+use mzpeak_prototyping::{
+    chunk_series::ChunkingStrategy, writer::{sample_array_types_from_file_reader, ArrayBuffersBuilder}, *,
+};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
 use std::{
@@ -41,6 +43,28 @@ fn main() -> io::Result<()> {
 // ============================================================================
 // Public Library Interface
 // ============================================================================
+
+fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
+    if let Some((method, chunk_size)) = method_str.split_once(":") {
+        let chunk_size = chunk_size.parse::<f64>().unwrap_or(50.0);
+        let v = match method.to_ascii_lowercase().as_str() {
+            "delta" => ChunkingStrategy::Delta { chunk_size },
+            "basic" | "plain" => ChunkingStrategy::Basic { chunk_size },
+            "numpress" => ChunkingStrategy::NumpressLinear { chunk_size },
+            _ => {
+                log::warn!("Failed to parse {method}, defaulting to delta encoding");
+                ChunkingStrategy::Delta { chunk_size }
+            }
+        };
+        Ok(v)
+    } else {
+        if method_str == "" {
+            Ok(ChunkingStrategy::Delta { chunk_size: 50.0 })
+        } else {
+            Err(format!("Failed to parse {method_str}"))
+        }
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 pub struct ConvertArgs {
@@ -96,9 +120,10 @@ pub struct ConvertArgs {
     #[arg(
         short,
         long,
-        help = "Use the chunked encoding instead of the flat peak array layout"
+        help = "Use the chunked encoding instead of the flat peak array layout",
+        value_parser=chunk_encoding_parser,
     )]
-    chunked_encoding: bool,
+    chunked_encoding: Option<ChunkingStrategy>,
 
     #[arg(
         short = 'k',
@@ -107,6 +132,13 @@ pub struct ConvertArgs {
         help = "The Zstd compression level to use. Defaults to 3, but ranges from 1-22"
     )]
     compression_level: i32,
+
+    #[arg(
+        short = 'p',
+        long,
+        help = "Whether or not to write both profile and peak picked data in the same file."
+    )]
+    write_peaks_and_profiles: bool,
 }
 
 pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
@@ -120,8 +152,7 @@ pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
 
     convert_file(filename, &outpath, &args)?;
 
-    let end = Instant::now();
-    eprintln!("{:0.2} seconds elapsed", (end - start).as_secs_f64());
+    eprintln!("{:0.2} seconds elapsed", start.elapsed().as_secs_f64());
 
     let stat = fs::metadata(&outpath)?;
     let size = stat.len() as f64 / 1e9;
@@ -147,10 +178,22 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
             ZstdLevel::try_new(args.compression_level).unwrap(),
         ));
 
+    if args.write_peaks_and_profiles {
+        let mut point_builder = ArrayBuffersBuilder::default().prefix("point");
+        for f in sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
+            &mut reader,
+            &overrides,
+            false,
+        ) {
+            point_builder = point_builder.add_field(f);
+        }
+        writer = writer.store_peaks_and_profiles_apart(Some(point_builder));
+    }
+
     writer = sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
         &mut reader,
         &overrides,
-        args.chunked_encoding,
+        args.chunked_encoding.is_some(),
     )
     .into_iter()
     .fold(writer, |writer, f| writer.add_spectrum_field(f));
@@ -165,6 +208,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     let (send, recv) = sync_channel(1);
 
+    let write_peaks_and_profiles = args.write_peaks_and_profiles;
     let read_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             for mut entry in reader.into_iter() {
@@ -173,6 +217,8 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
                         arrays.sort_by_array(&ArrayType::MZArray).unwrap();
                         entry.arrays = Some(arrays);
                     }
+                } else if write_peaks_and_profiles && entry.peaks.is_none() {
+                    entry.pick_peaks(3.0).unwrap();
                 }
                 if send.send(entry).is_err() {
                     break; // Receiver dropped
@@ -193,14 +239,18 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
                 if i % 10 == 0 {
                     log::debug!("Writing batch {i}");
                 }
-                batch.peaks = None;
+                if batch.signal_continuity() != SignalContinuity::Profile {
+                    batch.peaks = None;
+                }
                 writer.write_spectrum(&batch)?;
             }
             writer.finish()
         }));
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("Writer thread error: {}", e),
+            Ok(Err(e)) => {
+                eprintln!("Writer thread error: {}", e);
+            }
             Err(_) => eprintln!("Writer thread panicked"),
         }
     });
@@ -299,4 +349,15 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
     }
 
     overrides
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_from() {
+        let args = ConvertArgs::parse_from("-p -z -y -u".split_ascii_whitespace());
+        run_convert(r#"C:\Users\mobiu\Downloads\n40C_MS1_2pt7kV_15kOT_500-4000_MaxIT100_0to35A_140uL_RF100_MS2_1secCycle_OT7pt5k_AGC3e5and22ms_InjVol6_60min_20210220140305.mzML"#.as_ref(), args).unwrap();
+    }
 }

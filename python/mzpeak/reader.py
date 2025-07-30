@@ -353,6 +353,10 @@ class _ChunkIterator:
             return self
 
 
+DELTA_ENCODING = {"cv_id": 1, "accession": 1003089}
+NO_COMPRESSION = {"cv_id": 1, "accession": 1000576}
+
+
 class MzPeakSpectrumDataReader:
     handle: pq.ParquetFile
     meta: pq.FileMetaData
@@ -387,25 +391,52 @@ class MzPeakSpectrumDataReader:
         self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
 
     def _clean_point_batch(
-        self, data: pa.RecordBatch, median_delta: float | None = None
+        self, data: pa.RecordBatch | pa.StructArray, median_delta: float | None = None
     ):
-        nulls = []
-        for i, col in enumerate(data.columns):
-            if col.null_count == len(col):
-                nulls.append(i)
-        if len(nulls) > 1:
-            nulls.sort()
-        for i, j in enumerate(nulls):
-            data = data.drop_columns(data.schema[j - i].name)
-        data = data.rename_columns(
-            {
-                k: v["array_name"]
-                for k, v in self.array_index.items()
-                if k in data.column_names
+        if isinstance(data, pa.StructArray):
+            nulls = []
+            for i, name in enumerate(data.type):
+                col = data.field(name)
+                if col.null_count == len(col):
+                    nulls.append(i)
+            if len(nulls) > 1:
+                nulls.sort()
+
+            fields = [f.name for f in data.type]
+            data = {
+                f: v for f, v in zip(fields, data.flatten())
             }
-        )
+
+            for i in nulls:
+                data.pop(fields[i])
+
+            for k, v in {
+                        k: v["array_name"]
+                        for k, v in self.array_index.items()
+                        if k in data.keys()
+                    }.items():
+                data[v] = data.pop(k)
+            it = data.items()
+        else:
+            nulls = []
+            for i, col in enumerate(data.columns):
+                if col.null_count == len(col):
+                    nulls.append(i)
+            if len(nulls) > 1:
+                nulls.sort()
+            for i, j in enumerate(nulls):
+                data = data.drop_columns(data.schema[j - i].name)
+            data = data.rename_columns(
+                {
+                    k: v["array_name"]
+                    for k, v in self.array_index.items()
+                    if k in data.column_names
+                }
+            )
+            it = zip(data.column_names, data.columns)
+
         result = {}
-        for k, v in zip(data.column_names, data.columns):
+        for k, v in it:
             if v.null_count and self._do_null_filling:
                 if (
                     k == "m/z array"
@@ -463,25 +494,35 @@ class MzPeakSpectrumDataReader:
 
         arrays_of = {}
         for k, v in chunks[0].items():
-            if k in ("spectrum_index", "chunk_encoding") or k.startswith(axis_prefix):
+            if k == "spectrum_index" or k == "chunk_encoding" or k.startswith(axis_prefix):
                 continue
-            arrays_of[k] = np.zeros(n, dtype=np.asarray(v.values).dtype)
+            else:
+                arrays_of[k] = np.zeros(n, dtype=np.asarray(v.values).dtype)
 
         main_axis_array = np.zeros(n)
         offset = 0
         for chunk in chunks:
             start = chunk[f"{axis_prefix}_chunk_start"].as_py()
             steps = chunk[f"{axis_prefix}_chunk_values"]
-            chunk_size = len(steps) + 1
-            main_axis_array[offset : offset + chunk_size] = start
-            main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(steps.values)
+            encoding = chunk['chunk_encoding'].as_py()
+
+            # Delta encoding
+            if encoding == DELTA_ENCODING:
+                chunk_size = len(steps) + 1
+                main_axis_array[offset : offset + chunk_size] = start
+                main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(steps.values)
+            # Direct encoding
+            elif encoding == NO_COMPRESSION:
+                chunk_size = len(steps)
+                main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
+            else:
+                raise ValueError(f"Unsupported chunk encoding {encoding}")
 
             for k, v in chunk.items():
-                if k in ("spectrum_index", "chunk_encoding") or k.startswith(
-                    axis_prefix
-                ):
+                if k in ("spectrum_index", "chunk_encoding") or k.startswith(axis_prefix):
                     continue
-                arrays_of[k][offset : offset + chunk_size] = np.asarray(v.values)
+                else:
+                    arrays_of[k][offset : offset + chunk_size] = np.asarray(v.values)
 
             offset += chunk_size
         arrays_of[axis_prefix] = main_axis_array
@@ -532,14 +573,18 @@ class MzPeakSpectrumDataReader:
         )
         return self._clean_point_batch(data)
 
-    def _read_chunk(self, spectrum_index: int, rgs: list[int]):
+    def _read_chunk(self, spectrum_index: int, rgs: list[int], debug: bool = False):
         chunks = []
         it = _ChunkIterator(self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]))
+        it.seek(spectrum_index)
+        batch: pa.RecordBatch
         for idx, batch in it:
-            batch = pc.filter(
-                batch,
-                pc.equal(pc.struct_field(batch, "spectrum_index"), spectrum_index),
-            )
+            # batch = pc.filter(
+            #     batch,
+            #     pc.equal(pc.struct_field(batch, "spectrum_index"), spectrum_index),
+            # )
+            if idx > spectrum_index:
+                break
             if len(batch) == 0:
                 if chunks or idx > spectrum_index:
                     break
@@ -550,6 +595,8 @@ class MzPeakSpectrumDataReader:
             else:
                 chunks.append(batch)
         chunks = pa.chunked_array(chunks)
+        if debug:
+            return chunks
         return self._expand_chunks(chunks)
 
     def _read_chunk_range(
@@ -754,3 +801,19 @@ class MzPeakFile:
 
     def bpc(self):
         return self.spectrum_metadata.bpc()
+
+    @property
+    def spectra(self):
+        return self.spectrum_metadata.spectra
+
+    @property
+    def precursors(self):
+        return self.spectrum_metadata.precursors
+
+    @property
+    def selected_ions(self):
+        return self.spectrum_metadata.selected_ions
+
+    @property
+    def scans(self):
+        return self.spectrum_metadata.scans

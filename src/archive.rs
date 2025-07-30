@@ -109,10 +109,17 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         let path = path.as_ref();
         let p = path.file_name().map(|p| p.to_string_lossy().to_string());
         let mut handle = fs::File::open(&path)?;
-        self.add_other_file_from_read(&mut handle, p.as_ref())
+        self.add_file_from_read(&mut handle, p.as_ref())
     }
 
-    pub fn add_other_file_from_read<S: AsRef<str>>(
+    pub fn add_file<P: AsRef<Path>>(&mut self, path: P, archive_type: MzPeakArchiveType) -> io::Result<()> {
+        let path = path.as_ref();
+        let p = path.file_name().map(|p| p.to_string_lossy().to_string() + archive_type.tag_file_suffix());
+        let mut handle = fs::File::open(&path)?;
+        self.add_file_from_read(&mut handle, p.as_ref())
+    }
+
+    pub fn add_file_from_read<S: AsRef<str>>(
         &mut self,
         read: &mut impl io::Read,
         name: Option<&S>,

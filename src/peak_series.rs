@@ -339,6 +339,12 @@ impl Display for BufferFormat {
     }
 }
 
+impl PartialEq<str> for BufferFormat {
+    fn eq(&self, other: &str) -> bool {
+        self.to_string().eq_ignore_ascii_case(other)
+    }
+}
+
 /// Composite structure for directly naming a data array series
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct BufferName {
@@ -737,6 +743,7 @@ pub struct ArrayIndexEntry {
     pub array_type: ArrayType,
     /// The unit of the values in the array
     pub unit: Unit,
+    /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
 }
 
