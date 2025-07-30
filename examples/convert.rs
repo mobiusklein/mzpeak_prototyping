@@ -120,7 +120,7 @@ pub struct ConvertArgs {
     #[arg(
         short,
         long,
-        help = "Use the chunked encoding instead of the flat peak array layout",
+        help = "Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress', or 'plain'. You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'.",
         value_parser=chunk_encoding_parser,
     )]
     chunked_encoding: Option<ChunkingStrategy>,
