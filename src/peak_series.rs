@@ -25,10 +25,22 @@ use crate::param::{
 };
 use crate::spectrum::AuxiliaryArray;
 
-fn ascii_array(data_array: &DataArray) -> LargeBinaryArray {
+pub fn ascii_array(data_array: &DataArray) -> LargeBinaryArray {
     let tokens = data_array.data.split(|s| *s == b'\0');
     let ba = LargeBinaryArray::from_iter_values(tokens);
     ba
+}
+
+pub fn data_array_to_arrow_array(buffer_name: &BufferName, data_array: &DataArray) -> Result<ArrayRef, ArrayRetrievalError> {
+    let array: ArrayRef = match buffer_name.dtype {
+        BinaryDataArrayType::Unknown => Arc::new(UInt8Array::from(data_array.data.clone())),
+        BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(data_array.to_f64()?.to_vec())),
+        BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(data_array.to_f32()?.to_vec())),
+        BinaryDataArrayType::Int64 => Arc::new(Int64Array::from(data_array.to_i64()?.to_vec())),
+        BinaryDataArrayType::Int32 => Arc::new(Int32Array::from(data_array.to_i32()?.to_vec())),
+        BinaryDataArrayType::ASCII => Arc::new(ascii_array(&data_array)),
+    };
+    Ok(array)
 }
 
 /// Convert `mzdata`'s [`BinaryDataArrayType`] to `arrow`'s [`DataType`]
@@ -94,14 +106,7 @@ pub fn array_map_to_schema_arrays_and_excess(
 
         fields.push(fieldref.clone());
 
-        let array: ArrayRef = match buffer_name.dtype {
-            BinaryDataArrayType::Unknown => Arc::new(UInt8Array::from(v.data.clone())),
-            BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(v.to_f64()?.to_vec())),
-            BinaryDataArrayType::Float32 => Arc::new(Float32Array::from(v.to_f32()?.to_vec())),
-            BinaryDataArrayType::Int64 => Arc::new(Int64Array::from(v.to_i64()?.to_vec())),
-            BinaryDataArrayType::Int32 => Arc::new(Int32Array::from(v.to_i32()?.to_vec())),
-            BinaryDataArrayType::ASCII => Arc::new(ascii_array(&v)),
-        };
+        let array: ArrayRef = data_array_to_arrow_array(buffer_name, v)?;
 
         arrays.push(array);
     }
@@ -308,12 +313,28 @@ impl BufferContext {
     }
 }
 
+
+/// The layout of a buffer denoting the shape of the data in each position in the buffer
 #[derive(Default, Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferFormat {
+    /// A series of contiguous points
     #[default]
     Point,
+    /// A contiguous list of values in a chunk that may be transformed. It will have a start
+    /// and end value encoded in parallel with it.
     Chunked,
+    /// A contiguous list of values in a chunk contiguous with a [`BufferFormat::Chunked`] array
     ChunkedSecondary,
+}
+
+impl BufferFormat {
+    pub const fn prefix(&self) -> &'static str {
+        match self {
+            Self::Chunked => "chunk",
+            Self::Point => "point",
+            Self::ChunkedSecondary => "chunk"
+        }
+    }
 }
 
 impl FromStr for BufferFormat {
@@ -353,6 +374,7 @@ pub struct BufferName {
     pub dtype: BinaryDataArrayType,
     pub unit: Unit,
     pub buffer_format: BufferFormat,
+    pub transform: Option<CURIE>,
 }
 
 impl Ord for BufferName {
@@ -461,7 +483,7 @@ pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<Array
         == (ArrayType::NonStandardDataArray {
             name: "".to_string().into(),
         })
-        .as_param_const()
+        .as_param(None)
         .curie()?
     {
         ArrayType::NonStandardDataArray {
@@ -475,7 +497,7 @@ pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<Array
 
 /// Convert a [`CURIE`] into an [`BinaryDataArrayType`], or return `None` if the CURIE
 /// doesn't correspond to an [`BinaryDataArrayType`] term.
-pub fn binary_datatype_from_accession(accession: crate::CURIE) -> Option<BinaryDataArrayType> {
+pub fn binary_datatype_from_accession(accession: crate::param::CURIE) -> Option<BinaryDataArrayType> {
     let accession = accession.into();
     match accession {
         x if Some(x) == BinaryDataArrayType::Float32.curie() => Some(BinaryDataArrayType::Float32),
@@ -537,6 +559,7 @@ impl BufferName {
             dtype,
             unit: Unit::Unknown,
             buffer_format: BufferFormat::Point,
+            transform: None,
         }
     }
 
@@ -552,11 +575,17 @@ impl BufferName {
             dtype,
             unit: Unit::Unknown,
             buffer_format,
+            transform: None,
         }
     }
 
     pub const fn with_format(mut self, buffer_format: BufferFormat) -> Self {
         self.buffer_format = buffer_format;
+        self
+    }
+
+    pub const fn with_transform(mut self, transform: Option<CURIE>) -> Self {
+        self.transform = transform;
         self
     }
 
@@ -570,37 +599,45 @@ impl BufferName {
     }
 
     pub fn as_field_metadata(&self) -> HashMap<String, String> {
-        [
-            (
-                "unit".to_string(),
-                self.unit
-                    .to_curie()
-                    .map(|c| c.to_string())
-                    .unwrap_or_default(),
-            ),
-            (
-                "array_accession".to_string(),
-                self.array_type
-                    .as_param_const()
-                    .curie()
-                    .map(|c| c.to_string())
-                    .unwrap_or_default(),
-            ),
-            (
-                "data_type_accession".to_string(),
-                self.dtype
-                    .curie()
-                    .map(|c| c.to_string())
-                    .unwrap_or_default(),
-            ),
-            (
-                "array_name".to_string(),
-                self.array_type.as_param_const().name().to_string(),
-            ),
-            ("buffer_format".to_string(), self.buffer_format.to_string()),
-        ]
+        let mut meta: HashMap<String, String> = [
+                (
+                    "unit".to_string(),
+                    self.unit
+                        .to_curie()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "array_accession".to_string(),
+                    self.array_type
+                        .as_param(None)
+                        .curie()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "data_type_accession".to_string(),
+                    self.dtype
+                        .curie()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "array_name".to_string(),
+                    if let ArrayType::NonStandardDataArray { name } = &self.array_type {
+                        name.to_string()
+                    } else {
+                        self.array_type.as_param(None).name().to_string()
+                    }
+                ),
+                ("buffer_format".to_string(), self.buffer_format.to_string()),
+            ]
         .into_iter()
-        .collect()
+        .collect();
+        if let Some(trfm) = self.transform.as_ref() {
+            meta.insert("transform".to_string(), trfm.to_string());
+        }
+        meta
     }
 
     pub fn from_field(context: BufferContext, field: FieldRef) -> Option<Self> {
@@ -609,6 +646,7 @@ impl BufferName {
         let mut unit = Unit::Unknown;
         let mut name = None;
         let mut buffer_format = BufferFormat::Point;
+        let mut transform = None;
         for (k, v) in field.metadata().iter() {
             match k.as_str() {
                 "unit" => {
@@ -639,6 +677,9 @@ impl BufferName {
                         .inspect_err(|e| log::error!("Failed to parse buffer format: {e}"))
                         .ok()?;
                 }
+                "transform" => {
+                    transform = v.parse().inspect_err(|e| log::error!("Failed to parse transform: {e}")).ok();
+                }
                 _ => {}
             }
         }
@@ -651,6 +692,7 @@ impl BufferName {
                     dtype,
                     unit,
                     buffer_format,
+                    transform,
                 };
                 if let ArrayType::NonStandardDataArray { name } = &mut this.array_type {
                     *name = array_name.into();
@@ -745,6 +787,7 @@ pub struct ArrayIndexEntry {
     pub unit: Unit,
     /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
+    pub transform: Option<CURIE>,
 }
 
 /// A JSON-serializable version of [`ArrayIndexEntry`].
@@ -774,6 +817,12 @@ pub struct SerializedArrayIndexEntry {
     pub unit: Option<CURIE>,
     #[serde(default)]
     pub buffer_format: String,
+    #[serde(
+        serialize_with = "opt_curie_serialize",
+        deserialize_with = "opt_curie_deserialize",
+        default,
+    )]
+    pub transform: Option<CURIE>,
 }
 
 /// Convert an Arrow [`DataType`] to a [`BinaryDataArrayType`]
@@ -807,13 +856,14 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
                 DataType::Float64 => BinaryDataArrayType::Float64.curie().unwrap().into(),
                 _ => todo!("Cannot translate {:?} into CURIE", value.data_type),
             },
-            array_type: value.array_type.as_param_const().curie().unwrap().into(),
+            array_type: value.array_type.as_param(None).curie().unwrap().into(),
             array_name: match &value.array_type {
                 ArrayType::NonStandardDataArray { name } => name.to_string(),
                 _ => value.array_type.as_param_const().name().to_string(),
             },
             unit: value.unit.to_curie().map(|c| c.into()),
             buffer_format: value.buffer_format.to_string(),
+            transform: value.transform,
         }
     }
 }
@@ -847,6 +897,7 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
                 .buffer_format
                 .parse::<BufferFormat>()
                 .unwrap_or(BufferFormat::Point),
+            transform: value.transform,
         }
     }
 }
@@ -871,6 +922,7 @@ impl ArrayIndexEntry {
             array_type,
             unit,
             buffer_format,
+            transform: None,
         }
     }
 
@@ -885,6 +937,7 @@ impl ArrayIndexEntry {
             array_type: buffer_name.array_type,
             unit: buffer_name.unit,
             buffer_format: buffer_name.buffer_format,
+            transform: None,
         }
     }
 

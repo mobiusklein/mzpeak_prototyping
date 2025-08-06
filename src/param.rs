@@ -39,7 +39,7 @@ pub struct Param {
 }
 
 /// A numerical encoding of a CURIE accession similar to [`mzdata::params::CURIE`]
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CURIE {
     pub cv_id: u8,
     pub accession: u32,

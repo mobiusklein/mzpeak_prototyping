@@ -15,7 +15,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
-from .filters import fill_nulls
+from .filters import fill_nulls, null_delta_decode
 
 
 Q = TypeVar("Q", bound=Number)
@@ -364,7 +364,7 @@ class MzPeakSpectrumDataReader:
     _chunk_index: _SpectrumDataIndex
     array_index: dict[str, dict]
     n_spectra: int
-    _median_delta_series: np.ndarray | None
+    _delta_model_series: np.ndarray | None
     _do_null_filling: bool = True
 
     def __init__(self, handle: pq.ParquetFile):
@@ -375,7 +375,7 @@ class MzPeakSpectrumDataReader:
         self._point_index = _SpectrumDataIndex(self.meta, "point")
         self._chunk_index = _SpectrumDataIndex(self.meta, "chunk")
         self._infer_schema_idx()
-        self._median_delta_series = None
+        self._delta_model_series = None
 
     def _infer_schema_idx(self):
         rg = self.meta.row_group(0)
@@ -391,7 +391,9 @@ class MzPeakSpectrumDataReader:
         self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
 
     def _clean_point_batch(
-        self, data: pa.RecordBatch | pa.StructArray, median_delta: float | None = None
+        self,
+        data: pa.RecordBatch | pa.StructArray,
+        delta_model: float | np.ndarray | None = None
     ):
         if isinstance(data, pa.StructArray):
             nulls = []
@@ -440,14 +442,14 @@ class MzPeakSpectrumDataReader:
             if v.null_count and self._do_null_filling:
                 if (
                     k == "m/z array"
-                    and median_delta is not None
-                    and not np.any(np.isnan(median_delta))
+                    and delta_model is not None
+                    and not np.any(np.isnan(delta_model))
                 ):
-                    v = fill_nulls(v, median_delta)
+                    v = fill_nulls(v, delta_model)
                 elif (
                     k == "intensity array"
-                    and median_delta is not None
-                    and not np.any(np.isnan(median_delta))
+                    and delta_model is not None
+                    and not np.any(np.isnan(delta_model))
                 ):
                     v = np.asarray(v)
                     v[np.isnan(v)] = 0.0
@@ -483,7 +485,10 @@ class MzPeakSpectrumDataReader:
             raise NotImplementedError(prefix)
 
     def _expand_chunks(
-        self, chunks: list[dict[str, Any]], axis_prefix: str = "spectrum_mz_f64"
+        self,
+        chunks: list[dict[str, Any]],
+        axis_prefix: str = "spectrum_mz_f64",
+        delta_model: float | np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         n = 0
         for chunk in chunks:
@@ -501,6 +506,7 @@ class MzPeakSpectrumDataReader:
 
         main_axis_array = np.zeros(n)
         offset = 0
+        had_nulls = False
         for chunk in chunks:
             start = chunk[f"{axis_prefix}_chunk_start"].as_py()
             steps = chunk[f"{axis_prefix}_chunk_values"]
@@ -508,9 +514,21 @@ class MzPeakSpectrumDataReader:
 
             # Delta encoding
             if encoding == DELTA_ENCODING:
-                chunk_size = len(steps) + 1
-                main_axis_array[offset : offset + chunk_size] = start
-                main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(steps.values)
+                if steps.values.null_count > 0:
+                    had_nulls = True
+                    # The presence null values leads to sometimes restoring one fewer values because the chunk start is
+                    # included in the data itself.
+                    steps = null_delta_decode(steps.values, pa.scalar(start, type=steps.values.type))
+                    chunk_size = len(steps)
+                    if delta_model is not None:
+                        steps = fill_nulls(steps, delta_model)
+                    else:
+                        steps = np.asarray(steps)
+                    main_axis_array[offset:offset + len(steps)] = steps
+                else:
+                    chunk_size = len(steps) + 1
+                    main_axis_array[offset : offset + chunk_size] = start
+                    main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(steps.values)
             # Direct encoding
             elif encoding == NO_COMPRESSION:
                 chunk_size = len(steps)
@@ -532,7 +550,15 @@ class MzPeakSpectrumDataReader:
         }
         for k, v in rename_map.items():
             arrays_of[v] = arrays_of.pop(k)
-        return arrays_of
+            if v == "intensity array" and had_nulls:
+                arrays_of[v][np.isnan(arrays_of[v])] = 0
+
+        # truncate the arrays to just the size used in case we over-allocated
+        truncated = {}
+        for k, v in arrays_of.items():
+            truncated[k] = v[:offset]
+
+        return truncated
 
     def _read_point(
         self,
@@ -597,7 +623,12 @@ class MzPeakSpectrumDataReader:
         chunks = pa.chunked_array(chunks)
         if debug:
             return chunks
-        return self._expand_chunks(chunks)
+
+        delta_model = None
+        if self._do_null_filling:
+            delta_model = self._delta_model_series[spectrum_index]
+
+        return self._expand_chunks(chunks, delta_model=delta_model)
 
     def _read_chunk_range(
         self,
@@ -637,8 +668,8 @@ class MzPeakSpectrumDataReader:
         return self._expand_chunks(chunks)
 
     def _read_data_for(self, spectrum_index: int):
-        if self._median_delta_series is not None:
-            median_delta = self._median_delta_series[spectrum_index]
+        if self._delta_model_series is not None:
+            median_delta = self._delta_model_series[spectrum_index]
         else:
             median_delta = None
 
@@ -700,7 +731,7 @@ class MzPeakFileIter:
     def _format_data_buffer(self, index: int, buffers: pa.StructArray):
         if self.buffer_format == BufferFormat.Point:
             return self.archive.spectrum_data._clean_point_batch(
-                buffers, self.archive.spectrum_data._median_delta_series[index] if self.archive.spectrum_data._median_delta_series is not None else None
+                buffers, self.archive.spectrum_data._delta_model_series[index] if self.archive.spectrum_data._delta_model_series is not None else None
             )
         elif self.buffer_format == BufferFormat.Chunk:
             return self.archive.spectrum_data._expand_chunks(buffers)
@@ -766,7 +797,7 @@ class MzPeakFile:
         self.file_metadata = metadata
 
         if self.spectrum_data and self.spectrum_metadata:
-            self.spectrum_data._median_delta_series = (
+            self.spectrum_data._delta_model_series = (
                 self.spectrum_metadata._get_median_deltas()
             )
 

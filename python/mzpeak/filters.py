@@ -210,7 +210,9 @@ class NullTokenizer:
     def __init__(self, array):
         self.array = np.asarray(array)
         self._map = np.where(self.array)[0]
-        self._map_iter = iter(np.where(self.array)[0])
+        if len(self._map) == 1:
+            pass
+        self._map_iter = iter(self._map)
         self.index = 0
         self.state = None
         self.next_state = None
@@ -232,7 +234,12 @@ class NullTokenizer:
 
     def find_next_null(self):
         try:
+            prev = self.index
             self.index = next(self._map_iter)
+            # If the 0th position is null, then this will double-count index 0
+            # so we check for it and try again if the index is the same.
+            if self.index == prev:
+                self.index = next(self._map_iter)
             return
         except StopIteration:
             pass
@@ -269,6 +276,14 @@ class NullTokenizer:
             if self.is_null():
                 self.state = (0, self.index, NullFillState.NullBounded)
                 self.update_next_state()
+            else:
+                self.state = (0, None, NullFillState.NullStart)
+
+        if len(self.array) < 3 and self.state is None:
+            if start_null and not self.is_null():
+                self.state = (0, None, NullFillState.NullStart)
+            elif not start_null and self.is_null():
+                self.state = (0, None, NullFillState.NullStart)
 
     def emit(self) -> tuple[int | None, int | None, NullFillState] | None:
         state = self.state
@@ -281,7 +296,7 @@ class NullTokenizer:
             yield val
 
 
-def find_zero_runs(arr: list) -> list[int]:
+def find_zero_runs(arr: Sequence[Number]) -> Sequence[int]:
     n = len(arr)
     n1 = n - 1
     was_zero = False
@@ -306,3 +321,110 @@ def find_zero_runs(arr: list) -> list[int]:
             was_zero = False
         i += 1
     return np.array(acc)
+
+
+def is_zero_pair_mask(data: Sequence[Number]):
+    n = len(data)
+    n1 = n - 1
+    was_zero = False
+    acc = []
+    for i, v in enumerate(data):
+        if v == 0:
+            if was_zero or (i < n1 and data[i + 1] == 0):
+                acc.append(True)
+            else:
+                acc.append(False)
+            was_zero = True
+        else:
+            acc.append(False)
+            was_zero = False
+    return np.array(acc)
+
+
+def null_delta_encode(data: pa.Array) -> pa.Array:
+    acc = []
+    it = iter(data)
+    last = next(it)
+    if not last.is_valid:
+        acc.append(last)
+
+    for item in it:
+        if item.is_valid:
+            val = item.as_py()
+            if last.is_valid:
+                acc.append(pa.scalar(val - last.as_py()))
+            else:
+                acc.append(item)
+            last = item
+        else:
+            acc.append(item)
+            last = item
+    return pa.array(acc)
+
+
+def null_delta_decode(data: pa.Array, start: pa.Scalar) -> pa.Array:
+    acc = []
+    if not data[0].is_valid:
+        if not data[1].is_valid:
+            acc.append(start)
+        start = pa.scalar(None, data.type)
+    else:
+        acc.append(start.as_py())
+    last = start
+    for item in data:
+        if item.is_valid:
+            val = item.as_py()
+            if last.is_valid:
+                last = pa.scalar(val + last.as_py())
+                acc.append(last)
+            else:
+                acc.append(item)
+                last = item
+        else:
+            acc.append(item)
+            last = item
+    return pa.array(acc)
+
+
+def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
+    start = None
+    n = len(data)
+    i = 0
+    while i < n:
+        v = data[i]
+        if v.is_valid:
+            start = v.as_py()
+            break
+        else:
+            i += 1
+    if start is None:
+        return [(0, n)]
+
+    chunks = []
+    offset = 0
+    t = start + k
+    i = 0
+    while i < n:
+        v = data[i]
+        if v.is_valid:
+            v = v.as_py()
+            if v > t:
+                if ((i + 1) < n) and (not data[i + 1].is_valid):
+                    i += 2
+                chunks.append((offset, i))
+                offset = i
+                while t < v:
+                    t += k
+        elif ((i + 1) < n) and (data[i + 1].is_valid):
+            i += 1
+            v = data[i].as_py()
+            if v > t:
+                i -= 1
+                chunks.append((offset, i))
+                offset = i
+                while t < v:
+                    t += k
+        i += 1
+    if offset != n:
+        chunks.append((offset, n))
+    return chunks

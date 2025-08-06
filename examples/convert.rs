@@ -6,7 +6,9 @@ use mzdata::{
     spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity},
 };
 use mzpeak_prototyping::{
-    chunk_series::ChunkingStrategy, writer::{sample_array_types_from_file_reader, ArrayBuffersBuilder}, *,
+    chunk_series::ChunkingStrategy,
+    peak_series::{BufferContext, BufferName},
+    writer::{ArrayBuffersBuilder, MzPeakWriterType, sample_array_types_from_file_reader},
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
@@ -45,7 +47,10 @@ fn main() -> io::Result<()> {
 // ============================================================================
 
 fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
-    if let Some((method, chunk_size)) = method_str.split_once(":") {
+    if let Some((method, chunk_size)) = method_str
+        .split_once(":")
+        .or_else(|| Some((method_str, "50")))
+    {
         let chunk_size = chunk_size.parse::<f64>().unwrap_or(50.0);
         let v = match method.to_ascii_lowercase().as_str() {
             "delta" => ChunkingStrategy::Delta { chunk_size },
@@ -122,6 +127,8 @@ pub struct ConvertArgs {
         long,
         help = "Use the chunked encoding instead of the flat peak array layout",
         value_parser=chunk_encoding_parser,
+        default_missing_value="delta:50",
+        num_args=0..=1,
     )]
     chunked_encoding: Option<ChunkingStrategy>,
 
@@ -167,6 +174,10 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     let overrides = create_type_overrides(args);
 
+    if let Some(c) = args.chunked_encoding.as_ref() {
+        log::debug!("Using chunking method {c:?}");
+    }
+
     let handle = fs::File::create(output_path)?;
     let mut writer = MzPeakWriterType::<fs::File>::builder()
         .add_default_chromatogram_fields()
@@ -183,7 +194,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         for f in sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
             &mut reader,
             &overrides,
-            false,
+            None,
         ) {
             point_builder = point_builder.add_field(f);
         }
@@ -193,7 +204,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     writer = sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
         &mut reader,
         &overrides,
-        args.chunked_encoding.is_some(),
+        args.chunked_encoding,
     )
     .into_iter()
     .fold(writer, |writer, f| writer.add_spectrum_field(f));
@@ -352,12 +363,4 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_from() {
-        let args = ConvertArgs::parse_from("-p -z -y -u".split_ascii_whitespace());
-        run_convert(r#"C:\Users\mobiu\Downloads\n40C_MS1_2pt7kV_15kOT_500-4000_MaxIT100_0to35A_140uL_RF100_MS2_1secCycle_OT7pt5k_AGC3e5and22ms_InjVol6_60min_20210220140305.mzML"#.as_ref(), args).unwrap();
-    }
-}
+mod test {}

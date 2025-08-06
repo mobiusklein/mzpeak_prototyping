@@ -22,7 +22,7 @@ use parquet::{
 };
 
 use mzdata::{
-    io::MZReaderType,
+    io::{MZReaderType, StreamingSpectrumIterator},
     meta::{
         DataProcessing, FileDescription, FileMetadataConfig, InstrumentConfiguration,
         MSDataFileMetadata, MassSpectrometryRun, Sample, Software,
@@ -36,7 +36,6 @@ use mzdata::{
 };
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
-#[allow(unused)]
 use crate::{
     archive::ZipArchiveWriter,
     entry::Entry,
@@ -52,7 +51,7 @@ use crate::{
     },
 };
 use crate::{
-    chunk_series::{ArrayChunk, ChunkingStrategy},
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
     filter::select_delta_model,
     peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
     spectrum::AuxiliaryArray,
@@ -64,7 +63,7 @@ fn _eval_spectra_from_iter_for_fields<
 >(
     iter: impl Iterator<Item = MultiLayerSpectrum<C, D>>,
     overrides: &HashMap<BufferName, BufferName>,
-    use_chunked_encoding: bool,
+    use_chunked_encoding: Option<ChunkingStrategy>,
 ) -> Vec<Arc<Field>> {
     let mut arrays: Vec<Arc<Field>> = Vec::new();
     let mut is_profile = 0;
@@ -76,13 +75,15 @@ fn _eval_spectra_from_iter_for_fields<
                 is_profile += 1;
             }
             s.raw_arrays().and_then(|map| {
-                if use_chunked_encoding {
-                    ArrayChunk::from_arrays(
+                if let Some(use_chunked_encoding) = use_chunked_encoding {
+                    ArrowArrayChunk::from_arrays(
                         0,
                         MZ_ARRAY,
                         map,
-                        ChunkingStrategy::Delta { chunk_size: 50.0 },
+                        use_chunked_encoding,
                         None,
+                        overrides,
+                        false,
                         false,
                     )
                     .ok()
@@ -90,10 +91,8 @@ fn _eval_spectra_from_iter_for_fields<
                         (
                             s[0].to_schema(
                                 "spectrum_index",
-                                BufferContext::Spectrum,
-                                overrides,
                                 &[
-                                    ChunkingStrategy::Delta { chunk_size: 50.0 },
+                                    use_chunked_encoding,
                                     ChunkingStrategy::Basic { chunk_size: 50.0 },
                                 ],
                             )
@@ -131,20 +130,26 @@ fn _eval_spectra_from_iter_for_fields<
     arrays
 }
 
-// pub fn sample_array_types_from_stream<
-//     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
-//     D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
-//     I: Iterator<Item=MultiLayerSpectrum<C, D>>,
-// >(
-//     reader: &mut StreamingSpectrumIterator<C, D, MultiLayerSpectrum<C, D>, I>,
-//     overrides: &HashMap<BufferName, BufferName>,
-//     use_chunked_encoding: bool,
-// ) -> Vec<std::sync::Arc<arrow::datatypes::Field>> where MultiLayerSpectrum<C, D>: Clone {
-//     let spectra: Vec<_> = reader.by_ref().take(10).collect();
-
-//     let fields = _eval_spectra_from_iter_for_fields(spectra.clone().into_iter(), overrides, use_chunked_encoding);
-//     fields
-// }
+pub fn sample_array_types_from_stream<
+    C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+    D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+    I: Iterator<Item = MultiLayerSpectrum<C, D>>,
+>(
+    reader: &mut StreamingSpectrumIterator<C, D, MultiLayerSpectrum<C, D>, I>,
+    overrides: &HashMap<BufferName, BufferName>,
+    use_chunked_encoding: Option<ChunkingStrategy>,
+) -> Vec<std::sync::Arc<arrow::datatypes::Field>>
+where
+    MultiLayerSpectrum<C, D>: Clone,
+{
+    reader.populate_buffer(10);
+    let fields = _eval_spectra_from_iter_for_fields(
+        reader.iter_buffer().cloned(),
+        overrides,
+        use_chunked_encoding,
+    );
+    fields
+}
 
 pub fn sample_array_types_from_file_reader<
     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
@@ -152,7 +157,7 @@ pub fn sample_array_types_from_file_reader<
 >(
     reader: &mut MZReaderType<std::fs::File, C, D>,
     overrides: &HashMap<BufferName, BufferName>,
-    use_chunked_encoding: bool,
+    use_chunked_encoding: Option<ChunkingStrategy>,
 ) -> Vec<Arc<arrow::datatypes::Field>> {
     let n = reader.len();
     if n == 0 {
@@ -171,6 +176,9 @@ pub trait ArrayBufferWriter {
     fn fields(&self) -> &Fields;
     fn prefix(&self) -> &str;
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool);
+
+    fn nullify_zero_intensity(&self) -> bool;
+    fn drop_zero_intensity(&self) -> bool;
 
     fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]);
 
@@ -195,7 +203,9 @@ pub trait ArrayBufferWriter {
                 arrays.push(new_null_array(f.data_type(), num_rows));
             }
         }
-        RecordBatch::try_new(schema, arrays).unwrap()
+        RecordBatch::try_new(schema, arrays).unwrap_or_else(|e| {
+            panic!("Failed to convert arrays to record batch: {e:#?}");
+        })
     }
 
     fn overrides(&self) -> &HashMap<BufferName, BufferName>;
@@ -447,6 +457,14 @@ impl ArrayBufferWriter for PointBuffers {
     fn overrides(&self) -> &HashMap<BufferName, BufferName> {
         &self.overrides
     }
+
+    fn nullify_zero_intensity(&self) -> bool {
+        self.null_zeros
+    }
+
+    fn drop_zero_intensity(&self) -> bool {
+        self.drop_zero_column.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -560,6 +578,14 @@ impl ArrayBufferWriter for ChunkBuffers {
     fn overrides(&self) -> &HashMap<BufferName, BufferName> {
         &self.overrides
     }
+
+    fn nullify_zero_intensity(&self) -> bool {
+        self.null_zeros
+    }
+
+    fn drop_zero_intensity(&self) -> bool {
+        self.drop_zero_column.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -659,6 +685,28 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.overrides(),
             ArrayBufferWriterVariants::PointBuffers(array_buffers) => array_buffers.overrides(),
+        }
+    }
+
+    fn nullify_zero_intensity(&self) -> bool {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
+                chunk_buffers.nullify_zero_intensity()
+            }
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => {
+                point_buffers.nullify_zero_intensity()
+            }
+        }
+    }
+
+    fn drop_zero_intensity(&self) -> bool {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
+                chunk_buffers.drop_zero_intensity()
+            }
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => {
+                point_buffers.drop_zero_intensity()
+            }
         }
     }
 }
@@ -867,21 +915,27 @@ impl Default for MzPeakWriterBuilder {
 }
 
 impl MzPeakWriterBuilder {
+    /// Set the compression codec and level for all files to be written
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
         self
     }
 
+    /// Add a column to the spectrum data file's schema
     pub fn add_spectrum_field(mut self, f: FieldRef) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_field(f);
         self
     }
 
+    /// Use the chunked representation for spectrum data using the provided chunking strategy
+    /// if `Some`, otherwise use the point list representation.
     pub fn chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
         self.chunked_encoding = value;
         self
     }
 
+    /// Add a rule to store the `from` buffer as the type given by the `to` buffer name for the
+    /// spectrum data.
     pub fn add_spectrum_override(
         mut self,
         from: impl Into<BufferName>,
@@ -891,21 +945,30 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Shuffle m/z arrays using [`Encoding::BYTE_STREAM_SPLIT`] encoding
     pub fn shuffle_mz(mut self, shuffle_mz: bool) -> Self {
         self.shuffle_mz = shuffle_mz;
         self
     }
 
+    /// In addition to trimming runs of zero intensity, replace points with zero intensity with null
+    /// values which are stored more efficiently in Parquet.
     pub fn null_zeros(mut self, null_zeros: bool) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.null_zeros(null_zeros);
         self
     }
 
+    /// Set a separate array buffer schema for storing peak data in addition to profile data in the
+    /// main sequence of spectrum data.
+    ///
+    /// If set to a non-`None` value, a separate file will be used.
     pub fn store_peaks_and_profiles_apart(mut self, value: Option<ArrayBuffersBuilder>) -> Self {
         self.store_peaks_and_profiles_apart = value;
         self
     }
 
+    /// Add a rule to store the `from` buffer as the type given by the `to` buffer name for the
+    /// chromatogram data.
     pub fn add_chromatogram_override(
         mut self,
         from: impl Into<BufferName>,
@@ -915,16 +978,19 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Add columns to the spectrum data file's schema to support serializing `T`
     pub fn add_spectrum_peak_type<T: ToMzPeakDataSeries>(mut self) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.add_peak_type::<T>();
         self
     }
 
+    /// Specify the schema prefix for spectrum data
     pub fn spectrum_data_prefix(mut self, value: impl ToString) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.prefix(value);
         self
     }
 
+    /// Add a column to the chromatogram data file's schema
     pub fn add_chromatogram_field(mut self, f: FieldRef) -> Self {
         self.chromatogram_arrays = self.chromatogram_arrays.add_field(f);
         self
@@ -935,12 +1001,14 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Set the number of rows to buffer in memory before dumping to file
     pub fn buffer_size(mut self, value: usize) -> Self {
         self.buffer_size = value;
         self
     }
 
-    pub fn build_split<W: Write + Send>(
+    /// Build an unpacked writer
+    pub fn build_unpacked<W: Write + Send>(
         self,
         data_writer: W,
         metadata_writer: W,
@@ -957,6 +1025,7 @@ impl MzPeakWriterBuilder {
         )
     }
 
+    /// Build a zip archive-packed writer
     pub fn build<W: Write + Send + Seek>(
         self,
         writer: W,
@@ -1185,6 +1254,21 @@ pub trait AbstractMzPeakWriter {
         Ok(())
     }
 
+    fn build_delta_model(&self, binary_array_map: &BinaryArrayMap) -> Option<Vec<f64>> {
+        if let Ok(mzs) = binary_array_map.mzs() {
+            let delta_model = if let Ok(ints) = binary_array_map.intensities() {
+                let weights: Vec<f64> =
+                    ints.iter().map(|i| (*i + 1.0).ln().sqrt() as f64).collect();
+                select_delta_model(&mzs, Some(&weights))
+            } else {
+                select_delta_model(&mzs, None)
+            };
+            Some(delta_model)
+        } else {
+            None
+        }
+    }
+
     fn write_binary_array_map<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -1197,65 +1281,61 @@ pub trait AbstractMzPeakWriter {
         let n_points = binary_array_map.mzs()?.len();
         let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;
 
-        let (delta_params, extra_arrays) =
-            if let Some(chunking) = self.use_chunked_encoding().copied() {
-                let chunks = ArrayChunk::from_arrays(
-                    spectrum_count,
-                    MZ_ARRAY,
-                    binary_array_map,
-                    chunking,
-                    None,
-                    is_profile,
-                )?;
-                if !chunks.is_empty() {
-                    let buffer = self.spectrum_data_buffer_mut();
-                    let chunks = ArrayChunk::to_arrow(
-                        &chunks,
-                        "spectrum_index",
-                        BufferContext::Spectrum,
-                        buffer.schema(),
-                        buffer.overrides(),
-                        &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
-                    )?;
-                    let size = chunks.len();
-                    let (fields, arrays, _nulls) = chunks.into_parts();
-                    buffer.add_arrays(fields, arrays, size, is_profile);
-                }
-
-                (None, None)
+        let (delta_params, extra_arrays) = if let Some(chunking) =
+            self.use_chunked_encoding().copied()
+        {
+            let nullify_zero_intensity = self.spectrum_data_buffer_mut().nullify_zero_intensity();
+            let median_delta = if is_profile {
+                self.build_delta_model(binary_array_map)
             } else {
-                let median_delta = if is_profile {
-                    if let Ok(mzs) = binary_array_map.mzs() {
-                        let delta_model = if let Ok(ints) = binary_array_map.intensities() {
-                            let weights: Vec<f64> =
-                                ints.iter().map(|i| (*i + 1.0).ln().sqrt() as f64).collect();
-                            select_delta_model(&mzs, Some(&weights))
-                        } else {
-                            select_delta_model(&mzs, None)
-                        };
-                        Some(delta_model)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let buffer = self.spectrum_data_buffer_mut();
-
-                let (fields, data, extra_arrays) = array_map_to_schema_arrays_and_excess(
-                    BufferContext::Spectrum,
-                    binary_array_map,
-                    n_points,
-                    spectrum_count,
-                    "spectrum_index",
-                    &buffer.fields(),
-                    &buffer.overrides(),
-                )?;
-
-                buffer.add_arrays(fields, data, n_points, is_profile);
-                (median_delta, Some(extra_arrays))
+                None
             };
+            let chunks = ArrowArrayChunk::from_arrays(
+                spectrum_count,
+                MZ_ARRAY,
+                binary_array_map,
+                chunking,
+                None,
+                self.spectrum_data_buffer_mut().overrides(),
+                is_profile,
+                nullify_zero_intensity,
+            )?;
+            if !chunks.is_empty() {
+                let buffer = self.spectrum_data_buffer_mut();
+                let chunks = ArrowArrayChunk::to_struct_array(
+                    &chunks,
+                    "spectrum_index",
+                    buffer.schema(),
+                    &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
+                );
+                let size = chunks.len();
+                let (fields, arrays, _nulls) = chunks.into_parts();
+                buffer.add_arrays(fields, arrays, size, is_profile);
+            }
+
+            (median_delta, None)
+        } else {
+            let median_delta = if is_profile {
+                self.build_delta_model(binary_array_map)
+            } else {
+                None
+            };
+
+            let buffer = self.spectrum_data_buffer_mut();
+
+            let (fields, data, extra_arrays) = array_map_to_schema_arrays_and_excess(
+                BufferContext::Spectrum,
+                binary_array_map,
+                n_points,
+                spectrum_count,
+                "spectrum_index",
+                &buffer.fields(),
+                &buffer.overrides(),
+            )?;
+
+            buffer.add_arrays(fields, data, n_points, is_profile);
+            (median_delta, Some(extra_arrays))
+        };
 
         Ok((delta_params, extra_arrays))
     }
@@ -1267,33 +1347,34 @@ pub trait AbstractMzPeakWriter {
     ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
         if self.use_chunked_encoding().is_some() {
             let arrays = C::as_arrays(peaks);
-            let chunks = ArrayChunk::from_arrays(
+            let chunks = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 MZ_ARRAY,
                 &arrays,
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 None,
+                self.spectrum_data_buffer_mut().overrides(),
+                false,
                 false,
             )?;
             if !chunks.is_empty() {
                 let buffer = self.spectrum_data_buffer_mut();
-                let chunks = ArrayChunk::to_arrow(
+                let chunks = ArrowArrayChunk::to_struct_array(
                     &chunks,
                     "spectrum_index",
-                    BufferContext::Spectrum,
                     buffer.schema(),
-                    buffer.overrides(),
                     &[
                         ChunkingStrategy::Delta { chunk_size: 50.0 },
                         ChunkingStrategy::Basic { chunk_size: 50.0 },
                     ],
-                )?;
+                );
                 let size = chunks.len();
                 let (fields, arrays, _nulls) = chunks.into_parts();
                 buffer.add_arrays(fields, arrays, size, false);
             }
+        } else {
+            self.spectrum_data_buffer_mut().add(spectrum_count, peaks);
         }
-        self.spectrum_data_buffer_mut().add(spectrum_count, peaks);
         Ok((None, None))
     }
 
@@ -1321,7 +1402,7 @@ pub trait AbstractMzPeakWriter {
     }
 }
 
-struct MiniPeakWriterType<W: Write + Send + Seek> {
+pub(crate) struct MiniPeakWriterType<W: Write + Send + Seek> {
     writer: ArrowWriter<W>,
     spectrum_buffers: PointBuffers,
     buffer_size: usize,
@@ -1339,11 +1420,20 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
             buffer_size,
         };
         let spectrum_array_index: ArrayIndex = this.spectrum_buffers.as_array_index();
-        this.writer.append_key_value_metadata(KeyValue::new(
+        this.append_key_value_metadata(
             "spectrum_array_index".to_string(),
             Some(spectrum_array_index.to_json()),
-        ));
+        );
         this
+    }
+
+    pub(crate) fn append_key_value_metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<Option<String>>,
+    ) {
+        self.writer
+            .append_key_value_metadata(KeyValue::new(key.into(), value));
     }
 
     pub(crate) fn add_peaks<
@@ -1564,7 +1654,13 @@ impl<
 
         for c in parquet_schema.columns().iter() {
             let colpath = c.path().to_string();
-            if colpath.contains("_mz_") && shuffle_mz {
+            if colpath.contains("_mz_")
+                && shuffle_mz
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
                 log::debug!("{}: shuffling", c.path());
                 data_props =
                     data_props.set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
@@ -1734,34 +1830,6 @@ impl<
             "spectrum_array_index".to_string(),
             spectrum_array_index.to_json(),
         );
-
-        // let mut chromatogram_array_index =
-        //     ArrayIndex::new(self.chromatogram_buffers.prefix.clone(), HashMap::new());
-        // if let Ok(sub) = self
-        //     .chromatogram_buffers
-        //     .schema
-        //     .field_with_name(&self.chromatogram_buffers.prefix)
-        //     .cloned()
-        // {
-        //     if let DataType::Struct(fields) = sub.data_type() {
-        //         for f in fields.iter() {
-        //             if f.name() == "chromatogram_index" {
-        //                 continue;
-        //             }
-        //             let buffer_name =
-        //                 BufferName::from_field(BufferContext::Chromatogram, f.clone()).unwrap();
-        //             let aie = ArrayIndexEntry::from_buffer_name(
-        //                 self.chromatogram_buffers.prefix.clone(),
-        //                 buffer_name,
-        //             );
-        //             chromatogram_array_index.insert(aie.array_type.clone(), aie);
-        //         }
-        //     }
-        // }
-        // self.append_key_value_metadata(
-        //     "chromatogram_array_index".to_string(),
-        //     chromatogram_array_index.to_json(),
-        // );
     }
 
     pub fn write_spectrum<
@@ -1775,11 +1843,12 @@ impl<
     }
 
     fn flush_data_arrays(&mut self) -> io::Result<()> {
+        let use_chunks = self.use_chunked_encoding().is_some();
         for batch in self.spectrum_buffers.drain() {
             self.spectrum_data_point_counter += batch.num_rows() as u64;
             if let Some(writer) = self.archive_writer.as_mut() {
                 writer.write(&batch)?;
-                if writer.in_progress_size() > 512_000_000 {
+                if writer.in_progress_size() > 512_000_000 && use_chunks {
                     log::debug!(
                         "Flushing row group buffer with approximately {} bytes",
                         writer.in_progress_size()
