@@ -85,11 +85,12 @@ fn _eval_spectra_from_iter_for_fields<
                         overrides,
                         false,
                         false,
+                        None,
                     )
                     .ok()
                     .map(|s| {
                         (
-                            s[0].to_schema(
+                            s.0[0].to_schema(
                                 "spectrum_index",
                                 &[
                                     use_chunked_encoding,
@@ -171,20 +172,39 @@ pub fn sample_array_types_from_file_reader<
 }
 
 pub trait ArrayBufferWriter {
+    /// Whether the buffer describes a spectrum or chromatogram
     fn buffer_context(&self) -> BufferContext;
+    /// The Arrow schema this buffer is embedded in
     fn schema(&self) -> &SchemaRef;
+    /// The individual fields in this buffer's schema
     fn fields(&self) -> &Fields;
+    /// The name of the prefix in the schema for these fields
     fn prefix(&self) -> &str;
+
+    /// Add the provided `arrays` belonging to `fields` to the buffer
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool);
 
+    /// Whether or not to use a gapped sparse encoding, filling zero-intensity points with nulls left
+    /// after zero intensity runs were dropped ([`ArrayBufferWriter::drop_zero_intensity`]).
     fn nullify_zero_intensity(&self) -> bool;
+
+    /// Whether or not to drop runs of zero-intensity points from profile data, leaving only one zero-intensity
+    /// point flanking the gaps.
     fn drop_zero_intensity(&self) -> bool;
 
+    /// Add a peak list to the buffer.
+    ///
+    /// This might call [`ArrayBufferWriter::add_arrays`].
     fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]);
 
+    /// The number of distinct blocks of data points buffered
     fn num_chunks(&self) -> usize;
+
+    /// Drain the internal buffers into a sequence of [`RecordBatch`]
     fn drain(&mut self) -> impl Iterator<Item = RecordBatch>;
 
+    /// Convert a flat [`RecordBatch`] to a nested [`RecordBatch`] under `prefix`
+    /// and fill any missing top-level arrays in `schema` with null arrays.
     fn promote_record_batch_to_struct(
         prefix: &str,
         batch: RecordBatch,
@@ -836,7 +856,7 @@ impl ArrayBuffersBuilder {
             None
         };
         ChunkBuffers::new(
-            fields.into(),
+            self.array_fields.clone().into(),
             buffer_context,
             schema,
             self.prefix.clone(),
@@ -1195,27 +1215,46 @@ macro_rules! implement_mz_metadata {
 }
 
 pub trait AbstractMzPeakWriter {
+    /// Append an arbitrary key bytestring with an optional value to the (current) Parquet file
     fn append_key_value_metadata(
         &mut self,
         key: impl Into<String>,
         value: impl Into<Option<String>>,
     );
 
+    /// Whether or not a chunking strategy is being used
     fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
         None
     }
 
+    /// Get a mutable reference to the buffer of spectrum metadata values,
+    /// for appending only
     fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry>;
+
+    /// Get a mutable reference to the buffer of spectrum signal data values,
+    /// for appending only
     fn spectrum_data_buffer_mut(&mut self) -> &mut ArrayBufferWriterVariants;
 
+    /// Check if the data buffers are full, and flush them if so
     fn check_data_buffer(&mut self) -> io::Result<()>;
 
+    /// The current number of spectra having been written to the MzPeak file
     fn spectrum_counter(&self) -> u64;
+
+    /// A mutable reference to the number of spectra having been written to the MzPeak file,
+    /// for incrementing
     fn spectrum_counter_mut(&mut self) -> &mut u64;
 
+    /// The current number of distinct precursors having been written to the MzPeak file
     fn spectrum_precursor_counter(&self) -> u64;
+    /// A mutable reference to the number of distinct precursors having been written to the MzPeak file,
+    /// for incrementing
     fn spectrum_precursor_counter_mut(&mut self) -> &mut u64;
 
+    /// Convert a `spectrum` into one or more [`Entry`] records describing the spectrum and its subsidiary
+    /// structures.
+    ///
+    /// This method will update internal precursor counters if needed.
     fn spectrum_to_entries<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -1230,6 +1269,7 @@ pub trait AbstractMzPeakWriter {
         )
     }
 
+    /// Write a `spectrum` to the MzPeak file
     fn write_spectrum<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -1254,6 +1294,12 @@ pub trait AbstractMzPeakWriter {
         Ok(())
     }
 
+    /// Fit an [`MZDeltaModel`] instance on the provided (sparse) spectrum signal, and return the parameter
+    /// buffer.
+    ///
+    /// If an intensity array is available, it will be used to weight the parameter estimation procedure.
+    ///
+    /// If no m/z array is available, `None` is returned
     fn build_delta_model(&self, binary_array_map: &BinaryArrayMap) -> Option<Vec<f64>> {
         if let Ok(mzs) = binary_array_map.mzs() {
             let delta_model = if let Ok(ints) = binary_array_map.intensities() {
@@ -1269,6 +1315,15 @@ pub trait AbstractMzPeakWriter {
         }
     }
 
+    /// Write a [`BinaryArrayMap`] to the data buffer.
+    ///
+    /// If sparse data encoding is enabled ([`ArrayBufferWriter::nullify_zero_intensity`]), and the
+    /// `spectrum` is in profile mode, this will fit a delta model with [`AbstractMzPeakWriter::build_delta_model`].
+    ///
+    /// If chunked encoding is enabled, the [`ChunkingStrategy`] will be applied, regardless of whether or not the
+    /// spectrum is in profile mode. This might change in the future.
+    ///
+    /// This is a helper method for [`AbstractMzPeakWriter::write_spectrum_data`].
     fn write_binary_array_map<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -1290,30 +1345,31 @@ pub trait AbstractMzPeakWriter {
             } else {
                 None
             };
-            let chunks = ArrowArrayChunk::from_arrays(
+            let buffer_ref = self.spectrum_data_buffer_mut();
+            let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 MZ_ARRAY,
                 binary_array_map,
                 chunking,
                 None,
-                self.spectrum_data_buffer_mut().overrides(),
+                buffer_ref.overrides(),
                 is_profile,
                 nullify_zero_intensity,
+                Some(buffer_ref.fields()),
             )?;
             if !chunks.is_empty() {
-                let buffer = self.spectrum_data_buffer_mut();
                 let chunks = ArrowArrayChunk::to_struct_array(
                     &chunks,
                     "spectrum_index",
-                    buffer.schema(),
+                    buffer_ref.schema().fields(),
                     &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
                 );
                 let size = chunks.len();
                 let (fields, arrays, _nulls) = chunks.into_parts();
-                buffer.add_arrays(fields, arrays, size, is_profile);
+                buffer_ref.add_arrays(fields, arrays, size, is_profile);
             }
 
-            (median_delta, None)
+            (median_delta, Some(auxiliary_arrays))
         } else {
             let median_delta = if is_profile {
                 self.build_delta_model(binary_array_map)
@@ -1340,44 +1396,52 @@ pub trait AbstractMzPeakWriter {
         Ok((delta_params, extra_arrays))
     }
 
+    /// Write a peak list to the data buffer.
+    ///
+    /// If chunked encoding is enabled, [`ChunkingStrategy::Basic`] will be used.
     fn write_peaks<C: ToMzPeakDataSeries>(
         &mut self,
         spectrum_count: u64,
         peaks: &[C],
     ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
-        if self.use_chunked_encoding().is_some() {
+        if let Some(encoding)  = self.use_chunked_encoding().copied() {
             let arrays = C::as_arrays(peaks);
-            let chunks = ArrowArrayChunk::from_arrays(
+            let buffer_ref = self.spectrum_data_buffer_mut();
+            let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 MZ_ARRAY,
                 &arrays,
-                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                ChunkingStrategy::Basic { chunk_size: encoding.chunk_size() },
                 None,
-                self.spectrum_data_buffer_mut().overrides(),
+                buffer_ref.overrides(),
                 false,
                 false,
+                Some(buffer_ref.fields()),
             )?;
             if !chunks.is_empty() {
-                let buffer = self.spectrum_data_buffer_mut();
                 let chunks = ArrowArrayChunk::to_struct_array(
                     &chunks,
                     "spectrum_index",
-                    buffer.schema(),
+                    buffer_ref.schema().fields(),
                     &[
-                        ChunkingStrategy::Delta { chunk_size: 50.0 },
-                        ChunkingStrategy::Basic { chunk_size: 50.0 },
+                        encoding,
+                        ChunkingStrategy::Basic { chunk_size: encoding.chunk_size() },
                     ],
                 );
                 let size = chunks.len();
                 let (fields, arrays, _nulls) = chunks.into_parts();
-                buffer.add_arrays(fields, arrays, size, false);
+                buffer_ref.add_arrays(fields, arrays, size, false);
             }
+            Ok((None, Some(auxiliary_arrays)))
         } else {
             self.spectrum_data_buffer_mut().add(spectrum_count, peaks);
+            Ok((None, None))
         }
-        Ok((None, None))
     }
 
+    /// Write the spectrum data of any dimensions to the data buffer.
+    ///
+    /// Uses [`SpectrumLike::peaks`] to decide which kind of data to write.
     fn write_spectrum_data<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -1402,6 +1466,8 @@ pub trait AbstractMzPeakWriter {
     }
 }
 
+
+//// A small helper for writing peak list data to another stream with very narrow options.
 pub(crate) struct MiniPeakWriterType<W: Write + Send + Seek> {
     writer: ArrowWriter<W>,
     spectrum_buffers: PointBuffers,

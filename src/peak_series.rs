@@ -314,7 +314,9 @@ impl BufferContext {
 }
 
 
-/// The layout of a buffer denoting the shape of the data in each position in the buffer
+/// The layout of a buffer denoting the shape of the data in each position in the buffer.
+///
+/// This is part of a [`BufferName`] and helps guide a reader in decoding signal data.
 #[derive(Default, Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferFormat {
     /// A series of contiguous points
@@ -328,6 +330,7 @@ pub enum BufferFormat {
 }
 
 impl BufferFormat {
+    /// Get the prefix suggested for this format type
     pub const fn prefix(&self) -> &'static str {
         match self {
             Self::Chunked => "chunk",
@@ -509,6 +512,8 @@ pub fn binary_datatype_from_accession(accession: crate::param::CURIE) -> Option<
     }
 }
 
+
+/// Compute an ordering constant for [`mzdata::spectrum::ArrayType`]
 pub const fn array_priority(array_type: &ArrayType) -> u64 {
     match array_type {
         ArrayType::MZArray => 1,

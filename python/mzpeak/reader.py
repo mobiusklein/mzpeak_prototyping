@@ -10,6 +10,7 @@ from enum import Enum
 import numpy as np
 import pandas as pd
 
+import pynumpress
 import pyarrow as pa
 
 from pyarrow import compute as pc
@@ -355,6 +356,7 @@ class _ChunkIterator:
 
 DELTA_ENCODING = {"cv_id": 1, "accession": 1003089}
 NO_COMPRESSION = {"cv_id": 1, "accession": 1000576}
+NUMPRESS_LINEAR = {"cv_id": 1, "accession": 1002312}
 
 
 class MzPeakSpectrumDataReader:
@@ -491,9 +493,20 @@ class MzPeakSpectrumDataReader:
         delta_model: float | np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         n = 0
+        numpress_chunks = []
         for chunk in chunks:
             # The +1 is to account for the starting point
-            n += len(chunk[f"{axis_prefix}_chunk_values"]) + 1
+            encoding = chunk["chunk_encoding"].as_py()
+            if encoding == DELTA_ENCODING or encoding == NO_COMPRESSION:
+                n += len(chunk[f"{axis_prefix}_chunk_values"]) + 1
+            elif encoding == NUMPRESS_LINEAR:
+                raw = chunk[f"{axis_prefix}_numpress_bytes"].as_py()
+                part = pynumpress.decode_linear(raw)
+                n += len(part)
+                numpress_chunks.append(part)
+            else:
+                raise ValueError(f"Unsupported chunk encoding {encoding}")
+
         if n == 0:
             return {axis_prefix: np.array([])}
 
@@ -507,7 +520,8 @@ class MzPeakSpectrumDataReader:
         main_axis_array = np.zeros(n)
         offset = 0
         had_nulls = False
-        for chunk in chunks:
+        numpress_chunks_it = iter(numpress_chunks)
+        for i, chunk in enumerate(chunks):
             start = chunk[f"{axis_prefix}_chunk_start"].as_py()
             steps = chunk[f"{axis_prefix}_chunk_values"]
             encoding = chunk['chunk_encoding'].as_py()
@@ -533,6 +547,18 @@ class MzPeakSpectrumDataReader:
             elif encoding == NO_COMPRESSION:
                 chunk_size = len(steps)
                 main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
+            elif encoding == NUMPRESS_LINEAR:
+                part: np.ndarray = next(numpress_chunks_it)
+                chunk_size = len(part)
+                zeros = part == 0
+                if zeros.sum() > 0:
+                    had_nulls = True
+                    if delta_model is not None:
+                        part = pa.array(part, mask=zeros)
+                        part = fill_nulls(part, delta_model)
+                        part = np.asarray(part)
+                        chunk_size = len(part)
+                main_axis_array[offset : offset + chunk_size] = part
             else:
                 raise ValueError(f"Unsupported chunk encoding {encoding}")
 

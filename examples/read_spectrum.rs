@@ -1,5 +1,5 @@
-use std::{io, path::PathBuf, env};
-use mzdata::io::mgf::MGFWriter;
+use std::{io::{self, prelude::*}, path::PathBuf, env};
+use mzdata::{io::mgf::MGFWriter, prelude::SpectrumLike};
 use mzpeak_prototyping::MzPeakReader;
 
 
@@ -12,6 +12,15 @@ fn fetch(path: &PathBuf, index: usize) -> io::Result<()> {
     let mut writer = MGFWriter::new(writer);
     writer.write(&spec)?;
     drop(writer);
+
+    let mut writer = io::stdout().lock();
+    writeln!(writer, "Raw Data:")?;
+    let arrays = spec.raw_arrays().unwrap();
+    let mzs = arrays.mzs()?;
+    let ints = arrays.intensities()?;
+    for (mz, i) in mzs.iter().zip(ints.iter()) {
+        writeln!(writer, "{mz}\t{i}")?;
+    }
     Ok(())
 }
 

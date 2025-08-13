@@ -75,8 +75,6 @@ pub fn estimate_median_delta<T: Float, I: IntoIterator<Item = T>>(iter: I) -> (T
 /// allocation.
 pub fn fit_delta_model<
     T: Float
-        + num_traits::One
-        + num_traits::Zero
         + nalgebra::Scalar
         + nalgebra::ClosedAddAssign
         + nalgebra::ClosedMulAssign
@@ -196,7 +194,7 @@ pub trait MZDeltaModel<T: Float + AddAssign>: Sized {
 
     /// Fit an m/z delta model from experimental data.
     ///
-    /// If `weights` are provided, they are assumed to square-root transformed.
+    /// If `weights` are provided, they are assumedI  to square-root transformed.
     fn fit(
         mz_array: &[T],
         deltas: &[T],
@@ -205,13 +203,18 @@ pub trait MZDeltaModel<T: Float + AddAssign>: Sized {
     ) -> Result<Self, &'static str>;
 
     /// Compute the average error of the model from the data
-    fn mean_squared_error(&self, mzs: &[T], deltas: &[T]) -> T {
-        let mut acc = T::zero();
+    fn mean_squared_error<U: Float + AddAssign + NumCast>(&self, mzs: &[U], deltas: &[U]) -> U {
+        let mut acc = U::zero();
         for (mz, delta) in mzs.iter().zip(deltas) {
             let err = (self.predict(*mz) - *delta).powi(2);
             acc += err;
         }
         acc
+    }
+
+    fn from_f64_iter(iter: impl Iterator<Item=f64>) -> Self {
+        let val: Vec<_> = iter.collect();
+        Self::from_float64_array(&val.into())
     }
 
     /// Convert the model parameters to `Float64Array`
@@ -256,6 +259,10 @@ impl<T: Float + AddAssign + NumCast> MZDeltaModel<T> for ConstantDeltaModel<T> {
 
     fn from_float64_array(data: &Float64Array) -> Self {
         Self::from(T::from(data.value(0)).unwrap())
+    }
+
+    fn from_f64_iter(mut iter: impl Iterator<Item = f64>) -> Self {
+        Self::from(T::from(iter.next().unwrap()).unwrap())
     }
 }
 
@@ -328,6 +335,11 @@ where
     fn from_float64_array(data: &Float64Array) -> Self {
         let vals: Vec<T> = data.iter().flatten().flat_map(|v| T::from(v)).collect();
         Self::from(vals)
+    }
+
+    fn from_f64_iter(iter: impl Iterator<Item=f64>) -> Self {
+        let betas: Vec<_> = iter.map(|i| T::from(i).unwrap()).collect();
+        Self::from(betas)
     }
 }
 
@@ -460,7 +472,7 @@ impl<'a> NullTokenizer<'a> {
 
 /// Fill null m/z values of `array` with values inferred from adjacent populated values and
 /// either a local median delta value or a common model
-pub fn fill_nulls_for<T: ArrowPrimitiveType, F: MZDeltaModel<T::Native> + Debug>(
+pub fn fill_nulls_for<T: ArrowPrimitiveType, F: MZDeltaModel<f64> + Debug>(
     array: &PrimitiveArray<T>,
     common_delta: &F,
 ) -> Vec<T::Native>

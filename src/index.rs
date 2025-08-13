@@ -71,7 +71,6 @@ impl<T: HasProximity> PageIndexType<T> for PageIndexEntry<T> {
     }
 }
 
-
 /// An abstraction built atop the Parquet Page Index to support point and interval
 /// queries to find which row groups and pages contain values of interest, implying
 /// which rows actually need to be loaded.
@@ -173,10 +172,8 @@ where
         selectors.into()
     }
 
-    pub fn pages_contains(&self, query: T) -> impl Iterator<Item=&PageIndexEntry<T>> {
-        self.iter().filter(move |p| {
-            p.contains(&query)
-        })
+    pub fn pages_contains(&self, query: T) -> impl Iterator<Item = &PageIndexEntry<T>> {
+        self.iter().filter(move |p| p.contains(&query))
     }
 
     pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {
@@ -196,11 +193,18 @@ where
         selectors.into()
     }
 
-    pub fn pages_overlaps(&self, query: &impl Span1D<DimType = T>) -> impl Iterator<Item=&PageIndexEntry<T>> {
+    pub fn pages_overlaps(
+        &self,
+        query: &impl Span1D<DimType = T>,
+    ) -> impl Iterator<Item = &PageIndexEntry<T>> {
         self.iter().filter(move |p| p.overlaps(query))
     }
 
-    pub fn pages_to_row_selection<'a>(&'a self, it:  impl IntoIterator<Item=&'a PageIndexEntry<T>>, mut last_row: i64) -> RowSelection {
+    pub fn pages_to_row_selection<'a>(
+        &'a self,
+        it: impl IntoIterator<Item = &'a PageIndexEntry<T>>,
+        mut last_row: i64,
+    ) -> RowSelection {
         let mut selectors = Vec::new();
         for page in it {
             if page.start_row() != last_row {
@@ -212,7 +216,6 @@ where
         selectors.into()
     }
 }
-
 
 /// A generic interface to a page index entry.
 ///
@@ -322,7 +325,6 @@ macro_rules! read_numeric_page_index {
     }};
 }
 
-
 /// Read a `f32` values from the page index for the specified path from
 /// prepared metadata
 pub fn read_f32_page_index_from(
@@ -363,7 +365,6 @@ pub fn read_i64_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, i64)
 }
 
-
 /// Read a `u32` values from the page index for the specified path from
 /// prepared metadata
 pub fn read_u32_page_index_from(
@@ -373,7 +374,6 @@ pub fn read_u32_page_index_from(
 ) -> Option<PageIndex<u32>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, u32)
 }
-
 
 /// Read a `u64` values from the page index for the specified path from
 /// prepared metadata
@@ -385,7 +385,6 @@ pub fn read_u64_page_index_from(
     read_numeric_page_index!(metadata, pq_schema, column_path, u64)
 }
 
-
 /// Read a `u8` values from the page index for the specified path from
 /// prepared metadata
 pub fn read_u8_page_index_from(
@@ -395,7 +394,6 @@ pub fn read_u8_page_index_from(
 ) -> Option<PageIndex<u8>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, u8)
 }
-
 
 /// Read a `i8` values from the page index for the specified path from
 /// prepared metadata
@@ -554,3 +552,40 @@ where
 }
 
 impl<T: Span1D> SpanDynNumeric for T where T::DimType: num_traits::NumCast {}
+
+pub struct RangeIndex<'a, T: HasProximity> {
+    start_index: &'a PageIndex<T>,
+    end_index: &'a PageIndex<T>,
+}
+
+impl<'a, T: HasProximity> RangeIndex<'a, T> {
+    pub fn new(start_index: &'a PageIndex<T>, end_index: &'a PageIndex<T>) -> Self {
+        Self {
+            start_index,
+            end_index,
+        }
+    }
+
+    pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {
+        let mut selectors = Vec::new();
+        let mut last_row = 0;
+        for (start_page, end_page) in self.start_index.iter().zip(self.end_index.iter()) {
+            if start_page.start_row() != last_row {
+                selectors.push(RowSelector::skip(
+                    (start_page.start_row() - last_row) as usize,
+                ));
+            }
+
+            let overlaps = start_page.contains(&query.start())
+                || end_page.contains(&query.end())
+                || SimpleInterval::new(start_page.start(), end_page.end()).overlaps(query);
+            if overlaps {
+                selectors.push(RowSelector::select(start_page.row_len() as usize));
+            } else {
+                selectors.push(RowSelector::skip(start_page.row_len() as usize))
+            }
+            last_row = start_page.end_row();
+        }
+        selectors.into()
+    }
+}

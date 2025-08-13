@@ -8,10 +8,12 @@ use arrow::array::{
     Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
     LargeBinaryArray, LargeBinaryBuilder, LargeListBuilder, PrimitiveArray, StructArray,
     StructBuilder, UInt8Array, UInt8Builder, UInt32Builder, UInt64Array, UInt64Builder,
+    new_null_array,
 };
 use arrow::compute::kernels::nullif;
 use arrow::datatypes::{
     DataType, Field, FieldRef, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Schema,
+    UInt8Type,
 };
 use itertools::Itertools;
 use mzdata::params::Unit;
@@ -38,6 +40,7 @@ use crate::peak_series::{
     BufferContext, BufferFormat, BufferName, MZ_ARRAY, array_to_arrow_type,
     data_array_to_arrow_array,
 };
+use crate::spectrum::AuxiliaryArray;
 use crate::{CURIE, curie};
 
 pub fn chunk_every_k<T: Float>(data: &[T], k: T) -> Vec<SimpleInterval<usize>> {
@@ -131,12 +134,14 @@ impl ChunkingStrategy {
                     main_axis_name.dtype,
                 )
                 .with_format(BufferFormat::Chunked)
+                .with_transform(Some(curie!(MS:1002312)))
                 .as_field_metadata();
                 let bytes = Field::new(
                     format!("{}_numpress_bytes", main_axis_name),
-                    DataType::LargeBinary,
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
                     true,
-                ).with_metadata(meta);
+                )
+                .with_metadata(meta);
                 vec![bytes]
             }
         }
@@ -167,10 +172,17 @@ impl ChunkingStrategy {
                 }
                 visited.insert(idx);
 
-                let b: &mut LargeBinaryBuilder = chunk_builder.field_builder(idx).unwrap();
+                let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+                    chunk_builder.field_builder(idx).unwrap();
+                let inner = b
+                    .values()
+                    .as_any_mut()
+                    .downcast_mut::<UInt8Builder>()
+                    .unwrap();
                 if matches!(chunk.chunk_encoding, Self::NumpressLinear { chunk_size: _ }) {
                     let bytes: &UInt8Array = chunk.chunk_values.as_primitive();
-                    b.append_value(&bytes.values());
+                    inner.extend(bytes);
+                    b.append(true);
                 } else {
                     b.append_null();
                 }
@@ -299,7 +311,7 @@ impl ChunkingStrategy {
         array: &ArrayRef,
         start_value: f64,
         accumulator: &mut DataArray,
-        delta_model: Option<Vec<f64>>,
+        delta_model: Option<&RegressionDeltaModel<f64>>,
     ) {
         match self {
             ChunkingStrategy::Basic { chunk_size } => match array.data_type() {
@@ -321,10 +333,8 @@ impl ChunkingStrategy {
                     let it = array.as_primitive::<Float32Type>();
                     if it.null_count() > 0 {
                         let decoded = null_delta_decode(it, start_value as f32);
-                        if let Some(delta_params) = delta_model {
-                            let delta_model: RegressionDeltaModel<f32> =
-                                RegressionDeltaModel::from_float64_array(&delta_params.into());
-                            let values = fill_nulls_for(&decoded, &delta_model);
+                        if let Some(delta_model) = delta_model {
+                            let values = fill_nulls_for(&decoded, delta_model);
                             accumulator.extend(&values).unwrap();
                         } else {
                             log::debug!(
@@ -340,10 +350,8 @@ impl ChunkingStrategy {
                     let it = array.as_primitive::<Float64Type>();
                     if it.null_count() > 0 {
                         let decoded = null_delta_decode(it, start_value);
-                        if let Some(delta_params) = delta_model {
-                            let delta_model: RegressionDeltaModel<f64> =
-                                RegressionDeltaModel::from_float64_array(&delta_params.into());
-                            let values = fill_nulls_for(&decoded, &delta_model);
+                        if let Some(delta_model) = delta_model {
+                            let values = fill_nulls_for(&decoded, delta_model);
                             accumulator.extend(&values).unwrap();
                         } else {
                             log::debug!(
@@ -361,9 +369,30 @@ impl ChunkingStrategy {
                 ),
             },
             ChunkingStrategy::NumpressLinear { chunk_size } => match array.data_type() {
-                DataType::Float64 => {
-                    let it = array.as_primitive::<Float64Type>();
-                    todo!("Still working on numpress decoding")
+                DataType::UInt8 => {
+                    let it = array.as_primitive::<UInt8Type>();
+                    let buf = it.values();
+                    let data: Float64Array = DataArray::decompress_numpress_linear(buf)
+                        .unwrap()
+                        .into_iter()
+                        .map(|v| if v == 0.0 { None } else { Some(v) })
+                        .collect();
+                    if let Some(delta_model) = delta_model {
+                        if data.null_count() > 0 {
+                            let data = fill_nulls_for(&data, delta_model);
+                            match accumulator.dtype() {
+                                BinaryDataArrayType::Float64 => {
+                                    accumulator.extend(&data).unwrap();
+                                }
+                                BinaryDataArrayType::Float32 => {
+                                    for v in data {
+                                        accumulator.push(v as f32).unwrap();
+                                    }
+                                }
+                                _ => unimplemented!(),
+                            }
+                        }
+                    }
                 }
                 _ => panic!(
                     "Data type {:?} is not supported by numpress linear decoding",
@@ -409,7 +438,7 @@ impl ArrowArrayChunk {
     pub fn to_struct_array(
         chunks: &[Self],
         series_index_name: impl Into<String>,
-        schema: &Schema,
+        schema: &Fields,
         encodings: &[ChunkingStrategy],
     ) -> StructArray {
         let this_schema = chunks[0].to_schema(series_index_name, encodings);
@@ -632,13 +661,17 @@ impl ArrowArrayChunk {
         overrides: &HashMap<BufferName, BufferName>,
         drop_zero_intensity: bool,
         nullify_zero_intensity: bool,
-    ) -> Result<Vec<Self>, ArrayRetrievalError> {
+        fields: Option<&Fields>,
+    ) -> Result<(Vec<Self>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
         let mut chunks = Vec::new();
         let mut subset_arrays = BinaryArrayMap::new();
 
         let mut arrow_arrays = Vec::new();
         let mut intensity_idx = None;
         let mut mz_idx = None;
+
+        let mut auxiliary_arrays = Vec::new();
+
         for (i, (_, arr)) in arrays.iter().enumerate() {
             let name = BufferName::from_data_array(main_axis.context, arr);
             let buffer_name = if name.array_type == main_axis.array_type {
@@ -646,6 +679,15 @@ impl ArrowArrayChunk {
             } else {
                 overrides.get(&name).unwrap_or(&name)
             };
+            if let Some(fields) = fields {
+                /// If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
+                if !fields
+                    .find(buffer_name.to_field().name()).is_some() && *buffer_name != main_axis {
+                        log::debug!("Skipping {:?}, not in schema: {fields:?}", buffer_name.to_field().name());
+                        auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
+                        continue
+                    }
+            }
             if matches!(buffer_name.array_type, ArrayType::IntensityArray) {
                 intensity_idx = Some(i);
             } else if matches!(buffer_name.array_type, ArrayType::MZArray) {
@@ -779,7 +821,7 @@ impl ArrowArrayChunk {
             ));
         }
 
-        Ok(chunks)
+        Ok((chunks, auxiliary_arrays))
     }
 }
 
@@ -1192,7 +1234,7 @@ mod test {
             BinaryDataArrayType::Float32,
         );
 
-        let chunks = ArrowArrayChunk::from_arrays(
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
             target,
             &arrays,
@@ -1201,6 +1243,7 @@ mod test {
             &HashMap::new(),
             true,
             false,
+            None,
         )?;
 
         for chunk in chunks.iter() {
@@ -1213,7 +1256,7 @@ mod test {
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
             "spectrum_index",
-            &Schema::empty(),
+            Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
@@ -1234,7 +1277,7 @@ mod test {
             BinaryDataArrayType::Float32,
         );
 
-        let chunks = ArrowArrayChunk::from_arrays(
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
             target,
             &arrays,
@@ -1243,6 +1286,7 @@ mod test {
             &HashMap::new(),
             true,
             true,
+            None,
         )?;
 
         for chunk in chunks.iter() {
@@ -1255,7 +1299,7 @@ mod test {
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
             "spectrum_index",
-            &Schema::empty(),
+            Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
@@ -1276,7 +1320,7 @@ mod test {
             BinaryDataArrayType::Float32,
         );
 
-        let chunks = ArrowArrayChunk::from_arrays(
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
             target,
             &arrays,
@@ -1285,6 +1329,7 @@ mod test {
             &HashMap::new(),
             false,
             false,
+            None,
         )?;
 
         let schema = chunks[0].to_schema(
@@ -1298,7 +1343,7 @@ mod test {
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
             "spectrum_index",
-            &Schema::empty(),
+            Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },

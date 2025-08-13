@@ -8,7 +8,7 @@ use mzdata::{
 use mzpeak_prototyping::{
     chunk_series::ChunkingStrategy,
     peak_series::{BufferContext, BufferName},
-    writer::{ArrayBuffersBuilder, MzPeakWriterType, sample_array_types_from_file_reader},
+    writer::{sample_array_types_from_file_reader, ArrayBuffersBuilder, MzPeakWriterType},
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
