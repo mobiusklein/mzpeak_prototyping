@@ -31,7 +31,10 @@ pub fn ascii_array(data_array: &DataArray) -> LargeBinaryArray {
     ba
 }
 
-pub fn data_array_to_arrow_array(buffer_name: &BufferName, data_array: &DataArray) -> Result<ArrayRef, ArrayRetrievalError> {
+pub fn data_array_to_arrow_array(
+    buffer_name: &BufferName,
+    data_array: &DataArray,
+) -> Result<ArrayRef, ArrayRetrievalError> {
     let array: ArrayRef = match buffer_name.dtype {
         BinaryDataArrayType::Unknown => Arc::new(UInt8Array::from(data_array.data.clone())),
         BinaryDataArrayType::Float64 => Arc::new(Float64Array::from(data_array.to_f64()?.to_vec())),
@@ -313,7 +316,6 @@ impl BufferContext {
     }
 }
 
-
 /// The layout of a buffer denoting the shape of the data in each position in the buffer.
 ///
 /// This is part of a [`BufferName`] and helps guide a reader in decoding signal data.
@@ -335,7 +337,7 @@ impl BufferFormat {
         match self {
             Self::Chunked => "chunk",
             Self::Point => "point",
-            Self::ChunkedSecondary => "chunk"
+            Self::ChunkedSecondary => "chunk",
         }
     }
 }
@@ -370,14 +372,29 @@ impl PartialEq<str> for BufferFormat {
 }
 
 /// Composite structure for directly naming a data array series
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, Eq)]
 pub struct BufferName {
+    /// Is this a spectrum or chromatogram array?
     pub context: BufferContext,
+    /// The kind of array being stored semantically
     pub array_type: ArrayType,
+    /// The kind of physical data stored in the array
     pub dtype: BinaryDataArrayType,
+    /// The unit of the values in the array
     pub unit: Unit,
+    /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
     pub transform: Option<CURIE>,
+}
+
+impl PartialEq for BufferName {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.array_type == other.array_type
+            && self.dtype == other.dtype
+            && self.unit == other.unit
+            && self.buffer_format == other.buffer_format
+    }
 }
 
 impl Ord for BufferName {
@@ -500,7 +517,9 @@ pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<Array
 
 /// Convert a [`CURIE`] into an [`BinaryDataArrayType`], or return `None` if the CURIE
 /// doesn't correspond to an [`BinaryDataArrayType`] term.
-pub fn binary_datatype_from_accession(accession: crate::param::CURIE) -> Option<BinaryDataArrayType> {
+pub fn binary_datatype_from_accession(
+    accession: crate::param::CURIE,
+) -> Option<BinaryDataArrayType> {
     let accession = accession.into();
     match accession {
         x if Some(x) == BinaryDataArrayType::Float32.curie() => Some(BinaryDataArrayType::Float32),
@@ -511,7 +530,6 @@ pub fn binary_datatype_from_accession(accession: crate::param::CURIE) -> Option<
         _ => None,
     }
 }
-
 
 /// Compute an ordering constant for [`mzdata::spectrum::ArrayType`]
 pub const fn array_priority(array_type: &ArrayType) -> u64 {
@@ -605,38 +623,38 @@ impl BufferName {
 
     pub fn as_field_metadata(&self) -> HashMap<String, String> {
         let mut meta: HashMap<String, String> = [
-                (
-                    "unit".to_string(),
-                    self.unit
-                        .to_curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "array_accession".to_string(),
-                    self.array_type
-                        .as_param(None)
-                        .curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "data_type_accession".to_string(),
-                    self.dtype
-                        .curie()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "array_name".to_string(),
-                    if let ArrayType::NonStandardDataArray { name } = &self.array_type {
-                        name.to_string()
-                    } else {
-                        self.array_type.as_param(None).name().to_string()
-                    }
-                ),
-                ("buffer_format".to_string(), self.buffer_format.to_string()),
-            ]
+            (
+                "unit".to_string(),
+                self.unit
+                    .to_curie()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "array_accession".to_string(),
+                self.array_type
+                    .as_param(None)
+                    .curie()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "data_type_accession".to_string(),
+                self.dtype
+                    .curie()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "array_name".to_string(),
+                if let ArrayType::NonStandardDataArray { name } = &self.array_type {
+                    name.to_string()
+                } else {
+                    self.array_type.as_param(None).name().to_string()
+                },
+            ),
+            ("buffer_format".to_string(), self.buffer_format.to_string()),
+        ]
         .into_iter()
         .collect();
         if let Some(trfm) = self.transform.as_ref() {
@@ -683,7 +701,10 @@ impl BufferName {
                         .ok()?;
                 }
                 "transform" => {
-                    transform = v.parse().inspect_err(|e| log::error!("Failed to parse transform: {e}")).ok();
+                    transform = v
+                        .parse()
+                        .inspect_err(|e| log::error!("Failed to parse transform: {e}"))
+                        .ok();
                 }
                 _ => {}
             }
@@ -825,7 +846,7 @@ pub struct SerializedArrayIndexEntry {
     #[serde(
         serialize_with = "opt_curie_serialize",
         deserialize_with = "opt_curie_deserialize",
-        default,
+        default
     )]
     pub transform: Option<CURIE>,
 }

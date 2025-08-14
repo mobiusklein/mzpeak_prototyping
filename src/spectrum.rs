@@ -13,6 +13,7 @@ use crate::{
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct AuxiliaryArray {
     pub data: Vec<u8>,
+    pub name: Param,
     pub data_type: CURIE,
     pub compression: CURIE,
     pub unit: Option<CURIE>,
@@ -41,7 +42,9 @@ impl AuxiliaryArray {
             .curie()
             .unwrap()
             .into();
+        let name = source.name.clone().as_param(Some(source.unit)).into();
         let mut this = Self {
+            name,
             data,
             data_type,
             compression,

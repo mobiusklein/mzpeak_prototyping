@@ -6,3 +6,5 @@ small:
 
 test:
     cargo t
+
+alias t := test

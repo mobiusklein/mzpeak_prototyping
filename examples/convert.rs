@@ -215,7 +215,6 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     let mut writer = writer.build(handle, true);
     writer.copy_metadata_from(&reader);
-    writer.add_file_description(reader.file_description());
 
     let (send, recv) = sync_channel(1);
 

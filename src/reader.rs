@@ -607,9 +607,9 @@ impl<
         // based upon the pages matched
         let first_row = if !pages.is_empty() {
             let mut rg_row_skip = 0;
-
+            let meta = builder.metadata();
             for i in 0..rg_idx_acc[0] {
-                let rg = builder.metadata().row_group(i);
+                let rg = meta.row_group(i);
                 rg_row_skip += rg.num_rows();
             }
             rg_row_skip
