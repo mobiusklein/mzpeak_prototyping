@@ -28,12 +28,12 @@ name = "read"
 path = "examples/read.rs"
 
 [[example]]
-name = "test_extract_refs"
-path = "examples/test_extract_ref.rs"
+name = "extract_refs"
+path = "examples/extract_ref.rs"
 
 [[example]]
-name = "test extract"
-path = "test_extract.rs"
+name = "extract"
+path = "examples/extract.rs"
 
 [features]
 

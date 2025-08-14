@@ -4,10 +4,12 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use mzdata::spectrum::ArrayType;
 use mzpeaks::coordinate::SimpleInterval;
 use mzpeaks::{coordinate::IntervalTree, prelude::HasProximity};
 use parquet::file::metadata::ParquetMetaData;
 
+use parquet::file::reader::ChunkReader;
 use parquet::{
     self,
     arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
@@ -17,6 +19,8 @@ use parquet::{
 
 use mzdata::mzpeaks::coordinate::Span1D;
 use serde::{Deserialize, Serialize};
+
+use crate::peak_series::{ArrayIndex, BufferFormat};
 
 pub fn parquet_column(schema: &SchemaDescriptor, column: &str) -> Option<usize> {
     let mut column_ix: Option<usize> = None;
@@ -521,6 +525,40 @@ where
         }
     }
 
+    fn overlaps_dy(&self, start_array: &ArrayRef, end_array: &ArrayRef) -> BooleanArray {
+        macro_rules! overlaps_dyn_impl {
+            ($raw_ty:ty, $arr_ty:ty) => {{
+                let start = <$raw_ty as num_traits::NumCast>::from(self.start()).unwrap();
+                let end = <$raw_ty as num_traits::NumCast>::from(self.end()).unwrap();
+                let span = SimpleInterval::new(start, end);
+                let start_array: &$arr_ty = start_array.as_any().downcast_ref().unwrap();
+                let end_array: &$arr_ty = end_array.as_any().downcast_ref().unwrap();
+                start_array.iter().zip(end_array.iter()).map(|(start, end)| -> Option<bool> {
+                    let v = SimpleInterval::new(start?, end?);
+                    Some(v.overlaps(&span))
+                }).collect()
+            }};
+        }
+        match start_array.data_type() {
+            arrow::datatypes::DataType::Int8 => {
+                overlaps_dyn_impl!(i8, Int8Array)
+            }
+            arrow::datatypes::DataType::Int16 => {
+                overlaps_dyn_impl!(i16, Int16Array)
+            }
+            arrow::datatypes::DataType::Int32 => overlaps_dyn_impl!(i32, Int32Array),
+            arrow::datatypes::DataType::Int64 => overlaps_dyn_impl!(i64, Int64Array),
+            arrow::datatypes::DataType::UInt8 => overlaps_dyn_impl!(u8, UInt8Array),
+            arrow::datatypes::DataType::UInt16 => overlaps_dyn_impl!(u16, UInt16Array),
+            arrow::datatypes::DataType::UInt32 => overlaps_dyn_impl!(u32, UInt32Array),
+            arrow::datatypes::DataType::UInt64 => overlaps_dyn_impl!(u64, UInt64Array),
+            arrow::datatypes::DataType::Float32 => overlaps_dyn_impl!(f32, Float32Array),
+            arrow::datatypes::DataType::Float64 => overlaps_dyn_impl!(f64, Float64Array),
+            _ => BooleanArray::new_null(start_array.len()),
+        }
+
+    }
+
     fn contains_dy(&self, array: &ArrayRef) -> BooleanArray {
         macro_rules! span_dyn_impl {
             ($raw_ty:ty, $arr_ty:ty) => {{
@@ -587,5 +625,195 @@ impl<'a, T: HasProximity> RangeIndex<'a, T> {
             last_row = start_page.end_row();
         }
         selectors.into()
+    }
+}
+
+
+#[derive(Debug, Default, Clone)]
+pub struct SpectrumPointIndex {
+    pub spectrum_index: PageIndex<u64>,
+    pub mz_index: PageIndex<f64>,
+    pub im_index: PageIndex<f64>,
+}
+
+impl SpectrumPointIndex {
+    pub fn new(
+        spectrum_index: PageIndex<u64>,
+        mz_index: PageIndex<f64>,
+        im_index: PageIndex<f64>,
+    ) -> Self {
+        Self {
+            spectrum_index,
+            mz_index,
+            im_index,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spectrum_index.is_empty()
+    }
+
+    pub fn is_populated(&self) -> bool {
+        !self.spectrum_index.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SpectrumChunkIndex {
+    pub spectrum_index: PageIndex<u64>,
+    pub start_mz_index: PageIndex<f64>,
+    pub end_mz_index: PageIndex<f64>,
+}
+
+impl SpectrumChunkIndex {
+    pub fn new(
+        spectrum_index: PageIndex<u64>,
+        start_mz_index: PageIndex<f64>,
+        end_mz_index: PageIndex<f64>,
+    ) -> Self {
+        Self {
+            spectrum_index,
+            start_mz_index,
+            end_mz_index,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spectrum_index.is_empty()
+    }
+
+    pub fn is_populated(&self) -> bool {
+        !self.spectrum_index.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct QueryIndex {
+    pub spectrum_time_index: PageIndex<f32>,
+    pub spectrum_index_index: PageIndex<u64>,
+    pub spectrum_ms_level_index: PageIndex<u8>,
+    pub scan_index: PageIndex<u64>,
+    pub precursor_index: PageIndex<u64>,
+    pub selected_ion_index: PageIndex<u64>,
+
+    pub spectrum_point_index: SpectrumPointIndex,
+    pub spectrum_chunk_index: SpectrumChunkIndex,
+}
+
+impl QueryIndex {
+    /// Populate the indices for spectrum metadata
+    pub fn populate_spectrum_metadata_indices<T: ChunkReader>(
+        &mut self,
+        spectrum_metadata_reader: &ParquetRecordBatchReaderBuilder<T>,
+    ) {
+        let pq_schema = spectrum_metadata_reader.parquet_schema();
+
+        self.spectrum_index_index = read_u64_page_index_from(
+            &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "spectrum.index",
+        )
+        .unwrap_or_default();
+        self.spectrum_time_index = read_f32_page_index_from(
+            &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "spectrum.time",
+        )
+        .unwrap_or_default();
+        self.spectrum_ms_level_index = read_u8_page_index_from(
+            &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "spectrum.ms_level",
+        )
+        .unwrap_or_default();
+        self.scan_index = read_u64_page_index_from(
+            &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "scan.spectrum_index",
+        )
+        .unwrap_or_default();
+        self.precursor_index = read_u64_page_index_from(
+            &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "precursor.spectrum_index",
+        )
+        .unwrap_or_default();
+        self.selected_ion_index = read_u64_page_index_from(
+            &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "selected_ion.spectrum_index",
+        )
+        .unwrap_or_default();
+    }
+
+    /// Populate the indices for spectrum signal data
+    pub fn populate_spectrum_data_indices<T: ChunkReader>(
+        &mut self,
+        spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        spectrum_array_indices: &ArrayIndex,
+    ) {
+        let peak_pq_schema = spectrum_data_reader.parquet_schema();
+
+        if BufferFormat::Point.prefix() == spectrum_array_indices.prefix {
+            self.spectrum_point_index.spectrum_index = read_u64_page_index_from(
+                &spectrum_data_reader.metadata(),
+                &peak_pq_schema,
+                &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+            )
+            .unwrap_or_default();
+        } else if BufferFormat::Chunked.prefix() == spectrum_array_indices.prefix {
+            self.spectrum_chunk_index.spectrum_index = read_u64_page_index_from(
+                &spectrum_data_reader.metadata(),
+                &peak_pq_schema,
+                &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+            )
+            .unwrap_or_default();
+        } else {
+            log::error!("Prefix {} not recognized", spectrum_array_indices.prefix)
+        }
+
+        for (arr, entry) in spectrum_array_indices.iter() {
+            if BufferFormat::Point == *entry.prefix {
+                if matches!(arr, ArrayType::MZArray) {
+                    self.spectrum_point_index.mz_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &entry.path,
+                    )
+                    .unwrap_or_default();
+                } else if arr.is_ion_mobility() {
+                    self.spectrum_point_index.im_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &entry.path,
+                    )
+                    .unwrap_or_default();
+                }
+            } else if BufferFormat::Chunked == *entry.prefix {
+                if matches!(arr, ArrayType::MZArray) {
+                    self.spectrum_chunk_index.start_mz_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &format!("{}_chunk_start", entry.path),
+                    )
+                    .unwrap_or_default();
+                    self.spectrum_chunk_index.end_mz_index = read_f64_page_index_from(
+                        &spectrum_data_reader.metadata(),
+                        &peak_pq_schema,
+                        &format!("{}_chunk_end", entry.path),
+                    )
+                    .unwrap_or_default();
+                }
+            }
+        }
+
+        log::trace!(
+            "Point index initialized?: {}",
+            self.spectrum_point_index.spectrum_index.len()
+        );
+        log::trace!(
+            "Chunk index initialized?: {}",
+            self.spectrum_chunk_index.spectrum_index.len()
+        );
     }
 }

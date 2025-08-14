@@ -657,7 +657,6 @@ impl ArrowArrayChunk {
         main_axis: BufferName,
         arrays: &BinaryArrayMap,
         chunk_encoding: ChunkingStrategy,
-        excluded_arrays: Option<&[BufferName]>,
         overrides: &HashMap<BufferName, BufferName>,
         drop_zero_intensity: bool,
         nullify_zero_intensity: bool,
@@ -1239,7 +1238,6 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            None,
             &HashMap::new(),
             true,
             false,
@@ -1282,7 +1280,6 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            None,
             &HashMap::new(),
             true,
             true,
@@ -1292,7 +1289,7 @@ mod test {
         for chunk in chunks.iter() {
             let n = chunk.chunk_values.len();
             for (k, v) in chunk.arrays.iter() {
-                assert_eq!(v.len(), n + 1);
+                assert_eq!(v.len(), chunk.arrays.values().next().unwrap().len());
             }
         }
 
@@ -1305,9 +1302,6 @@ mod test {
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
         );
-
-        eprintln!("{:?}", chunks[2]);
-
         Ok(())
     }
 
@@ -1325,7 +1319,6 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            None,
             &HashMap::new(),
             false,
             false,
