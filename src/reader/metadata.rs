@@ -4,7 +4,7 @@ use arrow::array::{AsArray, UInt64Array};
 use mzdata::{io::OffsetIndex, meta, prelude::*};
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
-use crate::{archive::ZipArchiveReader, filter::RegressionDeltaModel, index::QueryIndex, peak_series::{ArrayIndex, SerializedArrayIndex}};
+use crate::{archive::ZipArchiveReader, filter::RegressionDeltaModel, reader::index::QueryIndex, buffer_descriptors::{ArrayIndex, SerializedArrayIndex}};
 
 pub struct MzPeakReaderMetadata {
     pub(crate) mz_metadata: mzdata::meta::FileMetadataConfig,

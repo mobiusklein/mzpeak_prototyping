@@ -23,9 +23,8 @@ use crate::{
     BufferName, CURIE,
     chunk_series::{ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR},
     filter::RegressionDeltaModel,
-    index::{PageIndexEntry, QueryIndex, RangeIndex, SpanDynNumeric},
     peak_series::{ArrayIndex, BufferFormat, data_array_to_arrow_array},
-    reader::MzPeakReaderMetadata,
+    reader::{MzPeakReaderMetadata, index::{PageIndexEntry, QueryIndex, RangeIndex, SpanDynNumeric}},
 };
 
 #[derive(Debug)]

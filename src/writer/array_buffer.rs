@@ -1,9 +1,11 @@
 use std::{
-    cmp::Ordering, collections::{HashMap, HashSet}, sync::Arc
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use arrow::{
-    array::{new_null_array, ArrayRef, RecordBatch, StructArray},
+    array::{ArrayRef, RecordBatch, StructArray, new_null_array},
     datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef},
 };
 use mzdata::spectrum::ArrayType;
@@ -23,6 +25,11 @@ pub trait ArrayBufferWriter {
     fn fields(&self) -> &Fields;
     /// The name of the prefix in the schema for these fields
     fn prefix(&self) -> &str;
+
+    /// The path in the schema to reach the spectrum index column
+    fn index_path(&self) -> String {
+        format!("{}.spectrum_index", self.prefix())
+    }
 
     /// Add the provided `arrays` belonging to `fields` to the buffer
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool);
@@ -573,8 +580,6 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
         }
     }
 }
-
-
 
 #[derive(Debug)]
 pub struct ArrayBuffersBuilder {

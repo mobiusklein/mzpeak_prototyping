@@ -20,7 +20,7 @@ use parquet::{
 use mzdata::mzpeaks::coordinate::Span1D;
 use serde::{Deserialize, Serialize};
 
-use crate::peak_series::{ArrayIndex, BufferFormat};
+use crate::buffer_descriptors::{ArrayIndex, BufferFormat};
 
 pub fn parquet_column(schema: &SchemaDescriptor, column: &str) -> Option<usize> {
     let mut column_ix: Option<usize> = None;
@@ -301,16 +301,16 @@ macro_rules! read_numeric_page_index {
             let offset_list = &offset_list[column_ix];
 
             match idx_list {
-                $crate::index::ParquetTypedIndex::FLOAT(native_index) => {
+                $crate::reader::index::ParquetTypedIndex::FLOAT(native_index) => {
                     read_pages!(rg, i, native_index, $type, pages, total_rows, offset_list);
                 }
-                $crate::index::ParquetTypedIndex::DOUBLE(native_index) => {
+                $crate::reader::index::ParquetTypedIndex::DOUBLE(native_index) => {
                     read_pages!(rg, i, native_index, $type, pages, total_rows, offset_list);
                 }
-                $crate::index::ParquetTypedIndex::INT32(native_index) => {
+                $crate::reader::index::ParquetTypedIndex::INT32(native_index) => {
                     read_pages!(rg, i, native_index, $type, pages, total_rows, offset_list);
                 }
-                $crate::index::ParquetTypedIndex::INT64(native_index) => {
+                $crate::reader::index::ParquetTypedIndex::INT64(native_index) => {
                     read_pages!(rg, i, native_index, $type, pages, total_rows, offset_list);
                 }
                 tp => {

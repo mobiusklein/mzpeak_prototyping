@@ -3,10 +3,9 @@ use std::{collections::HashMap, io, marker::PhantomData, sync::Arc};
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
-    arrow::{ArrowSchemaConverter, ArrowWriter, arrow_writer::ArrowWriterOptions},
-    basic::{Encoding, ZstdLevel},
-    file::properties::{EnabledStatistics, WriterProperties, WriterVersion},
-    format::{KeyValue, SortingColumn},
+    arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
+    basic::Compression,
+    format::KeyValue,
 };
 
 use mzdata::{meta::FileMetadataConfig, prelude::*};
@@ -14,6 +13,7 @@ use serde_arrow::schema::{SchemaLike, TracingOptions};
 
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
+    chunk_series::ChunkingStrategy,
     entry::Entry,
     peak_series::{ArrayIndex, ArrayIndexEntry},
     writer::{
@@ -120,97 +120,39 @@ impl<
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries,
 > MzPeakSplitWriter<W, C, D>
 {
-    fn data_writer_props(data_buffer: &PointBuffers, shuffle_mz: bool) -> WriterProperties {
-        let spectrum_point_prefix = format!("{}.spectrum_index", data_buffer.prefix);
-        let parquet_schema = Arc::new(
-            ArrowSchemaConverter::new()
-                .convert(&data_buffer.schema)
-                .unwrap(),
-        );
-        let mut sorted = Vec::new();
-        for (i, c) in parquet_schema.columns().iter().enumerate() {
-            match c.path().string().as_ref() {
-                x if x == spectrum_point_prefix => {
-                    sorted.push(SortingColumn::new(i as i32, false, false));
-                }
-                _ => {}
-            }
-        }
-
-        let mut data_props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::ZSTD(
-                ZstdLevel::try_new(3).unwrap(),
-            ))
-            .set_dictionary_enabled(true)
-            .set_sorting_columns(Some(sorted))
-            .set_column_encoding(spectrum_point_prefix.into(), Encoding::RLE)
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_statistics_enabled(EnabledStatistics::Page);
-
-        for col in parquet_schema.columns() {
-            if col.name().contains("_mz_") && shuffle_mz {
-                data_props =
-                    data_props.set_column_encoding(col.path().clone(), Encoding::BYTE_STREAM_SPLIT);
-            }
-        }
-
-        data_props.build()
-    }
-
-    fn metadata_writer_props(metadata_fields: &SchemaRef) -> WriterProperties {
-        let parquet_schema = Arc::new(
-            ArrowSchemaConverter::new()
-                .convert(&metadata_fields)
-                .unwrap(),
-        );
-
-        let mut sorted = Vec::new();
-        for (i, c) in parquet_schema.columns().iter().enumerate() {
-            match c.path().string().as_ref() {
-                "spectrum.index" => {
-                    sorted.push(SortingColumn::new(i as i32, false, false));
-                }
-                _ => {}
-            }
-        }
-        let metadata_props = WriterProperties::builder()
-            .set_compression(parquet::basic::Compression::ZSTD(
-                ZstdLevel::try_new(3).unwrap(),
-            ))
-            .set_dictionary_enabled(true)
-            .set_sorting_columns(Some(sorted))
-            .set_column_bloom_filter_enabled("spectrum.id".into(), true)
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .build();
-
-        metadata_props
-    }
-
     pub fn new(
         data_writer: W,
         metadata_writer: W,
-        spectrum_buffers: ArrayBuffersBuilder,
-        chromatogram_buffers: ArrayBuffersBuilder,
+        spectrum_buffers_builder: ArrayBuffersBuilder,
+        chromatogram_buffers_builder: ArrayBuffersBuilder,
         buffer_size: usize,
         mask_zero_intensity_runs: bool,
         shuffle_mz: bool,
+        use_chunked_encoding: Option<ChunkingStrategy>,
+        compression: Compression,
     ) -> Self {
         let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
-        let spectrum_buffers = spectrum_buffers.build(
+        let spectrum_buffers = spectrum_buffers_builder.build(
             Arc::new(Schema::empty()),
             BufferContext::Spectrum,
             mask_zero_intensity_runs,
         );
-        let chromatogram_buffers = chromatogram_buffers.build(
+        let chromatogram_buffers = chromatogram_buffers_builder.build(
             Arc::new(Schema::empty()),
             BufferContext::Chromatogram,
             false,
         );
 
-        let data_props = Self::data_writer_props(&spectrum_buffers, shuffle_mz);
-        let metadata_props = Self::metadata_writer_props(&metadata_fields);
+        let data_props = Self::spectrum_data_writer_props(
+            &spectrum_buffers,
+            spectrum_buffers.index_path(),
+            shuffle_mz,
+            &use_chunked_encoding,
+            compression,
+        );
+
+        let metadata_props = Self::spectrum_metadata_writer_props(&metadata_fields);
 
         let mut this = Self {
             metadata_fields: metadata_fields.clone(),

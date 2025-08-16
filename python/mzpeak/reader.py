@@ -50,15 +50,30 @@ def value_normalize(val: dict):
     return None
 
 
-def normalize_value_of(param: dict):
+def _format_curie(curie: dict):
+    idx = curie['cv_id']
+    acc = curie['accession']
+    if idx == 1:
+        return f"MS:{acc}"
+    elif idx == 2:
+        return f"UO:{acc:07d}"
+    else:
+        raise NotImplementedError()
+
+
+def _format_param(param: dict):
     param = param.copy()
     param["value"] = value_normalize(param["value"])
+    param['accession'] = _format_curie(param['accession'])
+    if param.get('unit'):
+        param["unit"] = _format_curie(param["unit"])
     return param
 
 
 def _clean_frame(df: pd.DataFrame):
     columns = df.columns[~df.isna().all(axis=0)]
-    return df[columns]
+    df = df[columns]
+    return df
 
 
 class MzPeakSpectrumMetadataReader:
@@ -177,22 +192,31 @@ class MzPeakSpectrumMetadataReader:
         if isinstance(i, str):
             i = self.id_index[i]
         spec = self.spectra.loc[i].to_dict()
-        spec["parameters"] = [normalize_value_of(v) for v in spec["parameters"]]
+        spec["mz_signal_continuity"] = _format_curie(spec["mz_signal_continuity"])
+        spec['spectrum_type'] = _format_curie(spec['spectrum_type'])
+        spec["parameters"] = [_format_param(v) for v in spec["parameters"]]
         spec["scans"] = self.scans.loc[i].to_dict()
+        if isinstance(spec['scans'], dict):
+            spec["scans"]["parameters"] = [
+                _format_param(v) for v in spec["scans"]["parameters"]
+            ]
+        else:
+            for scan in spec['scans']:
+                scan["parameters"] = [_format_param(v) for v in scan["parameters"]]
         try:
             precursors_of = self.precursors.loc[[i]]
             precursors_of["activation"] = precursors_of["activation"].apply(
-                lambda x: [normalize_value_of(v) for v in x["parameters"]]
+                lambda x: [_format_param(v) for v in x["parameters"]]
             )
             try:
                 ions = self.selected_ions.loc[[i]]
                 ions["parameters"] = ions["parameters"].apply(
-                    lambda x: [normalize_value_of(v) for v in x]
+                    lambda x: [_format_param(v) for v in x]
                 )
                 precursors_of = precursors_of.merge(ions, on="precursor_index")
             except KeyError:
                 pass
-            spec["precursors"] = precursors_of.to_dict()
+            spec["precursors"] = precursors_of.to_dict("records")
         except KeyError:
             pass
         spec["index"] = i
@@ -204,9 +228,11 @@ class MzPeakSpectrumMetadataReader:
     def __repr__(self):
         return f"{self.__class__.__name__}({self.handle})"
 
-    def _get_median_deltas(self):
+    def _get_mz_delta_model(self):
         if "median_delta" in self.spectra:
             return self.spectra["median_delta"].to_numpy()
+        elif "mz_delta_model" in self.spectra:
+            return self.spectra["mz_delta_model"].to_numpy()
         return None
 
 
@@ -215,22 +241,34 @@ class _SpectrumDataIndex:
     prefix: str
     index_i: int
     init: bool
+    row_group_index_ranges: list[Span[int] | None]
 
     def __init__(self, meta: pq.FileMetaData, prefix: str):
         self.meta = meta
         self.prefix = prefix
         self.index_i = 0
         self.init = False
+        self.row_group_index_ranges = []
         self._infer_schema_idx()
 
     def _infer_schema_idx(self):
         rg = self.meta.row_group(0)
         q = f"{self.prefix}.spectrum_index"
+        self.row_group_index_ranges = []
         for i in range(rg.num_columns):
             col = rg.column(i)
             if col.path_in_schema == q:
                 self.index_i = i
                 self.init = True
+
+        if self.index_i is not None:
+            for i in range(self.meta.num_row_groups):
+                rg = self.meta.row_group(i)
+                col_idx = rg.column(self.index_i)
+                if col_idx.statistics.has_min_max:
+                    self.row_group_index_ranges.append(Span(col_idx.statistics.min, col_idx.statistics.max))
+                else:
+                    self.row_group_index_ranges.append(None)
 
         index = json.loads(self.meta.metadata[b"spectrum_array_index"])
         self.array_index = {
@@ -238,7 +276,7 @@ class _SpectrumDataIndex:
         }
         self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
 
-    def row_groups_for_index(self, spectrum_index: int):
+    def row_groups_for_index(self, spectrum_index: int) -> list[int]:
         rgs = []
         if not self.init:
             return rgs
@@ -651,7 +689,7 @@ class MzPeakSpectrumDataReader:
             return chunks
 
         delta_model = None
-        if self._do_null_filling:
+        if self._do_null_filling and self._delta_model_series is not None:
             delta_model = self._delta_model_series[spectrum_index]
 
         return self._expand_chunks(chunks, delta_model=delta_model)
@@ -824,7 +862,7 @@ class MzPeakFile:
 
         if self.spectrum_data and self.spectrum_metadata:
             self.spectrum_data._delta_model_series = (
-                self.spectrum_metadata._get_median_deltas()
+                self.spectrum_metadata._get_mz_delta_model()
             )
 
     def __repr__(self):

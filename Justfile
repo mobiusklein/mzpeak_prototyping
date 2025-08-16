@@ -5,6 +5,6 @@ small:
     cargo r -r --example convert -- -c -y -z -u small.mzML -o small.chunked.mzpeak
 
 test:
-    cargo t
+    cargo t --tests
 
 alias t := test

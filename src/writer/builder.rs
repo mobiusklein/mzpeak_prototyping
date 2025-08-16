@@ -1,10 +1,16 @@
-use std::{io::prelude::*, sync::Arc};
 use arrow::datatypes::{DataType, Field, FieldRef};
-use mzdata::{params::Unit, spectrum::{ArrayType, BinaryDataArrayType}};
+use mzdata::{
+    params::Unit,
+    spectrum::{ArrayType, BinaryDataArrayType},
+};
 use parquet::basic::{Compression, ZstdLevel};
+use std::{io::prelude::*, sync::Arc};
 
-use crate::{chunk_series::ChunkingStrategy, writer::{ArrayBuffersBuilder, MzPeakSplitWriter}, BufferContext, BufferName, MzPeakWriterType, ToMzPeakDataSeries};
-
+use crate::{
+    BufferContext, BufferName, MzPeakWriterType, ToMzPeakDataSeries,
+    chunk_series::ChunkingStrategy,
+    writer::{ArrayBuffersBuilder, MzPeakSplitWriter},
+};
 
 #[derive(Debug)]
 pub struct MzPeakWriterBuilder {
@@ -140,6 +146,8 @@ impl MzPeakWriterBuilder {
             self.buffer_size,
             mask_zero_intensity_runs,
             self.shuffle_mz,
+            self.chunked_encoding,
+            self.compression,
         )
     }
 

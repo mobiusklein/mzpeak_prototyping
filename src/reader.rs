@@ -32,39 +32,23 @@ use mzpeaks::{
     prelude::Span1D,
 };
 
-#[allow(unused)]
-use parquet::{
-    arrow::{
-        ProjectionMask,
-        arrow_reader::{
-            ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, ParquetRecordBatchReader,
-            ParquetRecordBatchReaderBuilder, RowFilter,
-        },
-    },
-    file::{metadata::ParquetMetaData, reader::ChunkReader},
-    schema::types::{ColumnPath, SchemaDescriptor},
+use parquet::arrow::{
+    ProjectionMask,
+    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
 use serde_arrow::schema::SchemaLike;
 
-#[allow(unused)]
 use crate::{
-    BufferName, CURIE, PrecursorEntry, SelectedIonEntry,
+    CURIE, PrecursorEntry, SelectedIonEntry,
     archive::ZipArchiveReader,
-    chunk_series::{ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR},
+    buffer_descriptors::{ArrayIndex, arrow_to_array_type},
     curie,
     filter::{RegressionDeltaModel, fill_nulls_for},
-    index::{
-        PageIndex, PageIndexEntry, PageIndexType, QueryIndex, RangeIndex, SpanDynNumeric,
-        read_f32_page_index_from, read_f64_page_index_from, read_i32_page_index_from,
-        read_i64_page_index_from, read_u8_page_index_from, read_u32_page_index_from,
-        read_u64_page_index_from,
-    },
-    param::{DataProcessing, FileDescription, InstrumentConfiguration, Software},
-    peak_series::{ArrayIndex, SerializedArrayIndex},
-    peak_series::{BufferFormat, arrow_to_array_type},
+    reader::index::{PageIndexEntry, QueryIndex, SpanDynNumeric},
 };
 
 mod chunk;
+pub mod index;
 mod metadata;
 
 pub use chunk::SpectrumChunkReader;
@@ -275,7 +259,7 @@ trait SpectrumDataArrayReader {
         &self,
         points: &StructArray,
         bin_map: &mut HashMap<&String, DataArray>,
-        median_delta: Option<&RegressionDeltaModel<f64>>,
+        mz_delta_model: Option<&RegressionDeltaModel<f64>>,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
             if f.name() == "spectrum_index" {
@@ -303,8 +287,8 @@ trait SpectrumDataArrayReader {
                     let buf: &Float32Array = arr.as_primitive();
                     if has_nulls {
                         if is_mz_array {
-                            if let Some(median_delta) = median_delta {
-                                let interpolated = fill_nulls_for(buf, median_delta);
+                            if let Some(mz_delta_model) = mz_delta_model {
+                                let interpolated = fill_nulls_for(buf, mz_delta_model);
                                 store.extend(&interpolated).unwrap();
                                 continue;
                             }
@@ -316,8 +300,8 @@ trait SpectrumDataArrayReader {
                     let buf: &Float64Array = arr.as_primitive();
                     if has_nulls {
                         if is_mz_array {
-                            if let Some(median_delta) = median_delta {
-                                let interpolated = fill_nulls_for(buf, median_delta);
+                            if let Some(mz_delta_model) = mz_delta_model {
+                                let interpolated = fill_nulls_for(buf, mz_delta_model);
                                 store.extend(&interpolated).unwrap();
                                 continue;
                             }
@@ -381,7 +365,7 @@ impl SpectrumDataCache {
     fn slice_spectrum_data_record_batch_to_arrays_of(
         &mut self,
         index: u64,
-        median_delta: Option<&RegressionDeltaModel<f64>>,
+        mz_delta_model: Option<&RegressionDeltaModel<f64>>,
     ) -> io::Result<BinaryArrayMap> {
         let mut bin_map = HashMap::new();
         for (k, v) in self.spectrum_array_indices.iter() {
@@ -456,7 +440,7 @@ impl SpectrumDataCache {
             }
         };
 
-        self.populate_arrays_from_struct_array(&points, &mut bin_map, median_delta);
+        self.populate_arrays_from_struct_array(&points, &mut bin_map, mz_delta_model);
 
         let mut out = BinaryArrayMap::new();
         for v in bin_map.into_values() {
@@ -490,7 +474,7 @@ impl<
             _t: Default::default(),
         };
 
-        this.metadata.model_deltas = this.load_median_deltas()?;
+        this.metadata.model_deltas = this.load_delta_models()?;
 
         Ok(this)
     }
@@ -1431,7 +1415,7 @@ impl<
     }
 
     /// Load median delta coefficient column if it is present.
-    pub(crate) fn load_median_deltas(&mut self) -> io::Result<Vec<Option<Vec<f64>>>> {
+    pub(crate) fn load_delta_models(&mut self) -> io::Result<Vec<Option<Vec<f64>>>> {
         let builder = self.handle.spectrum_metadata()?;
 
         let schema = builder.parquet_schema();
@@ -1446,6 +1430,10 @@ impl<
                 .iter()
                 .zip(["spectrum", "median_delta"])
                 .all(|(a, b)| a == b)
+                || parts
+                    .iter()
+                    .zip(["spectrum", "mz_delta_model"])
+                    .all(|(a, b)| a == b)
             {
                 median_i = Some(i);
             }

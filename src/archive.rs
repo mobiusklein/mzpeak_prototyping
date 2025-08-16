@@ -148,6 +148,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
 pub enum MzPeakArchiveType {
     SpectrumMetadata,
     SpectrumDataArrays,
+    SpectrumPeakDataArrays,
     ChromatogramMetadata,
     ChromatogramDataArrays,
     Other,
@@ -158,6 +159,7 @@ impl MzPeakArchiveType {
         match self {
             MzPeakArchiveType::SpectrumMetadata => "spectra_metadata.mzpeak",
             MzPeakArchiveType::SpectrumDataArrays => "spectra_data.mzpeak",
+            MzPeakArchiveType::SpectrumPeakDataArrays => "spectra_peaks.mzpeak",
             MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.mzpeak",
             MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.mzpeak",
             MzPeakArchiveType::Other => "",
@@ -367,6 +369,7 @@ pub struct MzPeakArchiveEntry {
 struct SchemaMetadataManager {
     spectrum_data_arrays: Option<MzPeakArchiveEntry>,
     spectrum_metadata: Option<MzPeakArchiveEntry>,
+    peaks_data_arrays: Option<MzPeakArchiveEntry>,
 }
 
 pub struct ZipArchiveReader {
@@ -380,10 +383,12 @@ impl ZipArchiveReader {
         let mut members = SchemaMetadataManager::default();
         for (i, name) in archive.file_names.iter().enumerate() {
             let metadata = archive.metadata_for_index(i)?;
-            let tp = if name == "spectra_data.mzpeak" {
+            let tp = if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
                 MzPeakArchiveType::SpectrumDataArrays
-            } else if name == "spectra_metadata.mzpeak" {
+            } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
                 MzPeakArchiveType::SpectrumMetadata
+            } else if name.ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()) {
+                MzPeakArchiveType::SpectrumPeakDataArrays
             } else {
                 MzPeakArchiveType::Other
             };
@@ -399,6 +404,9 @@ impl ZipArchiveReader {
                 }
                 MzPeakArchiveType::SpectrumDataArrays => {
                     members.spectrum_data_arrays = Some(entry);
+                }
+                MzPeakArchiveType::SpectrumPeakDataArrays => {
+                    members.peaks_data_arrays = Some(entry)
                 }
                 MzPeakArchiveType::ChromatogramMetadata => todo!(),
                 MzPeakArchiveType::ChromatogramDataArrays => todo!(),
@@ -416,6 +424,18 @@ impl ZipArchiveReader {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Spectrum data entry not found",
+            ))
+        }
+    }
+
+    pub fn spectrum_peaks(&self) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
+        if let Some(meta) = self.members.peaks_data_arrays.as_ref() {
+            self.archive
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Spectrum peak data entry not found",
             ))
         }
     }
