@@ -1,6 +1,9 @@
+import logging
 import json
 import zipfile
+import zlib
 
+from dataclasses import dataclass
 from pathlib import Path
 from numbers import Number
 from collections.abc import Iterable
@@ -17,6 +20,10 @@ from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
 from .filters import fill_nulls, null_delta_decode
+
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 Q = TypeVar("Q", bound=Number)
@@ -51,6 +58,8 @@ def value_normalize(val: dict):
 
 
 def _format_curie(curie: dict):
+    if curie is None:
+        return None
     idx = curie['cv_id']
     acc = curie['accession']
     if idx == 1:
@@ -74,6 +83,75 @@ def _clean_frame(df: pd.DataFrame):
     columns = df.columns[~df.isna().all(axis=0)]
     df = df[columns]
     return df
+
+
+def _format_curie_arrow(arr):
+    cvs = arr.field(0)
+    cvs = pc.case_when(
+        pc.make_struct(
+            pc.equal(cvs, 1),
+            pc.equal(cvs, 2)
+        ),
+        "MS",
+        "UO",
+    )
+    accs = arr.field(1)
+    accs = pc.utf8_lpad(
+        pc.cast(
+            accs,
+            pa.string()
+        ),
+        7,
+        "0"
+    )
+    return pc.binary_join_element_wise(cvs, accs, ":")
+
+
+def _format_curies_batch(bat: pa.RecordBatch) -> pa.RecordBatch:
+    for i, col in enumerate(bat.schema):
+        if isinstance(col.type, pa.StructType) and col.type.names == [
+            "cv_id",
+            "accession",
+        ]:
+            c = _format_curie_arrow(bat.column(i))
+            bat = bat.set_column(
+                i, pa.field(col.name, c.type, col.nullable, col.metadata), c
+            )
+    return bat
+
+
+class AuxiliaryArrayDecoder:
+    compression = {
+        "MS:1000576": lambda x: x,
+        "MS:1000574": zlib.decompress,
+        'MS:1002314': pynumpress.decode_slof,
+        'MS:1002313': pynumpress.decode_pic,
+        'MS:1002312': pynumpress.decode_linear,
+    }
+
+    dtypes = {"MS:1000519": np.int32, 'MS:1000521': np.float32, "MS:1000522": np.int64, "MS:1000523": np.float64, }
+    ascii_code = "MS:1001479"
+
+    @classmethod
+    def decode(cls, arr: dict):
+        data: np.ndarray = arr['data']
+        compression_acc: str = _format_curie(arr['compression'])
+        dtype_acc: str = _format_curie(arr['data_type'])
+        name: str = _format_param(arr['name'])['name']
+        parameters = [_format_param(v) for v in arr.get('parameters', [])]
+        data: np.ndarray = cls.compression[compression_acc](data)
+        if cls.ascii_code != dtype_acc:
+            data = data.view(cls.dtypes[dtype_acc])
+        else:
+            raise NotImplementedError(cls.ascii_code)
+        return AuxiliaryArray(name, data, parameters)
+
+
+@dataclass
+class AuxiliaryArray:
+    name: str
+    values: np.ndarray
+    parameters: list[dict]
 
 
 class MzPeakSpectrumMetadataReader:
@@ -139,11 +217,17 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["spectrum"])
                 spectra.append(bat.filter(bat[0].is_valid()))
-        self.spectra = _clean_frame(
-            pa.record_batch(pa.concat_tables(spectra)["spectrum"].combine_chunks())
-            .to_pandas()
-            .set_index("index")
-        )
+
+        if not spectra:
+            self.spectra = pd.DataFrame([], columns=['index', 'id', ])
+        else:
+            bat = pa.record_batch(pa.concat_tables(spectra)["spectrum"].combine_chunks())
+            bat = _format_curies_batch(bat)
+            self.spectra = _clean_frame(
+                bat
+                .to_pandas()
+                .set_index("index")
+            )
         self.id_index = self.spectra[["id"]].reset_index().set_index("id")["index"]
 
     def _read_scans(self):
@@ -154,11 +238,17 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["scan"])
                 blocks.append(bat.filter(bat[0].is_valid()))
-        self.scans = _clean_frame(
-            pa.record_batch(pa.concat_tables(blocks)["scan"].combine_chunks())
-            .to_pandas()
-            .set_index("spectrum_index")
-        )
+
+        if blocks:
+            bat = pa.record_batch(pa.concat_tables(blocks)["scan"].combine_chunks())
+            bat = _format_curies_batch(bat)
+            self.scans = _clean_frame(
+                bat
+                .to_pandas()
+                .set_index("spectrum_index")
+            )
+        else:
+            self.scans = pd.DataFrame([], columns=['spectrum_index', ])
 
     def _read_precursors(self):
         blocks = []
@@ -168,11 +258,16 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["precursor"])
                 blocks.append(bat.filter(bat[0].is_valid()))
-        self.precursors = _clean_frame(
-            pa.record_batch(pa.concat_tables(blocks)["precursor"].combine_chunks())
-            .to_pandas()
-            .set_index("spectrum_index")
-        )
+        if blocks:
+            bat = pa.record_batch(pa.concat_tables(blocks)["precursor"].combine_chunks())
+            bat = _format_curies_batch(bat)
+            self.precursors = _clean_frame(
+                bat
+                .to_pandas()
+                .set_index("spectrum_index")
+            )
+        else:
+            self.precursors = pd.DataFrame([], columns=['spectrum_index', 'precursor_index', ])
 
     def _read_selected_ions(self):
         blocks = []
@@ -182,24 +277,29 @@ class MzPeakSpectrumMetadataReader:
             if col_idx.statistics.has_min_max:
                 bat = self.handle.read_row_group(i, columns=["selected_ion"])
                 blocks.append(bat.filter(bat[0].is_valid()))
-        self.selected_ions = _clean_frame(
-            pa.record_batch(pa.concat_tables(blocks)["selected_ion"].combine_chunks())
-            .to_pandas()
-            .set_index("spectrum_index")
-        )
+
+        if blocks:
+            bat = pa.record_batch(pa.concat_tables(blocks)["selected_ion"].combine_chunks())
+            bat = _format_curies_batch(bat)
+            self.selected_ions = _clean_frame(
+                bat
+                .to_pandas()
+                .set_index("spectrum_index")
+            )
+        else:
+            self.selected_ions = pd.DataFrame([], columns=['spectrum_index', 'precursor_index', ])
 
     def __getitem__(self, i: int | str):
         if isinstance(i, str):
             i = self.id_index[i]
         spec = self.spectra.loc[i].to_dict()
-        spec["mz_signal_continuity"] = _format_curie(spec["mz_signal_continuity"])
-        spec['spectrum_type'] = _format_curie(spec['spectrum_type'])
         spec["parameters"] = [_format_param(v) for v in spec["parameters"]]
         spec["scans"] = self.scans.loc[i].to_dict()
         if isinstance(spec['scans'], dict):
             spec["scans"]["parameters"] = [
                 _format_param(v) for v in spec["scans"]["parameters"]
             ]
+            spec['scans'] = [spec['scans']]
         else:
             for scan in spec['scans']:
                 scan["parameters"] = [_format_param(v) for v in scan["parameters"]]
@@ -220,6 +320,10 @@ class MzPeakSpectrumMetadataReader:
         except KeyError:
             pass
         spec["index"] = i
+        if 'auxiliary_arrays' in spec:
+            for v in spec.pop("auxiliary_arrays"):
+                v = AuxiliaryArrayDecoder.decode(v)
+                spec[v.name] = v.values
         return spec
 
     def __len__(self):
@@ -353,12 +457,12 @@ class _ChunkIterator:
         return self
 
     def _read_next_chunk(self):
-        # print(f"Reading next batch looking for {self.current_index}")
+        logger.debug(f"Reading next batch looking for {self.current_index}")
         batch = next(self.it).column(0)
         lowest_index = pc.min(pc.struct_field(batch, self.index_column)).as_py()
         if (self.current_index is not None and lowest_index > self.current_index) or self.current_index is None:
             self.current_index = lowest_index
-        # print(f"New batch starts with {lowest_index}")
+        logger.debug(f"New batch starts with {lowest_index}")
         self.batch = batch
 
     def _extract_next(self):
@@ -418,12 +522,6 @@ class MzPeakSpectrumDataReader:
         self._delta_model_series = None
 
     def _infer_schema_idx(self):
-        rg = self.meta.row_group(0)
-        for i in range(rg.num_columns):
-            col = rg.column(i)
-            if col.path_in_schema == "point.spectrum_index":
-                self.point_index_i = i
-
         index = json.loads(self.meta.metadata[b"spectrum_array_index"])
         self.array_index = {
             entry["path"].rsplit(".")[-1]: entry for entry in index["entries"]
@@ -628,7 +726,7 @@ class MzPeakSpectrumDataReader:
         self,
         spectrum_index: int,
         rgs: list[int],
-        median_delta: float | list[float] | None,
+        delta_model: float | list[float] | None,
     ):
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
         block = pc.filter(
@@ -638,7 +736,7 @@ class MzPeakSpectrumDataReader:
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
             "spectrum_index"
         )
-        return self._clean_point_batch(data, median_delta)
+        return self._clean_point_batch(data, delta_model)
 
     def _read_point_range(
         self,
@@ -835,6 +933,7 @@ class MzPeakFile:
     archive: zipfile.ZipFile
     spectrum_data: MzPeakSpectrumDataReader
     spectrum_metadata: MzPeakSpectrumMetadataReader
+    spectrum_peak_data: MzPeakSpectrumDataReader | None = None
 
     def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
         if isinstance(path, zipfile.ZipFile):
@@ -842,12 +941,16 @@ class MzPeakFile:
         else:
             self.archive = zipfile.ZipFile(path)
         for f in self.archive.filelist:
-            if f.filename == "spectra_data.mzpeak":
+            if f.filename.endswith("spectra_data.mzpeak"):
                 self.spectrum_data = MzPeakSpectrumDataReader(
                     pa.PythonFile(self.archive.open(f))
                 )
-            elif f.filename == "spectra_metadata.mzpeak":
+            elif f.filename.endswith("spectra_metadata.mzpeak"):
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
+                    pa.PythonFile(self.archive.open(f))
+                )
+            elif f.filename.endswith("spectra_peaks.mzpeak"):
+                self.spectrum_peak_data = MzPeakSpectrumDataReader(
                     pa.PythonFile(self.archive.open(f))
                 )
         metadata = {}

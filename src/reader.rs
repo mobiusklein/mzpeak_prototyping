@@ -9,11 +9,9 @@ use std::{
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int8Array, Int32Array, Int64Array,
-        LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt8Array, UInt32Array,
-        UInt64Array,
+        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, Int8Array, LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt32Array, UInt64Array, UInt8Array
     },
-    datatypes::{DataType, FieldRef, Float32Type, Float64Type},
+    datatypes::{DataType, FieldRef, Float32Type, Float64Type, UInt32Type, UInt64Type},
     error::ArrowError,
 };
 
@@ -39,12 +37,7 @@ use parquet::arrow::{
 use serde_arrow::schema::SchemaLike;
 
 use crate::{
-    CURIE, PrecursorEntry, SelectedIonEntry,
-    archive::ZipArchiveReader,
-    buffer_descriptors::{ArrayIndex, arrow_to_array_type},
-    curie,
-    filter::{RegressionDeltaModel, fill_nulls_for},
-    reader::index::{PageIndexEntry, QueryIndex, SpanDynNumeric},
+    archive::ZipArchiveReader, buffer_descriptors::{arrow_to_array_type, ArrayIndex}, curie, filter::{fill_nulls_for, RegressionDeltaModel}, reader::index::{PageIndexEntry, QueryIndex, SpanDynNumeric}, spectrum::AuxiliaryArray, PrecursorEntry, SelectedIonEntry, CURIE
 };
 
 mod chunk;
@@ -475,6 +468,7 @@ impl<
         };
 
         this.metadata.model_deltas = this.load_delta_models()?;
+        this.metadata.auxliary_array_counts = this.load_auxiliary_array_count()?;
 
         Ok(this)
     }
@@ -582,8 +576,11 @@ impl<
         // If there is only one row group in the scan, take the fast path through the cache
         if rg_idx_acc.len() == 1 {
             let rg = self.read_spectrum_data_cache(rg_idx_acc[0])?;
-            let arrays =
+            let mut arrays =
                 rg.slice_spectrum_data_record_batch_to_arrays_of(index, delta_model.as_ref())?;
+            for v in self.load_auxiliary_arrays_for(index)? {
+                arrays.add(v);
+            }
             return Ok(arrays);
         }
 
@@ -598,7 +595,11 @@ impl<
             }
             rg_row_skip
         } else {
-            return Ok(BinaryArrayMap::new());
+            let mut out = BinaryArrayMap::new();
+            for v in self.load_auxiliary_arrays_for(index)? {
+                out.add(v);
+            }
+            return Ok(out);
         };
 
         let rows = self
@@ -660,6 +661,10 @@ impl<
 
         let mut out = BinaryArrayMap::new();
         for v in bin_map.into_values() {
+            out.add(v);
+        }
+
+        for v in self.load_auxiliary_arrays_for(index)? {
             out.add(v);
         }
         Ok(out)
@@ -1259,9 +1264,6 @@ impl<
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .build()?;
 
-        // let curie_fields: Vec<FieldRef> =
-        //     SchemaLike::from_type::<CURIE>(TracingOptions::new()).unwrap();
-
         let param_fields: Vec<FieldRef> =
             SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
 
@@ -1412,6 +1414,129 @@ impl<
             // Does not yet support MSn for n > 2
         }
         Ok(descr)
+    }
+
+    pub(crate) fn load_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
+        let builder = self.handle.spectrum_metadata()?;
+
+        let schema = builder.parquet_schema();
+        let mut index_i = None;
+        let mut auxiliary_count_i = None;
+        for (i, c) in schema.columns().iter().enumerate() {
+            let parts = c.path().parts();
+            if parts == ["spectrum", "index"] {
+                index_i = Some(i);
+            }
+            if parts
+                .iter()
+                .zip(["spectrum", "number_of_auxiliary_arrays"])
+                .all(|(a, b)| a == b)
+            {
+                auxiliary_count_i = Some(i);
+            }
+        }
+
+        let proj = match (index_i, auxiliary_count_i) {
+            (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
+            _ => return Ok(Vec::new()),
+        };
+
+        let reader = builder.with_projection(proj).build()?;
+        let n = self.len();
+        let mut number_of_auxiliary_arrays = Vec::new();
+        number_of_auxiliary_arrays.resize(n, 0);
+        for batch in reader.flatten() {
+            let root = batch.column(0).as_struct();
+            let index_array: &UInt64Array = root.column(0).as_primitive();
+            let values_array = root.column(1);
+
+            if let Some(values) = values_array.as_primitive_opt::<UInt32Type>() {
+                for (i, c) in index_array.iter().zip(values.iter()) {
+                    number_of_auxiliary_arrays[i.unwrap() as usize] = c.unwrap();
+                }
+            } else if let Some(values) = values_array.as_primitive_opt::<UInt64Type>() {
+                for (i, c) in index_array.iter().zip(values.iter()) {
+                    number_of_auxiliary_arrays[i.unwrap() as usize] = c.unwrap() as u32;
+                }
+            } else {
+                unimplemented!(
+                    "auxiliary array count stored as {:?}",
+                    values_array.data_type()
+                )
+            }
+        }
+        Ok(number_of_auxiliary_arrays)
+    }
+
+    pub(crate) fn load_auxiliary_arrays_for(&self, index: u64) -> io::Result<Vec<DataArray>> {
+        if self.metadata.auxliary_array_counts.get(index as usize).copied().unwrap_or_default() == 0 {
+            return Ok(Vec::new())
+        }
+
+        let builder = self.handle.spectrum_metadata()?;
+
+        let mut rows = self
+            .query_indices
+            .spectrum_index_index
+            .row_selection_contains(index);
+
+        rows = rows.union(&self.query_indices.scan_index.row_selection_contains(index));
+        rows = rows.union(
+            &self
+                .query_indices
+                .precursor_index
+                .row_selection_contains(index),
+        );
+        rows = rows.union(
+            &self
+                .query_indices
+                .selected_ion_index
+                .row_selection_contains(index),
+        );
+
+        let predicate_mask = ProjectionMask::columns(
+            builder.parquet_schema(),
+            ["spectrum.index", "spectrum.auxiliary_arrays"],
+        );
+
+        let proj = predicate_mask.clone();
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let spectrum_index: &UInt64Array = batch
+                .column(0)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            Ok(spectrum_index
+                .iter()
+                .map(|v| v.map(|i| i == index))
+                .collect())
+        });
+
+        let filter = RowFilter::new(vec![Box::new(predicate)]);
+
+        let reader = builder
+            .with_projection(proj)
+            .with_row_filter(filter)
+            .with_row_selection(rows)
+            .build()?;
+
+        let mut results = Vec::new();
+        let fields: Vec<FieldRef> = SchemaLike::from_type::<AuxiliaryArray>(Default::default()).unwrap();
+        for bat in reader.flatten() {
+            let root = bat.column(0);
+            let root = root.as_struct();
+            let data = root.column(1).as_list::<i64>();
+            let data = data.values().as_struct();
+            let arrays: Vec<AuxiliaryArray> = serde_arrow::from_arrow(&fields, data.columns()).unwrap();
+            for array in arrays {
+                results.push(array.into());
+            }
+        }
+
+        Ok(results)
     }
 
     /// Load median delta coefficient column if it is present.

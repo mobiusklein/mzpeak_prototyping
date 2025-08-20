@@ -1892,9 +1892,9 @@ dependencies = [
 
 [[package]]
 name = "mzdata"
-version = "0.57.0"
+version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "077aa2a0f5db2ae0baa1f881dee25f99673dcc6de7696b308ac042a99edf6d67"
+checksum = "9650d9b0b88371007831a80b02e93a490ef3652329c9b0c910e57501e4e8410e"
 dependencies = [
  "base16ct",
  "base64-simd",
@@ -1930,6 +1930,7 @@ name = "mzpeak_prototyping"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64-simd",
  "bytemuck",
  "bytes",
  "clap",

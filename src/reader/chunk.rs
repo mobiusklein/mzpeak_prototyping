@@ -220,7 +220,6 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                         }
                         DELTA_ENCODE => {
                             let delta_model = metadata.model_deltas_for_conv(spectrum_idx as usize);
-                            let delta_model = delta_model.as_ref();
                             macro_rules! decode_deltas {
                                 ($chunk_values:ident, $starts:ident, $accumulator:ident) => {
                                     for (chunk_vals, start) in
@@ -233,7 +232,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                                     &chunk_vals,
                                                     start as f64,
                                                     $accumulator.as_mut().unwrap(),
-                                                    delta_model,
+                                                    delta_model.as_ref(),
                                                 );
                                         }
                                     }
@@ -252,7 +251,6 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                         }
                         NUMPRESS_LINEAR => {
                             let delta_model = metadata.model_deltas_for_conv(spectrum_idx as usize);
-                            let delta_model = delta_model.as_ref();
                             let chunk_values = chunk_values.as_list::<i64>();
                             macro_rules! decode_numpress {
                                 ($chunk_values:ident, $starts:ident, $accumulator:ident) => {
@@ -266,7 +264,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                                     &chunk_vals,
                                                     start as f64,
                                                     $accumulator.as_mut().unwrap(),
-                                                    delta_model,
+                                                    delta_model.as_ref(),
                                                 );
                                         }
                                     }

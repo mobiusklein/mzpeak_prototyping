@@ -4,7 +4,12 @@ use arrow::array::{AsArray, UInt64Array};
 use mzdata::{io::OffsetIndex, meta, prelude::*};
 use parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 
-use crate::{archive::ZipArchiveReader, filter::RegressionDeltaModel, reader::index::QueryIndex, buffer_descriptors::{ArrayIndex, SerializedArrayIndex}};
+use crate::{
+    archive::ZipArchiveReader,
+    buffer_descriptors::{ArrayIndex, SerializedArrayIndex},
+    filter::RegressionDeltaModel,
+    reader::index::QueryIndex,
+};
 
 pub struct MzPeakReaderMetadata {
     pub(crate) mz_metadata: mzdata::meta::FileMetadataConfig,
@@ -12,6 +17,7 @@ pub struct MzPeakReaderMetadata {
     pub chromatogram_array_indices: Arc<ArrayIndex>,
     pub spectrum_id_index: OffsetIndex,
     pub(crate) model_deltas: Vec<Option<Vec<f64>>>,
+    pub(crate) auxliary_array_counts: Vec<u32>,
 }
 
 impl MzPeakReaderMetadata {
@@ -21,6 +27,7 @@ impl MzPeakReaderMetadata {
         chromatogram_array_indices: Arc<ArrayIndex>,
         spectrum_id_index: OffsetIndex,
         model_deltas: Vec<Option<Vec<f64>>>,
+        auxliary_array_counts: Vec<u32>,
     ) -> Self {
         Self {
             mz_metadata,
@@ -28,6 +35,7 @@ impl MzPeakReaderMetadata {
             chromatogram_array_indices,
             spectrum_id_index,
             model_deltas,
+            auxliary_array_counts,
         }
     }
 
@@ -44,8 +52,6 @@ impl MzPeakReaderMetadata {
 impl MSDataFileMetadata for MzPeakReaderMetadata {
     mzdata::delegate_impl_metadata_trait!(mz_metadata);
 }
-
-
 
 pub(crate) fn build_spectrum_index(
     handle: &ZipArchiveReader,
@@ -78,8 +84,6 @@ pub(crate) fn build_spectrum_index(
     spectrum_id_index.init = true;
     Ok(spectrum_id_index)
 }
-
-
 
 /// Load the various metadata, indices and reference data
 pub(crate) fn load_indices_from(
@@ -169,8 +173,7 @@ pub(crate) fn load_indices_from(
             }
             "software_list" => {
                 if let Some(val) = kv.value.as_ref() {
-                    let software_list: Vec<crate::param::Software> =
-                        serde_json::from_str(&val)?;
+                    let software_list: Vec<crate::param::Software> = serde_json::from_str(&val)?;
                     for sw in software_list {
                         mz_metadata.softwares_mut().push(sw.into());
                     }
@@ -203,6 +206,7 @@ pub(crate) fn load_indices_from(
         Arc::new(spectrum_array_indices),
         Arc::new(chromatogram_array_indices),
         spectrum_id_index,
+        Vec::new(),
         Vec::new(),
     );
 

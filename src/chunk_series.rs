@@ -366,12 +366,19 @@ impl ChunkingStrategy {
 
 #[derive(Debug, Clone)]
 pub struct ArrowArrayChunk {
+    /// The index of source entity
     pub series_index: u64,
+    /// The starting coordinate of the chunk axis
     pub chunk_start: f64,
+    /// The ending coordinate of the chunk axis
     pub chunk_end: f64,
+    /// The buffer name for the main axis of the chunk
     pub chunk_axis: BufferName,
+    /// The array values of the chunk, encoded using [`Self::chunk_values`] as [`ChunkingStrategy`]
     pub chunk_values: ArrayRef,
+    /// The chunk encoding strategy applied to [`Self::chunk_values`].
     pub chunk_encoding: ChunkingStrategy,
+    /// The rest of the arrays of covering this chunk
     pub arrays: HashMap<BufferName, ArrayRef>,
 }
 
@@ -396,6 +403,7 @@ impl ArrowArrayChunk {
         }
     }
 
+    /// Convert a series of [`ArrowArrayChunk`] into a [`StructArray`]
     pub fn to_struct_array(
         chunks: &[Self],
         series_index_name: impl Into<String>,
@@ -561,6 +569,7 @@ impl ArrowArrayChunk {
         this_builder.finish()
     }
 
+    /// Construct an Arrow schema from this chunk.
     pub fn to_schema(
         &self,
         series_index_name: impl Into<String>,
@@ -613,6 +622,11 @@ impl ArrowArrayChunk {
         Schema::new(fields_of)
     }
 
+    /// Construct a series of [`ArrowArrayChunk`]s from a [`BinaryArrayMap`], using a specific array indicated by
+    /// [`BufferName`] as the main axis, split and encoded using `chunk_encoding`. This may include a set of
+    /// transforms according to `drop_zero_intensity`, `nullify_zero_intensity`.
+    ///
+    /// If `fields` is provided, any array not found in it will be returned as a [`AuxiliaryArray`].
     pub fn from_arrays(
         series_index: u64,
         main_axis: BufferName,

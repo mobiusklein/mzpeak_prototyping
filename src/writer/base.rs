@@ -153,14 +153,15 @@ pub trait AbstractMzPeakWriter {
         spectrum: &impl SpectrumLike<C, D>,
     ) -> io::Result<()> {
         log::trace!("Writing spectrum {}", spectrum.id());
-        let (median_delta, aux_arrays) = self.write_spectrum_data(spectrum)?;
+        let (mz_delta_model, aux_arrays) = self.write_spectrum_data(spectrum)?;
         let mut entries = self.spectrum_to_entries(spectrum);
         if let Some(entry) = entries.first_mut() {
             if let Some(spec_ent) = entry.spectrum.as_mut() {
-                spec_ent.median_delta = median_delta;
+                spec_ent.mz_delta_model = mz_delta_model;
                 spec_ent
                     .auxiliary_arrays
                     .extend(aux_arrays.unwrap_or_default());
+                spec_ent.number_of_auxiliary_arrays = spec_ent.auxiliary_arrays.len() as u32;
             }
         }
         self.spectrum_entry_buffer_mut().extend(entries);
@@ -208,14 +209,21 @@ pub trait AbstractMzPeakWriter {
         spectrum_count: u64,
         binary_array_map: &BinaryArrayMap,
     ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
-        let n_points = binary_array_map.mzs()?.len();
+        let mzs = binary_array_map.mzs();
+        let (_had_mzs, n_points, ) = if let Ok(mzs) = mzs {
+            (true, mzs.len())
+        } else {
+            (false, 0)
+        };
+
         let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;
 
         let (delta_params, extra_arrays) = if let Some(chunking) =
             self.use_chunked_encoding().copied()
         {
+            // If we use the chunked encoding, we pre-encode everything
             let nullify_zero_intensity = self.spectrum_data_buffer_mut().nullify_zero_intensity();
-            let median_delta = if is_profile {
+            let delta_model = if is_profile && nullify_zero_intensity {
                 self.build_delta_model(binary_array_map)
             } else {
                 None
@@ -243,9 +251,10 @@ pub trait AbstractMzPeakWriter {
                 buffer_ref.add_arrays(fields, arrays, size, is_profile);
             }
 
-            (median_delta, Some(auxiliary_arrays))
+            (delta_model, Some(auxiliary_arrays))
         } else {
-            let median_delta = if is_profile {
+            let nullify_zero_intensity = self.spectrum_data_buffer_mut().nullify_zero_intensity();
+            let delta_model = if is_profile && nullify_zero_intensity {
                 self.build_delta_model(binary_array_map)
             } else {
                 None
@@ -259,12 +268,12 @@ pub trait AbstractMzPeakWriter {
                 n_points,
                 spectrum_count,
                 "spectrum_index",
-                &buffer.fields(),
+                Some(&buffer.fields()),
                 &buffer.overrides(),
             )?;
 
             buffer.add_arrays(fields, data, n_points, is_profile);
-            (median_delta, Some(extra_arrays))
+            (delta_model, Some(extra_arrays))
         };
 
         Ok((delta_params, extra_arrays))

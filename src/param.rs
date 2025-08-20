@@ -1,8 +1,6 @@
 use std::{fmt::Display, str::FromStr};
 
-use mzdata::{
-    params::{ControlledVocabulary, ParamDescribed, ParamLike, Unit},
-};
+use mzdata::params::{ControlledVocabulary, ParamDescribed, ParamLike, Unit};
 use serde::{Deserialize, Serialize};
 
 /// Numerical identifier for "Proteomics Standards Initiative Mass Spectrometry Ontology"
@@ -39,10 +37,34 @@ pub struct Param {
 }
 
 /// A numerical encoding of a CURIE accession similar to [`mzdata::params::CURIE`]
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub struct CURIE {
     pub cv_id: u8,
     pub accession: u32,
+}
+
+impl CURIE {
+    pub fn format_with_namespace(&self, cvs: &[ControlledVocabulary]) -> Option<String> {
+        let cv = cvs.get(self.cv_id.saturating_sub(1) as usize)?;
+        Some(cv.curie(self.accession).to_string())
+    }
+
+    pub fn parse_with_namespace(
+        text: &str,
+        cvs: &[ControlledVocabulary],
+    ) -> Result<Self, mzdata::params::CURIEParsingError> {
+        let inst = mzdata::params::CURIE::from_str(text)?;
+        if let Some(i) = cvs.iter().position(|i| *i == inst.controlled_vocabulary) {
+            Ok(Self::new(i as u8, inst.accession))
+        } else {
+            Err(mzdata::params::CURIEParsingError::UnknownControlledVocabulary(
+                mzdata::params::ControlledVocabularyResolutionError::UnknownControlledVocabulary(
+                    format!("{:?}", inst.controlled_vocabulary)
+                )))
+        }
+    }
 }
 
 impl FromStr for CURIE {
@@ -655,7 +677,11 @@ impl From<Component> for mzdata::meta::Component {
                 ComponentType::Unknown => mzdata::meta::ComponentType::Unknown,
             },
             order: value.order,
-            params: value.parameters.into_iter().map(mzdata::Param::from).collect(),
+            params: value
+                .parameters
+                .into_iter()
+                .map(mzdata::Param::from)
+                .collect(),
         }
     }
 }
@@ -710,7 +736,6 @@ impl From<&mzdata::meta::InstrumentConfiguration> for InstrumentConfiguration {
     }
 }
 
-
 /// An adaptation of [`mzdata::meta::Sample`]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
@@ -718,7 +743,6 @@ pub struct Sample {
     pub name: Option<String>,
     pub parameters: Vec<MetaParam>,
 }
-
 
 impl From<Sample> for mzdata::meta::Sample {
     fn from(value: Sample) -> Self {

@@ -58,14 +58,14 @@ pub fn array_to_arrow_type(dtype: BinaryDataArrayType) -> DataType {
 }
 
 /// Convert a [`BinaryArrayMap`] to a collection of `arrow`  [`FieldRef`] and [`ArrayRef`] with
-/// unsupported arrays are spilled over as [`AuxiliaryArray`] instances.
+/// arrays not covered by `schema` are spilled over as [`AuxiliaryArray`] instances.
 pub fn array_map_to_schema_arrays_and_excess(
     context: BufferContext,
     array_map: &BinaryArrayMap,
     primary_array_len: usize,
     spectrum_index: u64,
     index_name: impl Into<String>,
-    schema: &Fields,
+    schema: Option<&Fields>,
     overrides: &HashMap<BufferName, BufferName>,
 ) -> Result<(Fields, Vec<ArrayRef>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
     let mut fields = Vec::new();
@@ -86,24 +86,30 @@ pub fn array_map_to_schema_arrays_and_excess(
         };
 
         let fieldref = buffer_name.to_field();
-        if !schema.is_empty()
-            && schema
+        if let Some(schema) = schema {
+            if schema
                 .iter()
                 .find(|c| c.name() == fieldref.name())
                 .is_none()
-        {
-            log::debug!("{fieldref:?} did not map to schema {schema:?}");
-            auxiliary.push(AuxiliaryArray::from_data_array(v)?);
-            continue;
+            {
+                log::trace!("{fieldref:?} did not map to schema {schema:?}");
+                auxiliary.push(AuxiliaryArray::from_data_array(v)?);
+                continue;
+            }
         }
 
         if v.data_len()? != primary_array_len {
-            unimplemented!(
-                "Still need to understand usage for uneven arrays: {} had {} points but primary length was {}",
-                buffer_name,
-                v.data_len()?,
-                primary_array_len
-            );
+            if primary_array_len == 0 {
+                auxiliary.push(AuxiliaryArray::from_data_array(v)?);
+                continue;
+            } else {
+                unimplemented!(
+                    "Still need to understand usage for uneven arrays: {} had {} points but primary length was {}",
+                    buffer_name,
+                    v.data_len()?,
+                    primary_array_len
+                );
+            }
         }
 
         fields.push(fieldref.clone());
@@ -124,14 +130,13 @@ pub fn array_map_to_schema_arrays(
     index_name: impl Into<String>,
     overrides: &HashMap<BufferName, BufferName>,
 ) -> Result<(Fields, Vec<ArrayRef>), ArrayRetrievalError> {
-    let schema = Fields::empty();
     let (fields, arrays, _aux) = array_map_to_schema_arrays_and_excess(
         context,
         array_map,
         primary_array_len,
         spectrum_index,
         index_name,
-        &schema,
+        None,
         overrides,
     )?;
     return Ok((fields, arrays));

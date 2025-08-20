@@ -1,7 +1,7 @@
 use mzdata::{
     params::{ControlledVocabulary, Unit},
     prelude::*,
-    spectrum::{DataArray, IsolationWindowState, ScanEvent, bindata::BinaryCompressionType},
+    spectrum::{bindata::{ArrayRetrievalError, BinaryCompressionType}, ArrayType, BinaryDataArrayType, DataArray, IsolationWindowState, ScanEvent},
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,28 +20,88 @@ pub struct AuxiliaryArray {
     pub parameters: Vec<Param>,
 }
 
+impl From<AuxiliaryArray> for DataArray {
+    fn from(value: AuxiliaryArray) -> Self {
+        value.into_data_array()
+    }
+}
+
+impl TryFrom<DataArray> for AuxiliaryArray {
+    type Error = ArrayRetrievalError;
+    fn try_from(value: DataArray) -> Result<Self, Self::Error> {
+        Self::from_data_array(&value)
+    }
+}
+
 impl AuxiliaryArray {
+
+    pub fn into_data_array(self) -> DataArray {
+        let mut chosen_compression = BinaryCompressionType::NoCompression;
+        for method in BinaryCompressionType::COMPRESSION_METHODS.iter() {
+            if let Some(method_param) = method.as_param() {
+                let acc: CURIE = method_param.curie().unwrap().into();
+                if acc == self.compression {
+                    chosen_compression = *method;
+                    break
+                }
+            }
+        }
+
+        let data = if matches!(chosen_compression, BinaryCompressionType::NoCompression) {
+            chosen_compression = BinaryCompressionType::Decoded;
+            self.data
+        } else {
+            base64_simd::STANDARD.encode_type::<Vec<u8>>(&self.data)
+        };
+
+        let dtype_acc: mzdata::params::CURIE = self.data_type.into();
+        let dtype = BinaryDataArrayType::from_accession(dtype_acc).unwrap();
+
+        let name: mzdata::Param = self.name.into();
+        let name = if let Some(name_acc) = name.curie() {
+            if let Some(name_t) = ArrayType::from_accession(name_acc) {
+                if matches!(name_t, ArrayType::NonStandardDataArray { name: _ }) {
+                    ArrayType::nonstandard(name.value.to_string())
+                } else {
+                    name_t
+                }
+            } else {
+                ArrayType::nonstandard(name.value.to_string())
+            }
+        } else {
+            ArrayType::nonstandard(name.value.to_string())
+        };
+
+        let mut result = DataArray::wrap(&name, dtype, data);
+        result.compression = chosen_compression;
+        if !self.parameters.is_empty() {
+            result.params = Some(Box::new(self.parameters.into_iter().map(mzdata::Param::from).collect()));
+        }
+        result
+    }
+
     pub fn from_data_array(
         source: &DataArray,
     ) -> Result<Self, mzdata::spectrum::bindata::ArrayRetrievalError> {
         let mut source = source.clone();
-        if source.compression == BinaryCompressionType::Decoded {
-            source.store_compressed(BinaryCompressionType::Zstd)?;
-        }
+        source.decode_and_store()?;
         let data = source.data;
-        let data_type = source
-            .dtype
-            .curie()
-            .ok_or_else(|| mzdata::spectrum::bindata::ArrayRetrievalError::DataTypeSizeMismatch)?
-            .into();
-        let unit = source.unit.to_curie().map(|c| c.into());
-        let compression = source
-            .compression
+
+        let compression = BinaryCompressionType::NoCompression
             .as_param()
             .unwrap()
             .curie()
             .unwrap()
             .into();
+
+        let data_type = source
+            .dtype
+            .curie()
+            .ok_or_else(|| mzdata::spectrum::bindata::ArrayRetrievalError::DataTypeSizeMismatch)?
+            .into();
+
+        let unit = source.unit.to_curie().map(|c| c.into());
+
         let name = source.name.clone().as_param(Some(source.unit)).into();
         let mut this = Self {
             name,
@@ -88,7 +148,8 @@ pub struct SpectrumEntry {
 
     pub data_processing_ref: Option<u32>,
     pub auxiliary_arrays: Vec<AuxiliaryArray>,
-    pub median_delta: Option<Vec<f64>>,
+    pub number_of_auxiliary_arrays: u32,
+    pub mz_delta_model: Option<Vec<f64>>,
 }
 
 impl SpectrumEntry {
@@ -109,12 +170,13 @@ impl SpectrumEntry {
             None
         };
 
-        Self {
-            id: spectrum.id().into(),
-            index: Some(spectrum.index() as u64),
-            ms_level: spectrum.ms_level(),
-            time: spectrum.start_time() as f32,
-            spectrum_type: match spectrum.ms_level() {
+        let spectrum_type = if let Some(v) = spectrum
+            .spectrum_type()
+            .map(|t| CURIE::from(t.to_param().curie().unwrap()))
+        {
+            v
+        } else {
+            match spectrum.ms_level() {
                 0 => panic!("Unsupported ms level"),
                 1 => CURIE {
                     cv_id: MS_CV_ID,
@@ -124,7 +186,15 @@ impl SpectrumEntry {
                     cv_id: MS_CV_ID,
                     accession: 1000580,
                 },
-            },
+            }
+        };
+
+        Self {
+            id: spectrum.id().into(),
+            index: Some(spectrum.index() as u64),
+            ms_level: spectrum.ms_level(),
+            time: spectrum.start_time() as f32,
+            spectrum_type,
             polarity: match spectrum.polarity() {
                 mzdata::spectrum::ScanPolarity::Unknown => 0,
                 mzdata::spectrum::ScanPolarity::Positive => 1,
