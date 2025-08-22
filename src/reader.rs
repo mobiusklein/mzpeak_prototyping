@@ -4,12 +4,12 @@ use std::{
     io,
     marker::PhantomData,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, Int8Array, LargeListArray, LargeStringArray, RecordBatch, StructArray, UInt32Array, UInt64Array, UInt8Array
+        Array, AsArray, Float32Array, Float64Array, Int8Array, LargeListArray, LargeStringArray,
+        RecordBatch, StructArray, UInt8Array, UInt32Array, UInt64Array,
     },
     datatypes::{DataType, FieldRef, Float32Type, Float64Type, UInt32Type, UInt64Type},
     error::ArrowError,
@@ -37,57 +37,29 @@ use parquet::arrow::{
 use serde_arrow::schema::SchemaLike;
 
 use crate::{
-    archive::ZipArchiveReader, buffer_descriptors::{arrow_to_array_type, ArrayIndex}, curie, filter::{fill_nulls_for, RegressionDeltaModel}, reader::index::{PageIndexEntry, QueryIndex, SpanDynNumeric}, spectrum::AuxiliaryArray, PrecursorEntry, SelectedIonEntry, CURIE
+    CURIE, PrecursorEntry, SelectedIonEntry,
+    archive::ZipArchiveReader,
+    filter::RegressionDeltaModel,
+    reader::{
+        chunk::SpectrumDataChunkCache,
+        index::{PageQuery, QueryIndex, SpanDynNumeric},
+    },
+    spectrum::AuxiliaryArray,
 };
 
 mod chunk;
 pub mod index;
 mod metadata;
+mod point;
 
 pub use chunk::SpectrumChunkReader;
 pub use metadata::MzPeakReaderMetadata;
+use point::{SpectrumDataArrayReader, SpectrumDataPointCache};
 
-fn binary_search_arrow_index(
-    array: &UInt64Array,
-    query: u64,
-    begin: Option<usize>,
-    end: Option<usize>,
-) -> Option<(usize, usize)> {
-    let mut lo = begin.unwrap_or(0);
-    let n = array.len() as usize;
-    let mut hi = end.unwrap_or(n);
-
-    while hi != lo {
-        let mid = (hi + lo) / 2;
-        let found = array.value(mid);
-        if found == query {
-            let mut i = mid;
-            while i > 0 && array.value(i) == query {
-                i -= 1;
-            }
-            if array.value(i) != query {
-                i += 1;
-            }
-            let begin = i;
-
-            i = mid;
-            while i < n && array.value(i) == query {
-                i += 1;
-            }
-            let end = i;
-
-            return Some((begin, end));
-        } else if hi - lo == 1 {
-            return None;
-        } else if found > query {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-
-    None
-}
+const DRIFT_TIME: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[0];
+const INVERSE_K_DRIFT_TIME: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[1];
+const FAIMS: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[2];
+const SELEXION: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[3];
 
 pub struct MzPeakReaderType<
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap = CentroidPeak,
@@ -100,7 +72,7 @@ pub struct MzPeakReaderType<
     pub metadata: MzPeakReaderMetadata,
     pub query_indices: QueryIndex,
     spectrum_metadata_cache: Option<Vec<SpectrumDescription>>,
-    spectrum_row_group_cache: Option<SpectrumDataCache>,
+    spectrum_row_group_cache: Option<DataCache>,
     _t: PhantomData<(C, D)>,
 }
 
@@ -247,199 +219,85 @@ impl<
     mzdata::delegate_impl_metadata_trait!(metadata);
 }
 
-trait SpectrumDataArrayReader {
-    fn populate_arrays_from_struct_array(
-        &self,
-        points: &StructArray,
-        bin_map: &mut HashMap<&String, DataArray>,
-        mz_delta_model: Option<&RegressionDeltaModel<f64>>,
-    ) {
-        for (f, arr) in points.fields().iter().zip(points.columns()) {
-            if f.name() == "spectrum_index" {
-                continue;
-            }
-            let store = bin_map.get_mut(f.name()).unwrap();
-
-            let has_nulls = arr.null_count() > 0;
-            let is_mz_array = matches!(store.name, ArrayType::MZArray);
-
-            macro_rules! extend_array {
-                ($buf:ident) => {
-                    if $buf.null_count() > 0 {
-                        for val in $buf.iter() {
-                            store.push(val.unwrap_or_default()).unwrap();
-                        }
-                    } else {
-                        store.extend($buf.values()).unwrap();
-                    }
-                };
-            }
-
-            match f.data_type() {
-                DataType::Float32 => {
-                    let buf: &Float32Array = arr.as_primitive();
-                    if has_nulls {
-                        if is_mz_array {
-                            if let Some(mz_delta_model) = mz_delta_model {
-                                let interpolated = fill_nulls_for(buf, mz_delta_model);
-                                store.extend(&interpolated).unwrap();
-                                continue;
-                            }
-                        }
-                    }
-                    extend_array!(buf);
-                }
-                DataType::Float64 => {
-                    let buf: &Float64Array = arr.as_primitive();
-                    if has_nulls {
-                        if is_mz_array {
-                            if let Some(mz_delta_model) = mz_delta_model {
-                                let interpolated = fill_nulls_for(buf, mz_delta_model);
-                                store.extend(&interpolated).unwrap();
-                                continue;
-                            }
-                        }
-                    }
-                    extend_array!(buf);
-                }
-                DataType::Int32 => {
-                    let buf: &Int32Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::Int64 => {
-                    let buf: &Int64Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::UInt8 => {
-                    let buf: &UInt8Array = arr.as_primitive();
-                    extend_array!(buf);
-                }
-                DataType::LargeUtf8 => {}
-                DataType::Utf8 => {}
-                _ => {}
-            }
-        }
-    }
-}
-
-struct SpectrumDataCache {
-    row_group: RecordBatch,
-    row_group_index: usize,
-    spectrum_array_indices: Arc<ArrayIndex>,
-    last_query_index: Option<u64>,
-    last_query_span: Option<(usize, usize)>,
-}
-
-impl SpectrumDataArrayReader for SpectrumDataCache {}
 impl<
-    C: CentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
-    D: DeconvolutedCentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
 > SpectrumDataArrayReader for MzPeakReaderType<C, D>
 {
 }
 
-impl SpectrumDataCache {
-    fn new(
-        row_group: RecordBatch,
-        spectrum_array_indices: Arc<ArrayIndex>,
+pub(crate) enum DataCache {
+    Point(SpectrumDataPointCache),
+    Chunk(SpectrumDataChunkCache),
+}
+
+impl DataCache {
+    pub fn slice_to_arrays_of(
+        &mut self,
         row_group_index: usize,
-        last_query_index: Option<u64>,
-        last_query_span: Option<(usize, usize)>,
-    ) -> Self {
-        Self {
-            row_group,
-            spectrum_array_indices,
-            row_group_index,
-            last_query_index,
-            last_query_span,
+        spectrum_index: u64,
+        mz_delta_model: Option<&RegressionDeltaModel<f64>>,
+    ) -> io::Result<BinaryArrayMap> {
+        if self.contains(row_group_index, spectrum_index) {
+            match self {
+                DataCache::Point(spectrum_data_point_cache) => {
+                    spectrum_data_point_cache.slice_to_arrays_of(spectrum_index, mz_delta_model)
+                }
+                DataCache::Chunk(spectrum_data_chunk_cache) => {
+                    spectrum_data_chunk_cache.slice_to_arrays_of(spectrum_index, mz_delta_model)
+                }
+            }
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Entries not found for {row_group_index}:{spectrum_index}"),
+            ))
         }
     }
 
-    fn slice_spectrum_data_record_batch_to_arrays_of(
-        &mut self,
-        index: u64,
-        mz_delta_model: Option<&RegressionDeltaModel<f64>>,
-    ) -> io::Result<BinaryArrayMap> {
-        let mut bin_map = HashMap::new();
-        for (k, v) in self.spectrum_array_indices.iter() {
-            let dtype = arrow_to_array_type(&v.data_type).unwrap();
-            bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
-        }
-
-        let mut begin_hint = None;
-        let mut end_hint = None;
-        if let Some(last_query_index) = self.last_query_index {
-            if last_query_index < index {
-                begin_hint = Some(self.last_query_span.unwrap().1);
-            } else if last_query_index > index {
-                end_hint = Some(self.last_query_span.unwrap().1)
-            } else if last_query_index == index {
-                let (a, b) = self.last_query_span.unwrap();
-                begin_hint = Some(a);
-                end_hint = Some(b);
+    pub fn contains(&self, row_group_index: usize, spectrum_index: u64) -> bool {
+        match self {
+            DataCache::Point(spectrum_data_point_cache) => {
+                spectrum_data_point_cache.row_group_index == row_group_index
             }
+            DataCache::Chunk(spectrum_data_chunk_cache) => spectrum_data_chunk_cache
+                .spectrum_index_range
+                .contains(&spectrum_index),
         }
+    }
 
-        let points = self.row_group.column(0).as_struct();
-        let indices: &UInt64Array = points
-            .column_by_name("spectrum_index")
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
-        let bounds = binary_search_arrow_index(indices, index, begin_hint, end_hint);
+    pub fn load_data_for<
+        C: CentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
+        D: DeconvolutedCentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
+    >(
+        reader: &MzPeakReaderType<C, D>,
+        row_group_index: usize,
+        spectrum_index: u64,
+    ) -> io::Result<Option<Self>> {
+        if reader.query_indices.spectrum_point_index.is_populated() {
+            let rg = reader
+                .load_spectrum_data_row_group(reader.handle.spectra_data()?, row_group_index)?;
+            let cache = SpectrumDataPointCache::new(
+                rg,
+                reader.metadata.spectrum_array_indices.clone(),
+                row_group_index,
+                None,
+                None,
+            );
 
-        let start;
-        let end;
-
-        if let Some((bstart, bend)) = bounds {
-            let at = indices.value(bstart);
-            assert_eq!(at, index);
-            let at = indices.value(bend - 1);
-            assert_eq!(at, index);
-            start = Some(bstart);
-            end = Some(bend);
+            Ok(Some(Self::Point(cache)))
+        } else if reader.query_indices.spectrum_chunk_index.is_populated() {
+            let builder = reader.handle.spectra_data()?;
+            let builder = SpectrumChunkReader::new(builder);
+            let cache = builder.load_cache_block(
+                SimpleInterval::new(spectrum_index, spectrum_index + 100),
+                &reader.metadata,
+                &reader.query_indices,
+            )?;
+            Ok(Some(Self::Chunk(cache)))
         } else {
-            panic!("Could not find start and end in binary search");
-            // for (i, idx) in indices.iter().enumerate() {
-            //     if idx.unwrap() == index {
-            //         if start.is_some() {
-            //             end = Some(i + 1)
-            //         } else {
-            //             start = Some(i)
-            //         }
-            //     }
-            // }
+            Ok(None)
         }
-
-        let points = match (start, end) {
-            (Some(start), Some(end)) => {
-                let len = end - start;
-                self.last_query_span = Some((start, end));
-                self.last_query_index = Some(index);
-                points.slice(start, len)
-            }
-            (Some(start), None) => {
-                self.last_query_span = Some((start, start + 1));
-                self.last_query_index = Some(index);
-                points.slice(start, 1)
-            }
-            _ => {
-                let mut out = BinaryArrayMap::new();
-                for v in bin_map.into_values() {
-                    out.add(v);
-                }
-                return Ok(out);
-            }
-        };
-
-        self.populate_arrays_from_struct_array(&points, &mut bin_map, mz_delta_model);
-
-        let mut out = BinaryArrayMap::new();
-        for v in bin_map.into_values() {
-            out.add(v);
-        }
-        Ok(out)
     }
 }
 
@@ -497,48 +355,31 @@ impl<
         metadata::load_indices_from(handle)
     }
 
-    /// Read a specific Parquet row group into memory as a single [`RecordBatch`]
-    ///
-    /// This reads from the spectrum data file
-    fn load_spectrum_data_row_group(&self, row_group: usize) -> io::Result<RecordBatch> {
-        log::trace!("Loading row group {row_group}");
-        let builder = self.handle.spectra_data()?;
-        let batch = builder
-            .with_row_groups(vec![row_group])
-            .with_batch_size(usize::MAX)
-            .build()?
-            .flatten()
-            .next();
-        if let Some(batch) = batch {
-            Ok(batch)
-        } else {
-            Err(parquet::errors::ParquetError::General(format!(
-                "Couldn't read row group {row_group}"
-            ))
-            .into())
-        }
-    }
-
     /// Load the [`SpectrumDataCache`] row group or retrieve the current cache if it matches the request
-    fn read_spectrum_data_cache(&mut self, row_group: usize) -> io::Result<&mut SpectrumDataCache> {
+    fn read_spectrum_data_cache(
+        &mut self,
+        row_group_index: usize,
+        spectrum_index: u64,
+    ) -> io::Result<&mut DataCache> {
         let cache_hit = if let Some(cache) = self.spectrum_row_group_cache.as_ref() {
-            cache.row_group_index == row_group
+            cache.contains(row_group_index, spectrum_index)
         } else {
             false
         };
+
         if cache_hit {
-            log::trace!("Spectrum data cache hit {row_group}");
+            log::trace!("Spectrum data cache hit {row_group_index:?}:{spectrum_index}");
             Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         } else {
-            let rg = self.load_spectrum_data_row_group(row_group)?;
-            self.spectrum_row_group_cache = Some(SpectrumDataCache::new(
-                rg,
-                self.metadata.spectrum_array_indices.clone(),
-                row_group,
-                None,
-                None,
-            ));
-            Ok(self.spectrum_row_group_cache.as_mut().unwrap())
+            log::trace!("Spectrum data cache miss {row_group_index:?}:{spectrum_index}");
+            if let Some(cache) = DataCache::load_data_for(self, row_group_index, spectrum_index)? {
+                self.spectrum_row_group_cache = Some(cache);
+                Ok(self.spectrum_row_group_cache.as_mut().unwrap())
+            } else {
+                Err(io::Error::other(format!(
+                    "Failed to load data cache for {row_group_index:?} {spectrum_index}"
+                )))
+            }
         }
     }
 
@@ -546,6 +387,24 @@ impl<
     pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
         let delta_model = self.metadata.model_deltas_for_conv(index as usize);
         let builder = self.handle.spectra_data()?;
+        let pq_schema = builder.parquet_schema();
+
+        let PageQuery {
+            pages,
+            row_group_indices: rg_idx_acc,
+        } = self.query_indices.query_pages(index);
+
+        // If there is only one row group in the scan, take the fast path through the cache
+        if rg_idx_acc.len() == 1 {
+            let row_group_index = rg_idx_acc[0];
+            let rg = self.read_spectrum_data_cache(row_group_index, index)?;
+            let mut arrays = rg.slice_to_arrays_of(row_group_index, index, delta_model.as_ref())?;
+            for v in self.load_auxiliary_arrays_for(index)? {
+                arrays.add(v);
+            }
+            return Ok(arrays);
+        }
+
         if self.query_indices.spectrum_chunk_index.is_populated() {
             log::trace!("Using chunk strategy for reading spectrum {index}");
             return SpectrumChunkReader::new(builder).read_chunks_for_spectrum(
@@ -553,35 +412,8 @@ impl<
                 &self.query_indices,
                 &self.metadata.spectrum_array_indices,
                 delta_model.as_ref(),
+                Some(PageQuery::new(rg_idx_acc, pages))
             );
-        }
-
-        let pq_schema = builder.parquet_schema();
-
-        let mut rg_idx_acc = Vec::new();
-        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
-
-        for page in self
-            .query_indices
-            .spectrum_point_index
-            .spectrum_index
-            .pages_contains(index)
-        {
-            if !rg_idx_acc.contains(&page.row_group_i) {
-                rg_idx_acc.push(page.row_group_i);
-            }
-            pages.push(*page);
-        }
-
-        // If there is only one row group in the scan, take the fast path through the cache
-        if rg_idx_acc.len() == 1 {
-            let rg = self.read_spectrum_data_cache(rg_idx_acc[0])?;
-            let mut arrays =
-                rg.slice_spectrum_data_record_batch_to_arrays_of(index, delta_model.as_ref())?;
-            for v in self.load_auxiliary_arrays_for(index)? {
-                arrays.add(v);
-            }
-            return Ok(arrays);
         }
 
         // Otherwise we must construct a more intricate read plan, first pruning rows and row groups
@@ -752,34 +584,41 @@ impl<
                             tp.value(pos),
                         );
                         let param_builder = mzdata::Param::builder().curie(tp).value(val);
-                        if tp == crate::param::ION_MOBILITY_SCAN_TERMS[0] {
-                            event.add_param(
-                                param_builder
-                                    .name("ion mobility drift time")
-                                    .unit(Unit::Millisecond)
-                                    .build(),
-                            );
-                        } else if tp == crate::param::ION_MOBILITY_SCAN_TERMS[1] {
-                            event.add_param(
-                                param_builder
-                                    .name("inverse reduced ion mobility drift time")
-                                    .unit(Unit::VoltSecondPerSquareCentimeter)
-                                    .build(),
-                            );
-                        } else if tp == crate::param::ION_MOBILITY_SCAN_TERMS[2] {
-                            event.add_param(
-                                param_builder
-                                    .name("FAIMS compensation voltage")
-                                    .unit(Unit::Volt)
-                                    .build(),
-                            );
-                        } else if tp == crate::param::ION_MOBILITY_SCAN_TERMS[3] {
-                            event.add_param(
-                                param_builder
-                                    .name("SELEXION compensation voltage")
-                                    .unit(Unit::Volt)
-                                    .build(),
-                            );
+
+                        match tp {
+                            DRIFT_TIME => {
+                                event.add_param(
+                                    param_builder
+                                        .name("ion mobility drift time")
+                                        .unit(Unit::Millisecond)
+                                        .build(),
+                                );
+                            }
+                            INVERSE_K_DRIFT_TIME => {
+                                event.add_param(
+                                    param_builder
+                                        .name("inverse reduced ion mobility drift time")
+                                        .unit(Unit::VoltSecondPerSquareCentimeter)
+                                        .build(),
+                                );
+                            }
+                            FAIMS => {
+                                event.add_param(
+                                    param_builder
+                                        .name("inverse reduced ion mobility drift time")
+                                        .unit(Unit::VoltSecondPerSquareCentimeter)
+                                        .build(),
+                                );
+                            }
+                            SELEXION => {
+                                event.add_param(
+                                    param_builder
+                                        .name("SELEXION compensation voltage")
+                                        .unit(Unit::Volt)
+                                        .build(),
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -825,9 +664,9 @@ impl<
         let continuity_curie = CURIE::new(cv_id_arr.value(offset), accession_arr.value(offset));
 
         descr.signal_continuity = match continuity_curie {
-            curie!(MS:1000525) => mzdata::spectrum::SignalContinuity::Unknown,
-            curie!(MS:1000127) => mzdata::spectrum::SignalContinuity::Centroid,
-            curie!(MS:1000128) => mzdata::spectrum::SignalContinuity::Profile,
+            crate::curie!(MS:1000525) => mzdata::spectrum::SignalContinuity::Unknown,
+            crate::curie!(MS:1000127) => mzdata::spectrum::SignalContinuity::Centroid,
+            crate::curie!(MS:1000128) => mzdata::spectrum::SignalContinuity::Profile,
             _ => todo!("Don't know how to deal with {continuity_curie}"),
         };
 
@@ -1469,8 +1308,15 @@ impl<
     }
 
     pub(crate) fn load_auxiliary_arrays_for(&self, index: u64) -> io::Result<Vec<DataArray>> {
-        if self.metadata.auxliary_array_counts.get(index as usize).copied().unwrap_or_default() == 0 {
-            return Ok(Vec::new())
+        if self
+            .metadata
+            .auxliary_array_counts
+            .get(index as usize)
+            .copied()
+            .unwrap_or_default()
+            == 0
+        {
+            return Ok(Vec::new());
         }
 
         let builder = self.handle.spectrum_metadata()?;
@@ -1524,13 +1370,15 @@ impl<
             .build()?;
 
         let mut results = Vec::new();
-        let fields: Vec<FieldRef> = SchemaLike::from_type::<AuxiliaryArray>(Default::default()).unwrap();
+        let fields: Vec<FieldRef> =
+            SchemaLike::from_type::<AuxiliaryArray>(Default::default()).unwrap();
         for bat in reader.flatten() {
             let root = bat.column(0);
             let root = root.as_struct();
             let data = root.column(1).as_list::<i64>();
             let data = data.values().as_struct();
-            let arrays: Vec<AuxiliaryArray> = serde_arrow::from_arrow(&fields, data.columns()).unwrap();
+            let arrays: Vec<AuxiliaryArray> =
+                serde_arrow::from_arrow(&fields, data.columns()).unwrap();
             for array in arrays {
                 results.push(array.into());
             }

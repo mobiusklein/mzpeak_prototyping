@@ -5,7 +5,7 @@ use arrow::{
         Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
         StructArray, UInt8Array, UInt64Array,
     },
-    datatypes::{DataType, Float32Type, Float64Type, UInt64Type},
+    datatypes::{DataType, Field, Float32Type, Float64Type, Schema, UInt64Type},
     error::ArrowError,
 };
 use parquet::arrow::{
@@ -21,11 +21,141 @@ use mzpeaks::coordinate::SimpleInterval;
 
 use crate::{
     BufferName, CURIE,
+    buffer_descriptors::arrow_to_array_type,
     chunk_series::{ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR},
     filter::RegressionDeltaModel,
     peak_series::{ArrayIndex, BufferFormat, data_array_to_arrow_array},
-    reader::{MzPeakReaderMetadata, index::{PageIndexEntry, QueryIndex, RangeIndex, SpanDynNumeric}},
+    reader::{
+        MzPeakReaderMetadata,
+        index::{PageQuery, QueryIndex, RangeIndex, SpanDynNumeric},
+        point::binary_search_arrow_index,
+    },
 };
+
+#[allow(unused)]
+pub(crate) struct SpectrumDataChunkCache {
+    pub(crate) row_group: RecordBatch,
+    pub(crate) spectrum_index_range: SimpleInterval<u64>,
+    pub(crate) spectrum_array_indices: Arc<ArrayIndex>,
+    pub(crate) last_query_index: Option<u64>,
+    pub(crate) last_query_span: Option<(usize, usize)>,
+}
+
+#[allow(unused)]
+impl SpectrumDataChunkCache {
+    pub(crate) fn new(
+        row_group: RecordBatch,
+        spectrum_index_range: SimpleInterval<u64>,
+        spectrum_array_indices: Arc<ArrayIndex>,
+        last_query_index: Option<u64>,
+        last_query_span: Option<(usize, usize)>,
+    ) -> Self {
+        Self {
+            row_group,
+            spectrum_index_range,
+            spectrum_array_indices,
+            last_query_index,
+            last_query_span,
+        }
+    }
+
+    pub(crate) fn find_span_for_query(&self, index: u64) -> (Option<usize>, Option<usize>) {
+        let mut begin_hint = None;
+        let mut end_hint = None;
+        if let Some(last_query_index) = self.last_query_index {
+            if last_query_index < index {
+                begin_hint = Some(self.last_query_span.unwrap().1);
+            } else if last_query_index > index {
+                end_hint = Some(self.last_query_span.unwrap().1)
+            } else if last_query_index == index {
+                let (a, b) = self.last_query_span.unwrap();
+                begin_hint = Some(a);
+                end_hint = Some(b);
+            }
+        }
+
+        let chunks = self.row_group.column(0).as_struct();
+        let indices: &UInt64Array = chunks
+            .column_by_name("spectrum_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref()
+            .unwrap();
+        let bounds = binary_search_arrow_index(indices, index, begin_hint, end_hint);
+
+        let mut start = None;
+        let mut end = None;
+
+        if let Some((bstart, bend)) = bounds {
+            let at = indices.value(bstart);
+            assert_eq!(at, index);
+            let at = indices.value(bend - 1);
+            assert_eq!(at, index);
+            start = Some(bstart);
+            end = Some(bend);
+        }
+        (start, end)
+    }
+
+    pub(crate) fn slice_to_arrays_of(
+        &mut self,
+        index: u64,
+        mz_delta_model: Option<&RegressionDeltaModel<f64>>,
+    ) -> io::Result<BinaryArrayMap> {
+        let (start, end) = self.find_span_for_query(index);
+        if !(start.is_some() && end.is_some()) {
+            panic!("Could not find start and end in binary search");
+        }
+
+        let chunks = self.row_group.column(0).as_struct();
+
+        let chunks = match (start, end) {
+            (Some(start), Some(end)) => {
+                let len = end - start;
+                self.last_query_span = Some((start, end));
+                self.last_query_index = Some(index);
+                chunks.slice(start, len)
+            }
+            (Some(start), None) => {
+                self.last_query_span = Some((start, start + 1));
+                self.last_query_index = Some(index);
+                chunks.slice(start, 1)
+            }
+            _ => {
+                let mut bin_map = HashMap::new();
+                for (k, v) in self.spectrum_array_indices.iter() {
+                    let dtype = arrow_to_array_type(&v.data_type).unwrap();
+                    bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
+                }
+                let mut out = BinaryArrayMap::new();
+                for v in bin_map.into_values() {
+                    out.add(v);
+                }
+                return Ok(out);
+            }
+        };
+
+        let subschema = Arc::new(Schema::new(vec![Arc::new(Field::new(
+            "chunk",
+            DataType::Struct(chunks.fields().clone()),
+            false,
+        ))]));
+
+        let batch = RecordBatch::from(StructArray::new(
+            subschema.fields().clone(),
+            vec![Arc::new(chunks)],
+            None,
+        ));
+
+        let out = SpectrumChunkReader::<std::fs::File>::decode_chunks(
+            [batch].into_iter(),
+            &self.spectrum_array_indices,
+            mz_delta_model,
+        )?;
+
+        Ok(out)
+    }
+}
 
 #[derive(Debug)]
 pub struct SpectrumChunkReader<T: parquet::file::reader::ChunkReader + 'static> {
@@ -35,6 +165,58 @@ pub struct SpectrumChunkReader<T: parquet::file::reader::ChunkReader + 'static> 
 impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
     pub fn new(builder: ParquetRecordBatchReaderBuilder<T>) -> Self {
         Self { builder }
+    }
+
+    #[allow(unused)]
+    pub(crate) fn load_cache_block(
+        self,
+        index_range: SimpleInterval<u64>,
+        metadata: &MzPeakReaderMetadata,
+        query_indices: &QueryIndex,
+    ) -> io::Result<SpectrumDataChunkCache> {
+        let rows = query_indices
+            .spectrum_chunk_index
+            .spectrum_index
+            .row_selection_overlaps(&index_range);
+
+        let proj =
+            ProjectionMask::columns(self.builder.parquet_schema(), vec!["chunk.spectrum_index"]);
+        let predicate_mask = proj.clone();
+
+        let schema = self.builder.schema().clone();
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let root = batch.column(0).as_struct();
+            let spectrum_index: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
+
+            let it = spectrum_index
+                .iter()
+                .map(|v| v.map(|v| index_range.contains(&v)));
+
+            Ok(it.collect())
+        });
+
+        let reader = self
+            .builder
+            .with_row_selection(rows)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .build()?;
+
+        let mut batches = Vec::new();
+        for bat in reader {
+            batches.push(bat.map_err(io::Error::other)?);
+        }
+
+        let batch =
+            arrow::compute::concat_batches(&schema, batches.iter()).map_err(io::Error::other)?;
+
+        Ok(SpectrumDataChunkCache::new(
+            batch,
+            index_range,
+            metadata.spectrum_array_indices.clone(),
+            None,
+            None,
+        ))
     }
 
     pub fn scan_chunks_for(
@@ -511,7 +693,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                 name.dtype,
                 name.dtype.size_of() * n,
             );
-            log::debug!("Unpacking {name} from {} chunks", chunks.len());
+            // log::debug!("Unpacking {name} from {} chunks", chunks.len());
             macro_rules! extend_array {
                 ($buf:ident) => {
                     if $buf.null_count() > 0 {
@@ -566,10 +748,10 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                     }
                 }
             }
-            log::debug!(
-                "Unpacked {} values, main axis had {n}",
-                store.data_len().unwrap()
-            );
+            // log::debug!(
+            //     "Unpacked {} values, main axis had {n}",
+            //     store.data_len().unwrap()
+            // );
             bin_map.add(store);
         }
         Ok(bin_map)
@@ -581,20 +763,12 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         query_indices: &QueryIndex,
         spectrum_array_indices: &ArrayIndex,
         delta_model: Option<&RegressionDeltaModel<f64>>,
+        page_query: Option<PageQuery>,
     ) -> io::Result<BinaryArrayMap> {
-        let mut rg_idx_acc = Vec::new();
-        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
-
-        for page in query_indices
-            .spectrum_chunk_index
-            .spectrum_index
-            .pages_contains(query)
-        {
-            if !rg_idx_acc.contains(&page.row_group_i) {
-                rg_idx_acc.push(page.row_group_i);
-            }
-            pages.push(*page);
-        }
+        let PageQuery {
+            row_group_indices: rg_idx_acc,
+            pages,
+        } = page_query.unwrap_or_else(|| query_indices.spectrum_chunk_index.query_pages(query));
 
         // Otherwise we must construct a more intricate read plan, first pruning rows and row groups
         // based upon the pages matched

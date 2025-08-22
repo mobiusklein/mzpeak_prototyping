@@ -825,12 +825,18 @@ where
 {
     let mut buffer: Vec<Option<<T as ArrowPrimitiveType>::Native>> =
         Vec::with_capacity(array.len());
-
+    // log::debug!("{} items", array.len());
+    // if array.len() == 1 && array.is_null(0) {
+    //     log::debug!("{array:?} {start:?}");
+    //     return buffer.into();
+    // } else {
+    //     log::debug!("{start:?}");
+    // }
     let mut last = Some(start);
     if array.is_null(0) {
         // If the buffer starts with two nulls, it means that the starting point of the chunk was
         // a singleton peak at the chunk boundary, so we need to add it back
-        if array.is_null(1) {
+        if array.len() > 1 && array.is_null(1) {
             buffer.push(last);
         }
         // If the first delta is null, then the subsequent non-null point will have been encoded
@@ -886,11 +892,16 @@ where
                 // If the next value is null, then skip ahead an extra step because nulls
                 // are supposed to be paired.
                 if (i + 1 < n) && array.is_null(i + 1) {
+                    // eprintln!("Skipping ahead from {i} to {} from {:?} to {:?}", (i + 2).min(array.len()), array.value(i), array.value(i + 2));
                     i += 2;
                     i = i.min(array.len());
                 }
-                chunks.push(SimpleInterval::new(offset, i));
-                offset = i;
+
+                if i - offset != 1 {
+                    // eprintln!("Segment 1 opening from {offset} to {i} | {t:?} | {:?}-{v:?}", array.value(offset));
+                    chunks.push(SimpleInterval::new(offset, i));
+                    offset = i;
+                }
                 while t < v {
                     t = t + k;
                 }
@@ -900,6 +911,7 @@ where
             let v = array.value(i);
             if v > t {
                 i -= 1;
+                // eprintln!("Segment 2 opening from {offset} to {i} {:?}-{v:?}", array.value(offset));
                 chunks.push(SimpleInterval::new(offset, i));
                 offset = i;
                 while t < v {
@@ -917,6 +929,8 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::io::{self, BufRead};
+
     use super::*;
 
     #[test]
@@ -2732,5 +2746,37 @@ mod test {
 
         let betas = fit_delta_model(&data, &delta, Some(&weights), 2).unwrap();
         eprintln!("{betas:?}");
+    }
+
+    #[test]
+    fn test_sparse_null_split() -> io::Result<()> {
+        let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_large_gaps.txt")?);
+        let mut mzs = Vec::new();
+        let mut intensities = Vec::new();
+        for line in reader.lines().flatten() {
+            if let Some((a, b)) = line.split_once("\t") {
+                mzs.push(a.parse::<f64>().unwrap());
+                intensities.push(b.parse::<f32>().unwrap());
+            }
+        }
+
+        let mzs = Float64Array::from(mzs);
+        let intensities = Float32Array::from(intensities);
+
+        let kept_indices = _skip_zero_runs_gen(&intensities);
+        let kept_indices: UInt64Array = kept_indices.into();
+
+        let mzs = arrow::compute::take(&mzs, &kept_indices, None).unwrap();
+        let intensities = arrow::compute::take(&intensities, &kept_indices, None).unwrap();
+        let masked = is_zero_pair_mask(intensities.as_primitive::<Float32Type>());
+
+        let mzs = arrow::compute::kernels::nullif::nullif(&mzs.clone(), &masked).unwrap();
+
+        let splits = super::null_chunk_every_k(mzs.as_primitive::<Float64Type>(), 50.0);
+        for seg in splits.iter() {
+            assert!(seg.end - seg.start > 1, "Segment {seg:?} is too short");
+        }
+
+        Ok(())
     }
 }

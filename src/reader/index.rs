@@ -649,6 +649,22 @@ impl SpectrumPointIndex {
         }
     }
 
+    pub fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self
+            .spectrum_index
+            .pages_contains(spectrum_index)
+        {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.spectrum_index.is_empty()
     }
@@ -676,6 +692,22 @@ impl SpectrumChunkIndex {
             start_mz_index,
             end_mz_index,
         }
+    }
+
+    pub fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self
+            .spectrum_index
+            .pages_contains(spectrum_index)
+        {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -815,5 +847,28 @@ impl QueryIndex {
             "Chunk index initialized?: {}",
             self.spectrum_chunk_index.spectrum_index.len()
         );
+    }
+
+    pub fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.query_pages(spectrum_index)
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.query_pages(spectrum_index)
+        } else {
+            PageQuery::default()
+        }
+    }
+}
+
+
+#[derive(Debug, Default)]
+pub struct PageQuery {
+    pub row_group_indices: Vec<usize>,
+    pub pages: Vec<PageIndexEntry<u64>>
+}
+
+impl PageQuery {
+    pub fn new(row_group_indices: Vec<usize>, pages: Vec<PageIndexEntry<u64>>) -> Self {
+        Self { row_group_indices, pages }
     }
 }

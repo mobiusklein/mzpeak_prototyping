@@ -390,6 +390,7 @@ def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
     start = None
     n = len(data)
     i = 0
+    # Find the first non-null position
     while i < n:
         v = data[i]
         if v.is_valid:
@@ -397,6 +398,8 @@ def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
             break
         else:
             i += 1
+
+    # If we never found a non-null position, just return a single chunk
     if start is None:
         return [(0, n)]
 
@@ -411,8 +414,11 @@ def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
             if v > t:
                 if ((i + 1) < n) and (not data[i + 1].is_valid):
                     i += 2
-                chunks.append((offset, i))
-                offset = i
+                # We don't want to create a chunk of length 1, especially not if it is a null
+                # point.
+                if i - offset > 1:
+                    chunks.append((offset, i))
+                    offset = i
                 while t < v:
                     t += k
         elif ((i + 1) < n) and (data[i + 1].is_valid):
