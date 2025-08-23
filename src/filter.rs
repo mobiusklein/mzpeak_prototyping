@@ -825,13 +825,6 @@ where
 {
     let mut buffer: Vec<Option<<T as ArrowPrimitiveType>::Native>> =
         Vec::with_capacity(array.len());
-    // log::debug!("{} items", array.len());
-    // if array.len() == 1 && array.is_null(0) {
-    //     log::debug!("{array:?} {start:?}");
-    //     return buffer.into();
-    // } else {
-    //     log::debug!("{start:?}");
-    // }
     let mut last = Some(start);
     if array.is_null(0) {
         // If the buffer starts with two nulls, it means that the starting point of the chunk was
@@ -892,13 +885,13 @@ where
                 // If the next value is null, then skip ahead an extra step because nulls
                 // are supposed to be paired.
                 if (i + 1 < n) && array.is_null(i + 1) {
-                    // eprintln!("Skipping ahead from {i} to {} from {:?} to {:?}", (i + 2).min(array.len()), array.value(i), array.value(i + 2));
                     i += 2;
                     i = i.min(array.len());
                 }
 
+                // We don't want to create a chunk of length 1, especially not if it is a null
+                // point.
                 if i - offset != 1 {
-                    // eprintln!("Segment 1 opening from {offset} to {i} | {t:?} | {:?}-{v:?}", array.value(offset));
                     chunks.push(SimpleInterval::new(offset, i));
                     offset = i;
                 }
@@ -911,7 +904,6 @@ where
             let v = array.value(i);
             if v > t {
                 i -= 1;
-                // eprintln!("Segment 2 opening from {offset} to {i} {:?}-{v:?}", array.value(offset));
                 chunks.push(SimpleInterval::new(offset, i));
                 offset = i;
                 while t < v {

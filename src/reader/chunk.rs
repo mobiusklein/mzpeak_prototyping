@@ -22,7 +22,9 @@ use mzpeaks::coordinate::SimpleInterval;
 use crate::{
     BufferName, CURIE,
     buffer_descriptors::arrow_to_array_type,
-    chunk_series::{ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR},
+    chunk_series::{
+        BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR,
+    },
     filter::RegressionDeltaModel,
     peak_series::{ArrayIndex, BufferFormat, data_array_to_arrow_array},
     reader::{
@@ -476,11 +478,28 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             arrays.push(axis);
 
             for (name, chunks) in buffers {
-                let chunks: Vec<&dyn Array> = chunks
-                    .iter()
-                    .map(|a| a.as_ref().as_list::<i64>().values().as_ref())
-                    .collect();
-                let chunks = arrow::compute::concat(&chunks)?;
+                let decoder = name.transform.map(BufferTransformDecoder);
+                let chunks = match decoder {
+                    Some(decoder) => {
+                        let chunks: Vec<ArrayRef> = chunks
+                            .iter()
+                            .flat_map(|a| a.as_list::<i64>().iter().map(|b| {
+                                decoder.decode(&name, b.as_ref().unwrap())
+                            }))
+                            .collect();
+                        let chunks: Vec<&dyn Array> = chunks.iter().map(|a| a as &dyn Array).collect();
+                        let chunks = arrow::compute::concat(&chunks)?;
+                        chunks
+                    },
+                    None => {
+                        let chunks: Vec<&dyn Array> = chunks
+                            .iter()
+                            .map(|a| a.as_ref().as_list::<i64>().values().as_ref())
+                            .collect();
+                        let chunks = arrow::compute::concat(&chunks)?;
+                        chunks
+                    },
+                };
                 arrays.push(chunks);
                 fields.push(name.to_field());
             }
@@ -693,57 +712,76 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                 name.dtype,
                 name.dtype.size_of() * n,
             );
-            // log::debug!("Unpacking {name} from {} chunks", chunks.len());
+            let decoder = name.transform.map(BufferTransformDecoder);
+
             macro_rules! extend_array {
-                ($buf:ident) => {
+                ($buf:ident, $tp:ty) => {
                     if $buf.null_count() > 0 {
-                        for val in $buf.iter() {
+                        let buf: &$tp = $buf.as_primitive();
+                        for val in buf.iter() {
                             store.push(val.unwrap_or_default()).unwrap();
                         }
                     } else {
-                        store.extend($buf.values()).unwrap();
+                        let buf: &$tp = $buf.as_primitive();
+                        store.extend(buf.values()).unwrap();
                     }
                 };
             }
+
             for arr in chunks {
                 if let Some(arr) = arr.as_list_opt::<i64>() {
-                    match arr.value_type() {
-                        DataType::Float32 => {
-                            for arr in arr.iter().flatten() {
-                                let buf: &Float32Array = arr.as_primitive();
-                                extend_array!(buf);
+                    if arr.is_empty() {
+                        continue;
+                    }
+
+                    // Decode the list if a decoding transform is required, lazily
+                    let mut arr_iter = arr
+                        .iter()
+                        .flatten()
+                        .map(|arr| {
+                            decoder
+                                .as_ref()
+                                .map(|decoder| decoder.decode(&name, &arr))
+                                .unwrap_or(arr)
+                        })
+                        .peekable();
+
+                    // Use the first array post-decode here to infer the "real" data type
+                    let first = arr_iter.peek().unwrap();
+                    {
+                        match first.data_type() {
+                            DataType::Float32 => {
+                                for arr in arr_iter {
+                                    extend_array!(arr, Float32Array);
+                                }
                             }
-                        }
-                        DataType::Float64 => {
-                            for arr in arr.iter().flatten() {
-                                let buf: &Float64Array = arr.as_primitive();
-                                extend_array!(buf);
+                            DataType::Float64 => {
+                                for arr in arr_iter {
+                                    extend_array!(arr, Float64Array);
+                                }
                             }
-                        }
-                        DataType::Int32 => {
-                            for arr in arr.iter().flatten() {
-                                let buf: &Int32Array = arr.as_primitive();
-                                extend_array!(buf);
+                            DataType::Int32 => {
+                                for arr in arr_iter {
+                                    extend_array!(arr, Int32Array);
+                                }
                             }
-                        }
-                        DataType::Int64 => {
-                            for arr in arr.iter().flatten() {
-                                let buf: &Int64Array = arr.as_primitive();
-                                extend_array!(buf);
+                            DataType::Int64 => {
+                                for arr in arr_iter {
+                                    extend_array!(arr, Int64Array);
+                                }
                             }
-                        }
-                        DataType::UInt8 => {
-                            for arr in arr.iter().flatten() {
-                                let buf: &UInt8Array = arr.as_primitive();
-                                extend_array!(buf);
+                            DataType::UInt8 => {
+                                for arr in arr_iter {
+                                    extend_array!(arr, UInt8Array);
+                                }
                             }
-                        }
-                        DataType::LargeUtf8 => {
-                            todo!("String arrays not supported yet")
-                        }
-                        DataType::Utf8 => {}
-                        dt => {
-                            panic!("Unsupported array type: {dt:?}");
+                            DataType::LargeUtf8 => {
+                                todo!("String arrays not supported yet")
+                            }
+                            DataType::Utf8 => {}
+                            dt => {
+                                panic!("Unsupported array type: {dt:?}");
+                            }
                         }
                     }
                 }

@@ -1,6 +1,6 @@
-use std::{collections::HashMap, io, marker::PhantomData, sync::Arc};
+use std::{io, marker::PhantomData, sync::Arc};
 
-use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
     arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
@@ -12,10 +12,10 @@ use mzdata::{meta::FileMetadataConfig, prelude::*};
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries,
+    BufferContext, ToMzPeakDataSeries,
     chunk_series::ChunkingStrategy,
     entry::Entry,
-    peak_series::{ArrayIndex, ArrayIndexEntry},
+    peak_series::ArrayIndex,
     writer::{
         AbstractMzPeakWriter, ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder,
         PointBuffers, implement_mz_metadata,
@@ -185,29 +185,7 @@ impl<
     implement_mz_metadata!();
 
     fn add_array_metadata(&mut self) {
-        let mut spectrum_array_index =
-            ArrayIndex::new(self.spectrum_buffers.prefix().to_string(), HashMap::new());
-        if let Ok(sub) = self
-            .spectrum_buffers
-            .schema()
-            .field_with_name(&self.spectrum_buffers.prefix().to_string())
-            .cloned()
-        {
-            if let DataType::Struct(fields) = sub.data_type() {
-                for f in fields.iter() {
-                    if f.name() == "spectrum_index" {
-                        continue;
-                    }
-                    let buffer_name =
-                        BufferName::from_field(BufferContext::Spectrum, f.clone()).unwrap();
-                    let aie = ArrayIndexEntry::from_buffer_name(
-                        self.spectrum_buffers.prefix().to_string(),
-                        buffer_name,
-                    );
-                    spectrum_array_index.insert(aie.array_type.clone(), aie);
-                }
-            }
-        }
+        let spectrum_array_index: ArrayIndex = self.spectrum_buffers.as_array_index();
         self.data_writer.append_key_value_metadata(KeyValue::new(
             "spectrum_array_index".to_string(),
             spectrum_array_index.to_json(),

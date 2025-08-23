@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Field, FieldRef};
 use mzdata::{
     params::{ParamLike, Unit},
     prelude::ByteArrayView,
-    spectrum::{ArrayType, BinaryDataArrayType, DataArray},
+    spectrum::{ArrayType, BinaryDataArrayType, DataArray, bindata::BinaryCompressionType},
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,19 @@ impl BufferContext {
             DataType::UInt64,
             true,
         ))
+    }
+
+    pub const fn name(&self) -> &'static str {
+        match self {
+            BufferContext::Spectrum => "spectrum",
+            BufferContext::Chromatogram => "chromatogram",
+        }
+    }
+}
+
+impl Display for BufferContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -101,7 +114,7 @@ pub struct BufferName {
     pub unit: Unit,
     /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
-    pub transform: Option<CURIE>,
+    pub transform: Option<BufferTransform>,
 }
 
 impl PartialEq for BufferName {
@@ -147,6 +160,47 @@ impl Ord for BufferName {
 impl PartialOrd for BufferName {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BufferTransform {
+    NumpressLinear,
+    NumpressSLOF,
+    NumpressPIC,
+}
+
+impl BufferTransform {
+    pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
+        match accession {
+            x if x == Self::NumpressSLOF.curie() => Some(Self::NumpressSLOF),
+            x if x == Self::NumpressPIC.curie() => Some(Self::NumpressPIC),
+            x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
+            _ => None,
+        }
+    }
+
+    pub fn curie(&self) -> CURIE {
+        match self {
+            BufferTransform::NumpressSLOF => BinaryCompressionType::NumpressSLOF
+                .as_param()
+                .unwrap()
+                .curie()
+                .unwrap()
+                .into(),
+            BufferTransform::NumpressPIC => BinaryCompressionType::NumpressPIC
+                .as_param()
+                .unwrap()
+                .curie()
+                .unwrap()
+                .into(),
+            BufferTransform::NumpressLinear => BinaryCompressionType::NumpressLinear
+                .as_param()
+                .unwrap()
+                .curie()
+                .unwrap()
+                .into(),
+        }
     }
 }
 
@@ -324,7 +378,7 @@ impl BufferName {
         self
     }
 
-    pub const fn with_transform(mut self, transform: Option<CURIE>) -> Self {
+    pub const fn with_transform(mut self, transform: Option<BufferTransform>) -> Self {
         self.transform = transform;
         self
     }
@@ -336,6 +390,14 @@ impl BufferName {
     pub const fn with_unit(mut self, unit: Unit) -> Self {
         self.unit = unit;
         self
+    }
+
+    pub fn array_name(&self) -> String {
+        if let ArrayType::NonStandardDataArray { name } = &self.array_type {
+            name.to_string()
+        } else {
+            self.array_type.as_param(None).name().to_string()
+        }
     }
 
     pub fn as_field_metadata(&self) -> HashMap<String, String> {
@@ -362,20 +424,13 @@ impl BufferName {
                     .map(|c| c.to_string())
                     .unwrap_or_default(),
             ),
-            (
-                "array_name".to_string(),
-                if let ArrayType::NonStandardDataArray { name } = &self.array_type {
-                    name.to_string()
-                } else {
-                    self.array_type.as_param(None).name().to_string()
-                },
-            ),
+            ("array_name".to_string(), self.array_name()),
             ("buffer_format".to_string(), self.buffer_format.to_string()),
         ]
         .into_iter()
         .collect();
         if let Some(trfm) = self.transform.as_ref() {
-            meta.insert("transform".to_string(), trfm.to_string());
+            meta.insert("transform".to_string(), trfm.curie().to_string());
         }
         meta
     }
@@ -419,9 +474,10 @@ impl BufferName {
                 }
                 "transform" => {
                     transform = v
-                        .parse()
+                        .parse::<CURIE>()
                         .inspect_err(|e| log::error!("Failed to parse transform: {e}"))
-                        .ok();
+                        .ok()
+                        .and_then(|v| BufferTransform::from_curie(v));
                 }
                 _ => {}
             }
@@ -460,10 +516,7 @@ impl BufferName {
 
 impl Display for BufferName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let context = match self.context {
-            BufferContext::Spectrum => "spectrum",
-            BufferContext::Chromatogram => "chromatogram",
-        };
+        let context = self.context.name();
         let tp_name = match &self.array_type {
             ArrayType::Unknown => Cow::Borrowed("unknown"),
             ArrayType::MZArray => Cow::Borrowed("mz"),
@@ -669,18 +722,29 @@ impl ArrayIndexEntry {
         }
     }
 
-    pub fn from_buffer_name(prefix: String, buffer_name: BufferName) -> Self {
-        let path = vec![prefix.clone(), buffer_name.to_string()].join(".");
+    pub fn from_buffer_name(
+        prefix: String,
+        buffer_name: BufferName,
+        field: Option<&Field>,
+    ) -> Self {
+        let path = vec![
+            prefix.clone(),
+            field
+                .map(|f| f.name().to_string())
+                .unwrap_or_else(|| buffer_name.to_string()),
+        ]
+        .join(".");
+
         Self {
             context: buffer_name.context,
             prefix,
             path,
             data_type: array_to_arrow_type(buffer_name.dtype),
-            name: buffer_name.to_string(),
+            name: buffer_name.array_name(),
             array_type: buffer_name.array_type,
             unit: buffer_name.unit,
             buffer_format: buffer_name.buffer_format,
-            transform: None,
+            transform: buffer_name.transform.map(|t| t.curie()),
         }
     }
 

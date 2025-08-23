@@ -95,6 +95,7 @@ pub trait ArrayBufferWriter {
                         let aie = ArrayIndexEntry::from_buffer_name(
                             self.prefix().to_string(),
                             buffer_name,
+                            Some(&f)
                         );
                         spectrum_array_index.insert(aie.array_type.clone(), aie);
                     } else {

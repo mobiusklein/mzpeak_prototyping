@@ -6,9 +6,7 @@ use mzdata::{
     spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity},
 };
 use mzpeak_prototyping::{
-    chunk_series::ChunkingStrategy,
-    peak_series::{BufferContext, BufferName},
-    writer::{sample_array_types_from_file_reader, ArrayBuffersBuilder, MzPeakWriterType},
+    buffer_descriptors::BufferTransform, chunk_series::ChunkingStrategy, peak_series::{BufferContext, BufferName}, writer::{sample_array_types_from_file_reader, ArrayBuffersBuilder, MzPeakWriterType}
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
@@ -93,6 +91,12 @@ pub struct ConvertArgs {
         help = "Encode the intensity values using float32"
     )]
     pub intensity_f32: bool,
+
+    #[arg(
+        long = "intensity-numpress-slof",
+        help = "Encode the intensity values using the Numpress Short Logged Float transform"
+    )]
+    pub intensity_slof: bool,
 
     #[arg(
         short = 'i',
@@ -295,6 +299,7 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
         );
     }
 
+    let intensity_transform = args.intensity_slof.then(|| BufferTransform::NumpressSLOF);
     if args.intensity_f32 {
         overrides.insert(
             BufferName::new(
@@ -306,10 +311,23 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
                 BufferContext::Spectrum,
                 ArrayType::IntensityArray,
                 BinaryDataArrayType::Float32,
-            ),
+            ).with_transform(intensity_transform),
         );
     }
-
+    if intensity_transform.is_some() {
+        overrides.insert(
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Float32,
+            ),
+            BufferName::new(
+                BufferContext::Spectrum,
+                ArrayType::IntensityArray,
+                BinaryDataArrayType::Float32,
+            ).with_transform(intensity_transform),
+        );
+    }
     if args.intensity_i32 {
         overrides.insert(
             BufferName::new(
@@ -321,7 +339,7 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
                 BufferContext::Spectrum,
                 ArrayType::IntensityArray,
                 BinaryDataArrayType::Int32,
-            ),
+            ).with_transform(intensity_transform),
         );
         overrides.insert(
             BufferName::new(
@@ -333,7 +351,7 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
                 BufferContext::Spectrum,
                 ArrayType::IntensityArray,
                 BinaryDataArrayType::Int32,
-            ),
+            ).with_transform(intensity_transform),
         );
     }
 
@@ -357,7 +375,6 @@ pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferNa
             );
         }
     }
-
     overrides
 }
 

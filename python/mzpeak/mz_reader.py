@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import logging
 import json
 
@@ -17,6 +18,27 @@ from .filters import null_delta_decode, fill_nulls
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+@dataclass(frozen=True)
+class BufferName:
+    key: str
+    array_name: str
+    buffer_format: "BufferFormat"
+    context: str
+    prefix: str
+    path: str
+    data_type: str
+    array_type: str
+    unit: str | None
+    transform: str | None
+
+    @classmethod
+    def from_index(cls, key, fields):
+        fields = fields.copy()
+        fmt = fields.pop('buffer_format', None)
+        if fmt:
+            fields['buffer_format'] = BufferFormat[fmt.title()]
+        return cls(key=key, **fields)
 
 
 class _SpectrumDataIndex:
@@ -111,6 +133,7 @@ class _SpectrumDataIndex:
 class BufferFormat(Enum):
     Point = 1
     Chunk = 2
+    Secondary_Chunk = 3
 
 
 class _ChunkIterator:
@@ -119,6 +142,10 @@ class _ChunkIterator:
     current_index: int
     index_column: str
 
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.it}, {self.current_index}, {self.index_column}" \
+               f", buffered={len(self.batch) if self.batch is not None else None})"
+
     def __init__(
         self,
         it: Iterator[pa.StructArray],
@@ -126,7 +153,6 @@ class _ChunkIterator:
         index_column: str = "spectrum_index",
     ):
         self.it = it
-        self.buffer = []
         self.batch = None
         self.current_index = current_index
         self.index_column = index_column
@@ -136,7 +162,7 @@ class _ChunkIterator:
         return pc.min(pc.struct_field(self.batch, self.index_column)).as_py()
 
     def __next__(self):
-        batch = self._extract_next()
+        batch = self._extract_for_index()
         i = self.current_index
         self.current_index += 1
         return i, batch
@@ -155,7 +181,7 @@ class _ChunkIterator:
         logger.debug(f"New batch starts with {lowest_index}")
         self.batch = batch
 
-    def _extract_next(self):
+    def _extract_for_index(self):
         mask = pc.equal(
             pc.struct_field(self.batch, self.index_column), self.current_index
         )
@@ -170,8 +196,10 @@ class _ChunkIterator:
             chunk = self.batch.slice(start, n)
 
         if n == len(self.batch):
+            # This batch is only composed of the current index, so we should also read the next batch in and
+            # take whatever rows correspond to this index too before advancing.
             self._read_next_chunk()
-            rest = self._extract_next()
+            rest = self._extract_for_index()
             chunk = pa.concat_arrays([chunk, rest])
         else:
             self.batch = self.batch.slice(n)
@@ -191,6 +219,17 @@ class _ChunkIterator:
 DELTA_ENCODING = {"cv_id": 1, "accession": 1003089}
 NO_COMPRESSION = {"cv_id": 1, "accession": 1000576}
 NUMPRESS_LINEAR = {"cv_id": 1, "accession": 1002312}
+
+NUMPRESS_SLOF = "MS:1002314"
+NUMPRESS_PIC = "MS:1002313"
+
+psims_dtypes = {
+    "MS:1000521": np.float32,
+    "MS:1000523": np.float64,
+    "MS:1000519": np.int32,
+    "MS:1000522": np.int64,
+    "MS:1001479": np.uint8,
+}
 
 
 class MzPeakSpectrumDataReader:
@@ -318,6 +357,8 @@ class MzPeakSpectrumDataReader:
         axis_prefix: str = "spectrum_mz_f64",
         delta_model: float | np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
+        has_transforms = {k: v.get('transform') for k, v in self.array_index.items() if v.get('transform')}
+
         n = 0
         numpress_chunks = []
         for chunk in chunks:
@@ -345,7 +386,9 @@ class MzPeakSpectrumDataReader:
             ):
                 continue
             else:
-                arrays_of[k] = np.zeros(n, dtype=np.asarray(v.values).dtype)
+                arrays_of[k] = np.zeros(
+                    n, dtype=psims_dtypes[self.array_index[k]["data_type"]]
+                )
 
         main_axis_array = np.zeros(n)
         offset = 0
@@ -402,7 +445,15 @@ class MzPeakSpectrumDataReader:
                 ):
                     continue
                 else:
-                    arrays_of[k][offset : offset + chunk_size] = np.asarray(v.values)
+                    values = np.asarray(v.values)
+                    if k in has_transforms:
+                        if has_transforms[k] == NUMPRESS_SLOF:
+                            values = pynumpress.decode_slof(values)
+                        elif has_transforms[k] == NUMPRESS_PIC:
+                            values = pynumpress.decode_pic(values)
+                        else:
+                            raise NotImplementedError(has_transforms[k])
+                    arrays_of[k][offset : offset + chunk_size] = values
 
             offset += chunk_size
         arrays_of[axis_prefix] = main_axis_array
@@ -410,6 +461,9 @@ class MzPeakSpectrumDataReader:
         rename_map = {
             k: v["array_name"] for k, v in self.array_index.items() if k in arrays_of
         }
+        rename_map[axis_prefix] = self.array_index[
+            f"{axis_prefix}_chunk_values"
+        ]['array_name']
         for k, v in rename_map.items():
             arrays_of[v] = arrays_of.pop(k)
             if v == "intensity array" and had_nulls:
@@ -461,10 +515,10 @@ class MzPeakSpectrumDataReader:
         )
         return self._clean_point_batch(data)
 
-    def _read_chunk(self, spectrum_index: int, rgs: list[int], debug: bool = False):
+    def _read_chunk(self, spectrum_index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512):
         chunks = []
         it = _ChunkIterator(
-            self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"])
+            self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"])
         )
         it.seek(spectrum_index)
         batch: pa.RecordBatch

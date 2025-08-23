@@ -6,9 +6,9 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, ArrowPrimitiveType, AsArray, Float32Array, Float32Builder,
     Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    LargeBinaryArray, LargeBinaryBuilder, LargeListBuilder, PrimitiveArray, StructArray,
-    StructBuilder, UInt8Array, UInt8Builder, UInt32Builder, UInt64Array, UInt64Builder,
-    new_null_array,
+    LargeBinaryArray, LargeBinaryBuilder, LargeListArray, LargeListBuilder, PrimitiveArray,
+    StructArray, StructBuilder, UInt8Array, UInt8Builder, UInt32Builder, UInt64Array,
+    UInt64Builder, new_null_array,
 };
 use arrow::compute::kernels::nullif;
 use arrow::datatypes::{
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use bytemuck::Pod;
 use num_traits::{Float, NumCast, ToPrimitive, Zero};
 
+use crate::buffer_descriptors::BufferTransform;
 use crate::filter::{
     _skip_zero_runs_gen, _skip_zero_runs_iter, MZDeltaModel, RegressionDeltaModel, fill_nulls_for,
     is_zero_pair_mask, null_chunk_every_k, null_delta_decode, null_delta_encode, take_data_array,
@@ -135,7 +136,7 @@ impl ChunkingStrategy {
                     main_axis_name.dtype,
                 )
                 .with_format(BufferFormat::Chunked)
-                .with_transform(Some(curie!(MS:1002312)))
+                .with_transform(Some(BufferTransform::NumpressLinear))
                 .as_field_metadata();
                 let bytes = Field::new(
                     format!("{}_numpress_bytes", main_axis_name),
@@ -364,6 +365,194 @@ impl ChunkingStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferTransformEncoder(pub(crate) BufferTransform);
+
+impl BufferTransformEncoder {
+    pub fn to_buffer_name(&self, buffer_name: &BufferName) -> BufferName {
+        match self.0 {
+            BufferTransform::NumpressLinear => todo!(),
+            BufferTransform::NumpressSLOF => {
+                BufferName::new(
+                    buffer_name.context,
+                    ArrayType::nonstandard(format!("{}_numpress_slof_bytes", buffer_name)),
+                    buffer_name.dtype,
+                )
+                .with_format(BufferFormat::ChunkedSecondary)
+                .with_transform(Some(self.0))
+            }
+            BufferTransform::NumpressPIC => {
+                BufferName::new(
+                    buffer_name.context,
+                    ArrayType::nonstandard(format!("{}_numpress_pic_bytes", buffer_name)),
+                    buffer_name.dtype,
+                )
+                .with_format(BufferFormat::ChunkedSecondary)
+                .with_transform(Some(self.0))
+            }
+        }
+    }
+
+    pub fn to_field(&self, buffer_name: &BufferName) -> Field {
+        match self.0 {
+            BufferTransform::NumpressLinear => todo!(),
+            BufferTransform::NumpressSLOF => {
+                // let meta = self.to_buffer_name(buffer_name).as_field_metadata();
+                let meta = buffer_name.as_field_metadata();
+                let bytes = Field::new(
+                    format!("{}_numpress_slof_bytes", buffer_name),
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
+                    true,
+                )
+                .with_metadata(meta);
+                bytes
+            }
+            BufferTransform::NumpressPIC => {
+                // let meta = self.to_buffer_name(buffer_name).as_field_metadata();
+                let meta = buffer_name.as_field_metadata();
+                let bytes = Field::new(
+                    format!("{}_numpress_pic_bytes", buffer_name),
+                    DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
+                    true,
+                )
+                .with_metadata(meta);
+                bytes
+            }
+        }
+    }
+
+    pub fn visit_builder(
+        &self,
+        buffer_name: &BufferName,
+        chunk: &ArrowArrayChunk,
+        chunk_builder: &mut StructBuilder,
+        schema: &Schema,
+        visited: &mut HashSet<usize>,
+    ) {
+        // The buffer name's array is already the name of the field we want, we don't want to
+        // use the full buffer name formatting again
+        let f = self.to_field(buffer_name);
+        let q = f.name();
+        let idx =  schema
+                .fields()
+                .iter()
+                .position(|p| p.name() == q)
+                .unwrap();
+
+        if visited.contains(&idx) {
+            return;
+        }
+        visited.insert(idx);
+        let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
+            chunk_builder.field_builder(idx).unwrap();
+
+        if let Some(chunk_segment) = chunk.arrays.get(buffer_name) {
+            let inner = b
+                .values()
+                .as_any_mut()
+                .downcast_mut::<UInt8Builder>()
+                .unwrap();
+            let bytes: &UInt8Array = chunk_segment.as_primitive();
+            inner.extend(bytes);
+            b.append(true);
+        } else {
+            b.append_null();
+        }
+    }
+
+    pub fn encode_arrow(&self, buffer_name: &BufferName, chunk_segment: &impl AsArray) -> ArrayRef {
+        match self.0 {
+            BufferTransform::NumpressLinear => todo!(),
+            BufferTransform::NumpressPIC => {
+                let mut bytes = Vec::new();
+                if let Some(vals) = chunk_segment.as_primitive_opt::<Float32Type>() {
+                    let vals = vals.values();
+                    numpress_rs::encode_pic(&vals, &mut bytes).unwrap();
+                } else if let Some(vals) = chunk_segment.as_primitive_opt::<Float64Type>() {
+                    let vals = vals.values();
+                    numpress_rs::encode_pic(&vals, &mut bytes).unwrap();
+                } else {
+                    todo!()
+                }
+                Arc::new(UInt8Array::from(bytes))
+            }
+            BufferTransform::NumpressSLOF => {
+                let mut bytes = Vec::new();
+                if let Some(vals) = chunk_segment.as_primitive_opt::<Float32Type>() {
+                    let vals = vals.values();
+                    let fp = numpress_rs::optimal_slof_fixed_point(&vals);
+                    numpress_rs::encode_slof(&vals, &mut bytes, fp).unwrap();
+                } else if let Some(vals) = chunk_segment.as_primitive_opt::<Float64Type>() {
+                    let vals = vals.values();
+                    let fp = numpress_rs::optimal_slof_fixed_point(&vals);
+                    numpress_rs::encode_slof(&vals, &mut bytes, fp).unwrap();
+                } else {
+                    todo!()
+                }
+                let bytes = UInt8Array::from(bytes);
+                Arc::new(bytes)
+            }
+        }
+    }
+}
+
+impl From<BufferTransform> for BufferTransformEncoder {
+    fn from(value: BufferTransform) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferTransformDecoder(pub(crate) BufferTransform);
+
+impl BufferTransformDecoder {
+    pub fn decode(&self, buffer_name: &BufferName, array: &impl AsArray) -> ArrayRef {
+        match self.0 {
+            BufferTransform::NumpressLinear => todo!(),
+            BufferTransform::NumpressSLOF => {
+                let data: &UInt8Array = array.as_primitive();
+                match buffer_name.dtype {
+                    BinaryDataArrayType::Float64 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        numpress_rs::decode_slof(data.values(), &mut acc).unwrap();
+                        return Arc::new(Float64Array::from(acc))
+                    },
+                    BinaryDataArrayType::Float32 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        numpress_rs::decode_slof(data.values(), &mut acc).unwrap();
+                        return Arc::new(Float32Array::from_iter_values(acc.into_iter().map(|v| v as f32)))
+                    },
+                    _ => todo!()
+                }
+            },
+            BufferTransform::NumpressPIC => {
+                let data: &UInt8Array = array.as_primitive();
+                match buffer_name.dtype {
+                    BinaryDataArrayType::Float64 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        numpress_rs::decode_pic(data.values(), &mut acc).unwrap();
+                        return Arc::new(Float64Array::from(acc))
+                    },
+                    BinaryDataArrayType::Float32 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        numpress_rs::decode_pic(data.values(), &mut acc).unwrap();
+                        return Arc::new(Float32Array::from_iter_values(acc.into_iter().map(|v| v as f32)))
+                    },
+                    _ => todo!()
+                }
+            },
+        }
+    }
+}
+
+impl From<BufferTransform> for BufferTransformDecoder {
+    fn from(value: BufferTransform) -> Self {
+        Self(value)
+    }
+}
+
+
+
 #[derive(Debug, Clone)]
 pub struct ArrowArrayChunk {
     /// The index of source entity
@@ -511,51 +700,62 @@ impl ArrowArrayChunk {
                 {
                     let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                         this_builder.field_builder(i).unwrap();
-                    if let Some(arr) = chunk.arrays.get(&buf_name) {
-                        match array_to_arrow_type(buf_name.dtype) {
-                            DataType::Int32 => {
-                                let inner = b
-                                    .values()
-                                    .as_any_mut()
-                                    .downcast_mut::<Int32Builder>()
-                                    .unwrap();
-                                inner.append_array(arr.as_primitive());
-                            }
-                            DataType::Int64 => {
-                                let inner = b
-                                    .values()
-                                    .as_any_mut()
-                                    .downcast_mut::<Int64Builder>()
-                                    .unwrap();
-                                inner.append_array(arr.as_primitive());
-                            }
-                            DataType::Float32 => {
-                                let inner = b
-                                    .values()
-                                    .as_any_mut()
-                                    .downcast_mut::<Float32Builder>()
-                                    .unwrap();
-                                inner.append_array(arr.as_primitive());
-                            }
-                            DataType::Float64 => {
-                                let inner = b
-                                    .values()
-                                    .as_any_mut()
-                                    .downcast_mut::<Float64Builder>()
-                                    .unwrap();
-                                inner.append_array(arr.as_primitive());
-                            }
-                            DataType::LargeBinary => todo!(),
-                            tp => {
-                                unimplemented!(
-                                    "Array type {tp:?} from {:?} not supported",
-                                    buf_name.dtype
-                                )
-                            }
-                        }
-                        b.append(true);
+                        if let Some(transform) = buf_name.transform.map(BufferTransformEncoder) {
+                        transform.visit_builder(
+                            &buf_name,
+                            chunk,
+                            &mut this_builder,
+                            &this_schema,
+                            &mut visited,
+                        );
                     } else {
-                        b.append_null();
+                        if let Some(arr) = chunk.arrays.get(&buf_name) {
+                            match array_to_arrow_type(buf_name.dtype) {
+                                DataType::Int32 => {
+                                    let inner = b
+                                        .values()
+                                        .as_any_mut()
+                                        .downcast_mut::<Int32Builder>()
+                                        .unwrap();
+                                    inner.append_array(arr.as_primitive());
+                                }
+                                DataType::Int64 => {
+                                    let inner = b
+                                        .values()
+                                        .as_any_mut()
+                                        .downcast_mut::<Int64Builder>()
+                                        .unwrap();
+                                    inner.append_array(arr.as_primitive());
+                                }
+                                DataType::Float32 => {
+                                    let inner = b
+                                        .values()
+                                        .as_any_mut()
+                                        .downcast_mut::<Float32Builder>()
+                                        .unwrap();
+                                    inner.append_array(arr.as_primitive());
+                                }
+                                DataType::Float64 => {
+                                    let inner = b
+                                        .values()
+                                        .as_any_mut()
+                                        .downcast_mut::<Float64Builder>()
+                                        .unwrap();
+                                    inner.append_array(arr.as_primitive());
+                                }
+                                DataType::LargeBinary => todo!(),
+                                tp => {
+                                    unimplemented!(
+                                        "Array type {tp:?} from {:?} not supported",
+                                        buf_name.dtype
+                                    )
+                                }
+                            }
+
+                            b.append(true);
+                        } else {
+                            b.append_null();
+                        }
                     }
                 } else {
                     if !visited.contains(&i) {
@@ -610,10 +810,18 @@ impl ArrowArrayChunk {
         ];
 
         for buffer_name in self.arrays.keys().sorted() {
-            let f_of = buffer_name.to_field();
-            let dtype =
-                DataType::LargeList(Arc::new(Field::new("item", f_of.data_type().clone(), true)));
-            fields_of.push(Arc::new((*f_of).clone().with_data_type(dtype)));
+            if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
+                let f_of = transform.to_field(buffer_name);
+                fields_of.push(Arc::new(f_of));
+            } else {
+                let f_of = buffer_name.to_field();
+                let dtype = DataType::LargeList(Arc::new(Field::new(
+                    "item",
+                    f_of.data_type().clone(),
+                    true,
+                )));
+                fields_of.push(Arc::new((*f_of).clone().with_data_type(dtype)));
+            }
         }
 
         for enc in encodings.iter() {
@@ -654,13 +862,22 @@ impl ArrowArrayChunk {
                 overrides.get(&name).unwrap_or(&name)
             };
             if let Some(fields) = fields {
+                let field_name = if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
+                    transform.to_field(buffer_name).name().clone()
+                } else {
+                    buffer_name.to_field().name().clone()
+                };
                 /// If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
-                if !fields
-                    .find(buffer_name.to_field().name()).is_some() && *buffer_name != main_axis {
-                        log::debug!("Skipping {:?}, not in schema: {fields:?}", buffer_name.to_field().name());
-                        auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
-                        continue
-                    }
+                if !fields.find(&field_name).is_some()
+                    && *buffer_name != main_axis
+                {
+                    log::debug!(
+                        "Skipping {:?}, not in schema: {fields:?}",
+                        buffer_name.to_field().name()
+                    );
+                    auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
+                    continue;
+                }
             }
             if matches!(buffer_name.array_type, ArrayType::IntensityArray) {
                 intensity_idx = Some(i);
@@ -773,16 +990,20 @@ impl ArrowArrayChunk {
                 _ => unimplemented!("{}", main_axis),
             };
 
-            let chunk_arrays: HashMap<BufferName, ArrayRef> = arrow_arrays
+            let mut chunk_arrays: HashMap<BufferName, ArrayRef> = Default::default();
+            for (k, v) in arrow_arrays
                 .iter()
                 .filter(|(k, _)| k.array_type != main_axis.array_type)
-                .map(|(k, v)| {
-                    (
-                        k.clone().with_format(BufferFormat::ChunkedSecondary),
-                        v.slice(step.start, step.end - step.start),
-                    )
-                })
-                .collect();
+            {
+                let k = k.clone().with_format(BufferFormat::ChunkedSecondary);
+                let v = v.slice(step.start, step.end - step.start);
+                if let Some(transform) = k.transform.map(BufferTransformEncoder) {
+                    let vi = transform.encode_arrow(&k, &v);
+                    chunk_arrays.insert(k, vi);
+                } else {
+                    chunk_arrays.insert(k, v);
+                }
+            }
 
             chunks.push(Self::new(
                 series_index,
@@ -798,7 +1019,6 @@ impl ArrowArrayChunk {
         Ok((chunks, auxiliary_arrays))
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -924,6 +1144,59 @@ mod test {
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_arrow_transform() -> io::Result<()> {
+        let arrays = get_arrays_from_mzml()?;
+        let target = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::MZArray,
+            BinaryDataArrayType::Float32,
+        );
+
+        let intensity_name = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::IntensityArray,
+            BinaryDataArrayType::Float32,
+        );
+        let intensity_name_tfm = intensity_name
+            .clone()
+            .with_transform(Some(BufferTransform::NumpressSLOF));
+        let overrides = HashMap::from_iter(vec![(intensity_name, intensity_name_tfm)]);
+
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
+            0,
+            target,
+            &arrays,
+            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &overrides,
+            false,
+            false,
+            None,
+        )?;
+
+        let schema = chunks[0].to_schema(
+            "spectrum_index",
+            &[
+                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                ChunkingStrategy::Delta { chunk_size: 50.0 },
+            ],
+        );
+
+        let rendered = ArrowArrayChunk::to_struct_array(
+            &chunks,
+            "spectrum_index",
+            Schema::empty().fields(),
+            &[
+                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                ChunkingStrategy::Delta { chunk_size: 50.0 },
+            ],
+        );
+
+        eprintln!("{:?}", rendered.slice(0, 1));
+
         Ok(())
     }
 

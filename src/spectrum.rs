@@ -1,7 +1,10 @@
 use mzdata::{
     params::{ControlledVocabulary, Unit},
     prelude::*,
-    spectrum::{bindata::{ArrayRetrievalError, BinaryCompressionType}, ArrayType, BinaryDataArrayType, DataArray, IsolationWindowState, ScanEvent},
+    spectrum::{
+        ArrayType, BinaryDataArrayType, DataArray, IsolationWindowState, ScanEvent,
+        bindata::{ArrayRetrievalError, BinaryCompressionType},
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +37,6 @@ impl TryFrom<DataArray> for AuxiliaryArray {
 }
 
 impl AuxiliaryArray {
-
     pub fn into_data_array(self) -> DataArray {
         let mut chosen_compression = BinaryCompressionType::NoCompression;
         for method in BinaryCompressionType::COMPRESSION_METHODS.iter() {
@@ -42,7 +44,7 @@ impl AuxiliaryArray {
                 let acc: CURIE = method_param.curie().unwrap().into();
                 if acc == self.compression {
                     chosen_compression = *method;
-                    break
+                    break;
                 }
             }
         }
@@ -75,7 +77,12 @@ impl AuxiliaryArray {
         let mut result = DataArray::wrap(&name, dtype, data);
         result.compression = chosen_compression;
         if !self.parameters.is_empty() {
-            result.params = Some(Box::new(self.parameters.into_iter().map(mzdata::Param::from).collect()));
+            result.params = Some(Box::new(
+                self.parameters
+                    .into_iter()
+                    .map(mzdata::Param::from)
+                    .collect(),
+            ));
         }
         result
     }
@@ -502,4 +509,58 @@ pub struct ChromatogramEntry {
     pub chromatogram_type: CURIE,
     pub number_of_data_points: Option<u64>,
     pub parameters: Vec<Param>,
+
+    pub data_processing_ref: Option<u32>,
+    pub auxiliary_arrays: Vec<AuxiliaryArray>,
+    pub number_of_auxiliary_arrays: u32,
+}
+
+impl ChromatogramEntry {
+    pub fn from_chromatogram(chromatogram: &impl ChromatogramLike) -> ChromatogramEntry {
+        let chromatogram_type: CURIE = chromatogram.chromatogram_type().to_curie().into();
+        let id = chromatogram.id().to_string();
+        let polarity = match chromatogram.polarity() {
+            mzdata::spectrum::ScanPolarity::Unknown => 0,
+            mzdata::spectrum::ScanPolarity::Positive => 1,
+            mzdata::spectrum::ScanPolarity::Negative => -1,
+        };
+
+        let parameters: Vec<Param> = chromatogram
+            .iter_params()
+            .map(|v| Param::from(v.clone()))
+            .collect();
+
+        Self {
+            index: Some(chromatogram.index() as u64),
+            id,
+            polarity,
+            chromatogram_type,
+            parameters,
+            ..Default::default()
+        }
+    }
+
+    pub fn new(
+        index: Option<u64>,
+        id: String,
+        polarity: i8,
+        chromatogram_type: CURIE,
+        number_of_data_points: Option<u64>,
+        parameters: Vec<Param>,
+        data_processing_ref: Option<u32>,
+        auxiliary_arrays: Vec<AuxiliaryArray>,
+        number_of_auxiliary_arrays: u32,
+    ) -> Self {
+        Self {
+            index,
+            id,
+            polarity,
+            chromatogram_type,
+            number_of_data_points,
+            parameters,
+            data_processing_ref,
+            auxiliary_arrays,
+            number_of_auxiliary_arrays,
+        }
+    }
 }

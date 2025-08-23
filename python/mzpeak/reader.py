@@ -450,6 +450,10 @@ class MzPeakFile:
         return self.spectrum_metadata.bpc()
 
     @property
+    def has_secondary_peaks_data(self) -> bool:
+        return self.spectrum_peak_data is not None
+
+    @property
     def spectra(self):
         return self.spectrum_metadata.spectra
 
