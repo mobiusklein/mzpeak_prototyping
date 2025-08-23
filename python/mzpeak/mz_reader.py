@@ -461,9 +461,16 @@ class MzPeakSpectrumDataReader:
         rename_map = {
             k: v["array_name"] for k, v in self.array_index.items() if k in arrays_of
         }
-        rename_map[axis_prefix] = self.array_index[
-            f"{axis_prefix}_chunk_values"
-        ]['array_name']
+
+        if f"{axis_prefix}_chunk_values" in self.array_index:
+            rename_map[axis_prefix] = self.array_index[
+                f"{axis_prefix}_chunk_values"
+            ]['array_name']
+        elif axis_prefix in self.array_index:
+            rename_map[axis_prefix] = self.array_index[axis_prefix][
+                "array_name"
+            ]
+
         for k, v in rename_map.items():
             arrays_of[v] = arrays_of.pop(k)
             if v == "intensity array" and had_nulls:
