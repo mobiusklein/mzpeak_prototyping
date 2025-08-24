@@ -370,6 +370,8 @@ struct SchemaMetadataManager {
     spectrum_data_arrays: Option<MzPeakArchiveEntry>,
     spectrum_metadata: Option<MzPeakArchiveEntry>,
     peaks_data_arrays: Option<MzPeakArchiveEntry>,
+    chromatogram_metadata: Option<MzPeakArchiveEntry>,
+    chromatogram_data_arrays: Option<MzPeakArchiveEntry>,
 }
 
 pub struct ZipArchiveReader {
@@ -389,7 +391,14 @@ impl ZipArchiveReader {
                 MzPeakArchiveType::SpectrumMetadata
             } else if name.ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()) {
                 MzPeakArchiveType::SpectrumPeakDataArrays
-            } else {
+            }
+            else if name.ends_with(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix()) {
+                MzPeakArchiveType::ChromatogramMetadata
+            }
+            else if name.ends_with(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix()) {
+                MzPeakArchiveType::ChromatogramDataArrays
+            }
+            else {
                 MzPeakArchiveType::Other
             };
             let entry = MzPeakArchiveEntry {
@@ -408,9 +417,13 @@ impl ZipArchiveReader {
                 MzPeakArchiveType::SpectrumPeakDataArrays => {
                     members.peaks_data_arrays = Some(entry)
                 }
-                MzPeakArchiveType::ChromatogramMetadata => todo!(),
-                MzPeakArchiveType::ChromatogramDataArrays => todo!(),
-                MzPeakArchiveType::Other => todo!(),
+                MzPeakArchiveType::ChromatogramMetadata => {
+                    members.chromatogram_metadata = Some(entry)
+                },
+                MzPeakArchiveType::ChromatogramDataArrays => {
+                    members.chromatogram_data_arrays = Some(entry)
+                },
+                MzPeakArchiveType::Other => {},
             }
         }
         Ok(Self { archive, members })

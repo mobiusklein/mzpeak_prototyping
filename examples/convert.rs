@@ -2,11 +2,18 @@ use clap::Parser;
 use mzdata::{
     self,
     io::MZReaderType,
+    params::Unit,
     prelude::*,
     spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity},
 };
 use mzpeak_prototyping::{
-    buffer_descriptors::BufferTransform, chunk_series::ChunkingStrategy, peak_series::{BufferContext, BufferName}, writer::{sample_array_types_from_file_reader, ArrayBuffersBuilder, MzPeakWriterType}
+    buffer_descriptors::BufferTransform,
+    chunk_series::ChunkingStrategy,
+    peak_series::{BufferContext, BufferName},
+    writer::{
+        AbstractMzPeakWriter, ArrayBuffersBuilder, MzPeakWriterType,
+        sample_array_types_from_file_reader,
+    },
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
@@ -152,6 +159,144 @@ pub struct ConvertArgs {
     write_peaks_and_profiles: bool,
 }
 
+impl ConvertArgs {
+    pub fn create_type_overrides(&self) -> HashMap<BufferName, BufferName> {
+        let mut overrides = HashMap::new();
+
+        if self.mz_f32 {
+            for unit in [Unit::MZ, Unit::Unknown] {
+                overrides.insert(
+                    BufferName::new(
+                        BufferContext::Spectrum,
+                        ArrayType::MZArray,
+                        BinaryDataArrayType::Float64,
+                    )
+                    .with_unit(unit),
+                    BufferName::new(
+                        BufferContext::Spectrum,
+                        ArrayType::MZArray,
+                        BinaryDataArrayType::Float32,
+                    )
+                    .with_unit(unit),
+                );
+            }
+        }
+
+        let intensity_transform = self.intensity_slof.then(|| BufferTransform::NumpressSLOF);
+        if self.chunked_encoding.is_none() && intensity_transform.is_some() {
+            log::warn!(
+                "Signal transforms require chunked encoding, without chunked encoding this will have no effect"
+            );
+        }
+        for ctx in [BufferContext::Chromatogram, BufferContext::Spectrum] {
+            for unit in [
+                Unit::Unknown,
+                Unit::DetectorCounts,
+                Unit::PercentBasePeak,
+                Unit::PercentBasePeakTimes100,
+                Unit::AbsorbanceUnit,
+                Unit::CountsPerSecond,
+                Unit::Pascal,
+                Unit::Percent,
+                Unit::Psi,
+                Unit::Kelvin,
+                Unit::MicrolitersPerMinute,
+            ] {
+                if self.intensity_f32 {
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float64,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit)
+                        .with_transform(intensity_transform),
+                    );
+                }
+                if intensity_transform.is_some() {
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        ),
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_transform(intensity_transform),
+                    );
+                }
+                if self.intensity_i32 {
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        ),
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Int32,
+                        )
+                        .with_transform(intensity_transform),
+                    );
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float64,
+                        ),
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Int32,
+                        )
+                        .with_transform(intensity_transform),
+                    );
+                }
+            }
+        }
+        if self.ion_mobility_f32 {
+            for unit in [
+                Unit::Unknown,
+                Unit::Millisecond,
+                Unit::VoltSecondPerSquareCentimeter,
+                Unit::Volt,
+            ] {
+                for t in [
+                    ArrayType::MeanInverseReducedIonMobilityArray,
+                    ArrayType::RawDriftTimeArray,
+                    ArrayType::RawIonMobilityArray,
+                ] {
+                    overrides.insert(
+                        BufferName::new(
+                            BufferContext::Spectrum,
+                            t.clone(),
+                            BinaryDataArrayType::Float64,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(
+                            BufferContext::Spectrum,
+                            t.clone(),
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit),
+                    );
+                }
+            }
+        }
+        overrides
+    }
+}
+
 pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
     let start = Instant::now();
 
@@ -176,7 +321,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&input_path)
         .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
 
-    let overrides = create_type_overrides(args);
+    let overrides = args.create_type_overrides();
 
     if let Some(c) = args.chunked_encoding.as_ref() {
         log::debug!("Using chunking method {c:?}");
@@ -215,6 +360,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     for (from, to) in overrides.iter() {
         writer = writer.add_spectrum_override(from.clone(), to.clone());
+        writer = writer.add_chromatogram_override(from.clone(), to.clone());
     }
 
     let mut writer = writer.build(handle, true);
@@ -225,7 +371,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     let write_peaks_and_profiles = args.write_peaks_and_profiles;
     let read_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            for mut entry in reader.into_iter() {
+            for mut entry in reader.iter() {
                 if entry.has_ion_mobility_dimension() {
                     if let Some(mut arrays) = entry.arrays {
                         arrays.sort_by_array(&ArrayType::MZArray).unwrap();
@@ -234,7 +380,13 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
                 } else if write_peaks_and_profiles && entry.peaks.is_none() {
                     entry.pick_peaks(3.0).unwrap();
                 }
-                if send.send(entry).is_err() {
+                if send.send((Some(entry), None)).is_err() {
+                    break; // Receiver dropped
+                }
+            }
+
+            for entry in reader.iter_chromatograms() {
+                if send.send((None, Some(entry))).is_err() {
                     break; // Receiver dropped
                 }
             }
@@ -246,17 +398,21 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     let write_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            for (i, mut batch) in recv.into_iter().enumerate() {
+            for (i, (spectrum, chromatogram)) in recv.into_iter().enumerate() {
                 if i % 5000 == 0 {
                     log::info!("Writing batch {i}");
                 }
                 if i % 10 == 0 {
                     log::debug!("Writing batch {i}");
                 }
-                if batch.signal_continuity() != SignalContinuity::Profile {
-                    batch.peaks = None;
+                if let Some(mut spectrum) = spectrum {
+                    if spectrum.signal_continuity() != SignalContinuity::Profile {
+                        spectrum.peaks = None;
+                    }
+                    writer.write_spectrum(&spectrum)?;
+                } else if let Some(chromatogram) = chromatogram {
+                    writer.write_chromatogram(&chromatogram)?;
                 }
-                writer.write_spectrum(&batch)?;
             }
             writer.finish()
         }));
@@ -279,103 +435,6 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         return Err(io::Error::new(io::ErrorKind::Other, "Writer thread failed"));
     }
     Ok(())
-}
-
-pub fn create_type_overrides(args: &ConvertArgs) -> HashMap<BufferName, BufferName> {
-    let mut overrides = HashMap::new();
-
-    if args.mz_f32 {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::MZArray,
-                BinaryDataArrayType::Float64,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::MZArray,
-                BinaryDataArrayType::Float32,
-            ),
-        );
-    }
-
-    let intensity_transform = args.intensity_slof.then(|| BufferTransform::NumpressSLOF);
-    if args.intensity_f32 {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float64,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-            ).with_transform(intensity_transform),
-        );
-    }
-    if intensity_transform.is_some() {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-            ).with_transform(intensity_transform),
-        );
-    }
-    if args.intensity_i32 {
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float32,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Int32,
-            ).with_transform(intensity_transform),
-        );
-        overrides.insert(
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Float64,
-            ),
-            BufferName::new(
-                BufferContext::Spectrum,
-                ArrayType::IntensityArray,
-                BinaryDataArrayType::Int32,
-            ).with_transform(intensity_transform),
-        );
-    }
-
-    if args.ion_mobility_f32 {
-        for t in [
-            ArrayType::MeanInverseReducedIonMobilityArray,
-            ArrayType::RawDriftTimeArray,
-            ArrayType::RawIonMobilityArray,
-        ] {
-            overrides.insert(
-                BufferName::new(
-                    BufferContext::Spectrum,
-                    t.clone(),
-                    BinaryDataArrayType::Float64,
-                ),
-                BufferName::new(
-                    BufferContext::Spectrum,
-                    t.clone(),
-                    BinaryDataArrayType::Float32,
-                ),
-            );
-        }
-    }
-    overrides
 }
 
 #[cfg(test)]

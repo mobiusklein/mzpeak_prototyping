@@ -3,7 +3,10 @@ use std::{fs, io, sync::Arc};
 use arrow::{array::Array, datatypes::SchemaRef};
 use mzdata::{
     prelude::*,
-    spectrum::{bindata::ArrayRetrievalError, BinaryArrayMap, RefPeakDataLevel, SignalContinuity},
+    spectrum::{
+        ArrayType, BinaryArrayMap, Chromatogram, RefPeakDataLevel, SignalContinuity,
+        bindata::ArrayRetrievalError,
+    },
 };
 use parquet::{
     arrow::ArrowSchemaConverter,
@@ -15,9 +18,14 @@ use parquet::{
 };
 
 use crate::{
-    chunk_series::{ArrowArrayChunk, ChunkingStrategy}, entry::Entry, filter::select_delta_model, peak_series::{array_map_to_schema_arrays_and_excess, MZ_ARRAY}, spectrum::AuxiliaryArray, writer::{ArrayBufferWriter, ArrayBufferWriterVariants, MiniPeakWriterType}, BufferContext, ToMzPeakDataSeries
+    BufferContext, BufferName, ToMzPeakDataSeries,
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
+    entry::{ChromatogramMetadataEntry, Entry},
+    filter::select_delta_model,
+    peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
+    spectrum::{AuxiliaryArray, ChromatogramEntry},
+    writer::{ArrayBufferWriter, ArrayBufferWriterVariants, MiniPeakWriterType},
 };
-
 
 macro_rules! implement_mz_metadata {
     () => {
@@ -88,7 +96,6 @@ macro_rules! implement_mz_metadata {
 
 pub(crate) use implement_mz_metadata;
 
-
 pub trait AbstractMzPeakWriter {
     /// Append an arbitrary key bytestring with an optional value to the (current) Parquet file
     fn append_key_value_metadata(
@@ -106,9 +113,15 @@ pub trait AbstractMzPeakWriter {
     /// for appending only
     fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry>;
 
+    /// Get a mutable reference to the buffer of chromatogram metadata values,
+    /// for appending only
+    fn chromatogram_entry_buffer_mut(&mut self) -> &mut Vec<ChromatogramMetadataEntry>;
+
     /// Get a mutable reference to the buffer of spectrum signal data values,
     /// for appending only
     fn spectrum_data_buffer_mut(&mut self) -> &mut ArrayBufferWriterVariants;
+
+    fn chromatogram_data_buffer_mut(&mut self) -> &mut ArrayBufferWriterVariants;
 
     /// Check if the data buffers are full, and flush them if so
     fn check_data_buffer(&mut self) -> io::Result<()>;
@@ -122,9 +135,14 @@ pub trait AbstractMzPeakWriter {
 
     /// The current number of distinct precursors having been written to the MzPeak file
     fn spectrum_precursor_counter(&self) -> u64;
+
     /// A mutable reference to the number of distinct precursors having been written to the MzPeak file,
     /// for incrementing
     fn spectrum_precursor_counter_mut(&mut self) -> &mut u64;
+
+    fn chromatogram_counter(&self) -> u64;
+    fn chromatogram_counter_mut(&mut self) -> &mut u64;
+    fn chromatogram_precursor_counter_mut(&mut self) -> &mut u64;
 
     /// Convert a `spectrum` into one or more [`Entry`] records describing the spectrum and its subsidiary
     /// structures.
@@ -142,6 +160,87 @@ pub trait AbstractMzPeakWriter {
             Some(self.spectrum_counter()),
             Some(self.spectrum_precursor_counter_mut()),
         )
+    }
+
+    fn chromatogram_to_entries(
+        &mut self,
+        chromatogram: &impl ChromatogramLike,
+    ) -> Vec<ChromatogramMetadataEntry> {
+        let mut ent = ChromatogramEntry::from_chromatogram(chromatogram);
+        ent.index = Some(self.chromatogram_counter());
+        vec![ent.into()]
+    }
+
+    fn write_chromatogram_arrays(
+        &mut self,
+        _chromatogram: &impl ChromatogramLike,
+        binary_array_map: &BinaryArrayMap,
+    ) -> io::Result<Option<Vec<AuxiliaryArray>>> {
+        let time = binary_array_map.get(&ArrayType::TimeArray).unwrap();
+        let n_points = time.data_len()?;
+        let time_axis = BufferName::from_data_array(BufferContext::Chromatogram, time);
+        let chromatogram_index = self.chromatogram_counter();
+        let extra_arrays = if let Some(chunking) = None
+        // self.use_chunked_encoding().copied()
+        {
+            let buffer_ref = self.chromatogram_data_buffer_mut();
+            let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
+                chromatogram_index,
+                time_axis,
+                binary_array_map,
+                chunking,
+                buffer_ref.overrides(),
+                false,
+                false,
+                Some(buffer_ref.fields()),
+            )?;
+            if !chunks.is_empty() {
+                let chunks = ArrowArrayChunk::to_struct_array(
+                    &chunks,
+                    BufferContext::Chromatogram.index_field().name(),
+                    buffer_ref.schema().fields(),
+                    &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
+                );
+                let size = chunks.len();
+                let (fields, arrays, _nulls) = chunks.into_parts();
+                buffer_ref.add_arrays(fields, arrays, size, true);
+            }
+
+            Some(auxiliary_arrays)
+        } else {
+            let buffer = self.chromatogram_data_buffer_mut();
+
+            let (fields, data, extra_arrays) = array_map_to_schema_arrays_and_excess(
+                BufferContext::Chromatogram,
+                binary_array_map,
+                n_points,
+                chromatogram_index,
+                BufferContext::Chromatogram.index_field().name(),
+                Some(&buffer.fields()),
+                &buffer.overrides(),
+            )?;
+
+            buffer.add_arrays(fields, data, n_points, true);
+            Some(extra_arrays)
+        };
+
+        Ok(extra_arrays)
+    }
+
+    fn write_chromatogram(&mut self, chromatogram: &Chromatogram) -> io::Result<()> {
+        log::trace!("Writing chromatogram {}", chromatogram.id());
+        let aux_arrays = self.write_chromatogram_arrays(chromatogram, &chromatogram.arrays)?;
+        let mut entries = self.chromatogram_to_entries(chromatogram);
+        if let Some(entry) = entries.first_mut() {
+            if let Some(ent) = entry.chromatogram.as_mut() {
+                ent.auxiliary_arrays.extend(aux_arrays.unwrap_or_default());
+                ent.number_of_auxiliary_arrays = ent.auxiliary_arrays.len() as u32;
+            }
+        }
+        self.chromatogram_entry_buffer_mut().extend(entries);
+        *self.chromatogram_counter_mut() += 1;
+        self.check_data_buffer()?;
+        Ok(())
     }
 
     /// Write a `spectrum` to the MzPeak file
@@ -200,7 +299,7 @@ pub trait AbstractMzPeakWriter {
     /// spectrum is in profile mode. This might change in the future.
     ///
     /// This is a helper method for [`AbstractMzPeakWriter::write_spectrum_data`].
-    fn write_binary_array_map<
+    fn write_spectrum_binary_array_map<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
     >(
@@ -210,7 +309,7 @@ pub trait AbstractMzPeakWriter {
         binary_array_map: &BinaryArrayMap,
     ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
         let mzs = binary_array_map.mzs();
-        let (_had_mzs, n_points, ) = if let Ok(mzs) = mzs {
+        let (_had_mzs, n_points) = if let Ok(mzs) = mzs {
             (true, mzs.len())
         } else {
             (false, 0)
@@ -350,7 +449,7 @@ pub trait AbstractMzPeakWriter {
             log::trace!("Writing both profile signal and peaks for {spectrum_count}");
             let raw_arrays = spectrum.raw_arrays().unwrap();
             let (delta_params, aux_arrays) =
-                self.write_binary_array_map(spectrum, spectrum_count, raw_arrays)?;
+                self.write_spectrum_binary_array_map(spectrum, spectrum_count, raw_arrays)?;
             self.separate_peak_writer()
                 .unwrap()
                 .add_peaks(spectrum_count, peaks)?;
@@ -358,9 +457,8 @@ pub trait AbstractMzPeakWriter {
         } else {
             let (delta_params, aux_arrays) = match peaks {
                 mzdata::spectrum::RefPeakDataLevel::Missing => (None, None),
-                mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => {
-                    self.write_binary_array_map(spectrum, spectrum_count, binary_array_map)?
-                }
+                mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => self
+                    .write_spectrum_binary_array_map(spectrum, spectrum_count, binary_array_map)?,
                 mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) => {
                     self.write_peaks(spectrum_count, peaks.as_slice())?
                 }
@@ -406,6 +504,71 @@ pub trait AbstractMzPeakWriter {
             .build();
 
         metadata_props
+    }
+
+    fn chromatogram_data_writer_props(
+        data_buffer: &impl ArrayBufferWriter,
+        index_path: String,
+        use_chunked_encoding: &Option<ChunkingStrategy>,
+        compression: Compression,
+    ) -> WriterProperties {
+        let parquet_schema = Arc::new(
+            ArrowSchemaConverter::new()
+                .convert(&data_buffer.schema())
+                .unwrap(),
+        );
+
+        let mut sorted = Vec::new();
+        for (i, c) in parquet_schema.columns().iter().enumerate() {
+            match c.path().string().as_ref() {
+                x if x == index_path => {
+                    sorted.push(SortingColumn::new(i as i32, false, false));
+                }
+                _ => {}
+            }
+        }
+
+        let mut data_props = WriterProperties::builder()
+            .set_compression(compression)
+            .set_dictionary_enabled(true)
+            .set_sorting_columns(Some(sorted))
+            .set_column_encoding(index_path.into(), Encoding::RLE)
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_statistics_enabled(EnabledStatistics::Page);
+
+        if use_chunked_encoding.is_some() {
+            data_props = data_props.set_max_row_group_size(1024 * 100)
+        }
+
+        for c in parquet_schema.columns().iter() {
+            let colpath = c.path().to_string();
+            if colpath.contains("_time")
+                && matches!(
+                    c.physical_type(),
+                    parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
+                )
+            {
+                log::debug!("{}: shuffling", c.path());
+                data_props =
+                    data_props.set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
+            }
+            if colpath.contains("_ion_mobility") {
+                log::debug!(
+                    "{}: ion mobility detected, increasing dictionary size",
+                    c.path()
+                );
+                data_props = data_props
+                    .set_dictionary_page_size_limit(DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT * 2);
+            }
+            if c.name().ends_with("_index") {
+                log::debug!("{}: delta binary packing", c.path());
+                data_props =
+                    data_props.set_column_encoding(c.path().clone(), Encoding::DELTA_BINARY_PACKED);
+            }
+        }
+
+        let data_props = data_props.build();
+        data_props
     }
 
     fn spectrum_data_writer_props(

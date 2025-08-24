@@ -77,8 +77,8 @@ pub fn array_map_to_schema_arrays_and_excess(
     let index_array = Arc::new(UInt64Array::from_value(spectrum_index, primary_array_len));
     arrays.push(index_array as ArrayRef);
 
-    for (k, v) in array_map.iter() {
-        let buffer_name = BufferName::new(context, k.clone(), v.dtype());
+    for (_, v) in array_map.iter() {
+        let buffer_name = BufferName::from_data_array(context, v);
         let buffer_name = if let Some(buffer_name) = overrides.get(&buffer_name) {
             buffer_name
         } else {

@@ -108,9 +108,36 @@ impl From<SelectedIonEntry> for Entry {
     }
 }
 
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct ChromatogramMetadataEntry {
-    pub spectrum: Option<Box<ChromatogramEntry>>,
-    pub scan: Option<Box<ScanEntry>>,
+    pub chromatogram: Option<Box<ChromatogramEntry>>,
     pub precursor: Option<Box<PrecursorEntry>>,
     pub selected_ion: Option<Box<SelectedIonEntry>>,
+}
+
+
+impl From<ChromatogramEntry> for ChromatogramMetadataEntry {
+    fn from(value: ChromatogramEntry) -> Self {
+        Self {
+            chromatogram: Some(Box::new(value)),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<PrecursorEntry> for ChromatogramMetadataEntry {
+    fn from(value: PrecursorEntry) -> Self {
+        let mut this = Self::default();
+        this.precursor = Some(Box::new(value));
+        this
+    }
+}
+
+impl From<SelectedIonEntry> for ChromatogramMetadataEntry {
+    fn from(value: SelectedIonEntry) -> Self {
+        let mut this = Self::default();
+        this.selected_ion = Some(Box::new(value));
+        this
+    }
 }

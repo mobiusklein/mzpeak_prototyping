@@ -44,7 +44,7 @@ arrow = "55.2.0"
 env_logger = "0.11.8"
 itertools = "0.14.0"
 log = "0.4.27"
-mzdata = { version = "0.57.1", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress"] }
+mzdata = { version = "0.58.0", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress"] }
 parquet = "55.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_arrow = { version = "0.13.3", features = ["arrow-55"] }

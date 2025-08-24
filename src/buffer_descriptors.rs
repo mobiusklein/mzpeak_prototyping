@@ -384,7 +384,9 @@ impl BufferName {
     }
 
     pub fn as_data_array(&self, size: usize) -> DataArray {
-        DataArray::from_name_type_size(&self.array_type, self.dtype, size * self.dtype.size_of())
+        let mut da = DataArray::from_name_type_size(&self.array_type, self.dtype, size * self.dtype.size_of());
+        da.unit = self.unit;
+        da
     }
 
     pub const fn with_unit(mut self, unit: Unit) -> Self {
@@ -504,7 +506,7 @@ impl BufferName {
 
     pub fn from_data_array(context: BufferContext, data_array: &DataArray) -> Self {
         let name = Self::new(context, data_array.name.clone(), data_array.dtype());
-        name
+        name.with_unit(data_array.unit)
     }
 
     pub fn to_field(&self) -> FieldRef {
@@ -560,7 +562,36 @@ impl Display for BufferName {
             BinaryDataArrayType::Int32 => "i32",
             BinaryDataArrayType::ASCII => "ascii",
         };
-        write!(f, "{}_{}_{}", context, tp_name, dtype)
+        if matches!(self.unit, Unit::Unknown) {
+            write!(f, "{}_{}_{}", context, tp_name, dtype)
+        } else {
+            let unit = match self.unit {
+                Unit::Unknown => "",
+                Unit::MZ => "mz",
+                Unit::Mass => "da",
+                Unit::PartsPerMillion => "ppm",
+                Unit::Nanometer => "nm",
+                Unit::Minute => "min",
+                Unit::Second => "sec",
+                Unit::Millisecond => "msec",
+                Unit::VoltSecondPerSquareCentimeter => "vspc",
+                Unit::DetectorCounts => "dc",
+                Unit::PercentBasePeak => "bp",
+                Unit::PercentBasePeakTimes100 => "bpp",
+                Unit::AbsorbanceUnit => "au",
+                Unit::CountsPerSecond => "cps",
+                Unit::Electronvolt => "ev",
+                Unit::Volt => "v",
+                Unit::Celsius => "c",
+                Unit::Kelvin => "k",
+                Unit::Pascal => "pa",
+                Unit::Psi => "psi",
+                Unit::MicrolitersPerMinute => "mlpmin",
+                Unit::Percent => "pct",
+                Unit::Dimensionless => "",
+            };
+            write!(f, "{}_{}_{}_{}", context, tp_name, dtype, unit)
+        }
     }
 }
 

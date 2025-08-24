@@ -81,23 +81,23 @@ pub trait ArrayBufferWriter {
     fn overrides(&self) -> &HashMap<BufferName, BufferName>;
 
     fn as_array_index(&self) -> ArrayIndex {
-        let mut spectrum_array_index: ArrayIndex =
+        let mut array_index: ArrayIndex =
             ArrayIndex::new(self.prefix().to_string(), HashMap::new());
         if let Ok(sub) = self.schema().field_with_name(&self.prefix()).cloned() {
             if let DataType::Struct(fields) = sub.data_type() {
                 for f in fields.iter() {
-                    if f.name() == "spectrum_index" {
+                    if f.name() == BufferContext::Spectrum.index_field().name() || f.name() == BufferContext::Chromatogram.index_field().name() {
                         continue;
                     }
                     if let Some(buffer_name) =
-                        BufferName::from_field(BufferContext::Spectrum, f.clone())
+                        BufferName::from_field(self.buffer_context(), f.clone())
                     {
                         let aie = ArrayIndexEntry::from_buffer_name(
                             self.prefix().to_string(),
                             buffer_name,
                             Some(&f)
                         );
-                        spectrum_array_index.insert(aie.array_type.clone(), aie);
+                        array_index.insert(aie.array_type.clone(), aie);
                     } else {
                         if f.name().ends_with("_chunk_end")
                             || f.name().ends_with("_chunk_start")
@@ -110,8 +110,8 @@ pub trait ArrayBufferWriter {
                 }
             }
         }
-        log::trace!("Spectrum array indices: {}", spectrum_array_index.to_json());
-        spectrum_array_index
+        log::trace!("{} array indices: {}", self.buffer_context(), array_index.to_json());
+        array_index
     }
 }
 

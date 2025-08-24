@@ -41,25 +41,28 @@ class BufferName:
         return cls(key=key, **fields)
 
 
-class _SpectrumDataIndex:
+class _DataIndex:
     meta: pq.FileMetaData
     prefix: str
     index_i: int
     init: bool
+    namespace: str
     row_group_index_ranges: list[Span[int] | None]
 
-    def __init__(self, meta: pq.FileMetaData, prefix: str):
+    def __init__(self, meta: pq.FileMetaData, prefix: str, namespace: str="spectrum"):
         self.meta = meta
         self.prefix = prefix
         self.index_i = 0
         self.init = False
         self.row_group_index_ranges = []
+        self.namespace = namespace
         self._infer_schema_idx()
 
     def _infer_schema_idx(self):
         rg = self.meta.row_group(0)
-        q = f"{self.prefix}.spectrum_index"
+        q = f"{self.prefix}.{self.namespace}_index"
         self.row_group_index_ranges = []
+        max_index = 0
         for i in range(rg.num_columns):
             col = rg.column(i)
             if col.path_in_schema == q:
@@ -74,14 +77,18 @@ class _SpectrumDataIndex:
                     self.row_group_index_ranges.append(
                         Span(col_idx.statistics.min, col_idx.statistics.max)
                     )
+                    max_index = max(max_index, col_idx.statistics.max)
                 else:
                     self.row_group_index_ranges.append(None)
 
-        index = json.loads(self.meta.metadata[b"spectrum_array_index"])
+        index = json.loads(self.meta.metadata[f"{self.namespace}_array_index".encode('utf8')])
         self.array_index = {
             entry["path"].rsplit(".")[-1]: entry for entry in index["entries"]
         }
-        self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
+        try:
+            self.n_entries = int(self.meta.metadata[f"{self.namespace}_count".encode('utf8')])
+        except KeyError:
+            self.n_entries = max_index
 
     def row_groups_for_index(self, spectrum_index: int) -> list[int]:
         rgs = []
@@ -109,7 +116,7 @@ class _SpectrumDataIndex:
             return []
         if isinstance(spectrum_index_range, slice):
             start = spectrum_index_range.start or 0
-            end = spectrum_index_range.stop or self.n_spectra
+            end = spectrum_index_range.stop or self.n_entries
         else:
             start = min(spectrum_index_range)
             end = max(spectrum_index_range)
@@ -232,32 +239,45 @@ psims_dtypes = {
 }
 
 
-class MzPeakSpectrumDataReader:
+class MzPeakArrayDataReader:
     handle: pq.ParquetFile
     meta: pq.FileMetaData
-    _point_index: _SpectrumDataIndex
-    _chunk_index: _SpectrumDataIndex
+    _point_index: _DataIndex
+    _chunk_index: _DataIndex
     array_index: dict[str, dict]
-    n_spectra: int
+    n_entries: int
     _delta_model_series: np.ndarray | None
     _do_null_filling: bool = True
+    _namespace: str
 
-    def __init__(self, handle: pq.ParquetFile):
+    def __init__(self, handle: pq.ParquetFile, namespace: str | None=None):
         if not isinstance(handle, pq.ParquetFile):
             handle = pq.ParquetFile(handle)
         self.handle = handle
         self.meta = self.handle.metadata
-        self._point_index = _SpectrumDataIndex(self.meta, "point")
-        self._chunk_index = _SpectrumDataIndex(self.meta, "chunk")
+        self._namespace = namespace
+        if namespace is None:
+            self._infer_namespace()
+        self._point_index = _DataIndex(self.meta, "point", namespace=self._namespace)
+        self._chunk_index = _DataIndex(self.meta, "chunk", namespace=self._namespace)
         self._infer_schema_idx()
         self._delta_model_series = None
 
+    def _infer_namespace(self):
+        if b"chromatogram_array_index" in self.meta.metadata:
+            self._namespace = "chromatogram"
+        elif b"spectrum_array_index" in self.meta.metadata:
+            self._namespace = "spectrum"
+        else:
+            logger.warning("Defaulting namespace for %r to 'spectrum'", self)
+            self._namespace = "spectrum"
+
     def _infer_schema_idx(self):
-        index = json.loads(self.meta.metadata[b"spectrum_array_index"])
+        index = json.loads(self.meta.metadata[f"{self._namespace}_array_index".encode('utf8')])
         self.array_index = {
             entry["path"].rsplit(".")[-1]: entry for entry in index["entries"]
         }
-        self.n_spectra = int(self.meta.metadata[b"spectrum_count"])
+        self.n_entries = max(self._point_index.n_entries, self._chunk_index.n_entries)
 
     def _clean_point_batch(
         self,
@@ -334,7 +354,7 @@ class MzPeakSpectrumDataReader:
         is_slice = False
         if isinstance(spectrum_index_range, slice):
             start = spectrum_index_range.start or 0
-            end = spectrum_index_range.stop or self.n_spectra
+            end = spectrum_index_range.stop or self.n_entries
             is_slice = True
         else:
             start = min(spectrum_index_range)
@@ -354,10 +374,21 @@ class MzPeakSpectrumDataReader:
     def _expand_chunks(
         self,
         chunks: list[dict[str, Any]],
-        axis_prefix: str = "spectrum_mz_f64",
+        axis_prefix: str | None = "spectrum_mz",
         delta_model: float | np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
+        if axis_prefix is None:
+            if self._namespace == "spectrum":
+                axis_prefix = f"{self._namespace}_mz"
+            elif self._namespace == "chromatogram":
+                axis_prefix = f"{self._namespace}_time"
+            else:
+                raise ValueError(self._namespace)
+
         has_transforms = {k: v.get('transform') for k, v in self.array_index.items() if v.get('transform')}
+        for k, v in self.array_index.items():
+            if k.startswith(axis_prefix):
+                axis_prefix = k.removesuffix("_chunk_values")
 
         n = 0
         numpress_chunks = []
@@ -380,7 +411,7 @@ class MzPeakSpectrumDataReader:
         arrays_of = {}
         for k, v in chunks[0].items():
             if (
-                k == "spectrum_index"
+                k == f"{self._namespace}_index"
                 or k == "chunk_encoding"
                 or k.startswith(axis_prefix)
             ):
@@ -440,7 +471,7 @@ class MzPeakSpectrumDataReader:
                 raise ValueError(f"Unsupported chunk encoding {encoding}")
 
             for k, v in chunk.items():
-                if k in ("spectrum_index", "chunk_encoding") or k.startswith(
+                if k in (f"{self._namespace}_index", "chunk_encoding") or k.startswith(
                     axis_prefix
                 ):
                     continue
@@ -491,11 +522,14 @@ class MzPeakSpectrumDataReader:
     ):
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
         block = pc.filter(
-            block, pc.equal(pc.struct_field(block, "spectrum_index"), spectrum_index)
+            block,
+            pc.equal(
+                pc.struct_field(block, f"{self._namespace}_index"), spectrum_index
+            ),
         )
 
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
-            "spectrum_index"
+            f"{self._namespace}_index"
         )
         return self._clean_point_batch(data, delta_model)
 
@@ -508,7 +542,7 @@ class MzPeakSpectrumDataReader:
         rgs: list[int],
     ):
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
-        idx_col = pc.struct_field(block, "spectrum_index")
+        idx_col = pc.struct_field(block, f"{self._namespace}_index")
 
         if is_slice:
             mask = pc.and_(
@@ -518,7 +552,7 @@ class MzPeakSpectrumDataReader:
             mask = pc.is_in(idx_col, pa.array(spectrum_index_range))
         block = pc.filter(block, mask)
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
-            "spectrum_index"
+            f"{self._namespace}_index"
         )
         return self._clean_point_batch(data)
 
@@ -566,7 +600,7 @@ class MzPeakSpectrumDataReader:
         chunks = []
         for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
             batch = batch["chunk"]
-            idx_col = pc.struct_field(batch, "spectrum_index")
+            idx_col = pc.struct_field(batch, f"{self._namespace}_index")
             batch_end = pc.max(idx_col).as_py()
             if batch_end < start:
                 continue
@@ -626,3 +660,6 @@ class MzPeakSpectrumDataReader:
             return BufferFormat.Chunk
         else:
             raise ValueError("Could not infer buffer format")
+
+
+MzPeakSpectrumDataReader = MzPeakArrayDataReader

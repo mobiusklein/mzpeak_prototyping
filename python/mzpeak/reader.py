@@ -17,7 +17,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
-from .mz_reader import _ChunkIterator, MzPeakSpectrumDataReader, BufferFormat
+from .mz_reader import _ChunkIterator, MzPeakArrayDataReader, BufferFormat
 
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,11 @@ class AuxiliaryArrayDecoder:
         data: np.ndarray = arr['data']
         compression_acc: str = _format_curie(arr['compression'])
         dtype_acc: str = _format_curie(arr['data_type'])
-        name: str = _format_param(arr['name'])['name']
+        name_param = _format_param(arr['name'])
+        if name_param['name'] == "non-standard data array":
+            name = name_param['value']
+        else:
+            name = name_param["name"]
         parameters = [_format_param(v) for v in arr.get('parameters', [])]
         data: np.ndarray = cls.compression[compression_acc](data)
         if cls.ascii_code != dtype_acc:
@@ -314,6 +318,149 @@ class MzPeakSpectrumMetadataReader:
         return None
 
 
+class MzPeakChromatogramMetadataReader:
+    handle: pq.ParquetFile
+    meta: pq.FileMetaData
+    num_chromatograms: int
+    num_chromatogram_points: int
+
+    chromatogram_index_i: int
+    precursor_index_i: int
+    selected_ion_i: int
+
+    id_index: pd.Series
+    chromatograms: pd.DataFrame
+    precursors: pd.DataFrame
+    selected_ions: pd.DataFrame
+
+    def __init__(self, handle: pq.ParquetFile):
+        if not isinstance(handle, pq.ParquetFile):
+            handle = pq.ParquetFile(handle)
+        self.handle = handle
+        self.meta = handle.metadata
+        self.num_chromatograms = int(handle.metadata.metadata[b"chromatogram_count"])
+        self.num_chromatogram_points = int(
+            handle.metadata.metadata[b"chromatogram_data_point_count"]
+        )
+        self._infer_schema_idx()
+        self._read_chromatograms()
+        self._read_precursors()
+        self._read_selected_ions()
+
+    def _infer_schema_idx(self):
+        rg = self.meta.row_group(0)
+        for i in range(rg.num_columns):
+            col = rg.column(i)
+            if col.path_in_schema == "chromatogram.index":
+                self.chromatogram_index_i = i
+            elif col.path_in_schema == "precursor.spectrum_index":
+                self.precursor_index_i = i
+            elif col.path_in_schema == "selected_ion.spectrum_index":
+                self.selected_ion_i = i
+
+    def _read_chromatograms(self):
+        chromatograms = []
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.chromatogram_index_i)
+            if col_idx.statistics.has_min_max:
+                bat = self.handle.read_row_group(i, columns=["chromatogram"])
+                chromatograms.append(bat.filter(bat[0].is_valid()))
+
+        if not chromatograms:
+            self.chromatograms = pd.DataFrame(
+                [],
+                columns=[
+                    "index",
+                    "id",
+                ],
+            )
+        else:
+            bat = pa.record_batch(
+                pa.concat_tables(chromatograms)["chromatogram"].combine_chunks()
+            )
+            bat = _format_curies_batch(bat)
+            self.chromatograms = _clean_frame(bat.to_pandas().set_index("index"))
+        self.id_index = self.chromatograms[["id"]].reset_index().set_index("id")["index"]
+
+    def _read_precursors(self):
+        blocks = []
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.precursor_index_i)
+            if col_idx.statistics.has_min_max:
+                bat = self.handle.read_row_group(i, columns=["precursor"])
+                blocks.append(bat.filter(bat[0].is_valid()))
+        if blocks:
+            bat = pa.record_batch(
+                pa.concat_tables(blocks)["precursor"].combine_chunks()
+            )
+            bat = _format_curies_batch(bat)
+            self.precursors = _clean_frame(bat.to_pandas().set_index("spectrum_index"))
+        else:
+            self.precursors = pd.DataFrame(
+                [],
+                columns=[
+                    "spectrum_index",
+                    "precursor_index",
+                ],
+            )
+
+    def _read_selected_ions(self):
+        blocks = []
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.selected_ion_i)
+            if col_idx.statistics.has_min_max:
+                bat = self.handle.read_row_group(i, columns=["selected_ion"])
+                blocks.append(bat.filter(bat[0].is_valid()))
+
+        if blocks:
+            bat = pa.record_batch(
+                pa.concat_tables(blocks)["selected_ion"].combine_chunks()
+            )
+            bat = _format_curies_batch(bat)
+            self.selected_ions = _clean_frame(
+                bat.to_pandas().set_index("spectrum_index")
+            )
+        else:
+            self.selected_ions = pd.DataFrame(
+                [],
+                columns=[
+                    "spectrum_index",
+                    "precursor_index",
+                ],
+            )
+
+    def __getitem__(self, i: int | str):
+        if isinstance(i, str):
+            i = self.id_index[i]
+        spec = self.chromatograms.loc[i].to_dict()
+        spec["parameters"] = [_format_param(v) for v in spec["parameters"]]
+        try:
+            precursors_of = self.precursors.loc[[i]]
+            precursors_of["activation"] = precursors_of["activation"].apply(
+                lambda x: [_format_param(v) for v in x["parameters"]]
+            )
+            try:
+                ions = self.selected_ions.loc[[i]]
+                ions["parameters"] = ions["parameters"].apply(
+                    lambda x: [_format_param(v) for v in x]
+                )
+                precursors_of = precursors_of.merge(ions, on="precursor_index")
+            except KeyError:
+                pass
+            spec["precursors"] = precursors_of.to_dict("records")
+        except KeyError:
+            pass
+        spec["index"] = i
+        if "auxiliary_arrays" in spec:
+            for v in spec.pop("auxiliary_arrays"):
+                v = AuxiliaryArrayDecoder.decode(v)
+                spec[v.name] = v.values
+        return spec
+
+
 class MzPeakFileIter:
     archive: "MzPeakFile"
     index: int
@@ -380,9 +527,13 @@ class MzPeakFileIter:
 
 class MzPeakFile:
     archive: zipfile.ZipFile
-    spectrum_data: MzPeakSpectrumDataReader
+
+    spectrum_data: MzPeakArrayDataReader
     spectrum_metadata: MzPeakSpectrumMetadataReader
-    spectrum_peak_data: MzPeakSpectrumDataReader | None = None
+    spectrum_peak_data: MzPeakArrayDataReader | None = None
+
+    chromatogram_metadata: MzPeakChromatogramMetadataReader | None = None
+    chromatogram_data: MzPeakArrayDataReader | None = None
 
     def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
         if isinstance(path, zipfile.ZipFile):
@@ -391,17 +542,29 @@ class MzPeakFile:
             self.archive = zipfile.ZipFile(path)
         for f in self.archive.filelist:
             if f.filename.endswith("spectra_data.mzpeak"):
-                self.spectrum_data = MzPeakSpectrumDataReader(
-                    pa.PythonFile(self.archive.open(f))
+                self.spectrum_data = MzPeakArrayDataReader(
+                    pa.PythonFile(self.archive.open(f)),
+                    namespace="spectrum",
                 )
             elif f.filename.endswith("spectra_metadata.mzpeak"):
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
-                    pa.PythonFile(self.archive.open(f))
+                    pa.PythonFile(self.archive.open(f)),
                 )
             elif f.filename.endswith("spectra_peaks.mzpeak"):
-                self.spectrum_peak_data = MzPeakSpectrumDataReader(
+                self.spectrum_peak_data = MzPeakArrayDataReader(
+                    pa.PythonFile(self.archive.open(f)),
+                    namespace="spectrum",
+                )
+            elif f.filename.endswith("chromatograms_metadata.mzpeak"):
+                self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
                     pa.PythonFile(self.archive.open(f))
                 )
+            elif f.filename.endswith("chromatograms_data.mzpeak"):
+                self.chromatogram_data = MzPeakArrayDataReader(
+                    pa.PythonFile(self.archive.open(f)),
+                    namespace="chromatogram",
+                )
+
         metadata = {}
         if self.spectrum_metadata:
             for k, v in self.spectrum_metadata.meta.metadata.items():
@@ -417,10 +580,7 @@ class MzPeakFile:
                 self.spectrum_metadata._get_mz_delta_model()
             )
 
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.archive.filename!r})"
-
-    def __getitem__(self, index):
+    def read_spectrum(self, index: int | str | Iterable[int | str] | slice):
         if isinstance(index, (int, str)):
             spec = self.spectrum_metadata[index]
             index = spec["index"]
@@ -429,13 +589,36 @@ class MzPeakFile:
         elif isinstance(index, Iterable):
             if not index:
                 return []
-            spec = [self[i] for i in index]
+            spec = [self.read_spectrum(i) for i in index]
         elif isinstance(index, slice):
             start = index.start or 0
             end = index.stop or len(self)
             step = index.step or 1
-            spec = self[range(start, end, step)]
+            spec = self.read_spectrum(range(start, end, step))
         return spec
+
+    def read_chromatogram(self, index: int | str | Iterable[int | str] | slice):
+        if isinstance(index, (int, str)):
+            chrom = self.chromatogram_metadata[index]
+            index = chrom["index"]
+            data = self.chromatogram_data[index]
+            chrom.update(data)
+        elif isinstance(index, Iterable):
+            if not index:
+                return []
+            chrom = [self.read_chromatogram(i) for i in index]
+        elif isinstance(index, slice):
+            start = index.start or 0
+            end = index.stop or len(self)
+            step = index.step or 1
+            chrom = self.read_chromatogram(range(start, end, step))
+        return chrom
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.archive.filename!r})"
+
+    def __getitem__(self, index: int | str | Iterable[int | str] | slice):
+        return self.read_spectrum(index)
 
     def __iter__(self):
         return MzPeakFileIter(self)
@@ -468,3 +651,8 @@ class MzPeakFile:
     @property
     def scans(self):
         return self.spectrum_metadata.scans
+
+    @property
+    def chromatograms(self):
+        if self.chromatogram_metadata is not None:
+            return self.chromatogram_metadata.chromatograms

@@ -249,6 +249,11 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
 
         if let Some(e) = metadata.spectrum_array_indices.get(&ArrayType::MZArray) {
             let prefix = e.path.as_str();
+            let prefix = if prefix.ends_with("_chunk_values") {
+                prefix.replace("_chunk_values", "")
+            } else {
+                prefix.to_string()
+            };
             fields.push(format!("{prefix}_chunk_values"));
             fields.push(format!("{prefix}_chunk_start"));
             fields.push(format!("{prefix}_chunk_end"));

@@ -28,7 +28,7 @@ impl Default for MzPeakWriterBuilder {
     fn default() -> Self {
         Self {
             spectrum_arrays: ArrayBuffersBuilder::default().prefix("point"),
-            chromatogram_arrays: ArrayBuffersBuilder::default().prefix("chromatogram_point"),
+            chromatogram_arrays: ArrayBuffersBuilder::default().prefix("point"),
             buffer_size: 5_000,
             shuffle_mz: false,
             chunked_encoding: None,
