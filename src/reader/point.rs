@@ -11,7 +11,6 @@ use mzdata::spectrum::{ArrayType, BinaryArrayMap, DataArray};
 use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::reader::ChunkReader};
 
 use crate::{
-    buffer_descriptors::arrow_to_array_type,
     filter::{RegressionDeltaModel, fill_nulls_for},
     peak_series::ArrayIndex
 };
@@ -225,9 +224,8 @@ impl SpectrumDataPointCache {
         mz_delta_model: Option<&RegressionDeltaModel<f64>>,
     ) -> io::Result<BinaryArrayMap> {
         let mut bin_map = HashMap::new();
-        for (k, v) in self.spectrum_array_indices.iter() {
-            let dtype = arrow_to_array_type(&v.data_type).unwrap();
-            bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
+        for v in self.spectrum_array_indices.iter() {
+            bin_map.insert(&v.name, v.as_buffer_name().as_data_array(0));
         }
 
         let (start, end) = self.find_span_for_query(index);

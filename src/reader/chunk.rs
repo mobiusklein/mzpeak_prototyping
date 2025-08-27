@@ -1,11 +1,15 @@
-use std::{collections::HashMap, io, sync::Arc};
+#![allow(unused_imports)]
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
-        Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StructArray, UInt8Array, UInt64Array,
+        Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StructArray, UInt64Array, UInt8Array
     },
-    datatypes::{DataType, Field, Float32Type, Float64Type, Schema, UInt64Type},
+    datatypes::{DataType, Field, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Int8Type, Schema, UInt32Type, UInt64Type, UInt8Type},
     error::ArrowError,
 };
 use parquet::arrow::{
@@ -125,9 +129,9 @@ impl SpectrumDataChunkCache {
             }
             _ => {
                 let mut bin_map = HashMap::new();
-                for (k, v) in self.spectrum_array_indices.iter() {
+                for v in self.spectrum_array_indices.iter() {
                     let dtype = arrow_to_array_type(&v.data_type).unwrap();
-                    bin_map.insert(&v.name, DataArray::from_name_and_type(k, dtype));
+                    bin_map.insert(&v.name, v.as_buffer_name().as_data_array(0));
                 }
                 let mut out = BinaryArrayMap::new();
                 for v in bin_map.into_values() {
@@ -164,12 +168,30 @@ pub struct SpectrumChunkReader<T: parquet::file::reader::ChunkReader + 'static> 
     builder: ParquetRecordBatchReaderBuilder<T>,
 }
 
+#[derive(Default, Debug)]
+struct OneCache<T: PartialEq + Eq, U> {
+    last_key: Option<T>,
+    last_value: Option<U>,
+}
+
+impl<T: PartialEq + Eq, U> OneCache<T, U> {
+    fn get<F: FnOnce() -> U>(&mut self, key: T, callback: F) -> &U {
+        let key = Some(key);
+        if self.last_key == key {
+            return self.last_value.as_ref().unwrap();
+        } else {
+            self.last_key = key;
+            self.last_value = Some(callback());
+            return self.last_value.as_ref().unwrap();
+        }
+    }
+}
+
 impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
     pub fn new(builder: ParquetRecordBatchReaderBuilder<T>) -> Self {
         Self { builder }
     }
 
-    #[allow(unused)]
     pub(crate) fn load_cache_block(
         self,
         index_range: SimpleInterval<u64>,
@@ -266,12 +288,14 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             fields.push(e.path.to_string());
         }
 
-        for (k, v) in metadata.spectrum_array_indices.iter() {
-            if k.is_ion_mobility() {
+        for v in metadata.spectrum_array_indices.iter() {
+            if v.is_ion_mobility() {
                 fields.push(v.path.to_string());
                 break;
             }
         }
+
+        log::trace!("Executing query on {fields:?}");
 
         let proj = ProjectionMask::columns(
             self.builder.parquet_schema(),
@@ -292,7 +316,6 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                 Some(mz_range) => {
                     let mz_start_array = root.column(1);
                     let mz_end_array = root.column(2);
-
                     let it2 = mz_range.overlaps_dy(mz_start_array, mz_end_array);
                     let it2 = it2.iter();
                     let it = it
@@ -309,6 +332,9 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .build()?;
 
+        let mut delta_model_cache: OneCache<u64, Option<RegressionDeltaModel<f64>>> =
+            OneCache::default();
+
         let it = reader.map(move |batch| -> Result<RecordBatch, ArrowError> {
             let batch = batch?;
             let root = batch.column(0).as_struct();
@@ -316,12 +342,13 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             let mut main_axis_buffers = Vec::new();
             let mut main_axis_starts = Vec::new();
             let mut chunk_encodings: Vec<CURIE> = Vec::new();
-            let mut spectrum_index = None;
+            let mut spectrum_index = Vec::new();
             let mut main_axis = None;
+
             for (f, arr) in root.fields().iter().zip(root.columns()) {
                 match f.name().as_str() {
                     "spectrum_index" => {
-                        spectrum_index = Some(arr.clone());
+                        spectrum_index.push(arr.clone());
                     }
                     "chunk_encoding" => {
                         let arr = arr.as_struct();
@@ -343,7 +370,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                     log::trace!(
                                         "Storing {name} with {:?} and {} entries",
                                         arr.data_type(),
-                                        arr.len()
+                                        arr.len(),
                                     );
                                     main_axis_buffers.push((name, arr.clone()));
                                 }
@@ -358,34 +385,40 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                 }
             }
 
+            // Accumulate the per-point spectrum association
+            let mut spectrum_idx_acc: Vec<u64> = Vec::with_capacity(
+                spectrum_index.iter().map(|v| v.len()).sum()
+            );
+
             for (name, chunk_values) in main_axis_buffers.drain(..) {
-                for ((encoding, chunk_starts), spectrum_idx) in chunk_encodings
+                for ((encoding, chunk_starts), spectrum_idxs) in chunk_encodings
                     .iter()
                     .copied()
                     .zip(main_axis_starts.iter())
                     .zip(
                         spectrum_index
-                            .as_ref()
-                            .unwrap()
-                            .as_primitive::<UInt64Type>()
                             .iter()
-                            .flatten(),
+                            .map(|v| v.as_primitive::<UInt64Type>()),
                     )
                 {
                     if main_axis.is_none() {
                         main_axis =
                             Some(DataArray::from_name_and_type(&name.array_type, name.dtype))
                     }
-
                     match encoding {
                         NO_COMPRESSION => {
                             macro_rules! decode_no_compression {
                                 ($chunk_values:ident, $starts:ident, $accumulator:ident) => {
-                                    for (chunk_vals, start) in
-                                        $chunk_values.iter().zip($starts.iter())
+                                    for (chunk_vals, (start, spectrum_idx)) in $chunk_values
+                                        .iter()
+                                        .zip($starts.iter().zip(spectrum_idxs.iter().flatten()))
                                     {
                                         let chunk_vals = chunk_vals.unwrap();
                                         let start = start.unwrap();
+                                        let main_axis_size_before = main_axis
+                                            .as_ref()
+                                            .map(|a| a.data_len().unwrap_or_default())
+                                            .unwrap_or_default();
                                         (ChunkingStrategy::Basic { chunk_size: 50.0 })
                                             .decode_arrow(
                                                 &chunk_vals,
@@ -393,6 +426,16 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                                 $accumulator.as_mut().unwrap(),
                                                 None,
                                             );
+                                        let main_axis_size_after = main_axis
+                                            .as_ref()
+                                            .map(|a| a.data_len().unwrap_or_default())
+                                            .unwrap_or_default();
+                                        let n_points_added =
+                                            main_axis_size_after - main_axis_size_before;
+                                        spectrum_idx_acc.extend(std::iter::repeat_n(
+                                            spectrum_idx,
+                                            n_points_added as usize,
+                                        ));
                                     }
                                 };
                             }
@@ -408,14 +451,24 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                             };
                         }
                         DELTA_ENCODE => {
-                            let delta_model = metadata.model_deltas_for_conv(spectrum_idx as usize);
                             macro_rules! decode_deltas {
                                 ($chunk_values:ident, $starts:ident, $accumulator:ident) => {
-                                    for (chunk_vals, start) in
-                                        $chunk_values.iter().zip($starts.iter())
+                                    for (chunk_vals, (start, spectrum_idx)) in $chunk_values
+                                        .iter()
+                                        .zip($starts.iter().zip(spectrum_idxs.iter().flatten()))
                                     {
                                         if let Some(chunk_vals) = chunk_vals {
                                             let start = start.unwrap();
+                                            let delta_model =
+                                                delta_model_cache.get(spectrum_idx, || {
+                                                    metadata.model_deltas_for_conv(
+                                                        spectrum_idx as usize,
+                                                    )
+                                                });
+                                            let main_axis_size_before = main_axis
+                                                .as_ref()
+                                                .map(|a| a.data_len().unwrap_or_default())
+                                                .unwrap_or_default();
                                             (ChunkingStrategy::Delta { chunk_size: 50.0 })
                                                 .decode_arrow(
                                                     &chunk_vals,
@@ -423,6 +476,16 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                                     $accumulator.as_mut().unwrap(),
                                                     delta_model.as_ref(),
                                                 );
+                                            let main_axis_size_after = main_axis
+                                                .as_ref()
+                                                .map(|a| a.data_len().unwrap_or_default())
+                                                .unwrap_or_default();
+                                            let n_points_added =
+                                                main_axis_size_after - main_axis_size_before;
+                                            spectrum_idx_acc.extend(std::iter::repeat_n(
+                                                spectrum_idx,
+                                                n_points_added as usize,
+                                            ));
                                         }
                                     }
                                 };
@@ -439,15 +502,25 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                             };
                         }
                         NUMPRESS_LINEAR => {
-                            let delta_model = metadata.model_deltas_for_conv(spectrum_idx as usize);
                             let chunk_values = chunk_values.as_list::<i64>();
                             macro_rules! decode_numpress {
                                 ($chunk_values:ident, $starts:ident, $accumulator:ident) => {
-                                    for (chunk_vals, start) in
-                                        $chunk_values.iter().zip($starts.iter())
+                                    for (chunk_vals, (start, spectrum_idx)) in $chunk_values
+                                        .iter()
+                                        .zip($starts.iter().zip(spectrum_idxs.iter().flatten()))
                                     {
                                         if let Some(chunk_vals) = chunk_vals {
                                             let start = start.unwrap();
+                                            let delta_model =
+                                                delta_model_cache.get(spectrum_idx, || {
+                                                    metadata.model_deltas_for_conv(
+                                                        spectrum_idx as usize,
+                                                    )
+                                                });
+                                            let main_axis_size_before = main_axis
+                                                .as_ref()
+                                                .map(|a| a.data_len().unwrap_or_default())
+                                                .unwrap_or_default();
                                             (ChunkingStrategy::NumpressLinear { chunk_size: 50.0 })
                                                 .decode_arrow(
                                                     &chunk_vals,
@@ -455,6 +528,16 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                                     $accumulator.as_mut().unwrap(),
                                                     delta_model.as_ref(),
                                                 );
+                                            let main_axis_size_after = main_axis
+                                                .as_ref()
+                                                .map(|a| a.data_len().unwrap_or_default())
+                                                .unwrap_or_default();
+                                            let n_points_added =
+                                                main_axis_size_after - main_axis_size_before;
+                                            spectrum_idx_acc.extend(std::iter::repeat_n(
+                                                spectrum_idx,
+                                                n_points_added as usize,
+                                            ));
                                         }
                                     }
                                 };
@@ -472,14 +555,29 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                 }
             }
 
+            // let uniq_idxs = spectrum_index
+            //     .iter()
+            //     .map(|v| HashSet::from_iter(v.as_primitive::<UInt64Type>().iter()))
+            //     .reduce(|prev, next| {
+            //         let combo: HashSet<_> = prev.union(&next).copied().collect();
+            //         combo
+            //     })
+            //     .unwrap_or_default();
+            // let mut uniq_idxs: Vec<_> = uniq_idxs.into_iter().flatten().collect();
+            // uniq_idxs.sort();
+            // log::debug!("{uniq_idxs:?}");
+            // log::debug!("{spectrum_idx_acc:?}");
+
             let axis = main_axis.unwrap();
             let buffer_name = BufferName::from_data_array(crate::BufferContext::Spectrum, &axis);
             let axis = data_array_to_arrow_array(&buffer_name, &axis).unwrap();
 
             let mut fields = Vec::with_capacity(buffers.len() + 1);
+            fields.push(buffer_name.context.index_field());
             fields.push(buffer_name.to_field());
 
             let mut arrays = Vec::with_capacity(buffers.len() + 1);
+            arrays.push(Arc::new(UInt64Array::from(spectrum_idx_acc)) as ArrayRef);
             arrays.push(axis);
 
             for (name, chunks) in buffers {
@@ -488,35 +586,86 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                     Some(decoder) => {
                         let chunks: Vec<ArrayRef> = chunks
                             .iter()
-                            .flat_map(|a| a.as_list::<i64>().iter().map(|b| {
-                                decoder.decode(&name, b.as_ref().unwrap())
-                            }))
+                            .flat_map(|a| {
+                                a.as_list::<i64>()
+                                    .iter()
+                                    .map(|b| decoder.decode(&name, b.as_ref().unwrap()))
+                            })
                             .collect();
-                        let chunks: Vec<&dyn Array> = chunks.iter().map(|a| a as &dyn Array).collect();
+                        let chunks: Vec<&dyn Array> =
+                            chunks.iter().map(|a| a as &dyn Array).collect();
                         let chunks = arrow::compute::concat(&chunks)?;
                         chunks
-                    },
+                    }
                     None => {
-                        let chunks: Vec<&dyn Array> = chunks
+                        let chunks: Vec<&ArrayRef> = chunks
                             .iter()
-                            .map(|a| a.as_ref().as_list::<i64>().values().as_ref())
+                            .map(|a| a.as_ref().as_list::<i64>().values())
                             .collect();
-                        let chunks = arrow::compute::concat(&chunks)?;
-                        chunks
-                    },
+
+                        macro_rules! fill_null {
+                            ($arr:ident, $p:ty, $out:expr) => {
+                                if let Some(arr) = $arr.as_primitive_opt::<$p>() {
+                                    let vals = arr.values().clone();
+                                    $out.push(Arc::new(PrimitiveArray::<$p>::new(vals, None)) as ArrayRef);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                        }
+
+                        let had_nulls = chunks.iter().any(|c| c.null_count() > 0);
+                        log::trace!("Found nulls in {name:?}");
+                        if had_nulls {
+                            let mut chunks_out: Vec<Arc<dyn Array>> = Vec::with_capacity(chunks.len());
+                            for chunk in chunks.iter() {
+                                if chunk.null_count() == 0 {
+                                    chunks_out.push((*chunk).clone());
+                                    continue;
+                                }
+                                if fill_null!(chunk, Int64Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, UInt64Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, Float64Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, Int32Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, UInt32Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, Float32Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, Int8Type, &mut chunks_out) {}
+                                else if fill_null!(chunk, UInt8Type, &mut chunks_out) {}
+                                else {
+                                    chunks_out.push((*chunk).clone());
+                                }
+                            }
+                            let chunks: Vec<_> = chunks_out.iter().map(|v| v.as_ref()).collect();
+                            arrow::compute::concat(&chunks)?
+                        } else {
+                            let chunks: Vec<_> = chunks.iter().map(|v| v.as_ref()).collect();
+                            arrow::compute::concat(&chunks)?
+                        }
+                    }
                 };
                 arrays.push(chunks);
                 fields.push(name.to_field());
             }
 
-            let mut batch: ArrayRef = Arc::new(StructArray::new(fields.into(), arrays, None));
+            let fields: Fields = fields.into();
+
+            let mut batch: ArrayRef = Arc::new(StructArray::new(fields.clone(), arrays, None));
 
             if let Some(query_range) = query_range.as_ref() {
-                let v = batch.as_struct().column(0);
+                let v = batch.as_struct().column(1);
                 let mask = query_range.contains_dy(v);
                 batch = arrow::compute::filter(&batch, &mask)?;
             }
-            let batch = RecordBatch::from(batch.as_struct());
+
+            let dt = DataType::Struct(fields.clone());
+            let batch = StructArray::new(
+                vec![Arc::new(Field::new("chunk", dt, false))].into(),
+                vec![batch],
+                None,
+            );
+
+            let batch = RecordBatch::from(batch);
             Ok(batch)
         });
 
@@ -701,7 +850,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
 
         // If we never populated the main axis, exit early and return empty arrays.
         if main_axis.is_none() {
-            for k in spectrum_array_indices.entries.values() {
+            for k in spectrum_array_indices.iter() {
                 bin_map.add(k.as_buffer_name().as_data_array(0));
             }
             return Ok(bin_map);
@@ -824,7 +973,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             rg_row_skip
         } else {
             let mut bin_map = BinaryArrayMap::new();
-            for k in spectrum_array_indices.entries.values() {
+            for k in spectrum_array_indices.iter() {
                 bin_map.add(k.as_buffer_name().as_data_array(0));
             }
             return Ok(bin_map);

@@ -97,7 +97,7 @@ pub trait ArrayBufferWriter {
                             buffer_name,
                             Some(&f)
                         );
-                        array_index.insert(aie.array_type.clone(), aie);
+                        array_index.push(aie);
                     } else {
                         if f.name().ends_with("_chunk_end")
                             || f.name().ends_with("_chunk_start")

@@ -4,14 +4,21 @@ import humanize
 from mzpeak import MzPeakFile
 
 @click.command
+@click.option("-c", "--chromatograms", is_flag=True)
 @click.argument('path')
 @click.argument("column_path")
-def main(path: str, column_path: str):
+def main(path: str, column_path: str, chromatograms: bool):
     archive = MzPeakFile(path)
-    if column_path.startswith(("point", 'chunk')):
-        meta = archive.spectrum_data.meta
+    if chromatograms:
+        if column_path.startswith(("point", "chunk")):
+            meta = archive.chromatogram_data.meta
+        else:
+            meta = archive.chromatogram_metadata.meta
     else:
-        meta = archive.spectrum_metadata.meta
+        if column_path.startswith(("point", 'chunk')):
+            meta = archive.spectrum_data.meta
+        else:
+            meta = archive.spectrum_metadata.meta
 
     z = 0
     zu = 0

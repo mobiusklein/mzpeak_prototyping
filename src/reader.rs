@@ -15,6 +15,7 @@ use arrow::{
     error::ArrowError,
 };
 
+use identity_hash::BuildIdentityHasher;
 use mzdata::{
     io::{DetailLevel, OffsetIndex},
     meta::MSDataFileMetadata,
@@ -224,6 +225,45 @@ impl<
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
 > SpectrumDataArrayReader for MzPeakReaderType<C, D>
 {
+}
+
+#[allow(unused)]
+#[derive(Debug, Default, Clone)]
+pub struct TimeQueryResult {
+    index_range: SimpleInterval<u64>,
+    time_index: Vec<f32>
+}
+
+impl TimeQueryResult {
+    pub fn new(index_range: SimpleInterval<u64>, time_index: Vec<f32>) -> Self {
+        Self { index_range, time_index }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item=(u64, f32)> {
+        self.time_index.iter().enumerate().map(|(i, v)| {
+            (i as u64 + self.start(), *v)
+        })
+    }
+
+    pub fn get(&self, index: u64) -> Option<f32> {
+        if !self.index_range.contains(&index) {
+            None
+        } else {
+            self.time_index.get((index - self.start()) as usize).copied()
+        }
+    }
+}
+
+impl Span1D for TimeQueryResult {
+    type DimType = u64;
+
+    fn start(&self) -> Self::DimType {
+        self.index_range.start
+    }
+
+    fn end(&self) -> Self::DimType {
+        self.index_range.end
+    }
 }
 
 pub(crate) enum DataCache {
@@ -480,7 +520,7 @@ impl<
             .build()?;
 
         let mut bin_map = HashMap::new();
-        for (_, v) in self.metadata.spectrum_array_indices.iter() {
+        for v in self.metadata.spectrum_array_indices.iter() {
             bin_map.insert(&v.name, v.as_buffer_name().as_data_array(1024));
         }
 
@@ -791,11 +831,38 @@ impl<
     pub fn get_spectrum_index_range_for_time_range(
         &self,
         time_range: SimpleInterval<f32>,
-    ) -> io::Result<(HashMap<u64, f32>, SimpleInterval<u64>)> {
-        let rows = self
-            .query_indices
-            .spectrum_time_index
-            .row_selection_overlaps(&time_range);
+    ) -> io::Result<(HashMap<u64, f32, BuildIdentityHasher<u64>>, SimpleInterval<u64>)> {
+        // let rows = self
+        //     .query_indices
+        //     .spectrum_time_index
+        //     .row_selection_overlaps(&time_range);
+
+        if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
+            let mut times: HashMap<u64, f32, _> = HashMap::default();
+            let mut min = u64::MAX;
+            let mut max = 0;
+
+            let offset = match cache.binary_search_by(|descr| {
+                time_range.start().total_cmp(&(descr.acquisition.start_time() as f32)).reverse()
+            }) {
+                Ok(i) => i,
+                Err(i) => i,
+            }.saturating_sub(1);
+
+            for (i, descr) in cache.iter().enumerate().skip(offset) {
+                let i = i as u64;
+                let t = descr.acquisition.start_time() as f32;
+                if time_range.contains(&t) {
+                    min = min.min(i);
+                    max = max.max(i);
+                    times.insert(i, t);
+                } else if !times.is_empty() {
+                    break;
+                }
+            }
+            return Ok((times, SimpleInterval::new(min, max)))
+        }
+
         let builder = self.handle.spectrum_metadata()?;
 
         let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.time"]);
@@ -811,7 +878,7 @@ impl<
         );
 
         let reader = builder
-            .with_row_selection(rows)
+            // .with_row_selection(rows)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .with_projection(proj)
             .build()?;
@@ -819,19 +886,19 @@ impl<
         let mut min = u64::MAX;
         let mut max = 0;
 
-        let mut times: HashMap<u64, f32> = HashMap::new();
+        let mut times: HashMap<u64, f32, _> = HashMap::default();
 
         for batch in reader.flatten() {
             let root = batch.column(0).as_struct();
-            let arr: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
+            let arr: &UInt64Array = root.column(0).as_primitive();
             let time_arr = root.column(1);
-            if let Some(time_arr) = time_arr.as_any().downcast_ref::<Float32Array>() {
+            if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
                 for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
                     min = min.min(val);
                     max = max.max(val);
                     times.insert(val, time);
                 }
-            } else if let Some(time_arr) = time_arr.as_any().downcast_ref::<Float64Array>() {
+            } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float64Type>() {
                 for (val, time) in arr
                     .iter()
                     .flatten()
@@ -861,7 +928,7 @@ impl<
         ion_mobility_range: Option<SimpleInterval<f64>>,
     ) -> io::Result<(
         Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>,
-        HashMap<u64, f32>,
+        HashMap<u64, f32, BuildIdentityHasher<u64>>,
     )> {
         let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
         let builder = self.handle.spectra_data()?;
@@ -930,8 +997,8 @@ impl<
             fields.push(e.path.as_str());
         }
 
-        for (k, v) in self.metadata.spectrum_array_indices.iter() {
-            if k.is_ion_mobility() {
+        for v in self.metadata.spectrum_array_indices.iter() {
+            if v.is_ion_mobility() {
                 fields.push(v.path.as_str());
                 break;
             }

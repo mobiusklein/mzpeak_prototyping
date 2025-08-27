@@ -343,30 +343,30 @@ class MzPeakArrayDataReader:
             result[k] = np.asarray(v)
         return result
 
-    def read_data_for_spectrum_range(self, spectrum_index_range: slice | list):
+    def read_data_for_range(self, index_range: slice | list[int]):
         prefix = BufferFormat.Point
-        rgs = self._point_index.row_groups_for_spectrum_range(spectrum_index_range)
+        rgs = self._point_index.row_groups_for_spectrum_range(index_range)
         if not rgs:
-            rgs = self._chunk_index.row_groups_for_spectrum_range(spectrum_index_range)
+            rgs = self._chunk_index.row_groups_for_spectrum_range(index_range)
             if rgs:
                 prefix = BufferFormat.Chunk
 
         is_slice = False
-        if isinstance(spectrum_index_range, slice):
-            start = spectrum_index_range.start or 0
-            end = spectrum_index_range.stop or self.n_entries
+        if isinstance(index_range, slice):
+            start = index_range.start or 0
+            end = index_range.stop or self.n_entries
             is_slice = True
         else:
-            start = min(spectrum_index_range)
-            end = max(spectrum_index_range)
+            start = min(index_range)
+            end = max(index_range)
 
         if prefix == BufferFormat.Point:
             return self._read_point_range(
-                start, end, spectrum_index_range, is_slice, rgs
+                start, end, index_range, is_slice, rgs
             )
         elif prefix == BufferFormat.Chunk:
             return self._read_chunk_range(
-                start, end, spectrum_index_range, is_slice, rgs
+                start, end, index_range, is_slice, rgs
             )
         else:
             raise NotImplementedError(prefix)
@@ -374,7 +374,7 @@ class MzPeakArrayDataReader:
     def _expand_chunks(
         self,
         chunks: list[dict[str, Any]],
-        axis_prefix: str | None = "spectrum_mz",
+        axis_prefix: str | None = None,
         delta_model: float | np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         if axis_prefix is None:
@@ -556,22 +556,22 @@ class MzPeakArrayDataReader:
         )
         return self._clean_point_batch(data)
 
-    def _read_chunk(self, spectrum_index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512):
+    def _read_chunk(self, index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512):
         chunks = []
         it = _ChunkIterator(
             self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"])
         )
-        it.seek(spectrum_index)
+        it.seek(index)
         batch: pa.RecordBatch
         for idx, batch in it:
             # batch = pc.filter(
             #     batch,
             #     pc.equal(pc.struct_field(batch, "spectrum_index"), spectrum_index),
             # )
-            if idx > spectrum_index:
+            if idx > index:
                 break
             if len(batch) == 0:
-                if chunks or idx > spectrum_index:
+                if chunks or idx > index:
                     break
                 else:
                     continue
@@ -585,7 +585,7 @@ class MzPeakArrayDataReader:
 
         delta_model = None
         if self._do_null_filling and self._delta_model_series is not None:
-            delta_model = self._delta_model_series[spectrum_index]
+            delta_model = self._delta_model_series[index]
 
         return self._expand_chunks(chunks, delta_model=delta_model)
 
@@ -593,7 +593,7 @@ class MzPeakArrayDataReader:
         self,
         start: int,
         end: int,
-        spectrum_index_range: list[int] | slice,
+        index_range: list[int] | slice,
         is_slice: bool,
         rgs: list[int],
     ):
@@ -609,7 +609,7 @@ class MzPeakArrayDataReader:
                     pc.less_equal(idx_col, end), pc.greater_equal(idx_col, start)
                 )
             else:
-                mask = pc.is_in(idx_col, pa.array(spectrum_index_range))
+                mask = pc.is_in(idx_col, pa.array(index_range))
             batch = pc.filter(
                 batch,
                 mask,
@@ -626,23 +626,23 @@ class MzPeakArrayDataReader:
         chunks = pa.chunked_array(chunks)
         return self._expand_chunks(chunks)
 
-    def _read_data_for(self, spectrum_index: int):
+    def _read_data_for(self, index: int):
         if self._delta_model_series is not None:
-            median_delta = self._delta_model_series[spectrum_index]
+            median_delta = self._delta_model_series[index]
         else:
             median_delta = None
 
         prefix = BufferFormat.Point
-        rgs = self._point_index.row_groups_for_index(spectrum_index)
+        rgs = self._point_index.row_groups_for_index(index)
         if not rgs:
-            rgs = self._chunk_index.row_groups_for_index(spectrum_index)
+            rgs = self._chunk_index.row_groups_for_index(index)
             if rgs:
                 prefix = BufferFormat.Chunk
         if prefix == BufferFormat.Point:
-            return self._read_point(spectrum_index, rgs, median_delta)
+            return self._read_point(index, rgs, median_delta)
         elif prefix == BufferFormat.Chunk:
             return self._read_chunk(
-                spectrum_index,
+                index,
                 rgs,
             )
         else:
@@ -650,7 +650,7 @@ class MzPeakArrayDataReader:
 
     def __getitem__(self, index: int | slice):
         if isinstance(index, slice):
-            return self.read_data_for_spectrum_range(index)
+            return self.read_data_for_range(index)
         return self._read_data_for(index)
 
     def buffer_format(self):

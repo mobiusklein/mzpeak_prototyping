@@ -595,28 +595,6 @@ impl Display for BufferName {
     }
 }
 
-/// Describes an array that is encoded long-form in the data file
-#[derive(Debug, Clone, PartialEq)]
-pub struct ArrayIndexEntry {
-    /// Is this a spectrum or chromatogram array?
-    pub context: BufferContext,
-    /// The prefix to this field in the schema
-    pub prefix: String,
-    /// The complete path to this field from the root of the schema
-    pub path: String,
-    /// The name of array, either given by `array_type` or a user-defined name
-    pub name: String,
-    /// The kind of physical data stored in the array
-    pub data_type: DataType,
-    /// The kind of array being stored semantically
-    pub array_type: ArrayType,
-    /// The unit of the values in the array
-    pub unit: Unit,
-    /// The layout of buffer, either point or chunks
-    pub buffer_format: BufferFormat,
-    pub transform: Option<CURIE>,
-}
-
 /// A JSON-serializable version of [`ArrayIndexEntry`].
 ///
 /// They can be inter-converted
@@ -690,7 +668,7 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
             },
             unit: value.unit.to_curie().map(|c| c.into()),
             buffer_format: value.buffer_format.to_string(),
-            transform: value.transform,
+            transform: value.transform.map(|t| t.curie()),
         }
     }
 }
@@ -724,9 +702,34 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
                 .buffer_format
                 .parse::<BufferFormat>()
                 .unwrap_or(BufferFormat::Point),
-            transform: value.transform,
+            transform: value.transform.and_then(|t| BufferTransform::from_curie(t).or_else(|| {
+                log::warn!("Failed to translate {t} into a buffer transform");
+                None
+            })),
         }
     }
+}
+
+/// Describes an array that is encoded long-form in the data file
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayIndexEntry {
+    /// Is this a spectrum or chromatogram array?
+    pub context: BufferContext,
+    /// The prefix to this field in the schema
+    pub prefix: String,
+    /// The complete path to this field from the root of the schema
+    pub path: String,
+    /// The name of array, either given by `array_type` or a user-defined name
+    pub name: String,
+    /// The kind of physical data stored in the array
+    pub data_type: DataType,
+    /// The kind of array being stored semantically
+    pub array_type: ArrayType,
+    /// The unit of the values in the array
+    pub unit: Unit,
+    /// The layout of buffer, either point or chunks
+    pub buffer_format: BufferFormat,
+    pub transform: Option<BufferTransform>,
 }
 
 impl ArrayIndexEntry {
@@ -775,7 +778,7 @@ impl ArrayIndexEntry {
             array_type: buffer_name.array_type,
             unit: buffer_name.unit,
             buffer_format: buffer_name.buffer_format,
-            transform: buffer_name.transform.map(|t| t.curie()),
+            transform: buffer_name.transform,
         }
     }
 
@@ -785,7 +788,12 @@ impl ArrayIndexEntry {
             self.array_type.clone(),
             arrow_to_array_type(&self.data_type).unwrap(),
             self.buffer_format,
-        )
+        ).with_transform(self.transform)
+         .with_unit(self.unit)
+    }
+
+    pub const fn is_ion_mobility(&self) -> bool {
+        self.array_type.is_ion_mobility()
     }
 }
 
@@ -797,32 +805,44 @@ pub struct ArrayIndex {
     /// The prefix to the arrays
     pub prefix: String,
     /// The collection of array index entries
-    pub entries: HashMap<ArrayType, ArrayIndexEntry>,
+    entries: Vec<ArrayIndexEntry>,
 }
 
 impl ArrayIndex {
     pub fn new(prefix: String, entries: HashMap<ArrayType, ArrayIndexEntry>) -> Self {
-        Self { prefix, entries }
+        Self { prefix, entries: entries.into_values().collect() }
     }
 
     pub fn get(&self, key: &ArrayType) -> Option<&ArrayIndexEntry> {
-        self.entries.get(key)
+        self.entries.iter().find(|v| v.array_type == *key)
+    }
+
+    pub fn get_all(&self, key: &ArrayType) -> impl Iterator<Item = &ArrayIndexEntry> {
+        self.entries.iter().filter(|v| v.array_type == *key)
+    }
+
+    pub fn as_slice(&self) -> &[ArrayIndexEntry] {
+        &self.entries
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    pub fn contains_key(&self, k: &ArrayType) -> bool {
-        self.entries.contains_key(k)
+    pub fn contains(&self, k: &ArrayType) -> bool {
+        self.get(k).is_some()
     }
 
-    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, ArrayType, ArrayIndexEntry> {
+    pub fn iter(&self) -> std::slice::Iter<'_, ArrayIndexEntry> {
         self.entries.iter()
     }
 
-    pub fn insert(&mut self, k: ArrayType, v: ArrayIndexEntry) -> Option<ArrayIndexEntry> {
-        self.entries.insert(k, v)
+    pub fn push(&mut self, v: ArrayIndexEntry) {
+        self.entries.push(v);
+    }
+
+    pub fn has_ion_mobility(&self) -> bool {
+        self.entries.iter().any(|v| v.is_ion_mobility())
     }
 
     /// Serialize the index to JSON as a string
@@ -840,10 +860,10 @@ impl ArrayIndex {
 
 impl From<SerializedArrayIndex> for ArrayIndex {
     fn from(value: SerializedArrayIndex) -> Self {
-        let mut entries = HashMap::new();
+        let mut entries = Vec::new();
         for v in value.entries.into_iter() {
             let v = ArrayIndexEntry::from(v);
-            entries.insert(v.array_type.clone(), v);
+            entries.push(v);
         }
 
         Self {
@@ -857,8 +877,8 @@ impl From<ArrayIndex> for SerializedArrayIndex {
     fn from(value: ArrayIndex) -> Self {
         let entries = value
             .entries
-            .into_values()
-            .map(SerializedArrayIndexEntry::from)
+            .into_iter()
+            .map(|v| SerializedArrayIndexEntry::from(v))
             .collect();
 
         Self {

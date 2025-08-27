@@ -804,16 +804,16 @@ impl QueryIndex {
             log::error!("Prefix {} not recognized", spectrum_array_indices.prefix)
         }
 
-        for (arr, entry) in spectrum_array_indices.iter() {
+        for entry in spectrum_array_indices.iter() {
             if BufferFormat::Point == *entry.prefix {
-                if matches!(arr, ArrayType::MZArray) {
+                if matches!(entry.array_type, ArrayType::MZArray) {
                     self.spectrum_point_index.mz_index = read_f64_page_index_from(
                         &spectrum_data_reader.metadata(),
                         &peak_pq_schema,
                         &entry.path,
                     )
                     .unwrap_or_default();
-                } else if arr.is_ion_mobility() {
+                } else if entry.is_ion_mobility() {
                     self.spectrum_point_index.im_index = read_f64_page_index_from(
                         &spectrum_data_reader.metadata(),
                         &peak_pq_schema,
@@ -822,7 +822,7 @@ impl QueryIndex {
                     .unwrap_or_default();
                 }
             } else if BufferFormat::Chunked == *entry.prefix {
-                if matches!(arr, ArrayType::MZArray) {
+                if matches!(entry.array_type, ArrayType::MZArray) {
                     self.spectrum_chunk_index.start_mz_index = read_f64_page_index_from(
                         &spectrum_data_reader.metadata(),
                         &peak_pq_schema,

@@ -1936,6 +1936,7 @@ dependencies = [
  "clap",
  "csv",
  "env_logger",
+ "identity-hash",
  "indicatif",
  "itertools",
  "log",

@@ -47,6 +47,14 @@ impl MzPeakReaderMetadata {
         self.model_deltas_for(index)
             .map(|v| RegressionDeltaModel::from(v))
     }
+
+    pub fn auxliary_array_counts(&self) -> &[u32] {
+        &self.auxliary_array_counts
+    }
+
+    pub fn file_metadata(&self) -> &mzdata::meta::FileMetadataConfig {
+        &self.mz_metadata
+    }
 }
 
 impl MSDataFileMetadata for MzPeakReaderMetadata {

@@ -429,6 +429,30 @@ impl ZipArchiveReader {
         Ok(Self { archive, members })
     }
 
+    pub fn chromatograms_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
+        if let Some(meta) = self.members.chromatogram_metadata.as_ref() {
+            self.archive
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Chromatogram metadata entry not found",
+            ))
+        }
+    }
+
+    pub fn chromatograms_data(&self) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
+        if let Some(meta) = self.members.chromatogram_data_arrays.as_ref() {
+            self.archive
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Chromatogram metadata entry not found",
+            ))
+        }
+    }
+
     pub fn spectra_data(&self) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
         if let Some(meta) = self.members.spectrum_data_arrays.as_ref() {
             self.archive

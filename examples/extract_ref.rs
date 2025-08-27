@@ -37,13 +37,22 @@ fn main() -> io::Result<()> {
         if let Some(arrays) = spec.arrays.as_ref() {
             let mzs = arrays.mzs()?;
             let ints = arrays.intensities()?;
-            let (ims, _) = arrays.ion_mobility()?;
-
-            for (mz, (int, im)) in mzs.iter().zip(ints.iter().zip(ims.iter())) {
-                if mz_range.contains(mz) && im_range.contains(im) {
-                    println!("{}\t{mz}\t{int}\t{im}", spec.index());
+            let time = spec.start_time();
+            let index = spec.index();
+            if let Ok((ims, _)) = arrays.ion_mobility() {
+                for (mz, (int, im)) in mzs.iter().zip(ints.iter().zip(ims.iter())) {
+                    if mz_range.contains(mz) && im_range.contains(im) {
+                        println!("{index}\t{time}\t{mz}\t{int}\t{im}");
+                    }
+                }
+            } else {
+                for (mz, int) in mzs.iter().zip(ints.iter()) {
+                    if mz_range.contains(mz) {
+                        println!("{index}\t{time}\t{mz}\t{int}");
+                    }
                 }
             }
+
         }
         if spec.start_time() > time_range.end {
             break
