@@ -557,6 +557,7 @@ impl From<BufferTransform> for BufferTransformDecoder {
 pub struct ArrowArrayChunk {
     /// The index of source entity
     pub series_index: u64,
+    pub series_time: Option<f32>,
     /// The starting coordinate of the chunk axis
     pub chunk_start: f64,
     /// The ending coordinate of the chunk axis
@@ -574,6 +575,7 @@ pub struct ArrowArrayChunk {
 impl ArrowArrayChunk {
     pub fn new(
         series_index: u64,
+        series_time: Option<f32>,
         chunk_start: f64,
         chunk_end: f64,
         chunk_axis: BufferName,
@@ -583,6 +585,7 @@ impl ArrowArrayChunk {
     ) -> Self {
         Self {
             series_index,
+            series_time,
             chunk_start,
             chunk_end,
             chunk_axis,
@@ -595,26 +598,42 @@ impl ArrowArrayChunk {
     /// Convert a series of [`ArrowArrayChunk`] into a [`StructArray`]
     pub fn to_struct_array(
         chunks: &[Self],
-        series_index_name: impl Into<String>,
+        buffer_context: BufferContext,
         schema: &Fields,
         encodings: &[ChunkingStrategy],
+        include_time: bool,
     ) -> StructArray {
-        let this_schema = chunks[0].to_schema(series_index_name, encodings);
+        let this_schema = chunks[0].to_schema(buffer_context, encodings, include_time);
         let mut this_builder =
             StructBuilder::from_fields(this_schema.fields().clone(), chunks.len());
 
+        let time_index = if include_time {
+            let q = buffer_context.time_field();
+            let q = q.name();
+            this_schema.fields().iter().position(|f| *f.name() == *q).unwrap()
+        } else {
+            0
+        };
+
         let mut visited: HashSet<usize> = HashSet::new();
         for chunk in chunks {
+            let mut field_i = 0;
             visited.clear();
-            let mut b = this_builder.field_builder::<UInt64Builder>(0).unwrap();
+            let mut b = this_builder.field_builder::<UInt64Builder>(field_i).unwrap();
             b.append_value(chunk.series_index);
-            let mut b = this_builder.field_builder::<Float64Builder>(1).unwrap();
+            visited.insert(field_i);
+            field_i += 1;
+            let mut b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
             b.append_value(chunk.chunk_start);
-            let mut b = this_builder.field_builder::<Float64Builder>(2).unwrap();
+            visited.insert(field_i);
+            field_i += 1;
+            let mut b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
             b.append_value(chunk.chunk_end);
+            visited.insert(field_i);
+            field_i += 1;
 
             let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-                this_builder.field_builder(3).unwrap();
+                this_builder.field_builder(field_i).unwrap();
             if matches!(
                 chunk.chunk_encoding,
                 ChunkingStrategy::NumpressLinear { chunk_size }
@@ -664,7 +683,8 @@ impl ArrowArrayChunk {
                 }
                 b.append(true);
             }
-
+            visited.insert(field_i);
+            field_i += 1;
             for encoding in encodings {
                 encoding.encode_extra_arrow(
                     &chunk.chunk_axis,
@@ -675,7 +695,7 @@ impl ArrowArrayChunk {
                 );
             }
 
-            let mut cb = this_builder.field_builder::<StructBuilder>(4).unwrap();
+            let mut cb = this_builder.field_builder::<StructBuilder>(field_i).unwrap();
             let curie_of = chunk.chunk_encoding.as_curie();
             cb.field_builder::<UInt8Builder>(0)
                 .unwrap()
@@ -684,14 +704,16 @@ impl ArrowArrayChunk {
                 .unwrap()
                 .append_value(curie_of.accession);
             cb.append(true);
+            visited.insert(field_i);
+            field_i += 1;
 
-            visited.insert(0);
-            visited.insert(1);
-            visited.insert(2);
-            visited.insert(3);
-            visited.insert(4);
+            if include_time {
+                let mut b = this_builder.field_builder::<Float32Builder>(time_index).unwrap();
+                b.append_option(chunk.series_time);
+                visited.insert(time_index);
+            }
 
-            for (i, f) in this_schema.fields().iter().enumerate().skip(5) {
+            for (i, f) in this_schema.fields().iter().enumerate().skip(field_i) {
                 if visited.contains(&i) {
                     continue;
                 }
@@ -772,8 +794,9 @@ impl ArrowArrayChunk {
     /// Construct an Arrow schema from this chunk.
     pub fn to_schema(
         &self,
-        series_index_name: impl Into<String>,
+        buffer_context: BufferContext,
         encodings: &[ChunkingStrategy],
+        include_time: bool,
     ) -> Schema {
         let curie_fields: Vec<FieldRef> =
             serde_arrow::schema::SchemaLike::from_type::<CURIE>(Default::default()).unwrap();
@@ -782,7 +805,7 @@ impl ArrowArrayChunk {
 
         let field_meta = base_name.as_field_metadata();
         let mut fields_of = vec![
-            Field::new(series_index_name, DataType::UInt64, true).into(),
+            buffer_context.index_field(),
             Field::new(
                 format!("{}_chunk_start", base_name),
                 DataType::Float64,
@@ -827,6 +850,9 @@ impl ArrowArrayChunk {
         for enc in encodings.iter() {
             fields_of.extend(enc.extra_arrays(&base_name).into_iter().map(Arc::new));
         }
+        if include_time {
+            fields_of.push(buffer_context.time_field());
+        }
         Schema::new(fields_of)
     }
 
@@ -837,6 +863,7 @@ impl ArrowArrayChunk {
     /// If `fields` is provided, any array not found in it will be returned as a [`AuxiliaryArray`].
     pub fn from_arrays(
         series_index: u64,
+        series_time: Option<f32>,
         main_axis: BufferName,
         arrays: &BinaryArrayMap,
         chunk_encoding: ChunkingStrategy,
@@ -1007,6 +1034,7 @@ impl ArrowArrayChunk {
 
             chunks.push(Self::new(
                 series_index,
+                series_time,
                 chunk_start,
                 chunk_end,
                 main_axis.clone(),
@@ -1077,6 +1105,7 @@ mod test {
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
+            None,
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
@@ -1095,12 +1124,13 @@ mod test {
 
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
-            "spectrum_index",
+            BufferContext::Spectrum,
             Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
+            false,
         );
 
         eprintln!("{:?}", rendered.slice(0, 1));
@@ -1119,6 +1149,7 @@ mod test {
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
+            None,
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
@@ -1137,12 +1168,13 @@ mod test {
 
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
-            "spectrum_index",
+            BufferContext::Spectrum,
             Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
+            false,
         );
         Ok(())
     }
@@ -1168,6 +1200,7 @@ mod test {
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
+            None,
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
@@ -1178,21 +1211,23 @@ mod test {
         )?;
 
         let schema = chunks[0].to_schema(
-            "spectrum_index",
+            BufferContext::Spectrum,
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
+            false,
         );
 
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
-            "spectrum_index",
+            BufferContext::Spectrum,
             Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
+            false,
         );
 
         eprintln!("{:?}", rendered.slice(0, 1));
@@ -1211,6 +1246,7 @@ mod test {
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
+            None,
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
@@ -1220,22 +1256,15 @@ mod test {
             None,
         )?;
 
-        let schema = chunks[0].to_schema(
-            "spectrum_index",
-            &[
-                ChunkingStrategy::Basic { chunk_size: 50.0 },
-                ChunkingStrategy::Delta { chunk_size: 50.0 },
-            ],
-        );
-
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
-            "spectrum_index",
+            BufferContext::Spectrum,
             Schema::empty().fields(),
             &[
                 ChunkingStrategy::Basic { chunk_size: 50.0 },
                 ChunkingStrategy::Delta { chunk_size: 50.0 },
             ],
+            true,
         );
 
         eprintln!("{:?}", rendered.slice(0, 1));

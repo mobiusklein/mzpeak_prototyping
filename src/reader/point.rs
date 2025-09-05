@@ -8,11 +8,14 @@ use arrow::{
     datatypes::DataType,
 };
 use mzdata::spectrum::{ArrayType, BinaryArrayMap, DataArray};
-use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::reader::ChunkReader};
+use parquet::{
+    arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder},
+    file::reader::ChunkReader,
+};
 
 use crate::{
     filter::{RegressionDeltaModel, fill_nulls_for},
-    peak_series::ArrayIndex
+    peak_series::ArrayIndex,
 };
 
 pub(crate) fn binary_search_arrow_index(
@@ -65,7 +68,7 @@ pub(crate) trait SpectrumDataArrayReader {
         mz_delta_model: Option<&RegressionDeltaModel<f64>>,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
-            if f.name() == "spectrum_index" {
+            if f.name() == "spectrum_index" || f.name() == "spectrum_time" {
                 continue;
             }
             let store = bin_map.get_mut(f.name()).unwrap();
@@ -134,10 +137,26 @@ pub(crate) trait SpectrumDataArrayReader {
     /// Read a specific Parquet row group into memory as a single [`RecordBatch`]
     ///
     /// This reads from the spectrum data file
-    fn load_spectrum_data_row_group<T: ChunkReader + 'static>(&self, builder: ParquetRecordBatchReaderBuilder<T>, row_group: usize) -> io::Result<RecordBatch> {
+    fn load_spectrum_data_row_group<T: ChunkReader + 'static>(
+        &self,
+        builder: ParquetRecordBatchReaderBuilder<T>,
+        row_group: usize,
+    ) -> io::Result<RecordBatch> {
         log::trace!("Loading row group {row_group}");
+        let schema = builder.parquet_schema();
+        let leaves=  schema
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| if f.path().string() != "point.spectrum_time" { Some(i)} else { None });
+        let mask = ProjectionMask::leaves(
+            schema,
+            leaves,
+        );
+
         let batch = builder
             .with_row_groups(vec![row_group])
+            .with_projection(mask)
             .with_batch_size(usize::MAX)
             .build()?
             .flatten()
@@ -275,5 +294,3 @@ impl SpectrumDataPointCache {
         Ok(out)
     }
 }
-
-

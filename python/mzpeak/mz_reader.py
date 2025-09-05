@@ -385,6 +385,9 @@ class MzPeakArrayDataReader:
             else:
                 raise ValueError(self._namespace)
 
+        time_label = f"{self._namespace}_time"
+
+
         has_transforms = {k: v.get('transform') for k, v in self.array_index.items() if v.get('transform')}
         for k, v in self.array_index.items():
             if k.startswith(axis_prefix):
@@ -413,6 +416,7 @@ class MzPeakArrayDataReader:
             if (
                 k == f"{self._namespace}_index"
                 or k == "chunk_encoding"
+                or k == time_label
                 or k.startswith(axis_prefix)
             ):
                 continue
@@ -471,7 +475,7 @@ class MzPeakArrayDataReader:
                 raise ValueError(f"Unsupported chunk encoding {encoding}")
 
             for k, v in chunk.items():
-                if k in (f"{self._namespace}_index", "chunk_encoding") or k.startswith(
+                if k in (f"{self._namespace}_index", "chunk_encoding", time_label) or k.startswith(
                     axis_prefix
                 ):
                     continue
@@ -531,6 +535,9 @@ class MzPeakArrayDataReader:
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
             f"{self._namespace}_index"
         )
+        time_label = f"{self._namespace}_time"
+        if time_label in data.column_names:
+            data = data.drop_columns(time_label)
         return self._clean_point_batch(data, delta_model)
 
     def _read_point_range(

@@ -763,3 +763,55 @@ impl From<&mzdata::meta::Sample> for Sample {
         }
     }
 }
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetadataColumn {
+    pub name: String,
+    pub path: Vec<String>,
+    pub index: usize,
+    #[serde(
+        serialize_with = "opt_curie_serialize",
+        deserialize_with = "opt_curie_deserialize"
+    )]
+    pub accession: Option<CURIE>,
+}
+
+impl MetadataColumn {
+    pub fn new(name: String, path: Vec<String>, index: usize, accession: Option<CURIE>) -> Self {
+        Self {
+            name,
+            path,
+            index,
+            accession,
+        }
+    }
+
+    pub fn scope(&self) -> &str {
+        if self.path.len() <= 2 {
+            ""
+        } else {
+            self.path.get(0).unwrap()
+        }
+    }
+
+    pub fn create(&self, value: mzdata::params::Value, unit: Unit) -> mzdata::Param {
+        if let Some(curie) = self.accession {
+            let curie: mzdata::params::CURIE = curie.into();
+            mzdata::Param {
+                name: self.name.clone(),
+                value,
+                accession: Some(curie.accession),
+                controlled_vocabulary: Some(curie.controlled_vocabulary),
+                unit,
+            }
+        } else {
+            mzdata::Param {
+                name: self.name.clone(),
+                value,
+                accession: None,
+                controlled_vocabulary: None,
+                unit,
+            }
+        }
+    }
+}

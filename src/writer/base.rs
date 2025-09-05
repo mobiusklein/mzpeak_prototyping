@@ -78,6 +78,7 @@ macro_rules! implement_mz_metadata {
                 .iter()
                 .map(|v| $crate::param::Sample::from(v))
                 .collect();
+
             self.append_key_value_metadata(
                 "sample_list",
                 Some(serde_json::to_string_pretty(&tmp).unwrap()),
@@ -89,7 +90,17 @@ macro_rules! implement_mz_metadata {
                     serde_json::to_string_pretty(self.mz_metadata.run_description().unwrap())
                         .unwrap(),
                 ),
-            )
+            );
+
+            self.append_key_value_metadata(
+                "spectrum_column_metadata_mapping",
+                Some(serde_json::to_string_pretty(&crate::spectrum::SpectrumEntry::metadata_columns()).unwrap())
+            );
+
+            self.append_key_value_metadata(
+                "scan_column_metadata_mapping",
+                Some(serde_json::to_string_pretty(&crate::spectrum::ScanEntry::metadata_columns()).unwrap())
+            );
         }
     };
 }
@@ -186,6 +197,7 @@ pub trait AbstractMzPeakWriter {
             let buffer_ref = self.chromatogram_data_buffer_mut();
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 chromatogram_index,
+                None,
                 time_axis,
                 binary_array_map,
                 chunking,
@@ -197,9 +209,10 @@ pub trait AbstractMzPeakWriter {
             if !chunks.is_empty() {
                 let chunks = ArrowArrayChunk::to_struct_array(
                     &chunks,
-                    BufferContext::Chromatogram.index_field().name(),
+                    BufferContext::Chromatogram,
                     buffer_ref.schema().fields(),
                     &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
+                    false,
                 );
                 let size = chunks.len();
                 let (fields, arrays, _nulls) = chunks.into_parts();
@@ -215,7 +228,7 @@ pub trait AbstractMzPeakWriter {
                 binary_array_map,
                 n_points,
                 chromatogram_index,
-                BufferContext::Chromatogram.index_field().name(),
+                None,
                 Some(&buffer.fields()),
                 &buffer.overrides(),
             )?;
@@ -316,6 +329,12 @@ pub trait AbstractMzPeakWriter {
         };
 
         let is_profile = spectrum.signal_continuity() == SignalContinuity::Profile;
+        let include_time = self.spectrum_data_buffer_mut().include_time();
+        let spectrum_time = if include_time {
+            Some(spectrum.start_time() as f32)
+        } else {
+            None
+        };
 
         let (delta_params, extra_arrays) = if let Some(chunking) =
             self.use_chunked_encoding().copied()
@@ -330,6 +349,7 @@ pub trait AbstractMzPeakWriter {
             let buffer_ref = self.spectrum_data_buffer_mut();
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
+                spectrum_time,
                 MZ_ARRAY,
                 binary_array_map,
                 chunking,
@@ -341,9 +361,10 @@ pub trait AbstractMzPeakWriter {
             if !chunks.is_empty() {
                 let chunks = ArrowArrayChunk::to_struct_array(
                     &chunks,
-                    "spectrum_index",
+                    BufferContext::Spectrum,
                     buffer_ref.schema().fields(),
                     &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
+                    include_time,
                 );
                 let size = chunks.len();
                 let (fields, arrays, _nulls) = chunks.into_parts();
@@ -366,7 +387,7 @@ pub trait AbstractMzPeakWriter {
                 binary_array_map,
                 n_points,
                 spectrum_count,
-                "spectrum_index",
+                spectrum_time,
                 Some(&buffer.fields()),
                 &buffer.overrides(),
             )?;
@@ -384,13 +405,19 @@ pub trait AbstractMzPeakWriter {
     fn write_peaks<C: ToMzPeakDataSeries>(
         &mut self,
         spectrum_count: u64,
+        mut spectrum_time: Option<f32>,
         peaks: &[C],
     ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
+        let include_time = self.spectrum_data_buffer_mut().include_time();
+        if !include_time {
+            spectrum_time = None;
+        }
         if let Some(encoding) = self.use_chunked_encoding().copied() {
             let arrays = C::as_arrays(peaks);
             let buffer_ref = self.spectrum_data_buffer_mut();
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
+                spectrum_time,
                 MZ_ARRAY,
                 &arrays,
                 ChunkingStrategy::Basic {
@@ -404,7 +431,7 @@ pub trait AbstractMzPeakWriter {
             if !chunks.is_empty() {
                 let chunks = ArrowArrayChunk::to_struct_array(
                     &chunks,
-                    "spectrum_index",
+                    BufferContext::Spectrum,
                     buffer_ref.schema().fields(),
                     &[
                         encoding,
@@ -412,6 +439,7 @@ pub trait AbstractMzPeakWriter {
                             chunk_size: encoding.chunk_size(),
                         },
                     ],
+                    include_time,
                 );
                 let size = chunks.len();
                 let (fields, arrays, _nulls) = chunks.into_parts();
@@ -419,7 +447,7 @@ pub trait AbstractMzPeakWriter {
             }
             Ok((None, Some(auxiliary_arrays)))
         } else {
-            self.spectrum_data_buffer_mut().add(spectrum_count, peaks);
+            self.spectrum_data_buffer_mut().add(spectrum_count, spectrum_time, peaks);
             Ok((None, None))
         }
     }
@@ -452,18 +480,23 @@ pub trait AbstractMzPeakWriter {
                 self.write_spectrum_binary_array_map(spectrum, spectrum_count, raw_arrays)?;
             self.separate_peak_writer()
                 .unwrap()
-                .add_peaks(spectrum_count, peaks)?;
+                .add_peaks(spectrum_count, Some(spectrum.start_time() as f32), peaks)?;
             (delta_params, aux_arrays)
         } else {
+            let spectrum_time = if self.spectrum_data_buffer_mut().include_time() {
+                Some(spectrum.start_time() as f32)
+            } else {
+                None
+            };
             let (delta_params, aux_arrays) = match peaks {
                 mzdata::spectrum::RefPeakDataLevel::Missing => (None, None),
                 mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => self
                     .write_spectrum_binary_array_map(spectrum, spectrum_count, binary_array_map)?,
                 mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) => {
-                    self.write_peaks(spectrum_count, peaks.as_slice())?
+                    self.write_peaks(spectrum_count, spectrum_time, peaks.as_slice())?
                 }
                 mzdata::spectrum::RefPeakDataLevel::Deconvoluted(peaks) => {
-                    self.write_peaks(spectrum_count, peaks.as_slice())?
+                    self.write_peaks(spectrum_count, spectrum_time, peaks.as_slice())?
                 }
             };
             (delta_params, aux_arrays)

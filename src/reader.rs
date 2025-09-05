@@ -18,12 +18,13 @@ use arrow::{
 use identity_hash::BuildIdentityHasher;
 use mzdata::{
     io::{DetailLevel, OffsetIndex},
-    meta::MSDataFileMetadata,
+    meta::{MSDataFileMetadata, SpectrumType},
     params::{ParamDescribed, Unit},
     prelude::*,
     spectrum::{
-        ArrayType, BinaryArrayMap, Chromatogram, DataArray, MultiLayerSpectrum, ScanEvent,
-        ScanPolarity, SpectrumDescription, bindata::BuildFromArrayMap,
+        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType,
+        DataArray, MultiLayerSpectrum, ScanEvent, ScanPolarity, SpectrumDescription,
+        bindata::BuildFromArrayMap,
     },
 };
 use mzpeaks::{
@@ -44,6 +45,7 @@ use crate::{
     reader::{
         chunk::SpectrumDataChunkCache,
         index::{PageQuery, QueryIndex, SpanDynNumeric},
+        metadata::MzSpectrumBuilder,
     },
     spectrum::AuxiliaryArray,
 };
@@ -231,25 +233,31 @@ impl<
 #[derive(Debug, Default, Clone)]
 pub struct TimeQueryResult {
     index_range: SimpleInterval<u64>,
-    time_index: Vec<f32>
+    time_index: Vec<f32>,
 }
 
 impl TimeQueryResult {
     pub fn new(index_range: SimpleInterval<u64>, time_index: Vec<f32>) -> Self {
-        Self { index_range, time_index }
+        Self {
+            index_range,
+            time_index,
+        }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item=(u64, f32)> {
-        self.time_index.iter().enumerate().map(|(i, v)| {
-            (i as u64 + self.start(), *v)
-        })
+    pub fn iter(&self) -> impl Iterator<Item = (u64, f32)> {
+        self.time_index
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64 + self.start(), *v))
     }
 
     pub fn get(&self, index: u64) -> Option<f32> {
         if !self.index_range.contains(&index) {
             None
         } else {
-            self.time_index.get((index - self.start()) as usize).copied()
+            self.time_index
+                .get((index - self.start()) as usize)
+                .copied()
         }
     }
 }
@@ -431,12 +439,12 @@ impl<
 
         let PageQuery {
             pages,
-            row_group_indices: rg_idx_acc,
+            row_group_indices,
         } = self.query_indices.query_pages(index);
 
         // If there is only one row group in the scan, take the fast path through the cache
-        if rg_idx_acc.len() == 1 {
-            let row_group_index = rg_idx_acc[0];
+        if row_group_indices.len() == 1 {
+            let row_group_index = row_group_indices[0];
             let rg = self.read_spectrum_data_cache(row_group_index, index)?;
             let mut arrays = rg.slice_to_arrays_of(row_group_index, index, delta_model.as_ref())?;
             for v in self.load_auxiliary_arrays_for(index)? {
@@ -452,7 +460,7 @@ impl<
                 &self.query_indices,
                 &self.metadata.spectrum_array_indices,
                 delta_model.as_ref(),
-                Some(PageQuery::new(rg_idx_acc, pages))
+                Some(PageQuery::new(row_group_indices, pages)),
             );
         }
 
@@ -461,7 +469,7 @@ impl<
         let first_row = if !pages.is_empty() {
             let mut rg_row_skip = 0;
             let meta = builder.metadata();
-            for i in 0..rg_idx_acc[0] {
+            for i in 0..row_group_indices[0] {
                 let rg = meta.row_group(i);
                 rg_row_skip += rg.num_rows();
             }
@@ -510,10 +518,10 @@ impl<
             [self.metadata.spectrum_array_indices.prefix.as_str()],
         );
 
-        log::trace!("{index} spread across row groups {rg_idx_acc:?}");
+        log::trace!("{index} spread across row groups {row_group_indices:?}");
 
         let reader = builder
-            .with_row_groups(rg_idx_acc)
+            .with_row_groups(row_group_indices)
             .with_row_selection(rows)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .with_projection(proj)
@@ -668,13 +676,21 @@ impl<
         }
     }
 
-    fn load_metadata_from_slice_into_description(
+    fn load_spectrum_metadata_from_slice_into_description(
         &self,
         spec_arr: &StructArray,
         descr: &mut SpectrumDescription,
         offset: usize,
         param_fields: &[FieldRef],
     ) {
+        if let Some(metacols) = self.metadata.spectrum_metadata_map.as_ref() {
+            log::warn!("Loading single description at {offset}");
+            let mut builder =
+                MzSpectrumBuilder::new(std::slice::from_mut(descr), &metacols, offset);
+            builder.visit(spec_arr);
+            return;
+        }
+
         let idx_arr: &UInt64Array = spec_arr.column(0).as_any().downcast_ref().unwrap();
         let idx_val = idx_arr.value(offset);
         descr.index = idx_val as usize;
@@ -710,30 +726,14 @@ impl<
             _ => todo!("Don't know how to deal with {continuity_curie}"),
         };
 
-        if let Some(mz_arr) = spec_arr
-            .column_by_name("lowest_observed_mz")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float64Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000528))
-                .name("lowest observed m/z")
-                .unit(Unit::MZ)
-                .value(mz_arr.value(offset))
-                .build();
-            descr.add_param(p);
-        }
-
-        if let Some(mz_arr) = spec_arr
-            .column_by_name("highest_observed_mz")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float64Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000527))
-                .name("highest observed m/z")
-                .unit(Unit::MZ)
-                .value(mz_arr.value(offset))
-                .build();
-            descr.add_param(p);
+        let spec_type_array = spec_arr.column(6).as_struct();
+        let cv_id_arr: &UInt8Array = spec_type_array.column(0).as_any().downcast_ref().unwrap();
+        let accession_arr: &UInt32Array =
+            spec_type_array.column(1).as_any().downcast_ref().unwrap();
+        let spec_type_curie = CURIE::new(cv_id_arr.value(offset), accession_arr.value(offset));
+        let spec_type = SpectrumType::from_accession(spec_type_curie.accession);
+        if let Some(spec_type) = spec_type {
+            descr.set_spectrum_type(spec_type);
         }
 
         if let Some(mz_arr) = spec_arr
@@ -828,10 +828,76 @@ impl<
         }
     }
 
+    fn load_chromatogram_metadata_from_slice_into_description(
+        &self,
+        spec_arr: &StructArray,
+        descr: &mut ChromatogramDescription,
+        offset: usize,
+        param_fields: &[FieldRef],
+    ) {
+        let idx_arr: &UInt64Array = spec_arr.column(0).as_any().downcast_ref().unwrap();
+        let idx_val = idx_arr.value(offset);
+        descr.index = idx_val as usize;
+
+        let id_arr: &LargeStringArray = spec_arr.column(1).as_string();
+        let id_val = id_arr.value(offset);
+        descr.id = id_val.to_string();
+
+        let polarity_arr: &Int8Array = spec_arr.column(2).as_any().downcast_ref().unwrap();
+        let polarity_val = polarity_arr.value(offset);
+        match polarity_val {
+            1 => descr.polarity = ScanPolarity::Positive,
+            -1 => descr.polarity = ScanPolarity::Negative,
+            _ => {
+                todo!("Don't know how to deal with polarity {polarity_val}")
+            }
+        }
+
+        let chromatogram_type_array = spec_arr.column(3).as_struct();
+        let cv_id_arr: &UInt8Array = chromatogram_type_array
+            .column(0)
+            .as_any()
+            .downcast_ref()
+            .unwrap();
+        let accession_arr: &UInt32Array = chromatogram_type_array
+            .column(1)
+            .as_any()
+            .downcast_ref()
+            .unwrap();
+        let chromatogram_type = CURIE::new(cv_id_arr.value(offset), accession_arr.value(offset));
+        if let Some(tp) = ChromatogramType::from_accession(chromatogram_type.accession) {
+            descr.chromatogram_type = tp;
+        } else {
+            descr.chromatogram_type = ChromatogramType::Unknown;
+        }
+
+        let params_array: &LargeListArray =
+            spec_arr.column_by_name("parameters").unwrap().as_list();
+        let params = params_array.value(offset);
+        let params = params.as_struct();
+
+        const SKIP_PARAMS: &[CURIE] = &[];
+        let params: Vec<crate::param::Param> =
+            serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
+
+        for p in params {
+            if let Some(acc) = p.accession {
+                if !SKIP_PARAMS.contains(&acc) {
+                    descr.add_param(p.into());
+                }
+            } else {
+                descr.add_param(p.into());
+            }
+        }
+    }
+
     pub fn get_spectrum_index_range_for_time_range(
         &self,
         time_range: SimpleInterval<f32>,
-    ) -> io::Result<(HashMap<u64, f32, BuildIdentityHasher<u64>>, SimpleInterval<u64>)> {
+    ) -> io::Result<(
+        HashMap<u64, f32, BuildIdentityHasher<u64>>,
+        SimpleInterval<u64>,
+    )> {
         // let rows = self
         //     .query_indices
         //     .spectrum_time_index
@@ -842,12 +908,51 @@ impl<
             let mut min = u64::MAX;
             let mut max = 0;
 
-            let offset = match cache.binary_search_by(|descr| {
-                time_range.start().total_cmp(&(descr.acquisition.start_time() as f32)).reverse()
+            let n = cache.len();
+
+            let offset_start = match cache.binary_search_by(|descr| {
+                time_range
+                    .start()
+                    .total_cmp(&(descr.acquisition.start_time() as f32))
+                    .reverse()
             }) {
                 Ok(i) => i,
-                Err(i) => i,
-            }.saturating_sub(1);
+                Err(i) => i.min(n),
+            }
+            .saturating_sub(1);
+            let offset = offset_start;
+
+            // TODO: Rewrite the output data structure and maybe this will be faster
+            // let mut i = offset_start;
+            // while i > 0 {
+            //     if time_range.start >= cache[i].acquisition.start_time()  as f32 {
+            //         i -= 1;
+            //     }
+            //     break;
+            // }
+            // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
+            //     i += 1;
+            // }
+            // offset_start = i;
+
+            // let mut offset_end = match cache.binary_search_by(|descr| {
+            //     time_range.end().total_cmp(&(descr.acquisition.start_time() as f32)).reverse()
+            // }) {
+            //     Ok(i) => i,
+            //     Err(i) => i.min(n),
+            // };
+
+            // i = offset_end;
+            // while i < n {
+            //     if time_range.end <= cache[i].acquisition.start_time()  as f32 {
+            //         i += 1;
+            //     }
+            //     break;
+            // }
+            // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
+            //     i = i.saturating_sub(1);
+            // }
+            // offset_end = i;
 
             for (i, descr) in cache.iter().enumerate().skip(offset) {
                 let i = i as u64;
@@ -860,7 +965,7 @@ impl<
                     break;
                 }
             }
-            return Ok((times, SimpleInterval::new(min, max)))
+            return Ok((times, SimpleInterval::new(min, max)));
         }
 
         let builder = self.handle.spectrum_metadata()?;
@@ -953,6 +1058,20 @@ impl<
             .spectrum_point_index
             .spectrum_index
             .row_selection_overlaps(&index_range);
+
+        let PageQuery { row_group_indices, pages } = self.query_indices.spectrum_point_index.query_pages_overlaps(&index_range);
+
+        if pages.is_empty() {
+            return Ok((Box::new(std::iter::empty()), HashMap::default()));
+        }
+
+        let mut up_to_first_row = 0;
+        let meta = builder.metadata();
+        for i in 0..row_group_indices[0] {
+            let rg = meta.row_group(i);
+            up_to_first_row += rg.num_rows();
+        }
+
         if let Some(mz_range) = mz_range.as_ref() {
             rows = rows.intersection(
                 &self
@@ -962,6 +1081,7 @@ impl<
                     .row_selection_overlaps(mz_range),
             );
         }
+
         if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
             rows = rows.union(
                 &self
@@ -971,6 +1091,8 @@ impl<
                     .row_selection_overlaps(&ion_mobility_range),
             );
         }
+
+        rows.split_off(up_to_first_row as usize);
 
         let sidx = format!(
             "{}.spectrum_index",
@@ -1009,55 +1131,36 @@ impl<
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
             let root = batch.column(0).as_struct();
-            let spectrum_index: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
-
-            let it = spectrum_index
-                .iter()
-                .map(|v| v.map(|v| index_range.contains(&v)));
+            let it = index_range.contains_dy(root.column(0));
 
             match (mz_range, ion_mobility_range) {
-                (None, None) => Ok(it.collect()),
+                (None, None) => Ok(it),
                 (None, Some(ion_mobility_range)) => {
                     let im_array = root.column(1);
                     let it2 = ion_mobility_range.contains_dy(im_array);
-                    let it2 = it2.iter();
-                    // let it2 = im_array
-                    //     .iter()
-                    //     .map(|v| v.map(|v| ion_mobility_range.contains(&v)));
-                    let it = it
-                        .zip(it2)
-                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
-                    Ok(it.collect())
+                    arrow::compute::and(&it, &it2)
                 }
                 (Some(mz_range), None) => {
                     let mz_array = root.column(1);
                     let it2 = mz_range.contains_dy(mz_array);
-                    let it2 = it2.iter();
-                    let it = it
-                        .zip(it2)
-                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
-                    Ok(it.collect())
+                    arrow::compute::and(&it, &it2)
                 }
                 (Some(mz_range), Some(ion_mobility_range)) => {
                     let mz_array = root.column(1);
                     let im_array = root.column(2);
-                    let it2 = mz_range.contains_dy_iter(mz_array);
-                    let it3 = ion_mobility_range.contains_dy_iter(im_array);
-                    let it = it
-                        .zip(it2)
-                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
-                    let it = it
-                        .zip(it3)
-                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
-                    Ok(it.collect())
+                    let it2 = mz_range.contains_dy(mz_array);
+                    let it3 = ion_mobility_range.contains_dy(im_array);
+                    arrow::compute::and(&arrow::compute::and(&it2, &it3)?, &it)
                 }
             }
         });
 
         let reader: ParquetRecordBatchReader = builder
+            .with_row_groups(row_group_indices)
             .with_row_selection(rows)
             .with_projection(proj)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_batch_size(10_000)
             .build()?;
 
         Ok((Box::new(reader), time_index))
@@ -1192,9 +1295,10 @@ impl<
                 .as_any()
                 .downcast_ref()
                 .unwrap();
+
             if let Some(pos) = index_arr.iter().position(|i| i.is_some_and(|i| i == index)) {
                 let spec_arr = spec_arr.slice(pos, 1);
-                self.load_metadata_from_slice_into_description(
+                self.load_spectrum_metadata_from_slice_into_description(
                     &spec_arr,
                     &mut descr,
                     0,
@@ -1625,6 +1729,7 @@ impl<
         let reader = builder
             .with_row_selection(rows)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_batch_size(10_000)
             .build()?;
 
         let mut descriptions: Vec<SpectrumDescription> = Default::default();
@@ -1647,16 +1752,25 @@ impl<
                 .as_any()
                 .downcast_ref()
                 .unwrap();
-            for (i, val) in index_arr.iter().enumerate() {
-                if val.is_some() {
-                    let mut descr = SpectrumDescription::default();
-                    self.load_metadata_from_slice_into_description(
-                        spec_arr,
-                        &mut descr,
-                        i,
-                        &param_fields,
-                    );
-                    descriptions.push(descr);
+            let n_spec = index_arr.len() - index_arr.null_count();
+            if let Some(metacols) = self.metadata.spectrum_metadata_map.as_ref() {
+                let mut local_descr = vec![SpectrumDescription::default(); n_spec];
+                let mut builder =
+                    MzSpectrumBuilder::new(&mut local_descr, &metacols, 0);
+                builder.visit(spec_arr);
+                descriptions.extend(local_descr);
+            } else {
+                for (i, val) in index_arr.iter().enumerate() {
+                    if val.is_some() {
+                        let mut descr = SpectrumDescription::default();
+                        self.load_spectrum_metadata_from_slice_into_description(
+                            spec_arr,
+                            &mut descr,
+                            i,
+                            &param_fields,
+                        );
+                        descriptions.push(descr);
+                    }
                 }
             }
 
@@ -1726,6 +1840,164 @@ impl<
 
         for (idx, scan) in scan_events {
             descriptions[idx as usize].acquisition.scans.push(scan);
+        }
+
+        for (idx, precursor) in precursors {
+            descriptions[idx.unwrap() as usize].precursor = Some(precursor);
+        }
+
+        Ok(descriptions)
+    }
+
+    #[allow(unused)]
+    pub(crate) fn load_all_chromatgram_metadata_impl(
+        &self,
+    ) -> io::Result<Vec<ChromatogramDescription>> {
+        let builder = self.handle.chromatograms_metadata()?;
+        let predicate_mask = ProjectionMask::columns(
+            builder.parquet_schema(),
+            [
+                "chromatogram.index",
+                "precursor.spectrum_index",
+                "selected_ion.spectrum_index",
+            ],
+        );
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let chromatogram_index: &UInt64Array = batch
+                .column(0)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            let precursor_spectrum_index: &UInt64Array = batch
+                .column(1)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+            let selected_ion_spectrum_index: &UInt64Array = batch
+                .column(2)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+
+            let it = chromatogram_index.iter().map(|val| val.is_some());
+
+            let it = precursor_spectrum_index
+                .iter()
+                .map(|val| val.is_some())
+                .zip(it)
+                .map(|(a, b)| a || b);
+
+            let it = selected_ion_spectrum_index
+                .iter()
+                .map(|val| val.is_some())
+                .zip(it)
+                .map(|(a, b)| a || b);
+
+            Ok(it.map(Some).collect())
+        });
+
+        let reader = builder
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .build()?;
+
+        let mut descriptions: Vec<ChromatogramDescription> = Default::default();
+        let mut precursors: Vec<PrecursorEntry> = Vec::new();
+        let mut selected_ions: Vec<SelectedIonEntry> = Vec::new();
+
+        let param_fields: Vec<FieldRef> =
+            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
+        let precursor_fields: Vec<FieldRef> =
+            SchemaLike::from_type::<PrecursorEntry>(Default::default()).unwrap();
+        let selected_ion_fields: Vec<FieldRef> =
+            SchemaLike::from_type::<SelectedIonEntry>(Default::default()).unwrap();
+
+        for batch in reader.flatten() {
+            let spec_arr = batch.column_by_name("chromatogram").unwrap().as_struct();
+            let index_arr: &UInt64Array = spec_arr
+                .column_by_name("index")
+                .unwrap()
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+
+            for (i, val) in index_arr.iter().enumerate() {
+                if val.is_some() {
+                    let mut descr = ChromatogramDescription::default();
+                    self.load_chromatogram_metadata_from_slice_into_description(
+                        spec_arr,
+                        &mut descr,
+                        i,
+                        &param_fields,
+                    );
+                    descriptions.push(descr);
+                }
+            }
+
+            let precursor_arr = batch.column_by_name("precursor").unwrap().as_struct();
+            {
+                let index_arr: &UInt64Array = precursor_arr
+                    .column_by_name("spectrum_index")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref()
+                    .unwrap();
+
+                for (pos, _) in index_arr.iter().enumerate().filter(|i| i.1.is_some()) {
+                    let row = precursor_arr.slice(pos, 1);
+                    precursors.extend(
+                        serde_arrow::from_arrow::<Vec<PrecursorEntry>, _>(
+                            &precursor_fields,
+                            row.columns(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+
+            let selected_ion_arr = batch.column_by_name("selected_ion").unwrap().as_struct();
+            {
+                let index_arr: &UInt64Array = selected_ion_arr
+                    .column_by_name("spectrum_index")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref()
+                    .unwrap();
+
+                for (pos, _) in index_arr.iter().enumerate().filter(|i| i.1.is_some()) {
+                    let row = selected_ion_arr.slice(pos, 1);
+                    selected_ions.extend(
+                        serde_arrow::from_arrow::<Vec<SelectedIonEntry>, _>(
+                            &selected_ion_fields,
+                            row.columns(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+
+        precursors.sort_unstable_by(|a, b| {
+            a.spectrum_index
+                .cmp(&b.spectrum_index)
+                .then_with(|| a.precursor_index.cmp(&b.precursor_index))
+        });
+
+        let mut precursors: Vec<(Option<u64>, mzdata::spectrum::Precursor)> = precursors
+            .into_iter()
+            .map(|p| (p.spectrum_index, p.to_mzdata()))
+            .collect();
+
+        for sie in selected_ions.iter() {
+            let si = sie.to_mzdata();
+            let prec = &mut precursors[sie.precursor_index.unwrap() as usize].1;
+            prec.add_ion(si);
         }
 
         for (idx, precursor) in precursors {

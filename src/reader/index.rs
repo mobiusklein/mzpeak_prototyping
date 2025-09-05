@@ -533,10 +533,14 @@ where
                 let span = SimpleInterval::new(start, end);
                 let start_array: &$arr_ty = start_array.as_any().downcast_ref().unwrap();
                 let end_array: &$arr_ty = end_array.as_any().downcast_ref().unwrap();
-                start_array.iter().zip(end_array.iter()).map(|(start, end)| -> Option<bool> {
-                    let v = SimpleInterval::new(start?, end?);
-                    Some(v.overlaps(&span))
-                }).collect()
+                start_array
+                    .iter()
+                    .zip(end_array.iter())
+                    .map(|(start, end)| -> Option<bool> {
+                        let v = SimpleInterval::new(start?, end?);
+                        Some(v.overlaps(&span))
+                    })
+                    .collect()
             }};
         }
         match start_array.data_type() {
@@ -556,7 +560,6 @@ where
             arrow::datatypes::DataType::Float64 => overlaps_dyn_impl!(f64, Float64Array),
             _ => BooleanArray::new_null(start_array.len()),
         }
-
     }
 
     fn contains_dy(&self, array: &ArrayRef) -> BooleanArray {
@@ -628,12 +631,12 @@ impl<'a, T: HasProximity> RangeIndex<'a, T> {
     }
 }
 
-
 #[derive(Debug, Default, Clone)]
 pub struct SpectrumPointIndex {
     pub spectrum_index: PageIndex<u64>,
     pub mz_index: PageIndex<f64>,
     pub im_index: PageIndex<f64>,
+    pub time_index: Option<PageIndex<f32>>,
 }
 
 impl SpectrumPointIndex {
@@ -641,11 +644,13 @@ impl SpectrumPointIndex {
         spectrum_index: PageIndex<u64>,
         mz_index: PageIndex<f64>,
         im_index: PageIndex<f64>,
+        time_index: Option<PageIndex<f32>>,
     ) -> Self {
         Self {
             spectrum_index,
             mz_index,
             im_index,
+            time_index,
         }
     }
 
@@ -653,10 +658,20 @@ impl SpectrumPointIndex {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
 
-        for page in self
-            .spectrum_index
-            .pages_contains(spectrum_index)
-        {
+        for page in self.spectrum_index.pages_contains(spectrum_index) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
+    pub fn query_pages_overlaps(&self, index_range:  &impl Span1D<DimType = u64>) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.spectrum_index.pages_overlaps(index_range) {
             if !rg_idx_acc.contains(&page.row_group_i) {
                 rg_idx_acc.push(page.row_group_i);
             }
@@ -679,6 +694,7 @@ pub struct SpectrumChunkIndex {
     pub spectrum_index: PageIndex<u64>,
     pub start_mz_index: PageIndex<f64>,
     pub end_mz_index: PageIndex<f64>,
+    pub time_index: Option<PageIndex<f32>>
 }
 
 impl SpectrumChunkIndex {
@@ -686,11 +702,13 @@ impl SpectrumChunkIndex {
         spectrum_index: PageIndex<u64>,
         start_mz_index: PageIndex<f64>,
         end_mz_index: PageIndex<f64>,
+        time_index: Option<PageIndex<f32>>,
     ) -> Self {
         Self {
             spectrum_index,
             start_mz_index,
             end_mz_index,
+            time_index,
         }
     }
 
@@ -698,10 +716,20 @@ impl SpectrumChunkIndex {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
 
-        for page in self
-            .spectrum_index
-            .pages_contains(spectrum_index)
-        {
+        for page in self.spectrum_index.pages_contains(spectrum_index) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
+    pub fn query_pages_overlaps(&self, index_range:  &impl Span1D<DimType = u64>) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.spectrum_index.pages_overlaps(index_range) {
             if !rg_idx_acc.contains(&page.row_group_i) {
                 rg_idx_acc.push(page.row_group_i);
             }
@@ -793,6 +821,11 @@ impl QueryIndex {
                 &format!("{}.spectrum_index", spectrum_array_indices.prefix),
             )
             .unwrap_or_default();
+            self.spectrum_point_index.time_index = read_f32_page_index_from(
+                spectrum_data_reader.metadata(),
+                peak_pq_schema,
+                &format!("{}.spectrum_time", spectrum_array_indices.prefix),
+            );
         } else if BufferFormat::Chunked.prefix() == spectrum_array_indices.prefix {
             self.spectrum_chunk_index.spectrum_index = read_u64_page_index_from(
                 &spectrum_data_reader.metadata(),
@@ -800,6 +833,11 @@ impl QueryIndex {
                 &format!("{}.spectrum_index", spectrum_array_indices.prefix),
             )
             .unwrap_or_default();
+            self.spectrum_chunk_index.time_index = read_f32_page_index_from(
+                spectrum_data_reader.metadata(),
+                peak_pq_schema,
+                &format!("{}.spectrum_time", spectrum_array_indices.prefix),
+            );
         } else {
             log::error!("Prefix {} not recognized", spectrum_array_indices.prefix)
         }
@@ -860,15 +898,17 @@ impl QueryIndex {
     }
 }
 
-
 #[derive(Debug, Default)]
 pub struct PageQuery {
     pub row_group_indices: Vec<usize>,
-    pub pages: Vec<PageIndexEntry<u64>>
+    pub pages: Vec<PageIndexEntry<u64>>,
 }
 
 impl PageQuery {
     pub fn new(row_group_indices: Vec<usize>, pages: Vec<PageIndexEntry<u64>>) -> Self {
-        Self { row_group_indices, pages }
+        Self {
+            row_group_indices,
+            pages,
+        }
     }
 }

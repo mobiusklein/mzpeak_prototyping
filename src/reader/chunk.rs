@@ -255,6 +255,17 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             .spectrum_index
             .row_selection_overlaps(&index_range);
 
+        let PageQuery { row_group_indices, pages: _ } = query_indices.spectrum_chunk_index.query_pages_overlaps(&index_range);
+
+        let mut up_to_first_row = 0;
+        if !row_group_indices.is_empty() {
+            let meta = self.builder.metadata();
+            for i in 0..row_group_indices[0] {
+                let rg = meta.row_group(i);
+                up_to_first_row += rg.num_rows();
+            }
+        }
+
         if let Some(query_range) = query_range.as_ref() {
             let chunk_range_idx = RangeIndex::new(
                 &query_indices.spectrum_chunk_index.start_mz_index,
@@ -262,6 +273,8 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             );
             rows = rows.intersection(&chunk_range_idx.row_selection_overlaps(query_range));
         }
+
+        rows.split_off(up_to_first_row as usize);
 
         let sidx = format!("{}.spectrum_index", metadata.spectrum_array_indices.prefix);
 
@@ -328,8 +341,10 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
 
         let reader = self
             .builder
+            .with_row_groups(row_group_indices)
             .with_row_selection(rows)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_batch_size(4096)
             .build()?;
 
         let mut delta_model_cache: OneCache<u64, Option<RegressionDeltaModel<f64>>> =
@@ -669,7 +684,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             Ok(batch)
         });
 
-        Ok(it)
+        Ok(Box::new(it))
     }
 
     pub fn decode_chunks<I: Iterator<Item = RecordBatch>>(

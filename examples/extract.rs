@@ -57,8 +57,6 @@ fn main() -> io::Result<()> {
     let query_range_end = std::time::Instant::now();
     eprintln!("{} seconds elapsed reading indices", (query_range_end - start).as_secs_f64());
 
-
-    let mut started = false;
     for batch in it {
         let batch = batch.unwrap();
         let root = batch.column(0).as_struct();
@@ -78,31 +76,29 @@ fn main() -> io::Result<()> {
 
                 if $ims.is_some() {
                     for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
-                        if time_index.contains_key(&index) && $mz_range.contains(&mz) && $im_range.contains(&im) {
+                        if $im_range.contains(&im) {
                             if last_index != index {
                                 last_time = time_index[&index];
                                 last_index = index;
                             }
                             println!("{index}\t{last_time}\t{mz}\t{intensity}\t{im}");
-                            started = true;
                         }
                     }
                 } else {
                     for ((index, mz), intensity) in it {
-                        if time_index.contains_key(&index) && $mz_range.contains(&mz) {
+                        {
                             if last_index != index {
                                 last_time = time_index[&index];
                                 last_index = index;
                             }
                             println!("{index}\t{last_time}\t{mz}\t{intensity}");
-                            started = true;
                         }
                     }
                 }
 
-                if started && !time_index.contains_key(&indices.values().last().unwrap()) {
-                    break;
-                }
+                // if started && !time_index.contains_key(&indices.values().last().unwrap()) {
+                //     break;
+                // }
             };
         }
 

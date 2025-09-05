@@ -71,6 +71,7 @@ fn _eval_spectra_from_iter_for_fields<
                 if let Some(use_chunked_encoding) = use_chunked_encoding {
                     ArrowArrayChunk::from_arrays(
                         0,
+                        None,
                         MZ_ARRAY,
                         map,
                         use_chunked_encoding,
@@ -84,11 +85,12 @@ fn _eval_spectra_from_iter_for_fields<
                         (
                             s.0[0]
                                 .to_schema(
-                                    "spectrum_index",
+                                    BufferContext::Spectrum,
                                     &[
                                         use_chunked_encoding,
                                         ChunkingStrategy::Basic { chunk_size: 50.0 },
                                     ],
+                                    false,
                                 )
                                 .fields,
                             Vec::new(),
@@ -100,7 +102,7 @@ fn _eval_spectra_from_iter_for_fields<
                         map,
                         map.mzs().map(|a| a.len()).unwrap_or_default(),
                         0,
-                        "spectrum_index",
+                        None,
                         overrides,
                     )
                     .ok()
@@ -140,7 +142,7 @@ pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
                             .and_then(|a| a.data_len().ok())
                             .unwrap_or_default(),
                         0,
-                        "chromatogram_index",
+                        None,
                         overrides,
                     )
                     .ok()
@@ -383,7 +385,7 @@ impl<
         {
             let peak_buffer_file =
                 tempfile::tempfile().expect("Failed to create temporary file to write peaks to");
-            let peak_buffer = peak_buffer_builder.build(
+            let peak_buffer = peak_buffer_builder.include_time(spectrum_buffers.include_time()).build(
                 Arc::new(Schema::empty()),
                 BufferContext::Spectrum,
                 false,

@@ -26,6 +26,8 @@ pub trait ArrayBufferWriter {
     /// The name of the prefix in the schema for these fields
     fn prefix(&self) -> &str;
 
+    fn include_time(&self) -> bool;
+
     /// The path in the schema to reach the spectrum index column
     fn index_path(&self) -> String {
         format!("{}.spectrum_index", self.prefix())
@@ -45,7 +47,12 @@ pub trait ArrayBufferWriter {
     /// Add a peak list to the buffer.
     ///
     /// This might call [`ArrayBufferWriter::add_arrays`].
-    fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]);
+    fn add<T: ToMzPeakDataSeries>(
+        &mut self,
+        spectrum_index: u64,
+        spectrum_time: Option<f32>,
+        peaks: &[T],
+    );
 
     /// The number of distinct blocks of data points buffered
     fn num_chunks(&self) -> usize;
@@ -86,7 +93,9 @@ pub trait ArrayBufferWriter {
         if let Ok(sub) = self.schema().field_with_name(&self.prefix()).cloned() {
             if let DataType::Struct(fields) = sub.data_type() {
                 for f in fields.iter() {
-                    if f.name() == BufferContext::Spectrum.index_field().name() || f.name() == BufferContext::Chromatogram.index_field().name() {
+                    if f.name() == BufferContext::Spectrum.index_field().name()
+                        || f.name() == BufferContext::Chromatogram.index_field().name()
+                    {
                         continue;
                     }
                     if let Some(buffer_name) =
@@ -95,7 +104,7 @@ pub trait ArrayBufferWriter {
                         let aie = ArrayIndexEntry::from_buffer_name(
                             self.prefix().to_string(),
                             buffer_name,
-                            Some(&f)
+                            Some(&f),
                         );
                         array_index.push(aie);
                     } else {
@@ -110,7 +119,11 @@ pub trait ArrayBufferWriter {
                 }
             }
         }
-        log::trace!("{} array indices: {}", self.buffer_context(), array_index.to_json());
+        log::trace!(
+            "{} array indices: {}",
+            self.buffer_context(),
+            array_index.to_json()
+        );
         array_index
     }
 }
@@ -126,6 +139,7 @@ pub struct PointBuffers {
     pub drop_zero_column: Option<Vec<String>>,
     pub null_zeros: bool,
     pub is_profile_buffer: Vec<bool>,
+    pub include_time: bool,
 }
 
 impl PointBuffers {
@@ -163,8 +177,13 @@ impl PointBuffers {
         RecordBatch::try_new(schema, arrays).unwrap()
     }
 
-    pub fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]) {
-        let (fields, chunks) = T::to_arrays(spectrum_index, peaks, &self.overrides);
+    pub fn add<T: ToMzPeakDataSeries>(
+        &mut self,
+        spectrum_index: u64,
+        spectrum_time: Option<f32>,
+        peaks: &[T],
+    ) {
+        let (fields, chunks) = T::to_arrays(spectrum_index, spectrum_time, peaks, &self.overrides);
         let mut visited = HashSet::new();
         for (f, arr) in fields.iter().zip(chunks.into_iter()) {
             self.array_chunks
@@ -297,6 +316,10 @@ impl ArrayBufferWriter for PointBuffers {
         self.buffer_context
     }
 
+    fn include_time(&self) -> bool {
+        self.include_time
+    }
+
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -309,8 +332,13 @@ impl ArrayBufferWriter for PointBuffers {
         self.add_arrays(fields, arrays, size, is_profile);
     }
 
-    fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]) {
-        self.add(spectrum_index, peaks);
+    fn add<T: ToMzPeakDataSeries>(
+        &mut self,
+        spectrum_index: u64,
+        spectrum_time: Option<f32>,
+        peaks: &[T],
+    ) {
+        self.add(spectrum_index, spectrum_time, peaks);
     }
 
     fn num_chunks(&self) -> usize {
@@ -349,6 +377,7 @@ pub struct ChunkBuffers {
     pub drop_zero_column: Option<Vec<String>>,
     pub null_zeros: bool,
     pub is_profile_buffer: Vec<bool>,
+    pub include_time: bool,
 }
 
 impl ChunkBuffers {
@@ -362,6 +391,7 @@ impl ChunkBuffers {
         drop_zero_column: Option<Vec<String>>,
         null_zeros: bool,
         is_profile_buffer: Vec<bool>,
+        include_time: bool,
     ) -> Self {
         Self {
             chunk_array_fields,
@@ -373,6 +403,7 @@ impl ChunkBuffers {
             drop_zero_column,
             null_zeros,
             is_profile_buffer,
+            include_time
         }
     }
 }
@@ -405,7 +436,12 @@ impl ArrayBufferWriter for ChunkBuffers {
         self.chunks.len()
     }
 
-    fn add<T: ToMzPeakDataSeries>(&mut self, _spectrum_index: u64, _peaks: &[T]) {
+    fn add<T: ToMzPeakDataSeries>(
+        &mut self,
+        _spectrum_index: u64,
+        _spectrum_time: Option<f32>,
+        _peaks: &[T],
+    ) {
         todo!("not ready yet")
     }
 
@@ -457,6 +493,10 @@ impl ArrayBufferWriter for ChunkBuffers {
     fn drop_zero_intensity(&self) -> bool {
         self.drop_zero_column.is_some()
     }
+
+    fn include_time(&self) -> bool {
+        self.include_time
+    }
 }
 
 #[derive(Debug)]
@@ -489,6 +529,7 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
         }
     }
 
+
     fn schema(&self) -> &SchemaRef {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.schema(),
@@ -510,13 +551,18 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
         }
     }
 
-    fn add<T: ToMzPeakDataSeries>(&mut self, spectrum_index: u64, peaks: &[T]) {
+    fn add<T: ToMzPeakDataSeries>(
+        &mut self,
+        spectrum_index: u64,
+        spectrum_time: Option<f32>,
+        peaks: &[T],
+    ) {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => {
-                chunk_buffers.add(spectrum_index, peaks)
+                chunk_buffers.add(spectrum_index, spectrum_time, peaks)
             }
             ArrayBufferWriterVariants::PointBuffers(array_buffers) => {
-                array_buffers.add(spectrum_index, peaks)
+                array_buffers.add(spectrum_index, spectrum_time, peaks)
             }
         }
     }
@@ -580,6 +626,13 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
             }
         }
     }
+
+    fn include_time(&self) -> bool {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.include_time(),
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.include_time(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -588,6 +641,7 @@ pub struct ArrayBuffersBuilder {
     array_fields: Vec<FieldRef>,
     overrides: HashMap<BufferName, BufferName>,
     null_zeros: bool,
+    include_time: bool,
 }
 
 impl Default for ArrayBuffersBuilder {
@@ -597,6 +651,7 @@ impl Default for ArrayBuffersBuilder {
             array_fields: Default::default(),
             overrides: HashMap::new(),
             null_zeros: false,
+            include_time: false,
         }
     }
 }
@@ -682,12 +737,20 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    pub fn include_time(mut self, include_time: bool) -> Self {
+        self.include_time = include_time;
+        self
+    }
+
     pub fn build_chunked(
         mut self,
         schema: SchemaRef,
         buffer_context: BufferContext,
         mask_zero_intensity_runs: bool,
     ) -> ChunkBuffers {
+        if self.include_time {
+            self = self.add_time_field(buffer_context);
+        }
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         self.prefix = "chunk".to_string();
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
@@ -716,7 +779,13 @@ impl ArrayBuffersBuilder {
             drop_zero_column,
             self.null_zeros,
             Vec::new(),
+            self.include_time,
         )
+    }
+
+    fn add_time_field(mut self, buffer_context: BufferContext) -> Self {
+        self = self.add_field(buffer_context.time_field());
+        self
     }
 
     pub fn build(
@@ -725,10 +794,12 @@ impl ArrayBuffersBuilder {
         buffer_context: BufferContext,
         mask_zero_intensity_runs: bool,
     ) -> PointBuffers {
+        if self.include_time {
+            self = self.add_time_field(buffer_context);
+        }
         self.canonicalize_field_order();
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
-
         let buffers: HashMap<String, _> = self
             .array_fields
             .iter()
@@ -755,6 +826,7 @@ impl ArrayBuffersBuilder {
             drop_zero_column,
             is_profile_buffer: Vec::new(),
             null_zeros: self.null_zeros,
+            include_time: self.include_time,
         }
     }
 }

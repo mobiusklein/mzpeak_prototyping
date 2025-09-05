@@ -32,6 +32,17 @@ impl BufferContext {
         ))
     }
 
+    pub fn time_field(&self) -> FieldRef {
+        Arc::new(Field::new(
+            match self {
+                BufferContext::Spectrum => "spectrum_time",
+                BufferContext::Chromatogram => "chromatogram_time",
+            },
+            DataType::Float32,
+            true,
+        ))
+    }
+
     pub const fn name(&self) -> &'static str {
         match self {
             BufferContext::Spectrum => "spectrum",
@@ -337,7 +348,7 @@ pub const fn array_priority(array_type: &ArrayType) -> u64 {
             }
             22u64.saturating_add(k).saturating_add(n as u64)
         }
-        ArrayType::Unknown => u64::MAX,
+        ArrayType::Unknown => u64::MAX - 10,
     }
 }
 

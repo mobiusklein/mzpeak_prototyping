@@ -10,8 +10,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     curie,
-    param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID, Param},
+    param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID, MetadataColumn, Param},
 };
+
+macro_rules! metacol {
+    ($name:literal, $path:expr, $index:literal, $accession:expr) => {
+        MetadataColumn::new(
+            $name.into(),
+            $path.into_iter().map(|v| v.into()).collect(),
+            $index,
+            Some($accession),
+        )
+    };
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct AuxiliaryArray {
@@ -160,6 +171,95 @@ pub struct SpectrumEntry {
 }
 
 impl SpectrumEntry {
+    pub fn metadata_columns() -> Vec<MetadataColumn> {
+        vec![
+            MetadataColumn::new(
+                "ms level".into(),
+                vec!["spectrum".into(), "ms_level".into()],
+                2,
+                Some(curie!(MS:1000511)),
+            ),
+            MetadataColumn::new(
+                "scan polarity".into(),
+                vec!["spectrum".into(), "polarity".into()],
+                4,
+                Some(curie!(MS:1000465)),
+            ),
+            MetadataColumn::new(
+                "spectrum representation".into(),
+                vec!["spectrum".into(), "mz_signal_continuity".into()],
+                5,
+                Some(curie!(MS:1000525)),
+            ),
+            MetadataColumn::new(
+                "spectrum type".into(),
+                vec!["spectrum".into(), "spectrum_type".into()],
+                6,
+                Some(curie!(MS:1000559)),
+            ),
+            MetadataColumn::new(
+                "lowest observed m/z".into(),
+                vec!["spectrum".into(), "lowest_observed_mz".into()],
+                7,
+                Some(curie!(MS:1000528)),
+            ),
+            MetadataColumn::new(
+                "highest observed m/z".into(),
+                vec!["spectrum".into(), "highest_observed_mz".into()],
+                8,
+                Some(curie!(MS:1000527)),
+            ),
+            MetadataColumn::new(
+                "lowest observed wavelength".into(),
+                vec!["spectrum".into(), "lowest_observed_wavelength".into()],
+                9,
+                Some(curie!(MS:1000619)),
+            ),
+            MetadataColumn::new(
+                "highest observed wavelength".into(),
+                vec!["spectrum".into(), "highest_observed_wavelength".into()],
+                10,
+                Some(curie!(MS:1000618)),
+            ),
+            MetadataColumn::new(
+                "lowest observed ion mobility".into(),
+                vec!["spectrum".into(), "lowest_observed_ion_mobility".into()],
+                11,
+                Some(curie!(MS:1003439)),
+            ),
+            MetadataColumn::new(
+                "highest observed ion mobility".into(),
+                vec!["spectrum".into(), "highest_observed_ion_mobility".into()],
+                12,
+                Some(curie!(MS:1003440)),
+            ),
+            metacol!(
+                "number of data points",
+                vec!["spectrum", "number_of_data_points"],
+                13,
+                crate::curie!(MS:1003060)
+            ),
+            MetadataColumn::new(
+                "base peak m/z".into(),
+                vec!["spectrum".into(), "base_peak_mz".into()],
+                14,
+                Some(curie!(MS:1000504)),
+            ),
+            MetadataColumn::new(
+                "base peak intensity".into(),
+                vec!["spectrum".into(), "base_peak_intensity".into()],
+                15,
+                Some(curie!(MS:1000505)),
+            ),
+            MetadataColumn::new(
+                "total ion current".into(),
+                vec!["spectrum".into(), "total_ion_current".into()],
+                16,
+                Some(curie!(MS:1000285)),
+            ),
+        ]
+    }
+
     pub fn from_spectrum<C: CentroidLike, D: DeconvolutedCentroidLike>(
         spectrum: &impl SpectrumLike<C, D>,
     ) -> Self {
@@ -240,6 +340,35 @@ pub struct ScanEntry {
 }
 
 impl ScanEntry {
+    pub fn metadata_columns() -> Vec<MetadataColumn> {
+        vec![
+            metacol!(
+                "scan start time",
+                ["scan", "scan_start_time"],
+                1,
+                crate::curie!(MS:1000016)
+            ),
+            metacol!(
+                "preset scan configuration",
+                ["scan", "preset_scan_configuration"],
+                2,
+                crate::curie!(MS:1000616)
+            ),
+            metacol!(
+                "filter string",
+                ["scan", "filter_string"],
+                3,
+                crate::curie!(MS:1000512)
+            ),
+            metacol!(
+                "ion injection time",
+                ["scan", "ion_injection_time"],
+                3,
+                crate::curie!(MS:1000927)
+            ),
+        ]
+    }
+
     pub fn from_scan_event(spectrum_index: Option<u64>, event: &ScanEvent) -> Self {
         let ion_mobility = event.ion_mobility();
         let ion_mobility_type = match ion_mobility {

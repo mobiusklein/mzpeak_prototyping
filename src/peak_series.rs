@@ -5,7 +5,7 @@ use arrow::array::{
     ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, UInt8Array,
     UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::datatypes::{DataType, Fields};
 use mzdata::params::Unit;
 use mzdata::spectrum::{BinaryArrayMap, DataArray};
 use mzdata::{
@@ -64,7 +64,7 @@ pub fn array_map_to_schema_arrays_and_excess(
     array_map: &BinaryArrayMap,
     primary_array_len: usize,
     spectrum_index: u64,
-    index_name: impl Into<String>,
+    spectrum_time: Option<f32>,
     schema: Option<&Fields>,
     overrides: &HashMap<BufferName, BufferName>,
 ) -> Result<(Fields, Vec<ArrayRef>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
@@ -72,10 +72,13 @@ pub fn array_map_to_schema_arrays_and_excess(
     let mut arrays = Vec::new();
     let mut auxiliary = Vec::new();
 
-    fields.push(Arc::new(Field::new(index_name, DataType::UInt64, true)));
-
+    fields.push(context.index_field());
     let index_array = Arc::new(UInt64Array::from_value(spectrum_index, primary_array_len));
     arrays.push(index_array as ArrayRef);
+    if let Some(spectrum_time) = spectrum_time {
+        fields.push(context.time_field());
+        arrays.push(Arc::new(Float32Array::from_value(spectrum_time, primary_array_len)));
+    }
 
     for (_, v) in array_map.iter() {
         let buffer_name = BufferName::from_data_array(context, v);
@@ -127,7 +130,7 @@ pub fn array_map_to_schema_arrays(
     array_map: &BinaryArrayMap,
     primary_array_len: usize,
     spectrum_index: u64,
-    index_name: impl Into<String>,
+    spectrum_time: Option<f32>,
     overrides: &HashMap<BufferName, BufferName>,
 ) -> Result<(Fields, Vec<ArrayRef>), ArrayRetrievalError> {
     let (fields, arrays, _aux) = array_map_to_schema_arrays_and_excess(
@@ -135,7 +138,7 @@ pub fn array_map_to_schema_arrays(
         array_map,
         primary_array_len,
         spectrum_index,
-        index_name,
+        spectrum_time,
         None,
         overrides,
     )?;
@@ -151,6 +154,7 @@ pub trait ToMzPeakDataSeries: Sized + BuildArrayMapFrom {
     /// Construct a collection of Arrow arrays from the specified peak list
     fn to_arrays(
         spectrum_index: u64,
+        spectrum_time: Option<f32>,
         peaks: &[Self],
         overrides: &HashMap<BufferName, BufferName>,
     ) -> (Fields, Vec<ArrayRef>);
@@ -186,6 +190,7 @@ impl ToMzPeakDataSeries for CentroidPeak {
 
     fn to_arrays(
         spectrum_index: u64,
+        spectrum_time: Option<f32>,
         peaks: &[Self],
         overrides: &HashMap<BufferName, BufferName>,
     ) -> (Fields, Vec<ArrayRef>) {
@@ -195,7 +200,7 @@ impl ToMzPeakDataSeries for CentroidPeak {
             &map,
             peaks.len(),
             spectrum_index,
-            "spectrum_index",
+            spectrum_time,
             overrides,
         )
         .unwrap()
@@ -220,6 +225,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareCentroidPeak {
 
     fn to_arrays(
         spectrum_index: u64,
+        spectrum_time: Option<f32>,
         peaks: &[Self],
         overrides: &HashMap<BufferName, BufferName>,
     ) -> (Fields, Vec<ArrayRef>) {
@@ -229,7 +235,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareCentroidPeak {
             &map,
             peaks.len(),
             spectrum_index,
-            "spectrum_index",
+            spectrum_time,
             overrides,
         )
         .unwrap()
@@ -249,6 +255,7 @@ impl ToMzPeakDataSeries for DeconvolutedPeak {
 
     fn to_arrays(
         spectrum_index: u64,
+        spectrum_time: Option<f32>,
         peaks: &[Self],
         overrides: &HashMap<BufferName, BufferName>,
     ) -> (Fields, Vec<ArrayRef>) {
@@ -258,7 +265,7 @@ impl ToMzPeakDataSeries for DeconvolutedPeak {
             &map,
             peaks.len(),
             spectrum_index,
-            "spectrum_index",
+            spectrum_time,
             overrides,
         )
         .unwrap()
@@ -284,6 +291,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
 
     fn to_arrays(
         spectrum_index: u64,
+        spectrum_time: Option<f32>,
         peaks: &[Self],
         overrides: &HashMap<BufferName, BufferName>,
     ) -> (Fields, Vec<ArrayRef>) {
@@ -293,7 +301,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
             &map,
             peaks.len(),
             spectrum_index,
-            "spectrum_index",
+            spectrum_time,
             overrides,
         )
         .unwrap()

@@ -55,14 +55,15 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
     >(
         &mut self,
         spectrum_count: u64,
+        spectrum_time: Option<f32>,
         peaks: RefPeakDataLevel<C, D>,
     ) -> io::Result<()> {
         match peaks {
             RefPeakDataLevel::Centroid(peaks) => {
-                self.spectrum_buffers.add(spectrum_count, peaks.as_slice());
+                self.spectrum_buffers.add(spectrum_count, spectrum_time, peaks.as_slice());
             }
             RefPeakDataLevel::Deconvoluted(peaks) => {
-                self.spectrum_buffers.add(spectrum_count, peaks.as_slice());
+                self.spectrum_buffers.add(spectrum_count, spectrum_time, peaks.as_slice());
             }
             RefPeakDataLevel::Missing => unimplemented!(),
             RefPeakDataLevel::RawData(_) => unimplemented!(),

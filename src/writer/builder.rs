@@ -27,7 +27,7 @@ pub struct MzPeakWriterBuilder {
 impl Default for MzPeakWriterBuilder {
     fn default() -> Self {
         Self {
-            spectrum_arrays: ArrayBuffersBuilder::default().prefix("point"),
+            spectrum_arrays: ArrayBuffersBuilder::default().prefix("point").include_time(true),
             chromatogram_arrays: ArrayBuffersBuilder::default().prefix("point"),
             buffer_size: 5_000,
             shuffle_mz: false,
