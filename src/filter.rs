@@ -63,9 +63,17 @@ pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
 /// - `deltas`: All delta values from `iter`
 pub fn estimate_median_delta<T: Float, I: IntoIterator<Item = T>>(iter: I) -> (T, Vec<T>) {
     let deltas = collect_deltas(iter, true);
-    let median_of = median(&deltas).unwrap_or_else(|| T::zero());
+    if deltas.is_empty() {
+        log::warn!("Empty deltas array in estimate_median_delta");
+        return (T::zero(), deltas);
+    }
+    let median_of = median(&deltas).unwrap_or_else(T::zero);
     let delta_below: Vec<T> = deltas.iter().copied().filter(|v| *v <= median_of).collect();
-    let median_of = median(&delta_below).unwrap_or_else(|| T::zero());
+    if delta_below.is_empty() {
+        log::warn!("Empty delta_below array in estimate_median_delta");
+        return (median_of, deltas);
+    }
+    let median_of = median(&delta_below).unwrap_or_else(T::zero);
     (median_of, deltas)
 }
 
@@ -113,7 +121,7 @@ where
 
         let sol = r
             .solve_upper_triangular(&v)
-            .ok_or("Failed to fit linear model, matrix not solvable")?;
+            .ok_or("Failed to solve linear system: matrix may be singular or unsolvable")?;
         Ok(sol.data.into())
     } else {
         let qr = xmat.qr();
@@ -122,7 +130,7 @@ where
         let r = qr.r();
         let sol = r
             .solve_upper_triangular(&v)
-            .ok_or("Failed to fit linear model, matrix not solvable")?;
+            .ok_or("Failed to solve linear system: matrix may be singular or unsolvable")?;
         Ok(sol.data.into())
     }
 }
@@ -250,6 +258,10 @@ impl<T: Float + AddAssign + NumCast> MZDeltaModel<T> for ConstantDeltaModel<T> {
         _weights: Option<&[T]>,
     ) -> Result<Self, &'static str> {
         let (delta, _) = estimate_median_delta(deltas.iter().copied());
+        if deltas.is_empty() {
+            log::warn!("Empty deltas array in ConstantDeltaModel::fit");
+            return Ok(Self { delta: T::zero() });
+        }
         Ok(Self { delta })
     }
 
@@ -314,6 +326,9 @@ where
                 sel_mzs.push(*mz);
                 sel_weights.push(*weight);
             }
+            if sel_mzs.len() < 3 {
+                return Err("Insufficient data to fit regression delta model, fewer than 3 data points available after filtering")
+            }
             let x = fit_delta_model(&sel_mzs, &sel_deltas, Some(&sel_weights), 2)?;
             Ok(Self::from(x))
         } else {
@@ -323,6 +338,9 @@ where
                 .zip(mz_array.iter().copied())
                 .filter(|(d, _m)| *d <= threshold)
                 .collect();
+            if sel_mzs.len() < 3 {
+                return Err("Insufficient data to fit regression delta model, fewer than 3 data points available after filtering")
+            }
             let x = fit_delta_model(&sel_mzs, &sel_deltas, None, 2)?;
             Ok(Self::from(x))
         }
