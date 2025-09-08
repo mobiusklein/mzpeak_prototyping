@@ -157,6 +157,9 @@ pub struct ConvertArgs {
         help = "Whether or not to write both profile and peak picked data in the same file."
     )]
     write_peaks_and_profiles: bool,
+
+    #[arg(short='t', long, help="Include an extra 'spectrum_time' array alongside the 'spectrum_index' array.")]
+    include_time_with_spectrum_data: bool,
 }
 
 impl ConvertArgs {
@@ -331,6 +334,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     let mut writer = MzPeakWriterType::<fs::File>::builder()
         .add_default_chromatogram_fields()
         .buffer_size(args.buffer_size)
+        .include_time_with_spectrum_data(args.include_time_with_spectrum_data)
         .shuffle_mz(args.shuffle_mz)
         .chunked_encoding(args.chunked_encoding)
         .null_zeros(args.null_zeros)

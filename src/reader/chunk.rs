@@ -997,7 +997,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         let rows = query_indices
             .spectrum_point_index
             .spectrum_index
-            .pages_to_row_selection(pages.iter(), first_row);
+            .pages_to_row_selection(&pages, first_row);
 
         let predicate_mask =
             ProjectionMask::columns(self.builder.parquet_schema(), ["chunk.spectrum_index"]);

@@ -713,6 +713,7 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    /// Canonicalize the order of array fields
     pub fn canonicalize_field_order(&mut self) {
         self.array_fields.sort_by(|a, b| {
             if a.name() == "spectrum_index" || a.name() == "chromatogram_index" {
@@ -732,11 +733,13 @@ impl ArrayBuffersBuilder {
         });
     }
 
+    /// Store zero intensity points as nulls in the intensity and coordinate domain
     pub fn null_zeros(mut self, null_zeros: bool) -> Self {
         self.null_zeros = null_zeros;
         self
     }
 
+    /// Add a column to the data file holding the entity's time in addition to the index
     pub fn include_time(mut self, include_time: bool) -> Self {
         self.include_time = include_time;
         self

@@ -27,7 +27,7 @@ pub struct MzPeakWriterBuilder {
 impl Default for MzPeakWriterBuilder {
     fn default() -> Self {
         Self {
-            spectrum_arrays: ArrayBuffersBuilder::default().prefix("point").include_time(true),
+            spectrum_arrays: ArrayBuffersBuilder::default().prefix("point"),
             chromatogram_arrays: ArrayBuffersBuilder::default().prefix("point"),
             buffer_size: 5_000,
             shuffle_mz: false,
@@ -42,6 +42,12 @@ impl MzPeakWriterBuilder {
     /// Set the compression codec and level for all files to be written
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Add a column to the spectrum data file holding the spectrum's time in addition to the index
+    pub fn include_time_with_spectrum_data(mut self, include_time: bool) -> Self {
+        self.spectrum_arrays = self.spectrum_arrays.include_time(include_time);
         self
     }
 

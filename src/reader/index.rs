@@ -206,7 +206,7 @@ where
 
     pub fn pages_to_row_selection<'a>(
         &'a self,
-        it: impl IntoIterator<Item = &'a PageIndexEntry<T>>,
+        it: &'a [PageIndexEntry<T>],
         mut last_row: i64,
     ) -> RowSelection {
         let mut selectors = Vec::new();
