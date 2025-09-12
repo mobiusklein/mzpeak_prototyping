@@ -29,15 +29,15 @@ class BufferName:
     path: str
     data_type: str
     array_type: str
-    unit: str | None
-    transform: str | None
+    unit: str | None = None
+    transform: str | None = None
 
     @classmethod
     def from_index(cls, key, fields):
         fields = fields.copy()
         fmt = fields.pop('buffer_format', None)
         if fmt:
-            fields['buffer_format'] = BufferFormat[fmt.title()]
+            fields['buffer_format'] = BufferFormat.from_str(fmt.title())
         return cls(key=key, **fields)
 
 
@@ -141,6 +141,16 @@ class BufferFormat(Enum):
     Point = 1
     Chunk = 2
     Secondary_Chunk = 3
+
+    @classmethod
+    def from_str(cls, name: str):
+        try:
+            return cls[name]
+        except KeyError:
+            if name.lower() == 'chunk_values':
+                return cls.Chunk
+            else:
+                raise
 
 
 class _ChunkIterator:

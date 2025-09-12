@@ -274,6 +274,11 @@ impl Span1D for TimeQueryResult {
     }
 }
 
+// This value can be made larger for a modest (<10%) improvement in linear reading performance
+// but the trade-off in memory load makes this impractical, especially if spectra are very,
+// very dense.
+const CHUNK_CACHE_BLOCK_SIZE: u64 = 100;
+
 pub(crate) enum DataCache {
     Point(SpectrumDataPointCache),
     Chunk(SpectrumDataChunkCache),
@@ -338,7 +343,7 @@ impl DataCache {
             let builder = reader.handle.spectra_data()?;
             let builder = SpectrumChunkReader::new(builder);
             let cache = builder.load_cache_block(
-                SimpleInterval::new(spectrum_index, spectrum_index + 100),
+                SimpleInterval::new(spectrum_index, spectrum_index + CHUNK_CACHE_BLOCK_SIZE),
                 &reader.metadata,
                 &reader.query_indices,
             )?;

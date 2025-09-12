@@ -202,13 +202,13 @@ impl SpectrumEntry {
                 vec!["spectrum".into(), "lowest_observed_mz".into()],
                 7,
                 Some(curie!(MS:1000528)),
-            ),
+            ).with_unit(Unit::MZ),
             MetadataColumn::new(
                 "highest observed m/z".into(),
                 vec!["spectrum".into(), "highest_observed_mz".into()],
                 8,
                 Some(curie!(MS:1000527)),
-            ),
+            ).with_unit(Unit::MZ),
             MetadataColumn::new(
                 "lowest observed wavelength".into(),
                 vec!["spectrum".into(), "lowest_observed_wavelength".into()],
@@ -244,7 +244,7 @@ impl SpectrumEntry {
                 vec!["spectrum".into(), "base_peak_mz".into()],
                 14,
                 Some(curie!(MS:1000504)),
-            ),
+            ).with_unit(Unit::MZ),
             MetadataColumn::new(
                 "base peak intensity".into(),
                 vec!["spectrum".into(), "base_peak_intensity".into()],

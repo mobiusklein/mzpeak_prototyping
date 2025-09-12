@@ -1,7 +1,7 @@
 use std::{fmt::Display, str::FromStr};
 
 use mzdata::params::{ControlledVocabulary, ParamDescribed, ParamLike, Unit};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeSeq};
 
 /// Numerical identifier for "Proteomics Standards Initiative Mass Spectrometry Ontology"
 pub const MS_CV_ID: u8 = 1;
@@ -183,6 +183,76 @@ where
         Some(curie) => serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string()),
         None => serializer.serialize_none(),
     }
+}
+
+pub(crate) fn path_or_curie_serialize<S>(
+    value: &PathOrCURIE,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        PathOrCURIE::Path(items) => {
+            let mut s = serializer.serialize_seq(Some(items.len()))?;
+            for i in items.iter() {
+                s.serialize_element(i)?;
+            }
+            s.end()
+        }
+        PathOrCURIE::CURIE(curie) => {
+            serializer.serialize_str(&mzdata::params::CURIE::from(*curie).to_string())
+        }
+        PathOrCURIE::None => serializer.serialize_none(),
+    }
+}
+
+pub(crate) fn path_or_curie_deserialize<'de, D>(deserializer: D) -> Result<PathOrCURIE, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor {}
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = PathOrCURIE;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("CURIE string, list of strings, or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(PathOrCURIE::None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            match v.parse::<mzdata::params::CURIE>() {
+                Ok(v) => Ok(PathOrCURIE::CURIE(v.into())),
+                Err(e) => Err(E::custom(e)),
+            }
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut path = Vec::new();
+            while let Some(v) = seq.next_element::<String>()? {
+                path.push(v);
+            }
+            Ok(PathOrCURIE::Path(path))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(PathOrCURIE::None)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor {})
 }
 
 // Provide a way to JSON-serialize CURIEs as string
@@ -764,6 +834,50 @@ impl From<&mzdata::meta::Sample> for Sample {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathOrCURIE {
+    Path(Vec<String>),
+    CURIE(CURIE),
+    #[default]
+    None,
+}
+
+impl From<Unit> for PathOrCURIE {
+    fn from(value: Unit) -> Self {
+        value.to_curie().map(|val| CURIE::from(val)).into()
+    }
+}
+
+impl From<Option<CURIE>> for PathOrCURIE {
+    fn from(value: Option<CURIE>) -> Self {
+        match value {
+            Some(v) => v.into(),
+            None => Self::None,
+        }
+    }
+}
+
+impl From<Option<Vec<String>>> for PathOrCURIE {
+    fn from(value: Option<Vec<String>>) -> Self {
+        match value {
+            Some(v) => v.into(),
+            None => Self::None,
+        }
+    }
+}
+
+impl From<CURIE> for PathOrCURIE {
+    fn from(v: CURIE) -> Self {
+        Self::CURIE(v)
+    }
+}
+
+impl From<Vec<String>> for PathOrCURIE {
+    fn from(v: Vec<String>) -> Self {
+        Self::Path(v)
+    }
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetadataColumn {
     pub name: String,
@@ -774,6 +888,12 @@ pub struct MetadataColumn {
         deserialize_with = "opt_curie_deserialize"
     )]
     pub accession: Option<CURIE>,
+    #[serde(
+        serialize_with = "path_or_curie_serialize",
+        deserialize_with = "path_or_curie_deserialize",
+        default
+    )]
+    pub unit: PathOrCURIE,
 }
 
 impl MetadataColumn {
@@ -783,7 +903,13 @@ impl MetadataColumn {
             path,
             index,
             accession,
+            unit: PathOrCURIE::None,
         }
+    }
+
+    pub fn with_unit(mut self, value: impl Into<PathOrCURIE>) -> Self {
+        self.unit = value.into();
+        self
     }
 
     pub fn scope(&self) -> &str {

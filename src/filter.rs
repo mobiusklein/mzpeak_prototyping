@@ -2,12 +2,11 @@ use std::{fmt::Debug, ops::AddAssign, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrowPrimitiveType, AsArray, BooleanArray, Float32Array, Float64Array,
-        PrimitiveArray, RecordBatch, UInt64Array,
+        Array, ArrowPrimitiveType, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array
     },
     buffer::NullBuffer,
     compute::{nullif, take_record_batch},
-    datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, Schema},
+    datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt32Type, UInt64Type},
 };
 
 use mzdata::{
@@ -645,7 +644,16 @@ pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
         Some(_skip_zero_runs_gen(array))
     } else if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else {
+    } else if let Some(array) = array.as_any().downcast_ref::<Int32Array>(){
+        Some(_skip_zero_runs_gen(array))
+    } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>(){
+        Some(_skip_zero_runs_gen(array))
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt32Array>(){
+        Some(_skip_zero_runs_gen(array))
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt64Array>(){
+        Some(_skip_zero_runs_gen(array))
+    }
+    else {
         None
     }
 }
@@ -776,6 +784,8 @@ pub fn nullify_at_zero(
         DataType::Float64 => is_zero_pair_mask(target_array.as_primitive::<Float64Type>()),
         DataType::Int32 => is_zero_pair_mask(target_array.as_primitive::<Int32Type>()),
         DataType::Int64 => is_zero_pair_mask(target_array.as_primitive::<Int64Type>()),
+        DataType::UInt32 => is_zero_pair_mask(target_array.as_primitive::<UInt32Type>()),
+        DataType::UInt64 => is_zero_pair_mask(target_array.as_primitive::<UInt64Type>()),
         _ => panic!("Unsupported data type {:?}", target_array.data_type()),
     };
 
@@ -808,6 +818,10 @@ where
 {
     let mut buffer: Vec<Option<<T as ArrowPrimitiveType>::Native>> =
         Vec::with_capacity(array.len());
+
+    if array.is_empty() {
+        return PrimitiveArray::from(buffer);
+    }
 
     let mut it = array.iter();
     let mut last = it.next().unwrap();
