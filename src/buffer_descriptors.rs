@@ -21,12 +21,16 @@ pub enum BufferContext {
 }
 
 impl BufferContext {
+    pub const fn index_name(&self) -> &'static str {
+        match self {
+            BufferContext::Spectrum => "spectrum_index",
+            BufferContext::Chromatogram => "chromatogram_index",
+        }
+    }
+
     pub fn index_field(&self) -> FieldRef {
         Arc::new(Field::new(
-            match self {
-                BufferContext::Spectrum => "spectrum_index",
-                BufferContext::Chromatogram => "chromatogram_index",
-            },
+            self.index_name(),
             DataType::UInt64,
             true,
         ))

@@ -631,6 +631,21 @@ impl<'a, T: HasProximity> RangeIndex<'a, T> {
     }
 }
 
+// An internal trait to make allow abstracting over different storage strategies expose a uniform API
+#[allow(unused)]
+pub(crate) trait SpectrumQueryIndex {
+    fn query_pages(&self, spectrum_index: u64) -> PageQuery;
+    fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery;
+    fn is_empty(&self) -> bool;
+    fn is_populated(&self) -> bool;
+
+    fn spectrum_data_index(&self) -> &PageIndex<u64>;
+
+    fn index_overlaps(&self, index_range: &SimpleInterval<u64>) -> RowSelection;
+    fn mz_overlaps(&self, mz_range: &SimpleInterval<f64>) -> RowSelection;
+    fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection;
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SpectrumPointIndex {
     pub spectrum_index: PageIndex<u64>,
@@ -654,6 +669,47 @@ impl SpectrumPointIndex {
         }
     }
 
+    pub fn from_reader<T: ChunkReader>(
+        spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        spectrum_array_indices: &ArrayIndex,
+    ) -> Self {
+        let peak_pq_schema = spectrum_data_reader.parquet_schema();
+        let mut this = Self::default();
+
+        this.spectrum_index = read_u64_page_index_from(
+            &spectrum_data_reader.metadata(),
+            &peak_pq_schema,
+            &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+        )
+        .unwrap_or_default();
+
+        this.time_index = read_f32_page_index_from(
+            spectrum_data_reader.metadata(),
+            peak_pq_schema,
+            &format!("{}.spectrum_time", spectrum_array_indices.prefix),
+        );
+
+        for entry in spectrum_array_indices.iter() {
+            if matches!(entry.array_type, ArrayType::MZArray) {
+                this.mz_index = read_f64_page_index_from(
+                    &spectrum_data_reader.metadata(),
+                    &peak_pq_schema,
+                    &entry.path,
+                )
+                .unwrap_or_default();
+            } else if entry.is_ion_mobility() {
+                this.im_index = read_f64_page_index_from(
+                    &spectrum_data_reader.metadata(),
+                    &peak_pq_schema,
+                    &entry.path,
+                )
+                .unwrap_or_default();
+            }
+        }
+
+        this
+    }
+
     pub fn query_pages(&self, spectrum_index: u64) -> PageQuery {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
@@ -667,7 +723,7 @@ impl SpectrumPointIndex {
         PageQuery::new(rg_idx_acc, pages)
     }
 
-    pub fn query_pages_overlaps(&self, index_range:  &impl Span1D<DimType = u64>) -> PageQuery {
+    pub fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
 
@@ -689,12 +745,46 @@ impl SpectrumPointIndex {
     }
 }
 
+impl SpectrumQueryIndex for SpectrumPointIndex {
+    fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        self.query_pages(spectrum_index)
+    }
+
+    fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
+        self.query_pages_overlaps(index_range)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn is_populated(&self) -> bool {
+        self.is_populated()
+    }
+
+    fn mz_overlaps(&self, query: &SimpleInterval<f64>) -> RowSelection {
+        self.mz_index.row_selection_overlaps(query)
+    }
+
+    fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection {
+        self.im_index.row_selection_overlaps(im_range)
+    }
+
+    fn index_overlaps(&self, index_range: &SimpleInterval<u64>) -> RowSelection {
+        self.spectrum_index.row_selection_overlaps(index_range)
+    }
+
+    fn spectrum_data_index(&self) -> &PageIndex<u64> {
+        &self.spectrum_index
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SpectrumChunkIndex {
     pub spectrum_index: PageIndex<u64>,
     pub start_mz_index: PageIndex<f64>,
     pub end_mz_index: PageIndex<f64>,
-    pub time_index: Option<PageIndex<f32>>
+    pub time_index: Option<PageIndex<f32>>,
 }
 
 impl SpectrumChunkIndex {
@@ -712,6 +802,44 @@ impl SpectrumChunkIndex {
         }
     }
 
+    pub fn from_reader<T: ChunkReader>(
+        spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        spectrum_array_indices: &ArrayIndex,
+    ) -> Self {
+        let peak_pq_schema = spectrum_data_reader.parquet_schema();
+        let mut this = Self::default();
+
+        this.spectrum_index = read_u64_page_index_from(
+            &spectrum_data_reader.metadata(),
+            &peak_pq_schema,
+            &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+        )
+        .unwrap_or_default();
+        this.time_index = read_f32_page_index_from(
+            spectrum_data_reader.metadata(),
+            peak_pq_schema,
+            &format!("{}.spectrum_time", spectrum_array_indices.prefix),
+        );
+
+        for entry in spectrum_array_indices.iter() {
+            if matches!(entry.array_type, ArrayType::MZArray) {
+                this.start_mz_index = read_f64_page_index_from(
+                    &spectrum_data_reader.metadata(),
+                    &peak_pq_schema,
+                    &format!("{}_chunk_start", entry.path),
+                )
+                .unwrap_or_default();
+                this.end_mz_index = read_f64_page_index_from(
+                    &spectrum_data_reader.metadata(),
+                    &peak_pq_schema,
+                    &format!("{}_chunk_end", entry.path),
+                )
+                .unwrap_or_default();
+            }
+        }
+        this
+    }
+
     pub fn query_pages(&self, spectrum_index: u64) -> PageQuery {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
@@ -725,7 +853,7 @@ impl SpectrumChunkIndex {
         PageQuery::new(rg_idx_acc, pages)
     }
 
-    pub fn query_pages_overlaps(&self, index_range:  &impl Span1D<DimType = u64>) -> PageQuery {
+    pub fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
         let mut rg_idx_acc = Vec::new();
         let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
 
@@ -747,6 +875,43 @@ impl SpectrumChunkIndex {
     }
 }
 
+impl SpectrumQueryIndex for SpectrumChunkIndex {
+    fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        self.query_pages(spectrum_index)
+    }
+
+    fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
+        self.query_pages_overlaps(index_range)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn is_populated(&self) -> bool {
+        self.is_populated()
+    }
+
+    fn mz_overlaps(&self, mz_range: &SimpleInterval<f64>) -> RowSelection {
+        let chunk_range_idx = RangeIndex::new(&self.start_mz_index, &self.end_mz_index);
+        chunk_range_idx.row_selection_overlaps(mz_range)
+    }
+
+    fn im_overlaps(&self, _im_range: &SimpleInterval<f64>) -> RowSelection {
+        RowSelection::from(vec![RowSelector::select(
+            self.spectrum_index.iter().map(|p| p.row_len()).sum::<i64>() as usize,
+        )])
+    }
+
+    fn index_overlaps(&self, index_range: &SimpleInterval<u64>) -> RowSelection {
+        self.spectrum_index.row_selection_overlaps(index_range)
+    }
+
+    fn spectrum_data_index(&self) -> &PageIndex<u64> {
+        &self.spectrum_index
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryIndex {
     pub spectrum_time_index: PageIndex<f32>,
@@ -758,6 +923,7 @@ pub struct QueryIndex {
 
     pub spectrum_point_index: SpectrumPointIndex,
     pub spectrum_chunk_index: SpectrumChunkIndex,
+    pub spectrum_peak_point_index: Option<SpectrumPointIndex>,
 }
 
 impl QueryIndex {
@@ -812,69 +978,14 @@ impl QueryIndex {
         spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
         spectrum_array_indices: &ArrayIndex,
     ) {
-        let peak_pq_schema = spectrum_data_reader.parquet_schema();
-
         if BufferFormat::Point.prefix() == spectrum_array_indices.prefix {
-            self.spectrum_point_index.spectrum_index = read_u64_page_index_from(
-                &spectrum_data_reader.metadata(),
-                &peak_pq_schema,
-                &format!("{}.spectrum_index", spectrum_array_indices.prefix),
-            )
-            .unwrap_or_default();
-            self.spectrum_point_index.time_index = read_f32_page_index_from(
-                spectrum_data_reader.metadata(),
-                peak_pq_schema,
-                &format!("{}.spectrum_time", spectrum_array_indices.prefix),
-            );
+            self.spectrum_point_index =
+                SpectrumPointIndex::from_reader(spectrum_data_reader, spectrum_array_indices);
         } else if BufferFormat::Chunked.prefix() == spectrum_array_indices.prefix {
-            self.spectrum_chunk_index.spectrum_index = read_u64_page_index_from(
-                &spectrum_data_reader.metadata(),
-                &peak_pq_schema,
-                &format!("{}.spectrum_index", spectrum_array_indices.prefix),
-            )
-            .unwrap_or_default();
-            self.spectrum_chunk_index.time_index = read_f32_page_index_from(
-                spectrum_data_reader.metadata(),
-                peak_pq_schema,
-                &format!("{}.spectrum_time", spectrum_array_indices.prefix),
-            );
+            self.spectrum_chunk_index =
+                SpectrumChunkIndex::from_reader(spectrum_data_reader, spectrum_array_indices);
         } else {
             log::error!("Prefix {} not recognized", spectrum_array_indices.prefix)
-        }
-
-        for entry in spectrum_array_indices.iter() {
-            if BufferFormat::Point == *entry.prefix {
-                if matches!(entry.array_type, ArrayType::MZArray) {
-                    self.spectrum_point_index.mz_index = read_f64_page_index_from(
-                        &spectrum_data_reader.metadata(),
-                        &peak_pq_schema,
-                        &entry.path,
-                    )
-                    .unwrap_or_default();
-                } else if entry.is_ion_mobility() {
-                    self.spectrum_point_index.im_index = read_f64_page_index_from(
-                        &spectrum_data_reader.metadata(),
-                        &peak_pq_schema,
-                        &entry.path,
-                    )
-                    .unwrap_or_default();
-                }
-            } else if BufferFormat::Chunked == *entry.prefix {
-                if matches!(entry.array_type, ArrayType::MZArray) {
-                    self.spectrum_chunk_index.start_mz_index = read_f64_page_index_from(
-                        &spectrum_data_reader.metadata(),
-                        &peak_pq_schema,
-                        &format!("{}_chunk_start", entry.path),
-                    )
-                    .unwrap_or_default();
-                    self.spectrum_chunk_index.end_mz_index = read_f64_page_index_from(
-                        &spectrum_data_reader.metadata(),
-                        &peak_pq_schema,
-                        &format!("{}_chunk_end", entry.path),
-                    )
-                    .unwrap_or_default();
-                }
-            }
         }
 
         log::trace!(
@@ -894,6 +1005,88 @@ impl QueryIndex {
             self.spectrum_chunk_index.query_pages(spectrum_index)
         } else {
             PageQuery::default()
+        }
+    }
+}
+
+impl SpectrumQueryIndex for QueryIndex {
+    fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.query_pages(spectrum_index)
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.query_pages(spectrum_index)
+        } else {
+            PageQuery::default()
+        }
+    }
+
+    fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.query_pages_overlaps(index_range)
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.query_pages_overlaps(index_range)
+        } else {
+            PageQuery::default()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.is_empty()
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.is_empty()
+        } else {
+            true
+        }
+    }
+
+    fn is_populated(&self) -> bool {
+        if self.spectrum_point_index.is_populated() {
+            true
+        } else if self.spectrum_chunk_index.is_populated() {
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mz_overlaps(&self, mz_range: &SimpleInterval<f64>) -> RowSelection {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.mz_overlaps(mz_range)
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.mz_overlaps(mz_range)
+        } else {
+            RowSelection::default()
+        }
+    }
+
+    fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.im_overlaps(im_range)
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.im_overlaps(im_range)
+        } else {
+            RowSelection::default()
+        }
+    }
+
+    fn index_overlaps(&self, index_range: &SimpleInterval<u64>) -> RowSelection {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.index_overlaps(index_range)
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.index_overlaps(index_range)
+        } else {
+            RowSelection::default()
+        }
+    }
+
+    fn spectrum_data_index(&self) -> &PageIndex<u64> {
+        if self.spectrum_point_index.is_populated() {
+            self.spectrum_point_index.spectrum_data_index()
+        } else if self.spectrum_chunk_index.is_populated() {
+            self.spectrum_chunk_index.spectrum_data_index()
+        } else {
+            &self.spectrum_point_index.spectrum_index
         }
     }
 }

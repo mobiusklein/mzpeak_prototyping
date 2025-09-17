@@ -327,6 +327,37 @@ impl SpectrumEntry {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+pub struct ScanWindowEntry {
+    pub lower_limit: f32,
+    pub upper_limit: f32,
+    pub unit: CURIE,
+    pub parameters: Vec<Param>
+}
+
+impl ScanWindowEntry {
+    pub fn new(lower_limit: f32, upper_limit: f32, unit: CURIE, parameters: Vec<Param>) -> Self {
+        Self { lower_limit, upper_limit,  unit, parameters }
+    }
+
+    pub fn from_mzdata(source: &mzdata::spectrum::ScanWindow) -> Self {
+        Self::new(source.lower_bound, source.upper_bound, Unit::MZ.to_curie().unwrap().into(), Vec::new())
+    }
+}
+
+impl From<&mzdata::spectrum::ScanWindow> for ScanWindowEntry {
+    fn from(value: &mzdata::spectrum::ScanWindow) -> Self {
+        Self::from_mzdata(value)
+    }
+}
+
+impl From<&ScanWindowEntry> for mzdata::spectrum::ScanWindow {
+    fn from(value: &ScanWindowEntry) -> Self {
+        Self::new(value.lower_limit, value.upper_limit)
+    }
+}
+
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct ScanEntry {
     pub spectrum_index: Option<u64>,
     pub scan_start_time: Option<f32>,
@@ -337,6 +368,7 @@ pub struct ScanEntry {
     pub ion_mobility_type: Option<CURIE>,
     pub instrument_configuration_ref: Option<u32>,
     pub parameters: Vec<Param>,
+    pub scan_windows: Vec<ScanWindowEntry>,
 }
 
 impl ScanEntry {
@@ -347,7 +379,7 @@ impl ScanEntry {
                 ["scan", "scan_start_time"],
                 1,
                 crate::curie!(MS:1000016)
-            ),
+            ).with_unit(Unit::Minute),
             metacol!(
                 "preset scan configuration",
                 ["scan", "preset_scan_configuration"],
@@ -363,9 +395,9 @@ impl ScanEntry {
             metacol!(
                 "ion injection time",
                 ["scan", "ion_injection_time"],
-                3,
+                4,
                 crate::curie!(MS:1000927)
-            ),
+            ).with_unit(Unit::Millisecond),
         ]
     }
 
@@ -388,16 +420,28 @@ impl ScanEntry {
             None => None,
         };
 
+        const PARAMS_TO_SKIP: &[mzdata::params::CURIE] = &[
+            mzdata::curie!(MS:1000616),
+            mzdata::curie!(MS:1000512),
+        ];
+
         Self {
             spectrum_index,
             ion_injection_time: Some(event.injection_time),
             scan_start_time: Some(event.start_time as f32),
-            preset_scan_configuration: Some(event.instrument_configuration_id),
+            preset_scan_configuration: event.scan_configuration().map(|v| v.to_i32().unwrap() as u32),
             filter_string: event.filter_string().map(|s| s.to_string()),
             ion_mobility_value: ion_mobility,
             ion_mobility_type,
-            parameters: event.params().iter().cloned().map(Param::from).collect(),
+            parameters: event.params().iter().filter(|v| {
+                if let Some(c) = v.curie() {
+                    !ION_MOBILITY_SCAN_TERMS.contains(&c) && !PARAMS_TO_SKIP.contains(&c)
+                } else {
+                    true
+                }
+            }).cloned().map(Param::from).collect(),
             instrument_configuration_ref: Some(event.instrument_configuration_id),
+            scan_windows: event.scan_windows.iter().map(ScanWindowEntry::from_mzdata).collect(),
             ..Default::default()
         }
     }
@@ -523,6 +567,10 @@ impl PrecursorEntry {
         prec.precursor_id = self.precursor_id.clone();
         prec
     }
+
+    pub fn metadata_columns() -> Vec<MetadataColumn> {
+        vec![]
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
@@ -568,6 +616,29 @@ impl SelectedIonEntry {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    pub fn metadata_columns() -> Vec<MetadataColumn> {
+        vec![
+            metacol!(
+                "selected ion m/z",
+                vec!["selected_ion", "selected_ion_mz"],
+                2,
+                curie!(MS:1000744)
+            ).with_unit(Unit::MZ),
+            metacol!(
+                "charge state",
+                vec!["selected_ion", "charge_state"],
+                3,
+                curie!(MS:1000041)
+            ),
+            metacol!(
+                "peak intensity",
+                vec!["selected_ion", "intensity"],
+                4,
+                curie!(MS:1000042)
+            ).with_unit(Unit::DetectorCounts),
+        ]
     }
 
     pub fn to_mzdata(&self) -> mzdata::spectrum::SelectedIon {
@@ -667,6 +738,29 @@ impl ChromatogramEntry {
             parameters,
             ..Default::default()
         }
+    }
+
+    pub fn metadata_columns() -> Vec<MetadataColumn> {
+        vec![
+            MetadataColumn::new(
+                "scan polarity".into(),
+                vec!["chromatogram".into(), "polarity".into()],
+                2,
+                Some(curie!(MS:1000465)),
+            ),
+            metacol!(
+                "chromatogram type",
+                vec!["chromatogram", "chromatogram_type"],
+                3,
+                curie!(MS:1000626)
+            ),
+            metacol!(
+                "number of data points",
+                vec!["chromatogram", "number_of_data_points"],
+                4,
+                crate::curie!(MS:1003060)
+            ),
+        ]
     }
 
     pub fn new(

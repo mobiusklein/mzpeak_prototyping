@@ -58,6 +58,11 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
         spectrum_time: Option<f32>,
         peaks: RefPeakDataLevel<C, D>,
     ) -> io::Result<()> {
+        let spectrum_time = if self.spectrum_buffers.include_time() {
+            spectrum_time
+        } else {
+            None
+        };
         match peaks {
             RefPeakDataLevel::Centroid(peaks) => {
                 self.spectrum_buffers.add(spectrum_count, spectrum_time, peaks.as_slice());

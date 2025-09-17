@@ -101,6 +101,21 @@ macro_rules! implement_mz_metadata {
                 "scan_column_metadata_mapping",
                 Some(serde_json::to_string_pretty(&crate::spectrum::ScanEntry::metadata_columns()).unwrap())
             );
+
+            self.append_key_value_metadata(
+                "selected_ion_column_metadata_mapping",
+                Some(serde_json::to_string_pretty(&crate::spectrum::SelectedIonEntry::metadata_columns()).unwrap())
+            );
+
+            self.append_key_value_metadata(
+                "precursor_column_metadata_mapping",
+                Some(serde_json::to_string_pretty(&crate::spectrum::PrecursorEntry::metadata_columns()).unwrap())
+            );
+
+            self.append_key_value_metadata(
+                "chromatogram_column_metadata_mapping",
+                Some(serde_json::to_string_pretty(&crate::spectrum::ChromatogramEntry::metadata_columns()).unwrap())
+            );
         }
     };
 }
@@ -466,6 +481,12 @@ pub trait AbstractMzPeakWriter {
 
         let peaks = spectrum.peaks();
 
+        let spectrum_time = if self.spectrum_data_buffer_mut().include_time() {
+            Some(spectrum.start_time() as f32)
+        } else {
+            None
+        };
+
         let (delta_params, aux_arrays) = if self.separate_peak_writer().is_some()
             && matches!(
                 spectrum.peaks(),
@@ -480,14 +501,9 @@ pub trait AbstractMzPeakWriter {
                 self.write_spectrum_binary_array_map(spectrum, spectrum_count, raw_arrays)?;
             self.separate_peak_writer()
                 .unwrap()
-                .add_peaks(spectrum_count, Some(spectrum.start_time() as f32), peaks)?;
+                .add_peaks(spectrum_count, spectrum_time, peaks)?;
             (delta_params, aux_arrays)
         } else {
-            let spectrum_time = if self.spectrum_data_buffer_mut().include_time() {
-                Some(spectrum.start_time() as f32)
-            } else {
-                None
-            };
             let (delta_params, aux_arrays) = match peaks {
                 mzdata::spectrum::RefPeakDataLevel::Missing => (None, None),
                 mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => self

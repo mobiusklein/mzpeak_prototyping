@@ -22,9 +22,7 @@ use mzdata::{
     params::{ParamDescribed, Unit},
     prelude::*,
     spectrum::{
-        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType,
-        DataArray, MultiLayerSpectrum, ScanEvent, ScanPolarity, SpectrumDescription,
-        bindata::BuildFromArrayMap,
+        bindata::BuildFromArrayMap, ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType, DataArray, MultiLayerSpectrum, PeakDataLevel, ScanEvent, ScanPolarity, SpectrumDescription
     },
 };
 use mzpeaks::{
@@ -34,20 +32,16 @@ use mzpeaks::{
 
 use parquet::arrow::{
     ProjectionMask,
-    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
+    arrow_reader::{ArrowPredicateFn, RowFilter},
 };
 use serde_arrow::schema::SchemaLike;
 
 use crate::{
-    CURIE, PrecursorEntry, SelectedIonEntry,
-    archive::ZipArchiveReader,
-    filter::RegressionDeltaModel,
-    reader::{
-        chunk::SpectrumDataChunkCache,
+    archive::ZipArchiveReader, filter::RegressionDeltaModel, reader::{
+        chunk::DataChunkCache,
         index::{PageQuery, QueryIndex, SpanDynNumeric},
-        metadata::MzSpectrumBuilder,
-    },
-    spectrum::AuxiliaryArray,
+        metadata::{MzScanBuilder, MzSpectrumBuilder}, point::PointDataReader,
+    }, spectrum::AuxiliaryArray, BufferContext, PrecursorEntry, SelectedIonEntry, CURIE
 };
 
 mod chunk;
@@ -56,8 +50,8 @@ mod metadata;
 mod point;
 
 pub use chunk::SpectrumChunkReader;
-pub use metadata::MzPeakReaderMetadata;
-use point::{SpectrumDataArrayReader, SpectrumDataPointCache};
+pub use metadata::ReaderMetadata;
+use point::{PointDataArrayReader, DataPointCache};
 
 const DRIFT_TIME: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[0];
 const INVERSE_K_DRIFT_TIME: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[1];
@@ -72,10 +66,10 @@ pub struct MzPeakReaderType<
     handle: ZipArchiveReader,
     index: usize,
     detail_level: DetailLevel,
-    pub metadata: MzPeakReaderMetadata,
+    pub metadata: ReaderMetadata,
     pub query_indices: QueryIndex,
     spectrum_metadata_cache: Option<Vec<SpectrumDescription>>,
-    spectrum_row_group_cache: Option<DataCache>,
+    spectrum_row_group_cache: Option<SpectrumDataCache>,
     _t: PhantomData<(C, D)>,
 }
 
@@ -225,53 +219,8 @@ impl<
 impl<
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> SpectrumDataArrayReader for MzPeakReaderType<C, D>
+> PointDataArrayReader for MzPeakReaderType<C, D>
 {
-}
-
-#[allow(unused)]
-#[derive(Debug, Default, Clone)]
-pub struct TimeQueryResult {
-    index_range: SimpleInterval<u64>,
-    time_index: Vec<f32>,
-}
-
-impl TimeQueryResult {
-    pub fn new(index_range: SimpleInterval<u64>, time_index: Vec<f32>) -> Self {
-        Self {
-            index_range,
-            time_index,
-        }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (u64, f32)> {
-        self.time_index
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (i as u64 + self.start(), *v))
-    }
-
-    pub fn get(&self, index: u64) -> Option<f32> {
-        if !self.index_range.contains(&index) {
-            None
-        } else {
-            self.time_index
-                .get((index - self.start()) as usize)
-                .copied()
-        }
-    }
-}
-
-impl Span1D for TimeQueryResult {
-    type DimType = u64;
-
-    fn start(&self) -> Self::DimType {
-        self.index_range.start
-    }
-
-    fn end(&self) -> Self::DimType {
-        self.index_range.end
-    }
 }
 
 // This value can be made larger for a modest (<10%) improvement in linear reading performance
@@ -279,12 +228,12 @@ impl Span1D for TimeQueryResult {
 // very dense.
 const CHUNK_CACHE_BLOCK_SIZE: u64 = 100;
 
-pub(crate) enum DataCache {
-    Point(SpectrumDataPointCache),
-    Chunk(SpectrumDataChunkCache),
+pub(crate) enum SpectrumDataCache {
+    Point(DataPointCache),
+    Chunk(DataChunkCache),
 }
 
-impl DataCache {
+impl SpectrumDataCache {
     pub fn slice_to_arrays_of(
         &mut self,
         row_group_index: usize,
@@ -293,10 +242,10 @@ impl DataCache {
     ) -> io::Result<BinaryArrayMap> {
         if self.contains(row_group_index, spectrum_index) {
             match self {
-                DataCache::Point(spectrum_data_point_cache) => {
+                SpectrumDataCache::Point(spectrum_data_point_cache) => {
                     spectrum_data_point_cache.slice_to_arrays_of(spectrum_index, mz_delta_model)
                 }
-                DataCache::Chunk(spectrum_data_chunk_cache) => {
+                SpectrumDataCache::Chunk(spectrum_data_chunk_cache) => {
                     spectrum_data_chunk_cache.slice_to_arrays_of(spectrum_index, mz_delta_model)
                 }
             }
@@ -310,10 +259,10 @@ impl DataCache {
 
     pub fn contains(&self, row_group_index: usize, spectrum_index: u64) -> bool {
         match self {
-            DataCache::Point(spectrum_data_point_cache) => {
+            SpectrumDataCache::Point(spectrum_data_point_cache) => {
                 spectrum_data_point_cache.row_group_index == row_group_index
             }
-            DataCache::Chunk(spectrum_data_chunk_cache) => spectrum_data_chunk_cache
+            SpectrumDataCache::Chunk(spectrum_data_chunk_cache) => spectrum_data_chunk_cache
                 .spectrum_index_range
                 .contains(&spectrum_index),
         }
@@ -329,13 +278,14 @@ impl DataCache {
     ) -> io::Result<Option<Self>> {
         if reader.query_indices.spectrum_point_index.is_populated() {
             let rg = reader
-                .load_spectrum_data_row_group(reader.handle.spectra_data()?, row_group_index)?;
-            let cache = SpectrumDataPointCache::new(
+                .load_cache_block(reader.handle.spectra_data()?, row_group_index)?;
+            let cache = DataPointCache::new(
                 rg,
                 reader.metadata.spectrum_array_indices.clone(),
                 row_group_index,
                 None,
                 None,
+                BufferContext::Spectrum,
             );
 
             Ok(Some(Self::Point(cache)))
@@ -404,7 +354,7 @@ impl<
     /// Load the various metadata, indices and reference data
     fn load_indices_from(
         handle: &mut ZipArchiveReader,
-    ) -> io::Result<(MzPeakReaderMetadata, QueryIndex)> {
+    ) -> io::Result<(ReaderMetadata, QueryIndex)> {
         metadata::load_indices_from(handle)
     }
 
@@ -413,7 +363,7 @@ impl<
         &mut self,
         row_group_index: usize,
         spectrum_index: u64,
-    ) -> io::Result<&mut DataCache> {
+    ) -> io::Result<&mut SpectrumDataCache> {
         let cache_hit = if let Some(cache) = self.spectrum_row_group_cache.as_ref() {
             cache.contains(row_group_index, spectrum_index)
         } else {
@@ -425,7 +375,7 @@ impl<
             Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         } else {
             log::trace!("Spectrum data cache miss {row_group_index:?}:{spectrum_index}");
-            if let Some(cache) = DataCache::load_data_for(self, row_group_index, spectrum_index)? {
+            if let Some(cache) = SpectrumDataCache::load_data_for(self, row_group_index, spectrum_index)? {
                 self.spectrum_row_group_cache = Some(cache);
                 Ok(self.spectrum_row_group_cache.as_mut().unwrap())
             } else {
@@ -541,7 +491,7 @@ impl<
         if !batches.is_empty() {
             let batch = arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
             let points = batch.column(0).as_struct();
-            self.populate_arrays_from_struct_array(points, &mut bin_map, delta_model.as_ref());
+            Self::populate_arrays_from_struct_array(points, &mut bin_map, delta_model.as_ref());
         }
 
         let mut out = BinaryArrayMap::new();
@@ -561,7 +511,17 @@ impl<
         param_fields: &[FieldRef],
         scan_accumulator: &mut Vec<(u64, ScanEvent)>,
     ) {
-        {
+        if let Some(metacols) = self.metadata.scan_metadata_map.as_ref() {
+            let n = scan_arr.column_by_name("spectrum_index").map(|a| a.len() - a.null_count()).unwrap_or_default();
+            if scan_accumulator.is_empty() && n > 0 {
+                scan_accumulator.resize(n, Default::default());
+            }
+            let mut builder =
+                MzScanBuilder::new(scan_accumulator, &metacols, 0, Vec::new());
+            builder.visit(scan_arr);
+            return;
+        }
+        else {
             let index_arr: &UInt64Array = scan_arr
                 .column_by_name("spectrum_index")
                 .unwrap()
@@ -1058,117 +1018,13 @@ impl<
             ));
         }
 
-        let mut rows = self
-            .query_indices
-            .spectrum_point_index
-            .spectrum_index
-            .row_selection_overlaps(&index_range);
-
-        let PageQuery { row_group_indices, pages } = self.query_indices.spectrum_point_index.query_pages_overlaps(&index_range);
-
-        if pages.is_empty() {
-            return Ok((Box::new(std::iter::empty()), HashMap::default()));
-        }
-
-        let mut up_to_first_row = 0;
-        let meta = builder.metadata();
-        for i in 0..row_group_indices[0] {
-            let rg = meta.row_group(i);
-            up_to_first_row += rg.num_rows();
-        }
-
-        if let Some(mz_range) = mz_range.as_ref() {
-            rows = rows.intersection(
-                &self
-                    .query_indices
-                    .spectrum_point_index
-                    .mz_index
-                    .row_selection_overlaps(mz_range),
-            );
-        }
-
-        if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
-            rows = rows.union(
-                &self
-                    .query_indices
-                    .spectrum_point_index
-                    .im_index
-                    .row_selection_overlaps(&ion_mobility_range),
-            );
-        }
-
-        rows.split_off(up_to_first_row as usize);
-
-        let sidx = format!(
-            "{}.spectrum_index",
-            self.metadata.spectrum_array_indices.prefix
-        );
-
-        let mut fields: Vec<&str> = Vec::new();
-
-        fields.push(&sidx);
-
-        if let Some(e) = self
-            .metadata
-            .spectrum_array_indices
-            .get(&ArrayType::MZArray)
-        {
-            fields.push(e.path.as_str());
-        }
-
-        if let Some(e) = self
-            .metadata
-            .spectrum_array_indices
-            .get(&ArrayType::IntensityArray)
-        {
-            fields.push(e.path.as_str());
-        }
-
-        for v in self.metadata.spectrum_array_indices.iter() {
-            if v.is_ion_mobility() {
-                fields.push(v.path.as_str());
-                break;
-            }
-        }
-
-        let proj = ProjectionMask::columns(builder.parquet_schema(), fields.iter().copied());
-        let predicate_mask = proj.clone();
-
-        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let root = batch.column(0).as_struct();
-            let it = index_range.contains_dy(root.column(0));
-
-            match (mz_range, ion_mobility_range) {
-                (None, None) => Ok(it),
-                (None, Some(ion_mobility_range)) => {
-                    let im_array = root.column(1);
-                    let it2 = ion_mobility_range.contains_dy(im_array);
-                    arrow::compute::and(&it, &it2)
-                }
-                (Some(mz_range), None) => {
-                    let mz_array = root.column(1);
-                    let it2 = mz_range.contains_dy(mz_array);
-                    arrow::compute::and(&it, &it2)
-                }
-                (Some(mz_range), Some(ion_mobility_range)) => {
-                    let mz_array = root.column(1);
-                    let im_array = root.column(2);
-                    let it2 = mz_range.contains_dy(mz_array);
-                    let it3 = ion_mobility_range.contains_dy(im_array);
-                    arrow::compute::and(&arrow::compute::and(&it2, &it3)?, &it)
-                }
-            }
-        });
-
-        let reader: ParquetRecordBatchReader = builder
-            .with_row_groups(row_group_indices)
-            .with_row_selection(rows)
-            .with_projection(proj)
-            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
-            .with_batch_size(10_000)
-            .build()?;
-
-        Ok((Box::new(reader), time_index))
+        let reader = PointDataReader(builder, BufferContext::Spectrum).query_points(
+            index_range,
+            mz_range, ion_mobility_range,
+            &self.query_indices,
+            &self.metadata.spectrum_array_indices
+        )?;
+        Ok((reader, time_index))
     }
 
     /// Get the number of spectra in the file
@@ -1178,6 +1034,31 @@ impl<
 
     pub fn is_empty(&self) -> bool {
         self.metadata.spectrum_id_index.is_empty()
+    }
+
+    pub fn get_spectrum_peaks_for(&mut self, index: u64) -> io::Result<Option<PeakDataLevel<C, D>>> {
+        let builder = self.handle.spectrum_peaks()?;
+        let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(io::ErrorKind::NotFound, "peak metadata was not found"))?;
+
+        return PointDataReader(builder, BufferContext::Spectrum).get_peak_list_for(index, meta_index);
+    }
+
+    pub fn query_peaks(
+        &mut self,
+        time_range: SimpleInterval<f32>,
+        mz_range: Option<SimpleInterval<f64>>,
+        ion_mobility_range: Option<SimpleInterval<f64>>,
+    ) -> io::Result<(
+        Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>,
+        HashMap<u64, f32, BuildIdentityHasher<u64>>,
+    )> {
+        let builder = self.handle.spectrum_peaks()?;
+        let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(io::ErrorKind::NotFound, "peak metadata was not found"))?;
+
+        let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
+
+        let iter = PointDataReader(builder, BufferContext::Spectrum).query_points(index_range, mz_range, ion_mobility_range, &meta_index.query_index, &meta_index.array_indices)?;
+        Ok((iter, time_index))
     }
 
     /// Read load descriptive metadata for the spectrum at `index`
@@ -1320,45 +1201,58 @@ impl<
                     .downcast_ref()
                     .unwrap();
 
-                let time_arr: &Float32Array = scan_arr.column(1).as_any().downcast_ref().unwrap();
-                let _config_arr: &UInt32Array = scan_arr.column(2).as_any().downcast_ref().unwrap();
-                let _filter_string_arr: &LargeStringArray = scan_arr.column(3).as_string();
-                let inject_arr: &Float32Array = scan_arr.column(4).as_any().downcast_ref().unwrap();
-                let _ion_mobility_arr: &Float64Array =
-                    scan_arr.column(5).as_any().downcast_ref().unwrap();
-                let _ion_mobility_tp_arr = scan_arr.column(6).as_struct();
-                let instrument_configuration_ref_arr: &UInt32Array =
-                    scan_arr.column(7).as_any().downcast_ref().unwrap();
-                let params_array: &LargeListArray = scan_arr.column(8).as_list();
-                for (pos, _) in index_arr
-                    .iter()
-                    .enumerate()
-                    .filter(|i| i.1.is_some_and(|i| i == index))
-                {
-                    let mut event = ScanEvent::default();
-                    event.start_time = time_arr.value(pos) as f64;
-                    event.injection_time = if inject_arr.is_valid(pos) {
-                        inject_arr.value(pos)
-                    } else {
-                        0.0
-                    };
-                    event.instrument_configuration_id =
-                        if instrument_configuration_ref_arr.is_valid(pos) {
-                            instrument_configuration_ref_arr.value(pos)
-                        } else {
-                            0
-                        };
+                let n_valid = index_arr.len() - index_arr.null_count();
 
-                    let params = params_array.value(pos);
-                    let params = params.as_struct();
-                    let params: Vec<crate::param::Param> =
-                        serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
-                    event
-                        .params_mut()
-                        .extend(params.into_iter().map(|p| p.into()));
+                if n_valid > 0 {
+                    let mut acc = Vec::new();
+                    self.load_scan_events_from(scan_arr, &param_fields, &mut acc);
+                    for (_, event) in acc {
+                        descr.acquisition.scans.push(event);
+                    }
+                } else {
 
-                    descr.acquisition.scans.push(event);
                 }
+
+                // let time_arr: &Float32Array = scan_arr.column(1).as_any().downcast_ref().unwrap();
+                // let _config_arr: &UInt32Array = scan_arr.column(2).as_any().downcast_ref().unwrap();
+                // let _filter_string_arr: &LargeStringArray = scan_arr.column(3).as_string();
+                // let inject_arr: &Float32Array = scan_arr.column(4).as_any().downcast_ref().unwrap();
+                // let _ion_mobility_arr: &Float64Array =
+                //     scan_arr.column(5).as_any().downcast_ref().unwrap();
+                // let _ion_mobility_tp_arr = scan_arr.column(6).as_struct();
+                // let instrument_configuration_ref_arr: &UInt32Array =
+                //     scan_arr.column(7).as_any().downcast_ref().unwrap();
+                // let params_array: &LargeListArray = scan_arr.column(8).as_list();
+                // for (pos, _) in index_arr
+                //     .iter()
+                //     .enumerate()
+                //     .filter(|i| i.1.is_some_and(|i| i == index))
+                // {
+                //     let mut event = ScanEvent::default();
+                //     event.start_time = time_arr.value(pos) as f64;
+                //     event.injection_time = if inject_arr.is_valid(pos) {
+                //         inject_arr.value(pos)
+                //     } else {
+                //         0.0
+                //     };
+                //     event.instrument_configuration_id =
+                //         if instrument_configuration_ref_arr.is_valid(pos) {
+                //             instrument_configuration_ref_arr.value(pos)
+                //         } else {
+                //             0
+                //         };
+
+                //     let params = params_array.value(pos);
+                //     let params = params.as_struct();
+                //     let params: Vec<crate::param::Param> =
+                //         serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
+                //     event
+                //         .params_mut()
+                //         .extend(params.into_iter().map(|p| p.into()));
+
+                //     descr.acquisition.scans.push(event);
+                // }
+
             }
 
             let precursor_arr = batch.column_by_name("precursor").unwrap().as_struct();
@@ -2206,6 +2100,7 @@ mod test {
     fn test_read_spectrum_chunked() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
         let descr = reader.get_spectrum(0)?;
+        eprintln!("{:#?}", descr.description());
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
         assert_eq!(descr.peaks().len(), 13589);

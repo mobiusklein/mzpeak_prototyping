@@ -32,14 +32,14 @@ use crate::{
     filter::RegressionDeltaModel,
     peak_series::{ArrayIndex, BufferFormat, data_array_to_arrow_array},
     reader::{
-        MzPeakReaderMetadata,
+        ReaderMetadata,
         index::{PageQuery, QueryIndex, RangeIndex, SpanDynNumeric},
         point::binary_search_arrow_index,
     },
 };
 
 #[allow(unused)]
-pub(crate) struct SpectrumDataChunkCache {
+pub(crate) struct DataChunkCache {
     pub(crate) row_group: RecordBatch,
     pub(crate) spectrum_index_range: SimpleInterval<u64>,
     pub(crate) spectrum_array_indices: Arc<ArrayIndex>,
@@ -48,7 +48,7 @@ pub(crate) struct SpectrumDataChunkCache {
 }
 
 #[allow(unused)]
-impl SpectrumDataChunkCache {
+impl DataChunkCache {
     pub(crate) fn new(
         row_group: RecordBatch,
         spectrum_index_range: SimpleInterval<u64>,
@@ -195,9 +195,9 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
     pub(crate) fn load_cache_block(
         self,
         index_range: SimpleInterval<u64>,
-        metadata: &MzPeakReaderMetadata,
+        metadata: &ReaderMetadata,
         query_indices: &QueryIndex,
-    ) -> io::Result<SpectrumDataChunkCache> {
+    ) -> io::Result<DataChunkCache> {
         let rows = query_indices
             .spectrum_chunk_index
             .spectrum_index
@@ -234,7 +234,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         let batch =
             arrow::compute::concat_batches(&schema, batches.iter()).map_err(io::Error::other)?;
 
-        Ok(SpectrumDataChunkCache::new(
+        Ok(DataChunkCache::new(
             batch,
             index_range,
             metadata.spectrum_array_indices.clone(),
@@ -247,7 +247,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         self,
         index_range: SimpleInterval<u64>,
         query_range: Option<SimpleInterval<f64>>,
-        metadata: &MzPeakReaderMetadata,
+        metadata: &ReaderMetadata,
         query_indices: &QueryIndex,
     ) -> io::Result<impl Iterator<Item = Result<RecordBatch, ArrowError>>> {
         let mut rows = query_indices

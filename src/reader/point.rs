@@ -2,20 +2,26 @@ use std::{collections::HashMap, io, sync::Arc};
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StructArray, UInt8Array, UInt64Array,
+        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StructArray, UInt64Array, UInt8Array
     },
-    datatypes::DataType,
+    datatypes::DataType, error::ArrowError,
 };
-use mzdata::spectrum::{ArrayType, BinaryArrayMap, DataArray};
+use mzdata::{
+    prelude::BuildFromArrayMap,
+    spectrum::{ArrayType, BinaryArrayMap, DataArray, PeakDataLevel},
+};
+use mzpeaks::{coordinate::SimpleInterval, CentroidLike, DeconvolutedCentroidLike};
 use parquet::{
-    arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder},
+    arrow::{
+        arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection}, ProjectionMask
+    },
     file::reader::ChunkReader,
 };
 
 use crate::{
-    filter::{RegressionDeltaModel, fill_nulls_for},
+    filter::{fill_nulls_for, RegressionDeltaModel},
     peak_series::ArrayIndex,
+    reader::{index::{PageQuery, SpanDynNumeric, SpectrumQueryIndex}, metadata::PeakMetadata}, BufferContext,
 };
 
 pub(crate) fn binary_search_arrow_index(
@@ -60,15 +66,14 @@ pub(crate) fn binary_search_arrow_index(
     None
 }
 
-pub(crate) trait SpectrumDataArrayReader {
+pub(crate) trait PointDataArrayReader {
     fn populate_arrays_from_struct_array(
-        &self,
         points: &StructArray,
         bin_map: &mut HashMap<&String, DataArray>,
         mz_delta_model: Option<&RegressionDeltaModel<f64>>,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
-            if f.name() == "spectrum_index" || f.name() == "spectrum_time" {
+            if f.name() == "spectrum_index" || f.name() == "spectrum_time" || f.name() == "chromatogram_index" {
                 continue;
             }
             let store = bin_map.get_mut(f.name()).unwrap();
@@ -136,23 +141,23 @@ pub(crate) trait SpectrumDataArrayReader {
 
     /// Read a specific Parquet row group into memory as a single [`RecordBatch`]
     ///
-    /// This reads from the spectrum data file
-    fn load_spectrum_data_row_group<T: ChunkReader + 'static>(
+    /// This may potentially use a lot of memory if row groups are large.
+    fn load_cache_block<T: ChunkReader + 'static>(
         &self,
         builder: ParquetRecordBatchReaderBuilder<T>,
         row_group: usize,
     ) -> io::Result<RecordBatch> {
         log::trace!("Loading row group {row_group}");
         let schema = builder.parquet_schema();
-        let leaves=  schema
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, f)| if f.path().string() != "point.spectrum_time" { Some(i)} else { None });
-        let mask = ProjectionMask::leaves(
-            schema,
-            leaves,
-        );
+        let leaves = schema.columns().iter().enumerate().filter_map(|(i, f)| {
+            if f.path().string() != "point.spectrum_time" {
+                log::trace!("Adding {f:?} to the point cache");
+                Some(i)
+            } else {
+                None
+            }
+        });
+        let mask = ProjectionMask::leaves(schema, leaves);
 
         let batch = builder
             .with_row_groups(vec![row_group])
@@ -172,23 +177,25 @@ pub(crate) trait SpectrumDataArrayReader {
     }
 }
 
-pub(crate) struct SpectrumDataPointCache {
+pub(crate) struct DataPointCache {
     pub(crate) row_group: RecordBatch,
     pub(crate) row_group_index: usize,
     pub(crate) spectrum_array_indices: Arc<ArrayIndex>,
     pub(crate) last_query_index: Option<u64>,
     pub(crate) last_query_span: Option<(usize, usize)>,
+    pub(crate) buffer_context: BufferContext,
 }
 
-impl SpectrumDataArrayReader for SpectrumDataPointCache {}
+impl PointDataArrayReader for DataPointCache {}
 
-impl SpectrumDataPointCache {
+impl DataPointCache {
     pub(crate) fn new(
         row_group: RecordBatch,
         spectrum_array_indices: Arc<ArrayIndex>,
         row_group_index: usize,
         last_query_index: Option<u64>,
         last_query_span: Option<(usize, usize)>,
+        buffer_context: BufferContext,
     ) -> Self {
         Self {
             row_group,
@@ -196,6 +203,7 @@ impl SpectrumDataPointCache {
             row_group_index,
             last_query_index,
             last_query_span,
+            buffer_context,
         }
     }
 
@@ -216,7 +224,7 @@ impl SpectrumDataPointCache {
 
         let points = self.row_group.column(0).as_struct();
         let indices: &UInt64Array = points
-            .column_by_name("spectrum_index")
+            .column_by_name(self.buffer_context.index_name())
             .unwrap()
             .as_any()
             .downcast_ref()
@@ -285,12 +293,237 @@ impl SpectrumDataPointCache {
             }
         };
 
-        self.populate_arrays_from_struct_array(&points, &mut bin_map, mz_delta_model);
+        Self::populate_arrays_from_struct_array(&points, &mut bin_map, mz_delta_model);
 
         let mut out = BinaryArrayMap::new();
         for v in bin_map.into_values() {
             out.add(v);
         }
         Ok(out)
+    }
+}
+
+pub(crate) struct PointDataReader<T: ChunkReader + 'static>(pub(crate) ParquetRecordBatchReaderBuilder<T>, pub(crate) BufferContext);
+
+impl<T: ChunkReader + 'static> PointDataArrayReader for PointDataReader<T> {}
+
+impl<T: ChunkReader + 'static> PointDataReader<T> {
+
+    pub(crate) fn find_row_groups_query<'a, I: SpectrumQueryIndex + 'a>(&self, index: u64, query_index: &'a I) -> (RowSelection, Vec<usize>) {
+        let PageQuery {
+            pages,
+            row_group_indices,
+        } = query_index.query_pages(index);
+
+        // Find which row groups we need to touch and the first possible row to read from relative to the start of the table
+        // because all `RowSelection` offsets are w.r.t. the row groups read, not the total possible rows in the table.
+        let first_row = if !pages.is_empty() {
+            let mut rg_row_skip = 0;
+            let meta = self.0.metadata();
+            for i in 0..row_group_indices[0] {
+                let rg = meta.row_group(i);
+                rg_row_skip += rg.num_rows();
+            }
+            rg_row_skip
+        } else {
+            0
+        };
+
+        let rows = query_index
+            .spectrum_data_index()
+            .pages_to_row_selection(&pages, first_row);
+
+        (rows, row_group_indices)
+    }
+
+    /// Read the arrays associated with the points of `index`
+    pub(crate) fn read_points_of<'a, I: SpectrumQueryIndex + 'a>(self, index: u64, query_index: &'a I, array_indices: &'a ArrayIndex) -> io::Result<Option<BinaryArrayMap>> {
+        let (rows, row_group_indices) = self.find_row_groups_query(index, query_index);
+
+        let predicate_mask = ProjectionMask::columns(
+            self.0.parquet_schema(),
+            [
+                match self.1 {
+                    BufferContext::Spectrum => format!("{}.{}", array_indices.prefix, self.1.index_name()),
+                    BufferContext::Chromatogram => format!("{}.{}", array_indices.prefix, self.1.index_name())
+                }.as_str()
+            ],
+        );
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let spectrum_index: &UInt64Array = batch
+                .column(0)
+                .as_struct()
+                .column(0)
+                .as_any()
+                .downcast_ref()
+                .unwrap();
+
+            let it = spectrum_index
+                .iter()
+                .map(|val| val.is_some_and(|val| val == index));
+
+            Ok(it.map(Some).collect())
+        });
+
+        let proj = ProjectionMask::columns(
+            &self.0.parquet_schema(),
+            [array_indices.prefix.as_str()],
+        );
+
+        log::trace!("{index} spread across row groups {row_group_indices:?}");
+
+        let reader = self
+            .0
+            .with_row_groups(row_group_indices)
+            .with_row_selection(rows)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_projection(proj)
+            .build()?;
+
+        let mut bin_map = HashMap::new();
+        for v in array_indices.iter() {
+            bin_map.insert(&v.name, v.as_buffer_name().as_data_array(1024));
+        }
+
+        let batches: Vec<_> = reader.flatten().collect();
+        if !batches.is_empty() {
+            let batch = arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
+            let points = batch.column(0).as_struct();
+            Self::populate_arrays_from_struct_array(points, &mut bin_map, None);
+        }
+
+        let mut out = BinaryArrayMap::new();
+        for v in bin_map.into_values() {
+            out.add(v);
+        }
+        Ok(Some(out))
+    }
+
+    pub(crate) fn get_peak_list_for<
+        C: CentroidLike + BuildFromArrayMap,
+        D: DeconvolutedCentroidLike + BuildFromArrayMap,
+    >(
+        self,
+        index: u64,
+        meta_index: &PeakMetadata,
+    ) -> io::Result<Option<PeakDataLevel<C, D>>> {
+        let out = self.read_points_of(index, &meta_index.query_index, &meta_index.array_indices)?;
+        match out {
+            Some(out) => {
+                match PeakDataLevel::try_from(&out) {
+                    Ok(val) => return Ok(Some(val)),
+                    Err(e) => return Err(e.into()),
+                }
+            },
+            None => Ok(None)
+        }
+    }
+
+    pub(crate) fn query_points<'a, I: SpectrumQueryIndex + 'a>(
+        self,
+        index_range: SimpleInterval<u64>,
+        mz_range: Option<SimpleInterval<f64>>,
+        ion_mobility_range: Option<SimpleInterval<f64>>,
+        query_index: &'a I,
+        array_indices: &'a ArrayIndex,
+    ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a>> {
+        let mut rows = query_index
+            .index_overlaps(&index_range);
+
+        let PageQuery { row_group_indices, pages } = query_index.query_pages_overlaps(&index_range);
+
+        if pages.is_empty() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+
+        let mut up_to_first_row = 0;
+        let meta = self.0.metadata();
+        for i in 0..row_group_indices[0] {
+            let rg = meta.row_group(i);
+            up_to_first_row += rg.num_rows();
+        }
+
+        if let Some(mz_range) = mz_range.as_ref() {
+            rows = rows.intersection(
+                &query_index.mz_overlaps(mz_range),
+            );
+        }
+
+        if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
+            rows = rows.union(
+                &query_index
+                    .im_overlaps(&ion_mobility_range),
+            );
+        }
+
+        rows.split_off(up_to_first_row as usize);
+
+        let sidx = format!(
+            "{}.spectrum_index",
+            array_indices.prefix
+        );
+
+        let mut fields: Vec<&str> = Vec::new();
+
+        fields.push(&sidx);
+
+        if let Some(e) = array_indices
+            .get(&ArrayType::MZArray)
+        {
+            fields.push(e.path.as_str());
+        }
+
+        if let Some(e) = array_indices
+            .get(&ArrayType::IntensityArray)
+        {
+            fields.push(e.path.as_str());
+        }
+
+        for v in array_indices.iter() {
+            if v.is_ion_mobility() {
+                fields.push(v.path.as_str());
+                break;
+            }
+        }
+
+        let proj = ProjectionMask::columns(self.0.parquet_schema(), fields.iter().copied());
+        let predicate_mask = proj.clone();
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let root = batch.column(0).as_struct();
+            let it = index_range.contains_dy(root.column(0));
+
+            match (mz_range, ion_mobility_range) {
+                (None, None) => Ok(it),
+                (None, Some(ion_mobility_range)) => {
+                    let im_array = root.column(1);
+                    let it2 = ion_mobility_range.contains_dy(im_array);
+                    arrow::compute::and(&it, &it2)
+                }
+                (Some(mz_range), None) => {
+                    let mz_array = root.column(1);
+                    let it2 = mz_range.contains_dy(mz_array);
+                    arrow::compute::and(&it, &it2)
+                }
+                (Some(mz_range), Some(ion_mobility_range)) => {
+                    let mz_array = root.column(1);
+                    let im_array = root.column(2);
+                    let it2 = mz_range.contains_dy(mz_array);
+                    let it3 = ion_mobility_range.contains_dy(im_array);
+                    arrow::compute::and(&arrow::compute::and(&it2, &it3)?, &it)
+                }
+            }
+        });
+
+        let reader: ParquetRecordBatchReader = self.0
+            .with_row_groups(row_group_indices)
+            .with_row_selection(rows)
+            .with_projection(proj)
+            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_batch_size(10_000)
+            .build()?;
+
+        Ok(Box::new(reader))
     }
 }
