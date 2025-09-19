@@ -22,7 +22,7 @@ impl Entry {
     >(
         spectrum: &impl SpectrumLike<C, D>,
         index: Option<u64>,
-        precursor_index: Option<&mut u64>,
+        mut precursor_index: Option<&mut u64>,
     ) -> Vec<Self> {
         let mut spec = SpectrumEntry::from_spectrum(spectrum);
         if let Some(index) = index {
@@ -46,28 +46,40 @@ impl Entry {
             }
         }
 
-        if let Some(precursor) = spectrum.precursor() {
+        for precursor in spectrum.precursor_iter() {
             let prec = PrecursorEntry::from_precursor(
                 precursor,
                 Some(spectrum.index() as u64),
                 precursor_index.as_ref().map(|v| **v),
             );
             let prec_index = prec.precursor_index;
-            if let Some(pi) = precursor_index {
-                *pi += 1
+            if let Some(pi) = precursor_index.as_mut() {
+                **pi += 1
             }
-            entries[0].precursor = Some(prec.into());
-            for (i, ion) in precursor.ions.iter().enumerate() {
+
+            match entries.iter_mut().find(|v| v.precursor.is_none()) {
+                Some(ent) => {
+                    ent.precursor = Some(prec.into());
+                },
+                None => {
+                    entries.push(prec.into());
+                }
+            }
+
+            for ion in precursor.ions.iter() {
                 let part = SelectedIonEntry::from_selected_ion(
                     ion,
                     Some(spectrum.index() as u64),
                     prec_index,
                 );
-                if i == 0 {
-                    entries[0].selected_ion = Some(part.into())
-                } else {
+                match entries.iter_mut().find(|v| v.selected_ion.is_none()) {
+                Some(ent) => {
+                    ent.selected_ion = Some(part.into());
+                },
+                None => {
                     entries.push(part.into());
                 }
+            }
             }
         }
         entries

@@ -8,8 +8,8 @@ use std::{
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int8Array, LargeListArray, LargeStringArray,
-        RecordBatch, StructArray, UInt8Array, UInt32Array, UInt64Array,
+        Array, AsArray, Float32Array,
+        RecordBatch, StructArray, UInt64Array,
     },
     datatypes::{DataType, FieldRef, Float32Type, Float64Type, UInt32Type, UInt64Type},
     error::ArrowError,
@@ -18,11 +18,13 @@ use arrow::{
 use identity_hash::BuildIdentityHasher;
 use mzdata::{
     io::{DetailLevel, OffsetIndex},
-    meta::{MSDataFileMetadata, SpectrumType},
-    params::{ParamDescribed, Unit},
+    meta::MSDataFileMetadata,
+    params::Unit,
     prelude::*,
     spectrum::{
-        bindata::BuildFromArrayMap, ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType, DataArray, MultiLayerSpectrum, PeakDataLevel, ScanEvent, ScanPolarity, SpectrumDescription
+        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, DataArray,
+        MultiLayerSpectrum, PeakDataLevel, Precursor, ScanEvent, SelectedIon,
+        SpectrumDescription, bindata::BuildFromArrayMap,
     },
 };
 use mzpeaks::{
@@ -37,26 +39,31 @@ use parquet::arrow::{
 use serde_arrow::schema::SchemaLike;
 
 use crate::{
-    archive::ZipArchiveReader, filter::RegressionDeltaModel, reader::{
+    BufferContext,
+    archive::ZipArchiveReader,
+    filter::RegressionDeltaModel,
+    param::MetadataColumn,
+    reader::{
         chunk::DataChunkCache,
         index::{PageQuery, QueryIndex, SpanDynNumeric},
-        metadata::{MzScanBuilder, MzSpectrumBuilder}, point::PointDataReader,
-    }, spectrum::AuxiliaryArray, BufferContext, PrecursorEntry, SelectedIonEntry, CURIE
+        point::PointDataReader,
+        visitor::{
+            MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
+            MzSpectrumVisitor,
+        },
+    },
+    spectrum::AuxiliaryArray,
 };
 
 mod chunk;
 pub mod index;
 mod metadata;
 mod point;
+mod visitor;
 
 pub use chunk::SpectrumChunkReader;
 pub use metadata::ReaderMetadata;
-use point::{PointDataArrayReader, DataPointCache};
-
-const DRIFT_TIME: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[0];
-const INVERSE_K_DRIFT_TIME: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[1];
-const FAIMS: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[2];
-const SELEXION: mzdata::params::CURIE = crate::param::ION_MOBILITY_SCAN_TERMS[3];
+use point::{DataPointCache, PointDataArrayReader};
 
 pub struct MzPeakReaderType<
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap = CentroidPeak,
@@ -228,6 +235,8 @@ impl<
 // very dense.
 const CHUNK_CACHE_BLOCK_SIZE: u64 = 100;
 
+const EMPTY_FIELDS: [MetadataColumn; 0] = [];
+
 pub(crate) enum SpectrumDataCache {
     Point(DataPointCache),
     Chunk(DataChunkCache),
@@ -277,8 +286,7 @@ impl SpectrumDataCache {
         spectrum_index: u64,
     ) -> io::Result<Option<Self>> {
         if reader.query_indices.spectrum_point_index.is_populated() {
-            let rg = reader
-                .load_cache_block(reader.handle.spectra_data()?, row_group_index)?;
+            let rg = reader.load_cache_block(reader.handle.spectra_data()?, row_group_index)?;
             let cache = DataPointCache::new(
                 rg,
                 reader.metadata.spectrum_array_indices.clone(),
@@ -375,7 +383,9 @@ impl<
             Ok(self.spectrum_row_group_cache.as_mut().unwrap())
         } else {
             log::trace!("Spectrum data cache miss {row_group_index:?}:{spectrum_index}");
-            if let Some(cache) = SpectrumDataCache::load_data_for(self, row_group_index, spectrum_index)? {
+            if let Some(cache) =
+                SpectrumDataCache::load_data_for(self, row_group_index, spectrum_index)?
+            {
                 self.spectrum_row_group_cache = Some(cache);
                 Ok(self.spectrum_row_group_cache.as_mut().unwrap())
             } else {
@@ -505,355 +515,93 @@ impl<
         Ok(out)
     }
 
+    fn load_precursors_from(
+        &self,
+        precursor_arr: &StructArray,
+        acc: &mut Vec<(u64, u64, Precursor)>,
+    ) {
+        let n = precursor_arr
+            .column_by_name("spectrum_index")
+            .map(|a| a.len() - a.null_count())
+            .unwrap_or_default();
+        if acc.is_empty() && n > 0 {
+            acc.resize(n, Default::default());
+        }
+        if n > 0 {
+            MzPrecursorVisitor::new(acc, &[], 0, Vec::new()).visit(&precursor_arr);
+        }
+    }
+
+    fn load_selected_ions_from(
+        &self,
+        si_arr: &StructArray,
+        acc: &mut Vec<(u64, u64, SelectedIon)>,
+    ) {
+        let metacols = self.metadata.selected_ion_metadata_map.as_deref().unwrap_or(&EMPTY_FIELDS);
+        let n = si_arr
+            .column_by_name("spectrum_index")
+            .map(|a| a.len() - a.null_count())
+            .unwrap_or_default();
+        if acc.is_empty() && n > 0 {
+            acc.resize(n, Default::default());
+        }
+        if n > 0 {
+            MzSelectedIonVisitor::new(acc, &metacols, 0, Vec::new()).visit(&si_arr);
+        }
+    }
+
     fn load_scan_events_from(
         &self,
         scan_arr: &StructArray,
-        param_fields: &[FieldRef],
         scan_accumulator: &mut Vec<(u64, ScanEvent)>,
     ) {
-        if let Some(metacols) = self.metadata.scan_metadata_map.as_ref() {
-            let n = scan_arr.column_by_name("spectrum_index").map(|a| a.len() - a.null_count()).unwrap_or_default();
-            if scan_accumulator.is_empty() && n > 0 {
-                scan_accumulator.resize(n, Default::default());
-            }
-            let mut builder =
-                MzScanBuilder::new(scan_accumulator, &metacols, 0, Vec::new());
-            builder.visit(scan_arr);
-            return;
+        let metacols = self
+            .metadata
+            .scan_metadata_map
+            .as_deref()
+            .unwrap_or(&EMPTY_FIELDS);
+        let n = scan_arr
+            .column_by_name("spectrum_index")
+            .map(|a| a.len() - a.null_count())
+            .unwrap_or_default();
+        if scan_accumulator.is_empty() && n > 0 {
+            scan_accumulator.resize(n, Default::default());
         }
-        else {
-            let index_arr: &UInt64Array = scan_arr
-                .column_by_name("spectrum_index")
-                .unwrap()
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-
-            let time_arr: &Float32Array = scan_arr.column(1).as_any().downcast_ref().unwrap();
-            let config_arr: &UInt32Array = scan_arr.column(2).as_any().downcast_ref().unwrap();
-            let filter_string_arr: &LargeStringArray = scan_arr.column(3).as_string();
-            let inject_arr: &Float32Array = scan_arr.column(4).as_any().downcast_ref().unwrap();
-            let ion_mobility_arr: &Float64Array =
-                scan_arr.column(5).as_any().downcast_ref().unwrap();
-            let ion_mobility_tp_arr = scan_arr.column(6).as_struct();
-            let instrument_configuration_ref_arr: &UInt32Array =
-                scan_arr.column(7).as_any().downcast_ref().unwrap();
-            let params_array: &LargeListArray = scan_arr.column(8).as_list();
-            for (pos, index) in index_arr.iter().enumerate().filter(|(_, v)| v.is_some()) {
-                let mut event = ScanEvent::default();
-                event.start_time = time_arr.value(pos) as f64;
-                event.injection_time = if inject_arr.is_valid(pos) {
-                    inject_arr.value(pos)
-                } else {
-                    0.0
-                };
-                event.instrument_configuration_id =
-                    if instrument_configuration_ref_arr.is_valid(pos) {
-                        instrument_configuration_ref_arr.value(pos)
-                    } else {
-                        0
-                    };
-
-                let params = params_array.value(pos);
-                let params = params.as_struct();
-                let params: Vec<crate::param::Param> =
-                    serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
-                event
-                    .params_mut()
-                    .extend(params.into_iter().map(|p| p.into()));
-
-                if filter_string_arr.is_valid(pos) {
-                    let filter = filter_string_arr.value(pos);
-                    event.add_param(
-                        mzdata::Param::builder()
-                            .name("filter string")
-                            .curie(mzdata::curie!(MS:1000512))
-                            .value(filter)
-                            .build(),
-                    );
-                }
-
-                if config_arr.is_valid(pos) {
-                    let conf = config_arr.value(pos);
-                    event.add_param(
-                        mzdata::Param::builder()
-                            .name("preset scan configuration")
-                            .curie(mzdata::curie!(MS:1000616))
-                            .value(conf)
-                            .build(),
-                    );
-                }
-
-                if ion_mobility_arr.is_valid(pos) {
-                    let val = ion_mobility_arr.value(pos);
-                    if ion_mobility_tp_arr.is_valid(pos) {
-                        let tp = ion_mobility_tp_arr
-                            .column(1)
-                            .as_any()
-                            .downcast_ref::<UInt32Array>()
-                            .unwrap();
-                        let tp = mzdata::params::CURIE::new(
-                            mzdata::params::ControlledVocabulary::MS,
-                            tp.value(pos),
-                        );
-                        let param_builder = mzdata::Param::builder().curie(tp).value(val);
-
-                        match tp {
-                            DRIFT_TIME => {
-                                event.add_param(
-                                    param_builder
-                                        .name("ion mobility drift time")
-                                        .unit(Unit::Millisecond)
-                                        .build(),
-                                );
-                            }
-                            INVERSE_K_DRIFT_TIME => {
-                                event.add_param(
-                                    param_builder
-                                        .name("inverse reduced ion mobility drift time")
-                                        .unit(Unit::VoltSecondPerSquareCentimeter)
-                                        .build(),
-                                );
-                            }
-                            FAIMS => {
-                                event.add_param(
-                                    param_builder
-                                        .name("inverse reduced ion mobility drift time")
-                                        .unit(Unit::VoltSecondPerSquareCentimeter)
-                                        .build(),
-                                );
-                            }
-                            SELEXION => {
-                                event.add_param(
-                                    param_builder
-                                        .name("SELEXION compensation voltage")
-                                        .unit(Unit::Volt)
-                                        .build(),
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                scan_accumulator.push((index.unwrap(), event));
-            }
-        }
+        let mut builder = MzScanVisitor::new(scan_accumulator, &metacols, 0, Vec::new());
+        builder.visit(scan_arr);
     }
 
     fn load_spectrum_metadata_from_slice_into_description(
         &self,
         spec_arr: &StructArray,
         descr: &mut SpectrumDescription,
-        offset: usize,
-        param_fields: &[FieldRef],
+        offset: usize
     ) {
-        if let Some(metacols) = self.metadata.spectrum_metadata_map.as_ref() {
-            log::warn!("Loading single description at {offset}");
+        let metacols = self.metadata.spectrum_metadata_map.as_deref().unwrap_or(&EMPTY_FIELDS);
+        {
             let mut builder =
-                MzSpectrumBuilder::new(std::slice::from_mut(descr), &metacols, offset);
+                MzSpectrumVisitor::new(std::slice::from_mut(descr), &metacols, offset);
             builder.visit(spec_arr);
-            return;
-        }
-
-        let idx_arr: &UInt64Array = spec_arr.column(0).as_any().downcast_ref().unwrap();
-        let idx_val = idx_arr.value(offset);
-        descr.index = idx_val as usize;
-
-        let id_arr: &LargeStringArray = spec_arr.column(1).as_string();
-        let id_val = id_arr.value(offset);
-        descr.id = id_val.to_string();
-
-        let ms_level_arr: &UInt8Array = spec_arr.column(2).as_any().downcast_ref().unwrap();
-        let ms_level_val = ms_level_arr.value(offset);
-        descr.ms_level = ms_level_val;
-
-        let polarity_arr: &Int8Array = spec_arr.column(4).as_any().downcast_ref().unwrap();
-        let polarity_val = polarity_arr.value(offset);
-        match polarity_val {
-            1 => descr.polarity = ScanPolarity::Positive,
-            -1 => descr.polarity = ScanPolarity::Negative,
-            _ => {
-                todo!("Don't know how to deal with polarity {polarity_val}")
-            }
-        }
-
-        let continuity_array = spec_arr.column(5).as_struct();
-        let cv_id_arr: &UInt8Array = continuity_array.column(0).as_any().downcast_ref().unwrap();
-        let accession_arr: &UInt32Array =
-            continuity_array.column(1).as_any().downcast_ref().unwrap();
-        let continuity_curie = CURIE::new(cv_id_arr.value(offset), accession_arr.value(offset));
-
-        descr.signal_continuity = match continuity_curie {
-            crate::curie!(MS:1000525) => mzdata::spectrum::SignalContinuity::Unknown,
-            crate::curie!(MS:1000127) => mzdata::spectrum::SignalContinuity::Centroid,
-            crate::curie!(MS:1000128) => mzdata::spectrum::SignalContinuity::Profile,
-            _ => todo!("Don't know how to deal with {continuity_curie}"),
-        };
-
-        let spec_type_array = spec_arr.column(6).as_struct();
-        let cv_id_arr: &UInt8Array = spec_type_array.column(0).as_any().downcast_ref().unwrap();
-        let accession_arr: &UInt32Array =
-            spec_type_array.column(1).as_any().downcast_ref().unwrap();
-        let spec_type_curie = CURIE::new(cv_id_arr.value(offset), accession_arr.value(offset));
-        let spec_type = SpectrumType::from_accession(spec_type_curie.accession);
-        if let Some(spec_type) = spec_type {
-            descr.set_spectrum_type(spec_type);
-        }
-
-        if let Some(mz_arr) = spec_arr
-            .column_by_name("base_peak_mz")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float64Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000504))
-                .name("base peak m/z")
-                .unit(Unit::MZ)
-                .value(mz_arr.value(offset))
-                .build();
-            descr.add_param(p);
-        }
-
-        if let Some(arr) = spec_arr
-            .column_by_name("base_peak_intensty")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float32Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000505))
-                .name("base peak intensity")
-                .unit(Unit::DetectorCounts)
-                .value(arr.value(offset))
-                .build();
-            descr.add_param(p);
-        }
-
-        if let Some(arr) = spec_arr
-            .column_by_name("total_ion_current")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float32Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000285))
-                .name("total ion current")
-                .unit(Unit::DetectorCounts)
-                .value(arr.value(offset))
-                .build();
-            descr.add_param(p);
-        }
-
-        if let Some(arr) = spec_arr
-            .column_by_name("lowest_observed_mz")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float64Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000528))
-                .name("lowest observed m/z")
-                .unit(Unit::MZ)
-                .value(arr.value(offset))
-                .build();
-            descr.add_param(p);
-        }
-
-        if let Some(arr) = spec_arr
-            .column_by_name("highest_observed_mz")
-            .and_then(|arr| arr.as_any().downcast_ref::<Float64Array>())
-        {
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000527))
-                .name("highest observed m/z")
-                .unit(Unit::MZ)
-                .value(arr.value(offset))
-                .build();
-            descr.add_param(p);
-        }
-
-        let params_array: &LargeListArray =
-            spec_arr.column_by_name("parameters").unwrap().as_list();
-        let params = params_array.value(offset);
-        let params = params.as_struct();
-
-        const SKIP_PARAMS: [CURIE; 6] = [
-            crate::curie!(MS:1000505),
-            crate::curie!(MS:1000504),
-            crate::curie!(MS:1000257),
-            crate::curie!(MS:1000285),
-            crate::curie!(MS:1000527),
-            crate::curie!(MS:1000528),
-        ];
-        let params: Vec<crate::param::Param> =
-            serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
-
-        for p in params {
-            if let Some(acc) = p.accession {
-                if !SKIP_PARAMS.contains(&acc) {
-                    descr.add_param(p.into());
-                }
-            } else {
-                descr.add_param(p.into());
-            }
         }
     }
 
+    #[allow(unused)]
     fn load_chromatogram_metadata_from_slice_into_description(
         &self,
-        spec_arr: &StructArray,
+        chrom_arr: &StructArray,
         descr: &mut ChromatogramDescription,
         offset: usize,
-        param_fields: &[FieldRef],
     ) {
-        let idx_arr: &UInt64Array = spec_arr.column(0).as_any().downcast_ref().unwrap();
-        let idx_val = idx_arr.value(offset);
-        descr.index = idx_val as usize;
-
-        let id_arr: &LargeStringArray = spec_arr.column(1).as_string();
-        let id_val = id_arr.value(offset);
-        descr.id = id_val.to_string();
-
-        let polarity_arr: &Int8Array = spec_arr.column(2).as_any().downcast_ref().unwrap();
-        let polarity_val = polarity_arr.value(offset);
-        match polarity_val {
-            1 => descr.polarity = ScanPolarity::Positive,
-            -1 => descr.polarity = ScanPolarity::Negative,
-            _ => {
-                todo!("Don't know how to deal with polarity {polarity_val}")
-            }
-        }
-
-        let chromatogram_type_array = spec_arr.column(3).as_struct();
-        let cv_id_arr: &UInt8Array = chromatogram_type_array
-            .column(0)
-            .as_any()
-            .downcast_ref()
-            .unwrap();
-        let accession_arr: &UInt32Array = chromatogram_type_array
-            .column(1)
-            .as_any()
-            .downcast_ref()
-            .unwrap();
-        let chromatogram_type = CURIE::new(cv_id_arr.value(offset), accession_arr.value(offset));
-        if let Some(tp) = ChromatogramType::from_accession(chromatogram_type.accession) {
-            descr.chromatogram_type = tp;
-        } else {
-            descr.chromatogram_type = ChromatogramType::Unknown;
-        }
-
-        let params_array: &LargeListArray =
-            spec_arr.column_by_name("parameters").unwrap().as_list();
-        let params = params_array.value(offset);
-        let params = params.as_struct();
-
-        const SKIP_PARAMS: &[CURIE] = &[];
-        let params: Vec<crate::param::Param> =
-            serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
-
-        for p in params {
-            if let Some(acc) = p.accession {
-                if !SKIP_PARAMS.contains(&acc) {
-                    descr.add_param(p.into());
-                }
-            } else {
-                descr.add_param(p.into());
-            }
-        }
+        MzChromatogramBuilder::new(
+            std::slice::from_mut(descr),
+            self.metadata
+                .chromatogram_metadata_map
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or_else(|| &EMPTY_FIELDS),
+            offset,
+        )
+        .visit(chrom_arr);
     }
 
     pub fn get_spectrum_index_range_for_time_range(
@@ -1020,9 +768,10 @@ impl<
 
         let reader = PointDataReader(builder, BufferContext::Spectrum).query_points(
             index_range,
-            mz_range, ion_mobility_range,
+            mz_range,
+            ion_mobility_range,
             &self.query_indices,
-            &self.metadata.spectrum_array_indices
+            &self.metadata.spectrum_array_indices,
         )?;
         Ok((reader, time_index))
     }
@@ -1036,11 +785,18 @@ impl<
         self.metadata.spectrum_id_index.is_empty()
     }
 
-    pub fn get_spectrum_peaks_for(&mut self, index: u64) -> io::Result<Option<PeakDataLevel<C, D>>> {
+    pub fn get_spectrum_peaks_for(
+        &mut self,
+        index: u64,
+    ) -> io::Result<Option<PeakDataLevel<C, D>>> {
         let builder = self.handle.spectrum_peaks()?;
-        let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(io::ErrorKind::NotFound, "peak metadata was not found"))?;
+        let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            "peak metadata was not found",
+        ))?;
 
-        return PointDataReader(builder, BufferContext::Spectrum).get_peak_list_for(index, meta_index);
+        return PointDataReader(builder, BufferContext::Spectrum)
+            .get_peak_list_for(index, meta_index);
     }
 
     pub fn query_peaks(
@@ -1053,11 +809,20 @@ impl<
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
     )> {
         let builder = self.handle.spectrum_peaks()?;
-        let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(io::ErrorKind::NotFound, "peak metadata was not found"))?;
+        let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            "peak metadata was not found",
+        ))?;
 
         let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
 
-        let iter = PointDataReader(builder, BufferContext::Spectrum).query_points(index_range, mz_range, ion_mobility_range, &meta_index.query_index, &meta_index.array_indices)?;
+        let iter = PointDataReader(builder, BufferContext::Spectrum).query_points(
+            index_range,
+            mz_range,
+            ion_mobility_range,
+            &meta_index.query_index,
+            &meta_index.array_indices,
+        )?;
         Ok((iter, time_index))
     }
 
@@ -1159,21 +924,16 @@ impl<
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .build()?;
 
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
-
-        let precursor_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<PrecursorEntry>(Default::default()).unwrap();
-
-        let selected_ion_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<SelectedIonEntry>(Default::default()).unwrap();
-
         let mut descr = SpectrumDescription::default();
 
-        let mut precursors: Vec<PrecursorEntry> = Vec::new();
-        let mut selected_ions: Vec<SelectedIonEntry> = Vec::new();
+        let mut precursors = Vec::new();
+        let mut selected_ions = Vec::new();
 
-        for batch in reader.flatten() {
+        for batch in reader {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(e) => return Err(io::Error::other(e)),
+            };
             let spec_arr = batch.column_by_name("spectrum").unwrap().as_struct();
             let index_arr: &UInt64Array = spec_arr
                 .column_by_name("index")
@@ -1188,7 +948,6 @@ impl<
                     &spec_arr,
                     &mut descr,
                     0,
-                    &param_fields,
                 );
             }
 
@@ -1205,122 +964,38 @@ impl<
 
                 if n_valid > 0 {
                     let mut acc = Vec::new();
-                    self.load_scan_events_from(scan_arr, &param_fields, &mut acc);
+                    self.load_scan_events_from(scan_arr, &mut acc);
                     for (_, event) in acc {
                         descr.acquisition.scans.push(event);
                     }
-                } else {
-
                 }
-
-                // let time_arr: &Float32Array = scan_arr.column(1).as_any().downcast_ref().unwrap();
-                // let _config_arr: &UInt32Array = scan_arr.column(2).as_any().downcast_ref().unwrap();
-                // let _filter_string_arr: &LargeStringArray = scan_arr.column(3).as_string();
-                // let inject_arr: &Float32Array = scan_arr.column(4).as_any().downcast_ref().unwrap();
-                // let _ion_mobility_arr: &Float64Array =
-                //     scan_arr.column(5).as_any().downcast_ref().unwrap();
-                // let _ion_mobility_tp_arr = scan_arr.column(6).as_struct();
-                // let instrument_configuration_ref_arr: &UInt32Array =
-                //     scan_arr.column(7).as_any().downcast_ref().unwrap();
-                // let params_array: &LargeListArray = scan_arr.column(8).as_list();
-                // for (pos, _) in index_arr
-                //     .iter()
-                //     .enumerate()
-                //     .filter(|i| i.1.is_some_and(|i| i == index))
-                // {
-                //     let mut event = ScanEvent::default();
-                //     event.start_time = time_arr.value(pos) as f64;
-                //     event.injection_time = if inject_arr.is_valid(pos) {
-                //         inject_arr.value(pos)
-                //     } else {
-                //         0.0
-                //     };
-                //     event.instrument_configuration_id =
-                //         if instrument_configuration_ref_arr.is_valid(pos) {
-                //             instrument_configuration_ref_arr.value(pos)
-                //         } else {
-                //             0
-                //         };
-
-                //     let params = params_array.value(pos);
-                //     let params = params.as_struct();
-                //     let params: Vec<crate::param::Param> =
-                //         serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
-                //     event
-                //         .params_mut()
-                //         .extend(params.into_iter().map(|p| p.into()));
-
-                //     descr.acquisition.scans.push(event);
-                // }
-
             }
 
             let precursor_arr = batch.column_by_name("precursor").unwrap().as_struct();
             {
-                let index_arr: &UInt64Array = precursor_arr
-                    .column_by_name("spectrum_index")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref()
-                    .unwrap();
-
-                for (pos, _) in index_arr
-                    .iter()
-                    .enumerate()
-                    .filter(|i| i.1.is_some_and(|i| i == index))
-                {
-                    let row = precursor_arr.slice(pos, 1);
-                    precursors.extend(
-                        serde_arrow::from_arrow::<Vec<PrecursorEntry>, _>(
-                            &precursor_fields,
-                            row.columns(),
-                        )
-                        .unwrap(),
-                    );
-                }
+                let mut precursors_acc = Vec::new();
+                self.load_precursors_from(precursor_arr, &mut precursors_acc);
+                precursors.extend(precursors_acc);
             }
 
             let selected_ion_arr = batch.column_by_name("selected_ion").unwrap().as_struct();
             {
-                let index_arr: &UInt64Array = selected_ion_arr
-                    .column_by_name("spectrum_index")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref()
-                    .unwrap();
-
-                for (pos, _) in index_arr
-                    .iter()
-                    .enumerate()
-                    .filter(|i| i.1.is_some_and(|i| i == index))
-                {
-                    let row = selected_ion_arr.slice(pos, 1);
-                    selected_ions.extend(
-                        serde_arrow::from_arrow::<Vec<SelectedIonEntry>, _>(
-                            &selected_ion_fields,
-                            row.columns(),
-                        )
-                        .unwrap(),
-                    );
-                }
+                let mut acc = Vec::new();
+                self.load_selected_ions_from(selected_ion_arr, &mut acc);
+                selected_ions.extend(acc.into_iter().map(|(a, b, c)| (a, b, Some(c))));
             }
         }
 
-        for precursor in precursors {
-            let mut prec = mzdata::spectrum::Precursor::default();
-            prec.isolation_window = precursor.isolation_window.into();
-            prec.activation = precursor.activation.into();
-            prec.precursor_id = precursor.precursor_id;
+        for (_spec_index, precursor_index, mut prec) in precursors {
             for selected_ion in selected_ions.iter_mut() {
-                if selected_ion.precursor_index != precursor.precursor_index {
+                if selected_ion.1 != precursor_index {
                     continue;
                 }
 
-                let si = selected_ion.to_mzdata();
+                let si = selected_ion.2.take().unwrap();
                 prec.add_ion(si);
             }
-            descr.precursor = Some(prec);
-            // Does not yet support MSn for n > 2
+            descr.precursor.push(prec);
         }
         Ok(descr)
     }
@@ -1631,17 +1306,10 @@ impl<
             .with_batch_size(10_000)
             .build()?;
 
-        let mut descriptions: Vec<SpectrumDescription> = Default::default();
-        let mut precursors: Vec<PrecursorEntry> = Vec::new();
-        let mut selected_ions: Vec<SelectedIonEntry> = Vec::new();
+        let mut descriptions: Vec<SpectrumDescription> = Vec::new();
+        let mut precursors: Vec<(u64, u64, Precursor)> = Vec::new();
+        let mut selected_ions: Vec<(u64, u64, SelectedIon)> = Vec::new();
         let mut scan_events: Vec<(u64, ScanEvent)> = Vec::new();
-
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
-        let precursor_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<PrecursorEntry>(Default::default()).unwrap();
-        let selected_ion_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<SelectedIonEntry>(Default::default()).unwrap();
 
         for batch in reader.flatten() {
             let spec_arr = batch.column_by_name("spectrum").unwrap().as_struct();
@@ -1654,8 +1322,7 @@ impl<
             let n_spec = index_arr.len() - index_arr.null_count();
             if let Some(metacols) = self.metadata.spectrum_metadata_map.as_ref() {
                 let mut local_descr = vec![SpectrumDescription::default(); n_spec];
-                let mut builder =
-                    MzSpectrumBuilder::new(&mut local_descr, &metacols, 0);
+                let mut builder = MzSpectrumVisitor::new(&mut local_descr, &metacols, 0);
                 builder.visit(spec_arr);
                 descriptions.extend(local_descr);
             } else {
@@ -1666,7 +1333,6 @@ impl<
                             spec_arr,
                             &mut descr,
                             i,
-                            &param_fields,
                         );
                         descriptions.push(descr);
                     }
@@ -1674,66 +1340,42 @@ impl<
             }
 
             if let Some(scan_arr) = batch.column_by_name("scan").map(|arr| arr.as_struct()) {
-                self.load_scan_events_from(scan_arr, &param_fields, &mut scan_events);
+                let mut acc = Vec::new();
+                self.load_scan_events_from(scan_arr, &mut acc);
+                if scan_events.is_empty() {
+                    scan_events = acc;
+                } else {
+                    scan_events.extend(acc);
+                }
             }
 
             let precursor_arr = batch.column_by_name("precursor").unwrap().as_struct();
             {
-                let index_arr: &UInt64Array = precursor_arr
-                    .column_by_name("spectrum_index")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref()
-                    .unwrap();
-
-                for (pos, _) in index_arr.iter().enumerate().filter(|i| i.1.is_some()) {
-                    let row = precursor_arr.slice(pos, 1);
-                    precursors.extend(
-                        serde_arrow::from_arrow::<Vec<PrecursorEntry>, _>(
-                            &precursor_fields,
-                            row.columns(),
-                        )
-                        .unwrap(),
-                    );
+                let mut precursor_acc = Vec::new();
+                self.load_precursors_from(precursor_arr, &mut precursor_acc);
+                if precursors.is_empty() {
+                    precursors = precursor_acc
+                } else {
+                    precursors.extend(precursor_acc);
                 }
             }
 
             let selected_ion_arr = batch.column_by_name("selected_ion").unwrap().as_struct();
             {
-                let index_arr: &UInt64Array = selected_ion_arr
-                    .column_by_name("spectrum_index")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref()
-                    .unwrap();
-
-                for (pos, _) in index_arr.iter().enumerate().filter(|i| i.1.is_some()) {
-                    let row = selected_ion_arr.slice(pos, 1);
-                    selected_ions.extend(
-                        serde_arrow::from_arrow::<Vec<SelectedIonEntry>, _>(
-                            &selected_ion_fields,
-                            row.columns(),
-                        )
-                        .unwrap(),
-                    );
+                let mut acc = Vec::new();
+                self.load_selected_ions_from(&selected_ion_arr, &mut acc);
+                if selected_ions.is_empty() {
+                    selected_ions = acc;
+                } else {
+                    selected_ions.extend(acc);
                 }
             }
         }
 
-        precursors.sort_unstable_by(|a, b| {
-            a.spectrum_index
-                .cmp(&b.spectrum_index)
-                .then_with(|| a.precursor_index.cmp(&b.precursor_index))
-        });
+        precursors.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
-        let mut precursors: Vec<(Option<u64>, mzdata::spectrum::Precursor)> = precursors
-            .into_iter()
-            .map(|p| (p.spectrum_index, p.to_mzdata()))
-            .collect();
-
-        for sie in selected_ions.iter() {
-            let si = sie.to_mzdata();
-            let prec = &mut precursors[sie.precursor_index.unwrap() as usize].1;
+        for (_, prec_idx, si) in selected_ions {
+            let prec = &mut precursors[prec_idx as usize].2;
             prec.add_ion(si);
         }
 
@@ -1741,8 +1383,8 @@ impl<
             descriptions[idx as usize].acquisition.scans.push(scan);
         }
 
-        for (idx, precursor) in precursors {
-            descriptions[idx.unwrap() as usize].precursor = Some(precursor);
+        for (idx, _, precursor) in precursors {
+            descriptions[idx as usize].precursor.push(precursor);
         }
 
         Ok(descriptions)
@@ -1807,100 +1449,56 @@ impl<
             .build()?;
 
         let mut descriptions: Vec<ChromatogramDescription> = Default::default();
-        let mut precursors: Vec<PrecursorEntry> = Vec::new();
-        let mut selected_ions: Vec<SelectedIonEntry> = Vec::new();
-
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
-        let precursor_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<PrecursorEntry>(Default::default()).unwrap();
-        let selected_ion_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<SelectedIonEntry>(Default::default()).unwrap();
+        let mut precursors = Vec::new();
+        let mut selected_ions = Vec::new();
 
         for batch in reader.flatten() {
-            let spec_arr = batch.column_by_name("chromatogram").unwrap().as_struct();
-            let index_arr: &UInt64Array = spec_arr
+            let chrom_arr = batch.column_by_name("chromatogram").unwrap().as_struct();
+            let index_arr: &UInt64Array = chrom_arr
                 .column_by_name("index")
                 .unwrap()
                 .as_any()
                 .downcast_ref()
                 .unwrap();
-
-            for (i, val) in index_arr.iter().enumerate() {
-                if val.is_some() {
-                    let mut descr = ChromatogramDescription::default();
-                    self.load_chromatogram_metadata_from_slice_into_description(
-                        spec_arr,
-                        &mut descr,
-                        i,
-                        &param_fields,
-                    );
-                    descriptions.push(descr);
-                }
-            }
+            let n_spec = index_arr.len() - index_arr.null_count();
+            let mut local_descr = vec![ChromatogramDescription::default(); n_spec];
+            let mut builder = MzChromatogramBuilder::new(
+                &mut local_descr,
+                &self
+                    .metadata
+                    .chromatogram_metadata_map
+                    .as_ref()
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&EMPTY_FIELDS),
+                0,
+            );
+            builder.visit(chrom_arr);
+            descriptions.extend(local_descr);
 
             let precursor_arr = batch.column_by_name("precursor").unwrap().as_struct();
             {
-                let index_arr: &UInt64Array = precursor_arr
-                    .column_by_name("spectrum_index")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref()
-                    .unwrap();
-
-                for (pos, _) in index_arr.iter().enumerate().filter(|i| i.1.is_some()) {
-                    let row = precursor_arr.slice(pos, 1);
-                    precursors.extend(
-                        serde_arrow::from_arrow::<Vec<PrecursorEntry>, _>(
-                            &precursor_fields,
-                            row.columns(),
-                        )
-                        .unwrap(),
-                    );
-                }
+                let mut acc = Vec::new();
+                self.load_precursors_from(precursor_arr, &mut acc);
+                precursors.extend(acc);
             }
 
             let selected_ion_arr = batch.column_by_name("selected_ion").unwrap().as_struct();
             {
-                let index_arr: &UInt64Array = selected_ion_arr
-                    .column_by_name("spectrum_index")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref()
-                    .unwrap();
-
-                for (pos, _) in index_arr.iter().enumerate().filter(|i| i.1.is_some()) {
-                    let row = selected_ion_arr.slice(pos, 1);
-                    selected_ions.extend(
-                        serde_arrow::from_arrow::<Vec<SelectedIonEntry>, _>(
-                            &selected_ion_fields,
-                            row.columns(),
-                        )
-                        .unwrap(),
-                    );
-                }
+                let mut acc = Vec::new();
+                self.load_selected_ions_from(selected_ion_arr, &mut acc);
+                selected_ions.extend(acc);
             }
         }
 
-        precursors.sort_unstable_by(|a, b| {
-            a.spectrum_index
-                .cmp(&b.spectrum_index)
-                .then_with(|| a.precursor_index.cmp(&b.precursor_index))
-        });
+        precursors.sort_unstable_by(|a, b| a.1.cmp(&b.1));
 
-        let mut precursors: Vec<(Option<u64>, mzdata::spectrum::Precursor)> = precursors
-            .into_iter()
-            .map(|p| (p.spectrum_index, p.to_mzdata()))
-            .collect();
-
-        for sie in selected_ions.iter() {
-            let si = sie.to_mzdata();
-            let prec = &mut precursors[sie.precursor_index.unwrap() as usize].1;
+        for (spec_idx, prec_idx, si) in selected_ions {
+            let prec = &mut precursors[prec_idx as usize].2;
             prec.add_ion(si);
         }
 
-        for (idx, precursor) in precursors {
-            descriptions[idx.unwrap() as usize].precursor = Some(precursor);
+        for (idx, _prec_idx, precursor) in precursors {
+            descriptions[idx as usize].precursor.push(precursor);
         }
 
         Ok(descriptions)
@@ -2100,13 +1698,13 @@ mod test {
     fn test_read_spectrum_chunked() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
         let descr = reader.get_spectrum(0)?;
-        eprintln!("{:#?}", descr.description());
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
         assert_eq!(descr.peaks().len(), 13589);
         let descr = reader.get_spectrum(5)?;
         assert_eq!(descr.index(), 5);
         assert_eq!(descr.peaks().len(), 650);
+        eprintln!("{:#?}", descr.description());
         let descr = reader.get_spectrum(25)?;
         assert_eq!(descr.index(), 25);
         assert_eq!(descr.peaks().len(), 789);
