@@ -32,6 +32,7 @@ pub struct AuxiliaryArray {
     pub compression: CURIE,
     pub unit: Option<CURIE>,
     pub parameters: Vec<Param>,
+    pub data_processing_ref: Option<Box<str>>
 }
 
 impl From<AuxiliaryArray> for DataArray {
@@ -128,6 +129,7 @@ impl AuxiliaryArray {
             compression,
             unit,
             parameters: Default::default(),
+            data_processing_ref: None,
         };
         if let Some(params) = source.params {
             this.parameters

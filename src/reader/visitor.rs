@@ -29,6 +29,30 @@ pub(crate) struct MzSpectrumVisitor<'a> {
     pub(crate) offsets: Vec<usize>,
 }
 
+macro_rules! extract_unit {
+    ($metacol:ident, $array:ident) => {{
+
+        let units: UnitCollection<'_> = match &$metacol.unit {
+            crate::param::PathOrCURIE::Path(items) => {
+                if let Some(val) = $array.column_by_name(items.last().unwrap()) {
+                    UnitCollection::series(val.as_struct())
+                } else {
+                    log::error!("The path {} did not exist", items.join("."));
+                    UnitCollection::unknown()
+                }
+            }
+            crate::param::PathOrCURIE::CURIE(curie) => {
+                UnitCollection::singular(Unit::from_curie(&(*curie).into()))
+            }
+            crate::param::PathOrCURIE::None => {
+                UnitCollection::unknown()
+            }
+        };
+        units
+        }
+    };
+}
+
 impl<'a> VisitorBuilderBase<'a, SpectrumDescription> for MzSpectrumVisitor<'a> {
     fn iter_instances(&mut self) -> OffsetCollection<'_, SpectrumDescription> {
         OffsetCollection::new(self.descriptions, &self.offsets)
@@ -235,11 +259,7 @@ impl<'a> MzSpectrumVisitor<'a> {
         index: usize,
         metacol: &MetadataColumn,
     ) {
-        let unit = match &metacol.unit {
-            crate::param::PathOrCURIE::Path(_items) => todo!(),
-            crate::param::PathOrCURIE::CURIE(curie) => Unit::from_curie(&(*curie).into()),
-            crate::param::PathOrCURIE::None => Unit::DetectorCounts,
-        };
+        let unit = extract_unit!(metacol, spec_arr);
 
         macro_rules! extract {
             ($arr:expr) => {
@@ -248,7 +268,7 @@ impl<'a> MzSpectrumVisitor<'a> {
                     let p = mzdata::Param::builder()
                         .curie(mzdata::curie!(MS:1000505))
                         .name("base peak intensity")
-                        .unit(unit)
+                        .unit(unit.value(i))
                         .value($arr.value(i))
                         .build();
                     descr.add_param(p);
@@ -277,12 +297,7 @@ impl<'a> MzSpectrumVisitor<'a> {
         index: usize,
         metacol: &MetadataColumn,
     ) {
-        let unit = match &metacol.unit {
-            crate::param::PathOrCURIE::Path(_items) => todo!(),
-            crate::param::PathOrCURIE::CURIE(curie) => Unit::from_curie(&(*curie).into()),
-            crate::param::PathOrCURIE::None => Unit::DetectorCounts,
-        };
-
+        let unit = extract_unit!(metacol, spec_arr);
         macro_rules! extract {
             ($arr:expr) => {
                 for (i, descr) in self.offsets.iter().copied().zip(self.descriptions.iter_mut()) {
@@ -290,7 +305,7 @@ impl<'a> MzSpectrumVisitor<'a> {
                     let p = mzdata::Param::builder()
                         .curie(mzdata::curie!(MS:1000285))
                         .name("total ion current")
-                        .unit(unit)
+                        .unit(unit.value(i))
                         .value($arr.value(i))
                         .build();
                     descr.add_param(p);
@@ -432,11 +447,105 @@ impl<'a> MzSpectrumVisitor<'a> {
                 "parameters" => {
                     self.visit_parameters(spec_arr, &SKIP_PARAMS);
                 }
+                "data_processing_ref" => {
+                    // TODO: Add a slot for this in the `mzdata` data model
+                }
                 _ => {}
             }
         }
     }
 }
+
+struct CURIEArray<'a> {
+    cv_id: &'a UInt8Array,
+    accession: &'a UInt32Array
+}
+
+impl<'a> CURIEArray<'a> {
+    fn new(cv_id: &'a UInt8Array, accession: &'a UInt32Array) -> Self {
+        Self { cv_id, accession }
+    }
+
+    fn from_struct_array(unit_series: &'a StructArray) -> Self {
+        Self::new(
+            unit_series.column(0).as_primitive(),
+            unit_series.column(1).as_primitive()
+        )
+    }
+
+    #[inline(always)]
+    fn is_null(&self, index: usize) -> bool {
+        self.cv_id.is_null(index) || self.accession.is_null(index)
+    }
+
+    #[inline(always)]
+    fn value(&self, index: usize) -> Option<CURIE> {
+        if self.is_null(index) {
+            None
+        } else {
+            Some(CURIE::new(self.cv_id.value(index), self.accession.value(index)))
+        }
+    }
+}
+
+struct UnitArray<'a>(CURIEArray<'a>);
+
+impl<'a> UnitArray<'a> {
+    fn from_struct_array(unit_series: &'a StructArray) -> Self {
+        Self(CURIEArray::from_struct_array(unit_series))
+    }
+
+    #[inline(always)]
+    fn value(&self, index: usize) -> Unit {
+        self.0.value(index).map(|v| {
+            Unit::from_curie(&(v.into()))
+        }).unwrap_or_default()
+    }
+}
+
+struct UnitScalar(Unit);
+
+impl UnitScalar {
+    #[inline(always)]
+    fn value(&self, _index: usize) -> Unit {
+        self.0
+    }
+}
+
+enum UnitCollection<'a> {
+    Array(UnitArray<'a>),
+    Scalar(UnitScalar)
+}
+
+impl<'a> Default for UnitCollection<'a> {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+impl<'a> UnitCollection<'a> {
+
+    #[inline(always)]
+    fn value(&self, index: usize) -> Unit {
+        match self {
+            UnitCollection::Array(unit_series) => unit_series.value(index),
+            UnitCollection::Scalar(unit_series_singular) => unit_series_singular.value(index),
+        }
+    }
+
+    fn series(unit_series: &'a StructArray) -> Self {
+        Self::Array(UnitArray::from_struct_array(unit_series))
+    }
+
+    fn singular(unit: Unit) -> Self {
+        Self::Scalar(UnitScalar(unit))
+    }
+
+    fn unknown() -> Self {
+        Self::Scalar(UnitScalar(Unit::Unknown))
+    }
+}
+
 
 /// Enclose the parallel arrays of "descriptions" and their offsets so that the borrow
 /// checker knows that method calls on this instance aren't tied to the owning objects
@@ -507,63 +616,21 @@ trait VisitorBuilder1<'a, T: ParamDescribed>: VisitorBuilderBase<'a, T> {
             return;
         }
 
-        let mut unit_single = None;
-        let mut unit_series: Option<&StructArray> = None;
-
-        match &metacol.unit {
-            crate::param::PathOrCURIE::Path(items) => {
-                if let Some(val) = spec_arr.column_by_name(items.last().unwrap()) {
-                    unit_series = Some(val.as_struct());
-                } else {
-                    log::error!("The path {} did not exist", items.join("."));
-                    unit_single = Some(Unit::Unknown)
-                }
-            }
-            crate::param::PathOrCURIE::CURIE(curie) => {
-                unit_single = Some(Unit::from_curie(&(*curie).into()));
-            }
-            crate::param::PathOrCURIE::None => {
-                unit_single = Some(Unit::Unknown);
-            }
-        };
-
+        let units = extract_unit!(metacol, spec_arr);
         let accession: Option<mzdata::params::CURIE> = metacol.accession.map(|v| v.into());
 
         macro_rules! convert {
             ($arr:ident) => {
-                if let Some(unit) = unit_single {
-                    for (i, descr) in self.iter_instances() {
-                        if $arr.is_null(i) {
-                            continue;
-                        };
-                        let mut p = mzdata::Param::builder();
-                        p = p.name(&metacol.name).value($arr.value(i)).unit(unit);
-                        if let Some(acc) = accession {
-                            p = p.curie(acc)
-                        }
-                        descr.add_param(p.build());
+                for (i, descr) in self.iter_instances() {
+                    if $arr.is_null(i) {
+                        continue;
+                    };
+                    let mut p = mzdata::Param::builder();
+                    p = p.name(&metacol.name).value($arr.value(i)).unit(units.value(i));
+                    if let Some(acc) = accession {
+                        p = p.curie(acc)
                     }
-                } else if let Some(unit_series) = unit_series {
-                    let cv_id_array = unit_series.column(0).as_primitive::<UInt8Type>();
-                    let acc_array = unit_series.column(1).as_primitive::<UInt32Type>();
-                    for (i, descr) in self.iter_instances() {
-                        if $arr.is_null(i) {
-                            continue;
-                        };
-                        let unit = if cv_id_array.is_null(i) || acc_array.is_null(i) {
-                            Unit::Unknown
-                        } else {
-                            let unit_acc: mzdata::params::CURIE =
-                                CURIE::new(cv_id_array.value(i), acc_array.value(i)).into();
-                            Unit::from_curie(&unit_acc)
-                        };
-                        let mut p = mzdata::Param::builder();
-                        p = p.name(&metacol.name).value($arr.value(i)).unit(unit);
-                        if let Some(acc) = accession {
-                            p = p.curie(acc)
-                        }
-                        descr.add_param(p.build());
-                    }
+                    descr.add_param(p.build());
                 }
             };
         }
@@ -622,15 +689,11 @@ trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
         }
 
         let (name, unit, accession) = if let Some(metacol) = metacol {
-            let unit = match &metacol.unit {
-                crate::param::PathOrCURIE::Path(_items) => todo!(),
-                crate::param::PathOrCURIE::CURIE(curie) => Unit::from_curie(&(*curie).into()),
-                crate::param::PathOrCURIE::None => Unit::Unknown,
-            };
             let accession: Option<mzdata::params::CURIE> = metacol.accession.map(|v| v.into());
-            (metacol.name.as_str(), unit, accession)
+            let units = extract_unit!(metacol, spec_arr);
+            (metacol.name.as_str(), units, accession)
         } else if let Some(name) = name {
-            (name, Unit::Unknown, None)
+            (name, UnitCollection::unknown(), None)
         } else {
             panic!("One of `metacol` or `name` must be defined")
         };
@@ -642,7 +705,7 @@ trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
                         continue;
                     };
                     let mut p = mzdata::Param::builder();
-                    p = p.name(&name).value($arr.value(i)).unit(unit);
+                    p = p.name(&name).value($arr.value(i)).unit(unit.value(i));
                     if let Some(acc) = accession {
                         p = p.curie(acc)
                     }
@@ -724,15 +787,11 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
         }
 
         let (name, unit, accession) = if let Some(metacol) = metacol {
-            let unit = match &metacol.unit {
-                crate::param::PathOrCURIE::Path(_items) => todo!(),
-                crate::param::PathOrCURIE::CURIE(curie) => Unit::from_curie(&(*curie).into()),
-                crate::param::PathOrCURIE::None => Unit::Unknown,
-            };
+            let unit = extract_unit!(metacol, spec_arr);
             let accession: Option<mzdata::params::CURIE> = metacol.accession.map(|v| v.into());
             (metacol.name.as_str(), unit, accession)
         } else if let Some(name) = name {
-            (name, Unit::Unknown, None)
+            (name, Default::default(), None)
         } else {
             panic!("One of `metacol` or `name` must be defined")
         };
@@ -744,7 +803,7 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
                         continue;
                     };
                     let mut p = mzdata::Param::builder();
-                    p = p.name(&name).value($arr.value(i)).unit(unit);
+                    p = p.name(&name).value($arr.value(i)).unit(unit.value(i));
                     if let Some(acc) = accession {
                         p = p.curie(acc)
                     }

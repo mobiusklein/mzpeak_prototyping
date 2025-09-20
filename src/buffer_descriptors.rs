@@ -130,6 +130,7 @@ pub struct BufferName {
     /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
     pub transform: Option<BufferTransform>,
+    pub data_processing_id: Option<Box<str>>,
 }
 
 impl PartialEq for BufferName {
@@ -369,6 +370,7 @@ impl BufferName {
             unit: Unit::Unknown,
             buffer_format: BufferFormat::Point,
             transform: None,
+            data_processing_id: None,
         }
     }
 
@@ -385,6 +387,7 @@ impl BufferName {
             unit: Unit::Unknown,
             buffer_format,
             transform: None,
+            data_processing_id: None,
         }
     }
 
@@ -449,6 +452,9 @@ impl BufferName {
         if let Some(trfm) = self.transform.as_ref() {
             meta.insert("transform".to_string(), trfm.curie().to_string());
         }
+        if let Some(dp_id) = self.data_processing_id.as_ref() {
+            meta.insert("data_processing_id".to_string(), dp_id.to_string());
+        }
         meta
     }
 
@@ -459,6 +465,7 @@ impl BufferName {
         let mut name = None;
         let mut buffer_format = BufferFormat::Point;
         let mut transform = None;
+        let mut data_processing_id = None;
         for (k, v) in field.metadata().iter() {
             match k.as_str() {
                 "unit" => {
@@ -496,6 +503,9 @@ impl BufferName {
                         .ok()
                         .and_then(|v| BufferTransform::from_curie(v));
                 }
+                "data_processing_id" => {
+                    data_processing_id = Some(v.clone().into_boxed_str())
+                }
                 _ => {}
             }
         }
@@ -509,6 +519,7 @@ impl BufferName {
                     unit,
                     buffer_format,
                     transform,
+                    data_processing_id,
                 };
                 if let ArrayType::NonStandardDataArray { name } = &mut this.array_type {
                     *name = array_name.into();

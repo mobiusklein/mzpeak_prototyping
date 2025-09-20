@@ -1217,6 +1217,7 @@ impl<
     pub(crate) fn load_all_spectrum_metadata_impl(
         &mut self,
     ) -> io::Result<Vec<SpectrumDescription>> {
+        log::trace!("Loading all spectrum metadata");
         let builder = self.handle.spectrum_metadata()?;
 
         let mut rows = self
@@ -1386,7 +1387,7 @@ impl<
         for (idx, _, precursor) in precursors {
             descriptions[idx as usize].precursor.push(precursor);
         }
-
+        log::trace!("Finished loading all spectrum metadata");
         Ok(descriptions)
     }
 
