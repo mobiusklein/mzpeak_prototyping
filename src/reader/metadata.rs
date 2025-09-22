@@ -15,21 +15,20 @@ use parquet::{
     schema::types::SchemaDescriptor,
 };
 
+#[derive(Debug)]
 pub struct ReaderMetadata {
     pub(crate) mz_metadata: mzdata::meta::FileMetadataConfig,
-    pub spectrum_array_indices: Arc<ArrayIndex>,
-    pub chromatogram_array_indices: Arc<ArrayIndex>,
-    pub spectrum_id_index: OffsetIndex,
-    pub(crate) model_deltas: Vec<Option<Vec<f64>>>,
-    pub(crate) auxliary_array_counts: Vec<u32>,
+    pub(crate) spectrum_array_indices: Arc<ArrayIndex>,
+    pub(crate) chromatogram_array_indices: Arc<ArrayIndex>,
+    pub(crate) spectrum_id_index: OffsetIndex,
+    pub(crate) mz_model_deltas: Vec<Option<Vec<f64>>>,
+    pub(crate) spectrum_auxiliary_array_counts: Vec<u32>,
+    pub(crate) chromatogram_auxiliary_array_counts: Vec<u32>,
     pub(crate) spectrum_metadata_map: Option<Vec<MetadataColumn>>,
-    #[allow(unused)]
     pub(crate) scan_metadata_map: Option<Vec<MetadataColumn>>,
-    #[allow(unused)]
     pub(crate) selected_ion_metadata_map: Option<Vec<MetadataColumn>>,
-    #[allow(unused)]
     pub(crate) chromatogram_metadata_map: Option<Vec<MetadataColumn>>,
-    pub peak_indices: Option<PeakMetadata>,
+    pub(crate) peak_indices: Option<PeakMetadata>,
 }
 
 impl ReaderMetadata {
@@ -39,7 +38,7 @@ impl ReaderMetadata {
         chromatogram_array_indices: Arc<ArrayIndex>,
         spectrum_id_index: OffsetIndex,
         model_deltas: Vec<Option<Vec<f64>>>,
-        auxliary_array_counts: Vec<u32>,
+        spectrum_auxiliary_array_counts: Vec<u32>,
         spectrum_metadata_map: Option<Vec<MetadataColumn>>,
         scan_metadata_map: Option<Vec<MetadataColumn>>,
         selected_ion_metadata_map: Option<Vec<MetadataColumn>>,
@@ -51,27 +50,43 @@ impl ReaderMetadata {
             spectrum_array_indices,
             chromatogram_array_indices,
             spectrum_id_index,
-            model_deltas,
-            auxliary_array_counts,
+            mz_model_deltas: model_deltas,
+            spectrum_auxiliary_array_counts,
             spectrum_metadata_map,
             scan_metadata_map,
             selected_ion_metadata_map,
             chromatogram_metadata_map,
             peak_indices,
+            chromatogram_auxiliary_array_counts: Vec::new(),
         }
     }
 
-    pub fn model_deltas_for(&self, index: usize) -> Option<Vec<f64>> {
-        self.model_deltas.get(index).cloned().unwrap_or_default()
-    }
-
-    pub fn model_deltas_for_conv(&self, index: usize) -> Option<RegressionDeltaModel<f64>> {
-        self.model_deltas_for(index)
+    pub fn model_deltas_for(&self, index: usize) -> Option<RegressionDeltaModel<f64>> {
+        self.mz_model_deltas
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
             .map(|v| RegressionDeltaModel::from(v))
     }
 
-    pub fn auxliary_array_counts(&self) -> &[u32] {
-        &self.auxliary_array_counts
+    pub fn spectrum_auxiliary_array_counts(&self) -> &[u32] {
+        &self.spectrum_auxiliary_array_counts
+    }
+
+    pub fn chromatogram_auxiliary_array_counts(&self) -> &[u32] {
+        &self.chromatogram_auxiliary_array_counts
+    }
+
+    pub fn peak_array_indices(&self) -> Option<&ArrayIndex> {
+        self.peak_indices.as_ref().map(|v| &v.array_indices)
+    }
+
+    pub fn spectrum_array_indices(&self) -> &ArrayIndex {
+        &self.spectrum_array_indices
+    }
+
+    pub fn chromatogram_array_indices(&self) -> &ArrayIndex {
+        &self.chromatogram_array_indices
     }
 
     pub fn file_metadata(&self) -> &mzdata::meta::FileMetadataConfig {
@@ -179,32 +194,8 @@ pub(crate) fn load_indices_from(
         .key_value_metadata()
         .into_iter()
         .flatten()
-        .chain(
-            spectrum_data_reader
-                .metadata()
-                .file_metadata()
-                .key_value_metadata()
-                .into_iter()
-                .flatten(),
-        )
     {
         match kv.key.as_str() {
-            "spectrum_array_index" => {
-                if let Some(val) = kv.value.as_ref() {
-                    let array_index: SerializedArrayIndex = serde_json::from_str(&val)?;
-                    spectrum_array_indices = array_index.into();
-                } else {
-                    log::warn!("spectrum array index was empty");
-                }
-            }
-            "chromatogram_array_index" => {
-                if let Some(val) = kv.value.as_ref() {
-                    let array_index: SerializedArrayIndex = serde_json::from_str(&val)?;
-                    chromatogram_array_indices = array_index.into();
-                } else {
-                    log::warn!("chromatogram array index was empty");
-                }
-            }
             "file_description" => {
                 if let Some(val) = kv.value.as_ref() {
                     let file_description: crate::param::FileDescription =
@@ -294,6 +285,26 @@ pub(crate) fn load_indices_from(
         }
     }
 
+    for kv in spectrum_data_reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .into_iter()
+        .flatten()
+    {
+        match kv.key.as_str() {
+            "spectrum_array_index" => {
+                if let Some(val) = kv.value.as_ref() {
+                    let array_index: SerializedArrayIndex = serde_json::from_str(&val)?;
+                    spectrum_array_indices = array_index.into();
+                } else {
+                    log::warn!("spectrum array index was empty");
+                }
+            }
+            _ => {}
+        }
+    }
+
     let pq_schema = spectrum_metadata_reader.parquet_schema();
 
     let spectrum_id_index = build_spectrum_index(&handle, pq_schema)?;
@@ -301,6 +312,52 @@ pub(crate) fn load_indices_from(
     let mut query_index = QueryIndex::default();
     query_index.populate_spectrum_metadata_indices(&spectrum_metadata_reader);
     query_index.populate_spectrum_data_indices(&spectrum_data_reader, &spectrum_array_indices);
+
+    if let Ok(chromatogram_metadata_reader) = handle.chromatograms_metadata() {
+        for kv in chromatogram_metadata_reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .into_iter()
+            .flatten()
+        {
+            match kv.key.as_str() {
+                "chromatogram_column_metadata_mapping" => {
+                    if let Some(val) = kv.value.as_ref() {
+                        let metacols: Vec<MetadataColumn> = serde_json::from_str(&val)?;
+                        chromatogram_metadata_mapping = Some(metacols);
+                    }
+                }
+                _ => {}
+            }
+        }
+        query_index.populate_chromatogram_metadata_indices(&chromatogram_metadata_reader);
+    }
+    if let Ok(chromatogram_data_reader) = handle.chromatograms_data() {
+        for kv in chromatogram_data_reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .into_iter()
+            .flatten()
+        {
+            match kv.key.as_str() {
+                "chromatogram_array_index" => {
+                    if let Some(val) = kv.value.as_ref() {
+                        let array_index: SerializedArrayIndex = serde_json::from_str(&val)?;
+                        chromatogram_array_indices = array_index.into();
+                    } else {
+                        log::warn!("chromatogram array index was empty");
+                    }
+                }
+                _ => {}
+            }
+        }
+        query_index.populate_chromatogram_data_indices(
+            &chromatogram_data_reader,
+            &chromatogram_array_indices,
+        );
+    }
 
     let peak_metadata = handle
         .spectrum_peaks()

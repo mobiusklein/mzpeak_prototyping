@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
 
 use arrow::{
     array::{
@@ -66,16 +66,29 @@ pub(crate) fn binary_search_arrow_index(
     None
 }
 
+/// An internal shared behavior set for reading point-layout data
 pub(crate) trait PointDataArrayReader {
+
+    /// Read a [`StructArray`] of parallel array values into a map of [`DataArray`] instances.
+    ///
+    /// If `incremental` is not true, assume we have all the information available and skip work
+    /// on completely null arrays.
     fn populate_arrays_from_struct_array(
         points: &StructArray,
         bin_map: &mut HashMap<&String, DataArray>,
         mz_delta_model: Option<&RegressionDeltaModel<f64>>,
+        incremental: bool
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
             if f.name() == "spectrum_index" || f.name() == "spectrum_time" || f.name() == "chromatogram_index" {
                 continue;
             }
+
+            if arr.null_count() == arr.len() && !incremental {
+                bin_map.remove(f.name());
+                continue;
+            }
+
             let store = bin_map.get_mut(f.name()).unwrap();
 
             let has_nulls = arr.null_count() > 0;
@@ -177,6 +190,9 @@ pub(crate) trait PointDataArrayReader {
     }
 }
 
+/// An internal data structure for caching a [`RecordBatch`] corresponding to a complete
+/// row group in memory, and reading out slices of the batch. This helps avoid repeated re-parsing
+/// of the Parquet file.
 pub(crate) struct DataPointCache {
     pub(crate) row_group: RecordBatch,
     pub(crate) row_group_index: usize,
@@ -293,7 +309,7 @@ impl DataPointCache {
             }
         };
 
-        Self::populate_arrays_from_struct_array(&points, &mut bin_map, mz_delta_model);
+        Self::populate_arrays_from_struct_array(&points, &mut bin_map, mz_delta_model, false);
 
         let mut out = BinaryArrayMap::new();
         for v in bin_map.into_values() {
@@ -303,6 +319,8 @@ impl DataPointCache {
     }
 }
 
+
+/// A facet that wraps the behavior for reading point-layout data.
 pub(crate) struct PointDataReader<T: ChunkReader + 'static>(pub(crate) ParquetRecordBatchReaderBuilder<T>, pub(crate) BufferContext);
 
 impl<T: ChunkReader + 'static> PointDataArrayReader for PointDataReader<T> {}
@@ -337,9 +355,8 @@ impl<T: ChunkReader + 'static> PointDataReader<T> {
     }
 
     /// Read the arrays associated with the points of `index`
-    pub(crate) fn read_points_of<'a, I: SpectrumQueryIndex + 'a>(self, index: u64, query_index: &'a I, array_indices: &'a ArrayIndex) -> io::Result<Option<BinaryArrayMap>> {
+    pub(crate) fn read_points_of<'a, I: SpectrumQueryIndex + Debug + 'a>(self, index: u64, query_index: &'a I, array_indices: &'a ArrayIndex) -> io::Result<Option<BinaryArrayMap>> {
         let (rows, row_group_indices) = self.find_row_groups_query(index, query_index);
-
         let predicate_mask = ProjectionMask::columns(
             self.0.parquet_schema(),
             [
@@ -390,7 +407,7 @@ impl<T: ChunkReader + 'static> PointDataReader<T> {
         if !batches.is_empty() {
             let batch = arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
             let points = batch.column(0).as_struct();
-            Self::populate_arrays_from_struct_array(points, &mut bin_map, None);
+            Self::populate_arrays_from_struct_array(points, &mut bin_map, None, false);
         }
 
         let mut out = BinaryArrayMap::new();

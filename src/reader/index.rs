@@ -6,7 +6,7 @@ use arrow::array::{
 };
 use mzdata::spectrum::ArrayType;
 use mzpeaks::coordinate::SimpleInterval;
-use mzpeaks::{coordinate::IntervalTree, prelude::HasProximity};
+use mzpeaks::prelude::HasProximity;
 use parquet::file::metadata::ParquetMetaData;
 
 use parquet::file::reader::ChunkReader;
@@ -100,13 +100,6 @@ impl<T: HasProximity> PageIndex<T>
 where
     PageIndexEntry<T>: PageIndexType<T>,
 {
-    pub fn as_interval_tree(&self) -> IntervalTree<T, PageIndexEntry<T>>
-    where
-        T: num_traits::real::Real + core::iter::Sum,
-    {
-        IntervalTree::new(self.0.clone())
-    }
-
     pub fn get(&self, index: usize) -> Option<&PageIndexEntry<T>> {
         self.0.get(index)
     }
@@ -646,12 +639,116 @@ pub(crate) trait SpectrumQueryIndex {
     fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection;
 }
 
+pub(crate) trait ChromatogramQueryIndex {
+    fn query_chromatrogram_pages(&self, chromatogram_index: u64) -> PageQuery;
+    fn query_chromatogram_pages_overlaps(
+        &self,
+        index_range: &impl Span1D<DimType = u64>,
+    ) -> PageQuery;
+    #[allow(unused)]
+    fn chromatogram_data_index(&self) -> &PageIndex<u64>;
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SpectrumPointIndex {
     pub spectrum_index: PageIndex<u64>,
     pub mz_index: PageIndex<f64>,
     pub im_index: PageIndex<f64>,
     pub time_index: Option<PageIndex<f32>>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ChromatogramPointIndex {
+    pub chromatogram_index: PageIndex<u64>,
+    pub time_index: PageIndex<f64>,
+}
+
+impl ChromatogramQueryIndex for ChromatogramPointIndex {
+    fn query_chromatrogram_pages(&self, chromatogram_index: u64) -> PageQuery {
+        self.query_pages(chromatogram_index)
+    }
+
+    fn query_chromatogram_pages_overlaps(
+        &self,
+        index_range: &impl Span1D<DimType = u64>,
+    ) -> PageQuery {
+        self.query_pages_overlaps(index_range)
+    }
+
+    fn chromatogram_data_index(&self) -> &PageIndex<u64> {
+        &self.chromatogram_index
+    }
+}
+
+impl ChromatogramPointIndex {
+    pub fn new(chromatogram_index: PageIndex<u64>, time_index: PageIndex<f64>) -> Self {
+        Self {
+            chromatogram_index,
+            time_index,
+        }
+    }
+
+    pub fn from_reader<T: ChunkReader>(
+        chromatogram_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        chromatogram_array_indices: &ArrayIndex,
+    ) -> Self {
+        let peak_pq_schema = chromatogram_data_reader.parquet_schema();
+        let mut this = Self::default();
+
+        this.chromatogram_index = read_u64_page_index_from(
+            &chromatogram_data_reader.metadata(),
+            &peak_pq_schema,
+            &format!("{}.chromatogram_index", chromatogram_array_indices.prefix),
+        )
+        .unwrap_or_default();
+
+        for entry in chromatogram_array_indices.iter() {
+            if matches!(entry.array_type, ArrayType::TimeArray) {
+                this.time_index = read_f64_page_index_from(
+                    &chromatogram_data_reader.metadata(),
+                    &peak_pq_schema,
+                    &entry.path,
+                )
+                .unwrap_or_default();
+            }
+        }
+
+        this
+    }
+
+    pub fn query_pages(&self, chromatogram_index: u64) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.chromatogram_index.pages_contains(chromatogram_index) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
+    pub fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.chromatogram_index.pages_overlaps(index_range) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chromatogram_index.is_empty()
+    }
+
+    pub fn is_populated(&self) -> bool {
+        !self.chromatogram_index.is_empty()
+    }
 }
 
 impl SpectrumPointIndex {
@@ -913,17 +1010,55 @@ impl SpectrumQueryIndex for SpectrumChunkIndex {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct QueryIndex {
+pub struct SpectrumMetadataIndex {
     pub spectrum_time_index: PageIndex<f32>,
-    pub spectrum_index_index: PageIndex<u64>,
     pub spectrum_ms_level_index: PageIndex<u8>,
-    pub scan_index: PageIndex<u64>,
+    pub spectrum_index_index: PageIndex<u64>,
+    pub spectrum_scan_index: PageIndex<u64>,
+    pub spectrum_precursor_index: PageIndex<u64>,
+    pub spectrum_selected_ion_index: PageIndex<u64>,
+}
+
+
+#[derive(Debug, Default, Clone)]
+pub struct ChromatogramMetadataIndex {
+    pub chromatogram_index_index: PageIndex<u64>,
     pub precursor_index: PageIndex<u64>,
     pub selected_ion_index: PageIndex<u64>,
+}
+
+impl ChromatogramMetadataIndex {
+    pub fn new(
+        chromatogram_index: PageIndex<u64>,
+        precursor_index: PageIndex<u64>,
+        selected_ion_index: PageIndex<u64>,
+    ) -> Self {
+        Self {
+            chromatogram_index_index: chromatogram_index,
+            precursor_index,
+            selected_ion_index,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct QueryIndex {
+    pub spectrum_index_index: PageIndex<u64>,
+    pub spectrum_time_index: PageIndex<f32>,
+    pub spectrum_ms_level_index: PageIndex<u8>,
+    pub spectrum_scan_index: PageIndex<u64>,
+    pub spectrum_precursor_index: PageIndex<u64>,
+    pub spectrum_selected_ion_index: PageIndex<u64>,
+
+    pub chromatogram_index_index: PageIndex<u64>,
+    pub chromatogram_precursor_index: PageIndex<u64>,
+    pub chromatogram_selected_ion_index: PageIndex<u64>,
 
     pub spectrum_point_index: SpectrumPointIndex,
     pub spectrum_chunk_index: SpectrumChunkIndex,
     pub spectrum_peak_point_index: Option<SpectrumPointIndex>,
+
+    pub chromatogram_point_index: ChromatogramPointIndex,
 }
 
 impl QueryIndex {
@@ -952,20 +1087,46 @@ impl QueryIndex {
             "spectrum.ms_level",
         )
         .unwrap_or_default();
-        self.scan_index = read_u64_page_index_from(
+        self.spectrum_scan_index = read_u64_page_index_from(
             &spectrum_metadata_reader.metadata(),
             &pq_schema,
             "scan.spectrum_index",
         )
         .unwrap_or_default();
-        self.precursor_index = read_u64_page_index_from(
+        self.spectrum_precursor_index = read_u64_page_index_from(
             &spectrum_metadata_reader.metadata(),
             &pq_schema,
             "precursor.spectrum_index",
         )
         .unwrap_or_default();
-        self.selected_ion_index = read_u64_page_index_from(
+        self.spectrum_selected_ion_index = read_u64_page_index_from(
             &spectrum_metadata_reader.metadata(),
+            &pq_schema,
+            "selected_ion.spectrum_index",
+        )
+        .unwrap_or_default();
+    }
+
+    pub fn populate_chromatogram_metadata_indices<T: ChunkReader>(
+        &mut self,
+        chromatogram_metadata_reader: &ParquetRecordBatchReaderBuilder<T>,
+    ) {
+        let pq_schema = chromatogram_metadata_reader.parquet_schema();
+
+        self.chromatogram_index_index = read_u64_page_index_from(
+            &chromatogram_metadata_reader.metadata(),
+            &pq_schema,
+            "chromatogram.index",
+        )
+        .unwrap_or_default();
+        self.chromatogram_precursor_index = read_u64_page_index_from(
+            &chromatogram_metadata_reader.metadata(),
+            &pq_schema,
+            "precursor.spectrum_index",
+        )
+        .unwrap_or_default();
+        self.chromatogram_selected_ion_index = read_u64_page_index_from(
+            &chromatogram_metadata_reader.metadata(),
             &pq_schema,
             "selected_ion.spectrum_index",
         )
@@ -995,6 +1156,17 @@ impl QueryIndex {
         log::trace!(
             "Chunk index initialized?: {}",
             self.spectrum_chunk_index.spectrum_index.len()
+        );
+    }
+
+    pub fn populate_chromatogram_data_indices<T: ChunkReader>(
+        &mut self,
+        chromatogram_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        chromatogram_array_indices: &ArrayIndex,
+    ) {
+        self.chromatogram_point_index = ChromatogramPointIndex::from_reader(
+            chromatogram_data_reader,
+            chromatogram_array_indices,
         );
     }
 
@@ -1088,6 +1260,59 @@ impl SpectrumQueryIndex for QueryIndex {
         } else {
             &self.spectrum_point_index.spectrum_index
         }
+    }
+}
+
+impl ChromatogramQueryIndex for QueryIndex {
+    fn query_chromatrogram_pages(&self, chromatogram_index: u64) -> PageQuery {
+        self.chromatogram_point_index
+            .query_pages(chromatogram_index)
+    }
+
+    fn query_chromatogram_pages_overlaps(
+        &self,
+        index_range: &impl Span1D<DimType = u64>,
+    ) -> PageQuery {
+        self.chromatogram_point_index
+            .query_pages_overlaps(index_range)
+    }
+
+    fn chromatogram_data_index(&self) -> &PageIndex<u64> {
+        &self.chromatogram_point_index.chromatogram_index
+    }
+}
+
+impl SpectrumQueryIndex for ChromatogramPointIndex {
+    fn query_pages(&self, spectrum_index: u64) -> PageQuery {
+        self.query_chromatrogram_pages(spectrum_index)
+    }
+
+    fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
+        self.query_chromatogram_pages_overlaps(index_range)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chromatogram_index.is_empty()
+    }
+
+    fn is_populated(&self) -> bool {
+        self.is_populated()
+    }
+
+    fn spectrum_data_index(&self) -> &PageIndex<u64> {
+        &self.chromatogram_index
+    }
+
+    fn index_overlaps(&self, index_range: &SimpleInterval<u64>) -> RowSelection {
+        self.chromatogram_index.row_selection_overlaps(index_range)
+    }
+
+    fn mz_overlaps(&self, _mz_range: &SimpleInterval<f64>) -> RowSelection {
+        RowSelection::default()
+    }
+
+    fn im_overlaps(&self, _im_range: &SimpleInterval<f64>) -> RowSelection {
+        RowSelection::default()
     }
 }
 

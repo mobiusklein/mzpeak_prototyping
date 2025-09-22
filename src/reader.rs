@@ -7,11 +7,10 @@ use std::{
 };
 
 use arrow::{
-    array::{
-        Array, AsArray, Float32Array,
-        RecordBatch, StructArray, UInt64Array,
+    array::{Array, AsArray, Float32Array, RecordBatch, StructArray, UInt64Array},
+    datatypes::{
+        DataType, FieldRef, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type,
     },
-    datatypes::{DataType, FieldRef, Float32Type, Float64Type, UInt32Type, UInt64Type},
     error::ArrowError,
 };
 
@@ -23,8 +22,8 @@ use mzdata::{
     prelude::*,
     spectrum::{
         ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, DataArray,
-        MultiLayerSpectrum, PeakDataLevel, Precursor, ScanEvent, SelectedIon,
-        SpectrumDescription, bindata::BuildFromArrayMap,
+        MultiLayerSpectrum, PeakDataLevel, Precursor, ScanEvent, SelectedIon, SpectrumDescription,
+        bindata::BuildFromArrayMap,
     },
 };
 use mzpeaks::{
@@ -34,7 +33,7 @@ use mzpeaks::{
 
 use parquet::arrow::{
     ProjectionMask,
-    arrow_reader::{ArrowPredicateFn, RowFilter},
+    arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
 use serde_arrow::schema::SchemaLike;
 
@@ -86,17 +85,23 @@ impl<
 > ChromatogramSource for MzPeakReaderType<C, D>
 {
     fn get_chromatogram_by_id(&mut self, id: &str) -> Option<Chromatogram> {
+        if let Some(chrom) = self.get_chromatogram_by_id(id) {
+            return Some(chrom)
+        }
         match id {
-            "TIC" => self.tic().ok(),
-            "BPC" => self.bpc().ok(),
+            "TIC" => self.encoded_tic().ok(),
+            "BPC" => self.encoded_bpc().ok(),
             _ => None,
         }
     }
 
     fn get_chromatogram_by_index(&mut self, index: usize) -> Option<Chromatogram> {
+        if let Some(chrom) = self.get_chromatogram(index) {
+            return Some(chrom)
+        }
         match index {
-            0 => self.tic().ok(),
-            1 => self.bpc().ok(),
+            0 => self.encoded_tic().ok(),
+            1 => self.encoded_bpc().ok(),
             _ => None,
         }
     }
@@ -126,7 +131,7 @@ impl<
         if self.index >= self.len() {
             return None;
         }
-        let x = self.get_spectrum(self.index).ok();
+        let x = self.get_spectrum(self.index);
         self.index += 1;
         x
     }
@@ -150,9 +155,9 @@ impl<
     }
 
     fn get_spectrum_by_id(&mut self, id: &str) -> Option<MultiLayerSpectrum<C, D>> {
-        let description = self.get_spectrum_metadata_by_id(id).ok()?;
+        let description = self.get_spectrum_metadata_by_id(id).ok()??;
         let arrays = if self.detail_level == DetailLevel::Full {
-            self.get_spectrum_arrays(description.index as u64).ok()?
+            self.get_spectrum_arrays(description.index as u64).ok()??
         } else {
             BinaryArrayMap::new()
         };
@@ -163,7 +168,7 @@ impl<
     }
 
     fn get_spectrum_by_index(&mut self, index: usize) -> Option<MultiLayerSpectrum<C, D>> {
-        self.get_spectrum(index).ok()
+        self.get_spectrum(index)
     }
 
     fn get_index(&self) -> &OffsetIndex {
@@ -191,7 +196,8 @@ impl<
     fn start_from_id(&mut self, id: &str) -> Result<&mut Self, SpectrumAccessError> {
         let s = self
             .get_spectrum_metadata_by_id(id)
-            .map_err(|e| SpectrumAccessError::IOError(Some(e)))?;
+            .map_err(|e| SpectrumAccessError::IOError(Some(e)))?
+            .unwrap();
         self.index = s.index;
         Ok(self)
     }
@@ -317,6 +323,7 @@ impl<
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
 > MzPeakReaderType<C, D>
 {
+    /// Open an mzPeak archive found at a specified path
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path = path.as_ref().into();
         let handle = File::open(&path)?;
@@ -336,8 +343,11 @@ impl<
             _t: Default::default(),
         };
 
-        this.metadata.model_deltas = this.load_delta_models()?;
-        this.metadata.auxliary_array_counts = this.load_auxiliary_array_count()?;
+        this.metadata.mz_model_deltas = this.load_delta_models()?;
+        this.metadata.spectrum_auxiliary_array_counts =
+            this.load_spectrum_auxiliary_array_count()?;
+        this.metadata.chromatogram_auxiliary_array_counts =
+            this.load_chromatogram_auxiliary_array_count()?;
 
         Ok(this)
     }
@@ -355,6 +365,7 @@ impl<
         Ok(self.spectrum_metadata_cache.as_deref())
     }
 
+    /// The location of the archive.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -397,8 +408,8 @@ impl<
     }
 
     /// Read the complete data arrays for the spectrum at `index`
-    pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<BinaryArrayMap> {
-        let delta_model = self.metadata.model_deltas_for_conv(index as usize);
+    pub fn get_spectrum_arrays(&mut self, index: u64) -> io::Result<Option<BinaryArrayMap>> {
+        let delta_model = self.metadata.model_deltas_for(index as usize);
         let builder = self.handle.spectra_data()?;
         let pq_schema = builder.parquet_schema();
 
@@ -412,21 +423,23 @@ impl<
             let row_group_index = row_group_indices[0];
             let rg = self.read_spectrum_data_cache(row_group_index, index)?;
             let mut arrays = rg.slice_to_arrays_of(row_group_index, index, delta_model.as_ref())?;
-            for v in self.load_auxiliary_arrays_for(index)? {
+            for v in self.load_auxiliary_arrays_for_spectrum(index)? {
                 arrays.add(v);
             }
-            return Ok(arrays);
+            return Ok(Some(arrays));
         }
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
             log::trace!("Using chunk strategy for reading spectrum {index}");
-            return SpectrumChunkReader::new(builder).read_chunks_for_spectrum(
-                index,
-                &self.query_indices,
-                &self.metadata.spectrum_array_indices,
-                delta_model.as_ref(),
-                Some(PageQuery::new(row_group_indices, pages)),
-            );
+            return SpectrumChunkReader::new(builder)
+                .read_chunks_for_spectrum(
+                    index,
+                    &self.query_indices,
+                    &self.metadata.spectrum_array_indices,
+                    delta_model.as_ref(),
+                    Some(PageQuery::new(row_group_indices, pages)),
+                )
+                .map(Some);
         }
 
         // Otherwise we must construct a more intricate read plan, first pruning rows and row groups
@@ -441,10 +454,10 @@ impl<
             rg_row_skip
         } else {
             let mut out = BinaryArrayMap::new();
-            for v in self.load_auxiliary_arrays_for(index)? {
+            for v in self.load_auxiliary_arrays_for_spectrum(index)? {
                 out.add(v);
             }
-            return Ok(out);
+            return Ok(Some(out));
         };
 
         let rows = self
@@ -501,7 +514,12 @@ impl<
         if !batches.is_empty() {
             let batch = arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
             let points = batch.column(0).as_struct();
-            Self::populate_arrays_from_struct_array(points, &mut bin_map, delta_model.as_ref());
+            Self::populate_arrays_from_struct_array(
+                points,
+                &mut bin_map,
+                delta_model.as_ref(),
+                false,
+            );
         }
 
         let mut out = BinaryArrayMap::new();
@@ -509,10 +527,10 @@ impl<
             out.add(v);
         }
 
-        for v in self.load_auxiliary_arrays_for(index)? {
+        for v in self.load_auxiliary_arrays_for_spectrum(index)? {
             out.add(v);
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     fn load_precursors_from(
@@ -537,7 +555,11 @@ impl<
         si_arr: &StructArray,
         acc: &mut Vec<(u64, u64, SelectedIon)>,
     ) {
-        let metacols = self.metadata.selected_ion_metadata_map.as_deref().unwrap_or(&EMPTY_FIELDS);
+        let metacols = self
+            .metadata
+            .selected_ion_metadata_map
+            .as_deref()
+            .unwrap_or(&EMPTY_FIELDS);
         let n = si_arr
             .column_by_name("spectrum_index")
             .map(|a| a.len() - a.null_count())
@@ -575,13 +597,17 @@ impl<
         &self,
         spec_arr: &StructArray,
         descr: &mut SpectrumDescription,
-        offset: usize
-    ) {
-        let metacols = self.metadata.spectrum_metadata_map.as_deref().unwrap_or(&EMPTY_FIELDS);
+        offset: usize,
+    ) -> usize {
+        let metacols = self
+            .metadata
+            .spectrum_metadata_map
+            .as_deref()
+            .unwrap_or(&EMPTY_FIELDS);
         {
             let mut builder =
                 MzSpectrumVisitor::new(std::slice::from_mut(descr), &metacols, offset);
-            builder.visit(spec_arr);
+            builder.visit(spec_arr)
         }
     }
 
@@ -591,7 +617,7 @@ impl<
         chrom_arr: &StructArray,
         descr: &mut ChromatogramDescription,
         offset: usize,
-    ) {
+    ) -> usize {
         MzChromatogramBuilder::new(
             std::slice::from_mut(descr),
             self.metadata
@@ -601,7 +627,7 @@ impl<
                 .unwrap_or_else(|| &EMPTY_FIELDS),
             offset,
         )
-        .visit(chrom_arr);
+        .visit(chrom_arr)
     }
 
     pub fn get_spectrum_index_range_for_time_range(
@@ -611,11 +637,6 @@ impl<
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
         SimpleInterval<u64>,
     )> {
-        // let rows = self
-        //     .query_indices
-        //     .spectrum_time_index
-        //     .row_selection_overlaps(&time_range);
-
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
             let mut times: HashMap<u64, f32, _> = HashMap::default();
             let mut min = u64::MAX;
@@ -681,6 +702,11 @@ impl<
             return Ok((times, SimpleInterval::new(min, max)));
         }
 
+        let rows = self
+            .query_indices
+            .spectrum_time_index
+            .row_selection_overlaps(&time_range);
+
         let builder = self.handle.spectrum_metadata()?;
 
         let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.time"]);
@@ -696,7 +722,7 @@ impl<
         );
 
         let reader = builder
-            // .with_row_selection(rows)
+            .with_row_selection(rows)
             .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
             .with_projection(proj)
             .build()?;
@@ -739,6 +765,15 @@ impl<
 
     /// Read all signal data within the specified `time_range`, optionally constrained to `mz_range` m/z values and/or
     /// `ion_mobility_range` IM values.
+    ///
+    /// # Arguments
+    /// - `time_range`: A time interval to select spectra from.
+    /// - `mz_range`: An optional m/z range to filter within.
+    /// - `ion_mobility_range`: An optional ion mobility range to filter within.
+    ///
+    /// # Returns
+    /// - An iterator over record batches covering the spectrum data: `Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>`.
+    /// - A mapping from spectrum index to scan start time.
     pub fn extract_peaks(
         &mut self,
         time_range: SimpleInterval<f32>,
@@ -752,18 +787,40 @@ impl<
         let builder = self.handle.spectra_data()?;
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
-            if ion_mobility_range.is_some() {
-                todo!("Ion mobility filter is not implemented for the chunked encoding");
-            }
-            return Ok((
-                Box::new(SpectrumChunkReader::new(builder).scan_chunks_for(
-                    index_range,
-                    mz_range,
-                    &self.metadata,
-                    &self.query_indices,
-                )?),
-                time_index,
-            ));
+            let it = Box::new(SpectrumChunkReader::new(builder).scan_chunks_for(
+                index_range,
+                mz_range,
+                &self.metadata,
+                &self.query_indices,
+            )?);
+            let it: Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_> =
+                if ion_mobility_range.is_some() {
+                    // If there is an ion mobility array constraint, the chunked encoding doesn't support filtering on this
+                    // dimension directly.
+                    if let Some(im_name) = self
+                        .metadata
+                        .spectrum_array_indices
+                        .iter()
+                        .find(|v| v.is_ion_mobility())
+                    {
+                        let it = it.map(move |bat| -> Result<RecordBatch, ArrowError> {
+                            let bat = bat?;
+                            let arr = bat
+                                .column(0)
+                                .as_struct()
+                                .column_by_name(&im_name.name)
+                                .unwrap();
+                            let mask = ion_mobility_range.unwrap().contains_dy(&arr);
+                            arrow::compute::filter_record_batch(&bat, &mask)
+                        });
+                        Box::new(it)
+                    } else {
+                        it
+                    }
+                } else {
+                    it
+                };
+            return Ok((it, time_index));
         }
 
         let reader = PointDataReader(builder, BufferContext::Spectrum).query_points(
@@ -776,7 +833,7 @@ impl<
         Ok((reader, time_index))
     }
 
-    /// Get the number of spectra in the file
+    /// Get the number of spectra in the archive
     pub fn len(&self) -> usize {
         self.metadata.spectrum_id_index.len()
     }
@@ -785,6 +842,13 @@ impl<
         self.metadata.spectrum_id_index.is_empty()
     }
 
+    /// Read peak data for a spectrum.
+    ///
+    /// # Returns
+    /// - If this mzPeak archive does not have a peak data file, this method will return an Err([`io::Error`])
+    /// - If this mzPeak archive does have a peak data file, but does not have an entry for the requested
+    ///   spectrum index, this method will return `Ok(None)`. There may still be peak data available in the main
+    ///   spectrum data file.
     pub fn get_spectrum_peaks_for(
         &mut self,
         index: u64,
@@ -792,13 +856,26 @@ impl<
         let builder = self.handle.spectrum_peaks()?;
         let meta_index = self.metadata.peak_indices.as_ref().ok_or(io::Error::new(
             io::ErrorKind::NotFound,
-            "peak metadata was not found",
+            "peak data index was not found",
         ))?;
 
         return PointDataReader(builder, BufferContext::Spectrum)
             .get_peak_list_for(index, meta_index);
     }
 
+    /// Perform slicing random access over the peak data for spectra in this file.
+    ///
+    /// If there are no stored peaks for a given spectrum, there will be gaps.
+    ///
+    /// # Arguments
+    /// - `time_range`: A time interval to select spectra from.
+    /// - `mz_range`: An optional m/z range to filter within.
+    /// - `ion_mobility_range`: An optional ion mobility range to filter within.
+    ///
+    /// # Returns
+    /// - If this mzPeak archive does not have a peak data file, this method will return an Err([`io::Error`])
+    /// - An iterator over record batches covering the spectrum data: `Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>`.
+    /// - A mapping from spectrum index to scan start time.
     pub fn query_peaks(
         &mut self,
         time_range: SimpleInterval<f32>,
@@ -827,11 +904,9 @@ impl<
     }
 
     /// Read load descriptive metadata for the spectrum at `index`
-    pub fn get_spectrum_metadata(&mut self, index: u64) -> io::Result<SpectrumDescription> {
+    pub fn get_spectrum_metadata(&mut self, index: u64) -> io::Result<Option<SpectrumDescription>> {
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
-            if let Some(descr) = cache.get(index as usize) {
-                return Ok(descr.clone());
-            }
+            return Ok(cache.get(index as usize).cloned());
         }
 
         let builder = self.handle.spectrum_metadata()?;
@@ -841,17 +916,22 @@ impl<
             .spectrum_index_index
             .row_selection_contains(index);
 
-        rows = rows.union(&self.query_indices.scan_index.row_selection_contains(index));
         rows = rows.union(
             &self
                 .query_indices
-                .precursor_index
+                .spectrum_scan_index
                 .row_selection_contains(index),
         );
         rows = rows.union(
             &self
                 .query_indices
-                .selected_ion_index
+                .spectrum_precursor_index
+                .row_selection_contains(index),
+        );
+        rows = rows.union(
+            &self
+                .query_indices
+                .spectrum_selected_ion_index
                 .row_selection_contains(index),
         );
 
@@ -929,6 +1009,8 @@ impl<
         let mut precursors = Vec::new();
         let mut selected_ions = Vec::new();
 
+        let mut k = 0;
+
         for batch in reader {
             let batch = match batch {
                 Ok(batch) => batch,
@@ -944,11 +1026,8 @@ impl<
 
             if let Some(pos) = index_arr.iter().position(|i| i.is_some_and(|i| i == index)) {
                 let spec_arr = spec_arr.slice(pos, 1);
-                self.load_spectrum_metadata_from_slice_into_description(
-                    &spec_arr,
-                    &mut descr,
-                    0,
-                );
+                k += self
+                    .load_spectrum_metadata_from_slice_into_description(&spec_arr, &mut descr, 0);
             }
 
             let scan_arr = batch.column_by_name("scan").unwrap().as_struct();
@@ -997,10 +1076,39 @@ impl<
             }
             descr.precursor.push(prec);
         }
-        Ok(descr)
+
+        if k > 0 { Ok(Some(descr)) } else { Ok(None) }
     }
 
-    pub(crate) fn load_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
+    pub fn get_chromatogram_metadata(
+        &mut self,
+        index: u64,
+    ) -> io::Result<Option<ChromatogramDescription>> {
+        self.load_all_chromatgram_metadata_impl()
+            .map(|v| v.into_iter().nth(index as usize))
+    }
+
+    pub fn get_chromatogram_arrays(&mut self, index: u64) -> io::Result<Option<BinaryArrayMap>> {
+        let builder = self.handle.chromatograms_data()?;
+        let reader = PointDataReader(builder, BufferContext::Chromatogram);
+        let out = reader.read_points_of(
+            index,
+            &self.query_indices.chromatogram_point_index,
+            &self.metadata.chromatogram_array_indices,
+        )?;
+
+        if let Some(mut out) = out {
+            for v in self.load_auxiliary_arrays_for_chromatogram(index)? {
+                out.add(v);
+            }
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+
+    }
+
+    pub(crate) fn load_spectrum_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
         let builder = self.handle.spectrum_metadata()?;
 
         let schema = builder.parquet_schema();
@@ -1029,19 +1137,30 @@ impl<
         let n = self.len();
         let mut number_of_auxiliary_arrays = Vec::new();
         number_of_auxiliary_arrays.resize(n, 0);
+
+        macro_rules! unpack {
+            ($index_array:ident, $values_array:ident, $dtype:ty) => {
+                if let Some(values) = $values_array.as_primitive_opt::<$dtype>() {
+                    for (i, c) in $index_array.iter().zip(values.iter()) {
+                        number_of_auxiliary_arrays[i.unwrap() as usize] =
+                            c.unwrap_or_default() as u32;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+        }
+
         for batch in reader.flatten() {
             let root = batch.column(0).as_struct();
             let index_array: &UInt64Array = root.column(0).as_primitive();
             let values_array = root.column(1);
 
-            if let Some(values) = values_array.as_primitive_opt::<UInt32Type>() {
-                for (i, c) in index_array.iter().zip(values.iter()) {
-                    number_of_auxiliary_arrays[i.unwrap() as usize] = c.unwrap();
-                }
-            } else if let Some(values) = values_array.as_primitive_opt::<UInt64Type>() {
-                for (i, c) in index_array.iter().zip(values.iter()) {
-                    number_of_auxiliary_arrays[i.unwrap() as usize] = c.unwrap() as u32;
-                }
+            if unpack!(index_array, values_array, UInt32Type) {
+            } else if unpack!(index_array, values_array, UInt64Type) {
+            } else if unpack!(index_array, values_array, Int32Type) {
+            } else if unpack!(index_array, values_array, Int64Type) {
             } else {
                 unimplemented!(
                     "auxiliary array count stored as {:?}",
@@ -1052,68 +1171,70 @@ impl<
         Ok(number_of_auxiliary_arrays)
     }
 
-    pub(crate) fn load_auxiliary_arrays_for(&self, index: u64) -> io::Result<Vec<DataArray>> {
-        if self
-            .metadata
-            .auxliary_array_counts
-            .get(index as usize)
-            .copied()
-            .unwrap_or_default()
-            == 0
-        {
-            return Ok(Vec::new());
+    pub(crate) fn load_chromatogram_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
+        let builder = self.handle.chromatograms_metadata()?;
+
+        let schema = builder.parquet_schema();
+        let mut index_i = None;
+        let mut auxiliary_count_i = None;
+        for (i, c) in schema.columns().iter().enumerate() {
+            let parts = c.path().parts();
+            if parts == ["chromatogram", "index"] {
+                index_i = Some(i);
+            }
+            if parts
+                .iter()
+                .zip(["chromatogram", "number_of_auxiliary_arrays"])
+                .all(|(a, b)| a == b)
+            {
+                auxiliary_count_i = Some(i);
+            }
         }
 
-        let builder = self.handle.spectrum_metadata()?;
+        let proj = match (index_i, auxiliary_count_i) {
+            (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
+            _ => return Ok(Vec::new()),
+        };
 
-        let mut rows = self
-            .query_indices
-            .spectrum_index_index
-            .row_selection_contains(index);
+        let reader = builder.with_projection(proj).build()?;
+        let n = self.len();
+        let mut number_of_auxiliary_arrays = Vec::new();
+        number_of_auxiliary_arrays.resize(n, 0);
 
-        rows = rows.union(&self.query_indices.scan_index.row_selection_contains(index));
-        rows = rows.union(
-            &self
-                .query_indices
-                .precursor_index
-                .row_selection_contains(index),
-        );
-        rows = rows.union(
-            &self
-                .query_indices
-                .selected_ion_index
-                .row_selection_contains(index),
-        );
+        macro_rules! unpack {
+            ($index_array:ident, $values_array:ident, $dtype:ty) => {
+                if let Some(values) = $values_array.as_primitive_opt::<$dtype>() {
+                    for (i, c) in $index_array.iter().zip(values.iter()) {
+                        number_of_auxiliary_arrays[i.unwrap() as usize] =
+                            c.unwrap_or_default() as u32;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+        }
 
-        let predicate_mask = ProjectionMask::columns(
-            builder.parquet_schema(),
-            ["spectrum.index", "spectrum.auxiliary_arrays"],
-        );
+        for batch in reader.flatten() {
+            let root = batch.column(0).as_struct();
+            let index_array: &UInt64Array = root.column(0).as_primitive();
+            let values_array = root.column(1);
 
-        let proj = predicate_mask.clone();
+            if unpack!(index_array, values_array, UInt32Type) {
+            } else if unpack!(index_array, values_array, UInt64Type) {
+            } else if unpack!(index_array, values_array, Int32Type) {
+            } else if unpack!(index_array, values_array, Int64Type) {
+            } else {
+                unimplemented!(
+                    "auxiliary array count stored as {:?}",
+                    values_array.data_type()
+                )
+            }
+        }
+        Ok(number_of_auxiliary_arrays)
+    }
 
-        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let spectrum_index: &UInt64Array = batch
-                .column(0)
-                .as_struct()
-                .column(0)
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-            Ok(spectrum_index
-                .iter()
-                .map(|v| v.map(|i| i == index))
-                .collect())
-        });
-
-        let filter = RowFilter::new(vec![Box::new(predicate)]);
-
-        let reader = builder
-            .with_projection(proj)
-            .with_row_filter(filter)
-            .with_row_selection(rows)
-            .build()?;
-
+    fn load_auxiliary_arrays_from(&self, reader: ParquetRecordBatchReader) -> Vec<DataArray> {
         let mut results = Vec::new();
         let fields: Vec<FieldRef> =
             SchemaLike::from_type::<AuxiliaryArray>(Default::default()).unwrap();
@@ -1129,6 +1250,95 @@ impl<
             }
         }
 
+        results
+    }
+
+    #[allow(unused)]
+    pub(crate) fn load_auxiliary_arrays_for_chromatogram(
+        &self,
+        index: u64,
+    ) -> io::Result<Vec<DataArray>> {
+        if self
+            .metadata
+            .chromatogram_auxiliary_array_counts()
+            .get(index as usize)
+            .copied()
+            .unwrap_or_default()
+            == 0
+        {
+            return Ok(Vec::new());
+        }
+
+        let builder = self.handle.chromatograms_metadata()?;
+        let predicate_mask = ProjectionMask::columns(
+            builder.parquet_schema(),
+            ["chromatogram.index", "chromatogram.auxiliary_arrays"],
+        );
+
+        let proj = predicate_mask.clone();
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let index_array: &UInt64Array = batch.column(0).as_struct().column(0).as_primitive();
+            Ok(index_array.iter().map(|v| v.map(|i| i == index)).collect())
+        });
+
+        let filter = RowFilter::new(vec![Box::new(predicate)]);
+
+        let reader = builder
+            .with_projection(proj)
+            .with_row_filter(filter)
+            .build()?;
+
+        let results = self.load_auxiliary_arrays_from(reader);
+        Ok(results)
+    }
+
+    pub(crate) fn load_auxiliary_arrays_for_spectrum(
+        &self,
+        index: u64,
+    ) -> io::Result<Vec<DataArray>> {
+        if self
+            .metadata
+            .spectrum_auxiliary_array_counts()
+            .get(index as usize)
+            .copied()
+            .unwrap_or_default()
+            == 0
+        {
+            return Ok(Vec::new());
+        }
+
+        let builder = self.handle.spectrum_metadata()?;
+
+        let rows = self
+            .query_indices
+            .spectrum_index_index
+            .row_selection_contains(index);
+
+        let predicate_mask = ProjectionMask::columns(
+            builder.parquet_schema(),
+            ["spectrum.index", "spectrum.auxiliary_arrays"],
+        );
+
+        let proj = predicate_mask.clone();
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let spectrum_index: &UInt64Array = batch.column(0).as_struct().column(0).as_primitive();
+            Ok(spectrum_index
+                .iter()
+                .map(|v| v.map(|i| i == index))
+                .collect())
+        });
+
+        let filter = RowFilter::new(vec![Box::new(predicate)]);
+
+        let reader = builder
+            .with_projection(proj)
+            .with_row_filter(filter)
+            .with_row_selection(rows)
+            .build()?;
+
+        let results = self.load_auxiliary_arrays_from(reader);
         Ok(results)
     }
 
@@ -1162,7 +1372,10 @@ impl<
             _ => return Ok(Vec::new()),
         };
 
-        let reader = builder.with_projection(proj).build()?;
+        let reader = builder
+            .with_projection(proj)
+            .with_batch_size(10_000)
+            .build()?;
         let n = self.len();
         let mut medians = Vec::new();
         medians.resize(n, None);
@@ -1214,9 +1427,7 @@ impl<
         Ok(medians)
     }
 
-    pub(crate) fn load_all_spectrum_metadata_impl(
-        &mut self,
-    ) -> io::Result<Vec<SpectrumDescription>> {
+    pub(crate) fn load_all_spectrum_metadata_impl(&self) -> io::Result<Vec<SpectrumDescription>> {
         log::trace!("Loading all spectrum metadata");
         let builder = self.handle.spectrum_metadata()?;
 
@@ -1225,17 +1436,22 @@ impl<
             .spectrum_index_index
             .row_selection_is_not_null();
 
-        rows = rows.union(&self.query_indices.scan_index.row_selection_is_not_null());
         rows = rows.union(
             &self
                 .query_indices
-                .precursor_index
+                .spectrum_scan_index
                 .row_selection_is_not_null(),
         );
         rows = rows.union(
             &self
                 .query_indices
-                .selected_ion_index
+                .spectrum_precursor_index
+                .row_selection_is_not_null(),
+        );
+        rows = rows.union(
+            &self
+                .query_indices
+                .spectrum_selected_ion_index
                 .row_selection_is_not_null(),
         );
 
@@ -1321,22 +1537,22 @@ impl<
                 .downcast_ref()
                 .unwrap();
             let n_spec = index_arr.len() - index_arr.null_count();
-            if let Some(metacols) = self.metadata.spectrum_metadata_map.as_ref() {
+            if n_spec > 0 {
                 let mut local_descr = vec![SpectrumDescription::default(); n_spec];
-                let mut builder = MzSpectrumVisitor::new(&mut local_descr, &metacols, 0);
+                let mut builder = MzSpectrumVisitor::new(
+                    &mut local_descr,
+                    &self
+                        .metadata
+                        .spectrum_metadata_map
+                        .as_deref()
+                        .unwrap_or(&EMPTY_FIELDS),
+                    0,
+                );
                 builder.visit(spec_arr);
-                descriptions.extend(local_descr);
-            } else {
-                for (i, val) in index_arr.iter().enumerate() {
-                    if val.is_some() {
-                        let mut descr = SpectrumDescription::default();
-                        self.load_spectrum_metadata_from_slice_into_description(
-                            spec_arr,
-                            &mut descr,
-                            i,
-                        );
-                        descriptions.push(descr);
-                    }
+                if descriptions.is_empty() {
+                    descriptions = local_descr;
+                } else {
+                    descriptions.extend(local_descr);
                 }
             }
 
@@ -1506,7 +1722,10 @@ impl<
     }
 
     /// Retrieve the metadata for a spectrum by its `nativeId`
-    pub fn get_spectrum_metadata_by_id(&mut self, id: &str) -> io::Result<SpectrumDescription> {
+    pub fn get_spectrum_metadata_by_id(
+        &mut self,
+        id: &str,
+    ) -> io::Result<Option<SpectrumDescription>> {
         if let Some(idx) = self.metadata.spectrum_id_index.get(id) {
             return self.get_spectrum_metadata(idx);
         }
@@ -1517,22 +1736,60 @@ impl<
     }
 
     /// Retrieve a complete spectrum by its index
-    pub fn get_spectrum(&mut self, index: usize) -> io::Result<MultiLayerSpectrum<C, D>> {
-        let description = self.get_spectrum_metadata(index as u64)?;
+    pub fn get_spectrum(&mut self, index: usize) -> Option<MultiLayerSpectrum<C, D>> {
+        let description = self
+            .get_spectrum_metadata(index as u64)
+            .inspect_err(|e| log::error!("Failed to read spectrum metadata for {index}: {e}"))
+            .ok()??;
         let arrays = if self.detail_level == DetailLevel::Full {
-            self.get_spectrum_arrays(index as u64)?
+            self.get_spectrum_arrays(index as u64)
+                .inspect_err(|e| log::error!("Failed to read spectrum data for {index}: {e}"))
+                .ok()??
         } else {
             BinaryArrayMap::new()
         };
 
-        Ok(MultiLayerSpectrum::from_arrays_and_description(
+        Some(MultiLayerSpectrum::from_arrays_and_description(
             arrays,
             description,
         ))
     }
 
+    /// Retrieve a complete chromatogram by its index
+    pub fn get_chromatogram(&mut self, index: usize) -> Option<Chromatogram> {
+        let description = self
+            .get_chromatogram_metadata(index as u64)
+            .inspect_err(|e| log::error!("Failed to read chromatogram metadata for {index}: {e}"))
+            .ok()??;
+        let arrays = if self.detail_level == DetailLevel::Full {
+            self.get_chromatogram_arrays(index as u64)
+                .inspect_err(|e| log::error!("Failed to read chromatogram data for {index}: {e}"))
+                .ok()??
+        } else {
+            BinaryArrayMap::new()
+        };
+
+        Some(Chromatogram::new(description, arrays))
+    }
+
+    pub fn get_chromatogram_by_id(&mut self, id: &str) -> Option<Chromatogram> {
+        if let Some(description) = self.load_all_chromatgram_metadata_impl().ok()?.into_iter().find(|v| v.id == id) {
+            let arrays = if self.detail_level == DetailLevel::Full {
+            self.get_chromatogram_arrays(description.index as u64)
+                .inspect_err(|e| log::error!("Failed to read chromatogram data for {id}: {e}"))
+                .ok()??
+            } else {
+                BinaryArrayMap::new()
+            };
+
+            Some(Chromatogram::new(description, arrays))
+        } else {
+            None
+        }
+    }
+
     /// Read the total ion chromatogram from the surrogate metadata in the spectrum table
-    pub fn tic(&mut self) -> io::Result<Chromatogram> {
+    pub fn encoded_tic(&mut self) -> io::Result<Chromatogram> {
         let builder = self.handle.spectrum_metadata()?;
         let rows = self
             .query_indices
@@ -1602,7 +1859,7 @@ impl<
     }
 
     /// Read the base peak chromatogram from the surrogate metadata in the spectrum table
-    pub fn bpc(&mut self) -> io::Result<Chromatogram> {
+    pub fn encoded_bpc(&mut self) -> io::Result<Chromatogram> {
         let builder = self.handle.spectrum_metadata()?;
         let rows = self
             .query_indices
@@ -1682,14 +1939,14 @@ mod test {
     #[test]
     fn test_read_spectrum() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
-        let descr = reader.get_spectrum(0)?;
+        let descr = reader.get_spectrum(0).unwrap();
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
         assert_eq!(descr.peaks().len(), 13589);
-        let descr = reader.get_spectrum(5)?;
+        let descr = reader.get_spectrum(5).unwrap();
         assert_eq!(descr.index(), 5);
         assert_eq!(descr.peaks().len(), 650);
-        let descr = reader.get_spectrum(25)?;
+        let descr = reader.get_spectrum(25).unwrap();
         assert_eq!(descr.index(), 25);
         assert_eq!(descr.peaks().len(), 789);
         Ok(())
@@ -1698,15 +1955,15 @@ mod test {
     #[test]
     fn test_read_spectrum_chunked() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
-        let descr = reader.get_spectrum(0)?;
+        let descr = reader.get_spectrum(0).unwrap();
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
         assert_eq!(descr.peaks().len(), 13589);
-        let descr = reader.get_spectrum(5)?;
+        let descr = reader.get_spectrum(5).unwrap();
         assert_eq!(descr.index(), 5);
         assert_eq!(descr.peaks().len(), 650);
         eprintln!("{:#?}", descr.description());
-        let descr = reader.get_spectrum(25)?;
+        let descr = reader.get_spectrum(25).unwrap();
         assert_eq!(descr.index(), 25);
         assert_eq!(descr.peaks().len(), 789);
         Ok(())
@@ -1715,7 +1972,17 @@ mod test {
     #[test]
     fn test_tic() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
-        let tic = reader.tic()?;
+        let tic = reader.encoded_tic()?;
+        assert_eq!(tic.index(), 0);
+        assert_eq!(tic.time()?.len(), 48);
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_chromatogram() -> io::Result<()> {
+        let mut reader = MzPeakReader::new("small.mzpeak").unwrap();
+        let tic = reader.get_chromatogram(0).unwrap();
+        eprintln!("{tic:?}");
         assert_eq!(tic.index(), 0);
         assert_eq!(tic.time()?.len(), 48);
         Ok(())
@@ -1723,9 +1990,17 @@ mod test {
 
     #[test]
     fn test_load_all_metadata() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.mzpeak")?;
+        let reader = MzPeakReader::new("small.mzpeak")?;
         let out = reader.load_all_spectrum_metadata_impl()?;
         assert_eq!(out.len(), 48);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_all_chromatogram_metadata() -> io::Result<()> {
+        let reader = MzPeakReader::new("small.mzpeak")?;
+        let out = reader.load_all_chromatgram_metadata_impl()?;
+        eprintln!("{out:?}");
         Ok(())
     }
 

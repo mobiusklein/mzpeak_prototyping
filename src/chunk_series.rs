@@ -1,14 +1,13 @@
-#![allow(unused)]
 use std::collections::{HashMap, HashSet};
 use std::ops::AddAssign;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, ArrowPrimitiveType, AsArray, Float32Array, Float32Builder,
-    Float64Array, Float64Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    LargeBinaryArray, LargeBinaryBuilder, LargeListArray, LargeListBuilder, PrimitiveArray,
+    Float64Array, Float64Builder, Int32Builder, Int64Builder,
+    LargeListBuilder, PrimitiveArray,
     StructArray, StructBuilder, UInt8Array, UInt8Builder, UInt32Builder, UInt64Array,
-    UInt64Builder, new_null_array,
+    UInt64Builder,
 };
 use arrow::compute::kernels::nullif;
 use arrow::datatypes::{
@@ -16,29 +15,26 @@ use arrow::datatypes::{
     UInt8Type,
 };
 use itertools::Itertools;
-use mzdata::params::Unit;
-use mzdata::spectrum::bindata::BinaryCompressionType;
-use mzdata::{
-    prelude::*,
+use mzdata::prelude::ByteArrayView;
+use mzdata::
     spectrum::{
         ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray,
-        bindata::{ArrayRetrievalError, DataArraySlice},
-    },
-};
+        bindata::ArrayRetrievalError,
+    }
+;
 
 use mzpeaks::coordinate::SimpleInterval;
-use serde::{Deserialize, Serialize};
 
 use bytemuck::Pod;
-use num_traits::{Float, NumCast, ToPrimitive, Zero};
+use num_traits::{Float, NumCast, ToPrimitive};
 
 use crate::buffer_descriptors::BufferTransform;
 use crate::filter::{
-    _skip_zero_runs_gen, _skip_zero_runs_iter, MZDeltaModel, RegressionDeltaModel, fill_nulls_for,
-    is_zero_pair_mask, null_chunk_every_k, null_delta_decode, null_delta_encode, take_data_array,
+    _skip_zero_runs_gen, RegressionDeltaModel, fill_nulls_for,
+    is_zero_pair_mask, null_chunk_every_k, null_delta_decode, null_delta_encode,
 };
 use crate::peak_series::{
-    BufferContext, BufferFormat, BufferName, MZ_ARRAY, array_to_arrow_type,
+    BufferContext, BufferFormat, BufferName, array_to_arrow_type,
     data_array_to_arrow_array,
 };
 use crate::spectrum::AuxiliaryArray;
@@ -97,7 +93,7 @@ pub fn delta_decode<T: Float + Pod + AddAssign>(
     accumulator: &mut DataArray,
 ) {
     let mut state = start_value;
-    accumulator.push(state);
+    accumulator.push(state).unwrap();
     for val in it.iter().copied() {
         state += val;
         accumulator.push(state).unwrap();
@@ -109,27 +105,41 @@ pub const DELTA_ENCODE: CURIE = curie!(MS:1003089);
 pub const NUMPRESS_LINEAR: CURIE = curie!(MS:1002312);
 pub const NUMPRESS_SLOF: CURIE = curie!(MS:1002314);
 
+
+/// Different methods for encoding chunks along a coordinate dimension
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ChunkingStrategy {
+    /// Values are encoded as-is without any transformation. While this doesn't have any compression
+    /// benefits, it provides compatibility for sparse data. The start and end values are included in
+    /// the encoded data.
     Basic { chunk_size: f64 },
+    /// Values are stored as deltas w.r.t. previous values. The first value stored is w.r.t. to the chunk
+    /// starting value, but the starting value is not encoded in the chunk values array itself. Decoding
+    /// of the chunk values requires the chunk start value be read from the chunk metadata.
     Delta { chunk_size: f64 },
+    /// Values are stored using MS-Numpress linear compression. The entire chunk is encoded in a byte buffer
+    /// which may not align with a multi-byte value type and must be stored in a dedicated byte array. The
+    /// start and end values are included in the encoded chunk as well as the chunk metadata.
     NumpressLinear { chunk_size: f64 },
 }
 
 impl ChunkingStrategy {
+    /// Convert the chunking stategy to a CURIE
     pub const fn as_curie(&self) -> CURIE {
         match self {
-            Self::Basic { chunk_size } => NO_COMPRESSION,
-            Self::Delta { chunk_size } => DELTA_ENCODE,
-            Self::NumpressLinear { chunk_size } => NUMPRESS_LINEAR,
+            Self::Basic { chunk_size: _ } => NO_COMPRESSION,
+            Self::Delta { chunk_size: _ } => DELTA_ENCODE,
+            Self::NumpressLinear { chunk_size: _ } => NUMPRESS_LINEAR,
         }
     }
 
+    /// Given the name of the main axis for this chunk, generate all extra [`arrow::datatypes::Field`]
+    /// instances needed to populate the schema to include this chunk type.
     pub fn extra_arrays(&self, main_axis_name: &BufferName) -> Vec<Field> {
         match self {
-            ChunkingStrategy::Basic { chunk_size } => vec![],
-            ChunkingStrategy::Delta { chunk_size } => vec![],
-            ChunkingStrategy::NumpressLinear { chunk_size } => {
+            ChunkingStrategy::Basic { chunk_size: _ } => vec![],
+            ChunkingStrategy::Delta { chunk_size: _ } => vec![],
+            ChunkingStrategy::NumpressLinear { chunk_size: _ } => {
                 let meta = BufferName::new(
                     main_axis_name.context,
                     ArrayType::nonstandard(format!("{}_numpress_bytes", main_axis_name)),
@@ -149,6 +159,10 @@ impl ChunkingStrategy {
         }
     }
 
+    /// Encode any extra data arrays from this [`ArrowArrayChunk`] beyond the `chunk_values` array.
+    ///
+    /// This exists primarily to serve `Numpress` encoding right now, but future encodings might need
+    /// it too.
     pub fn encode_extra_arrow(
         &self,
         main_axis_name: &BufferName,
@@ -158,9 +172,9 @@ impl ChunkingStrategy {
         visited: &mut HashSet<usize>,
     ) {
         match self {
-            ChunkingStrategy::Basic { chunk_size } => {}
-            ChunkingStrategy::Delta { chunk_size } => {}
-            ChunkingStrategy::NumpressLinear { chunk_size } => {
+            ChunkingStrategy::Basic { chunk_size: _ } => {}
+            ChunkingStrategy::Delta { chunk_size: _ } => {}
+            ChunkingStrategy::NumpressLinear { chunk_size: _ } => {
                 let fields = self.extra_arrays(main_axis_name);
                 let byte_col = &fields[0];
                 let idx = schema
@@ -192,6 +206,7 @@ impl ChunkingStrategy {
         }
     }
 
+    /// Get the step size along the main axis for the chunking strategy
     pub const fn chunk_size(&self) -> f64 {
         match self {
             ChunkingStrategy::Basic { chunk_size } => *chunk_size,
@@ -200,34 +215,12 @@ impl ChunkingStrategy {
         }
     }
 
-    pub fn encode<T: Float + Pod>(
-        &self,
-        data: &[T],
-        name: &ArrayType,
-        dtype: &BinaryDataArrayType,
-    ) -> (f64, f64, DataArray) {
-        match self {
-            ChunkingStrategy::Basic { chunk_size } => {
-                let mut acc =
-                    DataArray::from_name_type_size(name, *dtype, dtype.size_of() * data.len());
-                acc.extend(data).unwrap();
-                let start = data.first().copied().unwrap_or_else(|| T::zero());
-                let end = data.last().copied().unwrap_or_else(|| T::zero());
-                (start.to_f64().unwrap(), end.to_f64().unwrap(), acc)
-            }
-            ChunkingStrategy::Delta { chunk_size } => delta_encode(data, name, dtype),
-            ChunkingStrategy::NumpressLinear { chunk_size } => {
-                let mut acc =
-                    DataArray::from_name_type_size(name, *dtype, dtype.size_of() * data.len());
-                acc.extend(data).unwrap();
-                acc.store_compressed(BinaryCompressionType::NumpressLinear);
-                let start = data.first().copied().unwrap_or_else(|| T::zero());
-                let end = data.last().copied().unwrap_or_else(|| T::zero());
-                (start.to_f64().unwrap(), end.to_f64().unwrap(), acc)
-            }
-        }
-    }
-
+    /// Encode a chunk of an [`PrimitiveArray`] into minimal chunk start, end, and chunk values.
+    ///
+    /// Assumes the provided `array` has already been cut as a chunk of the desired width.
+    ///
+    /// # Note
+    /// If the array is empty or all null, start and end will be 0.0 and chunk values may be empty.
     pub fn encode_arrow<T: ArrowPrimitiveType>(
         &self,
         array: &PrimitiveArray<T>,
@@ -247,27 +240,35 @@ impl ChunkingStrategy {
             .and_then(|v| v.map(|v| v.to_f64().unwrap_or(0.0)))
             .unwrap_or(0.0);
         match self {
-            ChunkingStrategy::Basic { chunk_size } => (start, end, Arc::new(array.clone())),
-            ChunkingStrategy::Delta { chunk_size } => {
+            ChunkingStrategy::Basic { chunk_size: _ } => (start, end, Arc::new(array.clone())),
+            ChunkingStrategy::Delta { chunk_size: _ } => {
                 (start, end, Arc::new(null_delta_encode(array)))
             }
-            ChunkingStrategy::NumpressLinear { chunk_size } => {
-                // if array.null_count() > 0 {
-                //     log::warn!(
-                //         "Numpress compression on an array with null values is poorly supported at read time."
-                //     );
-                // }
-                let values: Vec<_> = array
-                    .iter()
-                    .map(|v| v.and_then(|v| v.to_f64()).unwrap_or_default())
-                    .collect();
-                let bytes_of = DataArray::compress_numpress_linear(&values).unwrap();
+            ChunkingStrategy::NumpressLinear { chunk_size: _ } => {
+                let bytes_of = if matches!(array.data_type(), DataType::Float64) {
+                    let array: &PrimitiveArray<Float64Type> = array.as_any().downcast_ref().unwrap();
+                    DataArray::compress_numpress_linear(array.values()).unwrap()
+                } else {
+                    let values: Vec<_> = array
+                        .iter()
+                        .map(|v| v.and_then(|v| v.to_f64()).unwrap_or_default())
+                        .collect();
+                    DataArray::compress_numpress_linear(&values).unwrap()
+                };
                 let array = Arc::new(UInt8Array::from(bytes_of));
                 (start, end, array)
             }
         }
     }
 
+    /// Decode the encoded main axis of a chunk into a [`DataArray`].
+    ///
+    /// Requires the `start_value` of the chunk to provide context.
+    ///
+    /// ## Warning
+    /// If the [`DataArray`] stored type is not bit-level compatible
+    /// with the data type that `array` contains or is decoded into,
+    /// the data will be meaningless.
     pub fn decode_arrow(
         &self,
         array: &ArrayRef,
@@ -275,8 +276,28 @@ impl ChunkingStrategy {
         accumulator: &mut DataArray,
         delta_model: Option<&RegressionDeltaModel<f64>>,
     ) {
+        macro_rules! decode_delta {
+            ($array:ident, $dtype:ty, $native:ty, $debug:literal) => {
+                let it = $array.as_primitive::<$dtype>();
+                if it.null_count() > 0 {
+                    let decoded = null_delta_decode(it, start_value as $native);
+                    if let Some(delta_model) = delta_model {
+                        let values = fill_nulls_for(&decoded, delta_model);
+                        accumulator.extend(&values).unwrap();
+                    } else {
+                        log::debug!(
+                            $debug
+                        );
+                        accumulator.extend(decoded.values()).unwrap()
+                    }
+                } else {
+                    delta_decode(it.values(), start_value as $native, accumulator);
+                }
+            };
+        }
+
         match self {
-            ChunkingStrategy::Basic { chunk_size } => match array.data_type() {
+            ChunkingStrategy::Basic { chunk_size: _ } => match array.data_type() {
                 DataType::Float32 => {
                     let it = array.as_primitive::<Float32Type>();
                     accumulator.extend(it.values()).unwrap();
@@ -290,47 +311,19 @@ impl ChunkingStrategy {
                     array.data_type()
                 ),
             },
-            ChunkingStrategy::Delta { chunk_size } => match array.data_type() {
+            ChunkingStrategy::Delta { chunk_size: _ } => match array.data_type() {
                 DataType::Float32 => {
-                    let it = array.as_primitive::<Float32Type>();
-                    if it.null_count() > 0 {
-                        let decoded = null_delta_decode(it, start_value as f32);
-                        if let Some(delta_model) = delta_model {
-                            let values = fill_nulls_for(&decoded, delta_model);
-                            accumulator.extend(&values).unwrap();
-                        } else {
-                            log::debug!(
-                                "f32 delta decoding contained nulls but no delta model provided"
-                            );
-                            accumulator.extend(decoded.values()).unwrap()
-                        }
-                    } else {
-                        delta_decode(it.values(), start_value as f32, accumulator);
-                    }
+                    decode_delta!(array, Float32Type, f32, "f32 delta decoding contained nulls but no delta model provided");
                 }
                 DataType::Float64 => {
-                    let it = array.as_primitive::<Float64Type>();
-                    if it.null_count() > 0 {
-                        let decoded = null_delta_decode(it, start_value);
-                        if let Some(delta_model) = delta_model {
-                            let values = fill_nulls_for(&decoded, delta_model);
-                            accumulator.extend(&values).unwrap();
-                        } else {
-                            log::debug!(
-                                "f64 delta decoding contained nulls but no delta model provided"
-                            );
-                            accumulator.extend(decoded.values()).unwrap()
-                        }
-                    } else {
-                        delta_decode(it.values(), start_value, accumulator);
-                    }
+                    decode_delta!(array, Float64Type, f64, "f64 delta decoding contained nulls but no delta model provided");
                 }
                 _ => panic!(
                     "Data type {:?} is not supported by chunk decoding",
                     array.data_type()
                 ),
             },
-            ChunkingStrategy::NumpressLinear { chunk_size } => match array.data_type() {
+            ChunkingStrategy::NumpressLinear { chunk_size: _ } => match array.data_type() {
                 DataType::UInt8 => {
                     let it = array.as_primitive::<UInt8Type>();
                     let buf = it.values();
@@ -460,7 +453,7 @@ impl BufferTransformEncoder {
         }
     }
 
-    pub fn encode_arrow(&self, buffer_name: &BufferName, chunk_segment: &impl AsArray) -> ArrayRef {
+    pub fn encode_arrow(&self, _buffer_name: &BufferName, chunk_segment: &impl AsArray) -> ArrayRef {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressPIC => {
@@ -599,7 +592,7 @@ impl ArrowArrayChunk {
     pub fn to_struct_array(
         chunks: &[Self],
         buffer_context: BufferContext,
-        schema: &Fields,
+        _schema: &Fields,
         encodings: &[ChunkingStrategy],
         include_time: bool,
     ) -> StructArray {
@@ -619,15 +612,15 @@ impl ArrowArrayChunk {
         for chunk in chunks {
             let mut field_i = 0;
             visited.clear();
-            let mut b = this_builder.field_builder::<UInt64Builder>(field_i).unwrap();
+            let b = this_builder.field_builder::<UInt64Builder>(field_i).unwrap();
             b.append_value(chunk.series_index);
             visited.insert(field_i);
             field_i += 1;
-            let mut b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
+            let b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
             b.append_value(chunk.chunk_start);
             visited.insert(field_i);
             field_i += 1;
-            let mut b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
+            let b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
             b.append_value(chunk.chunk_end);
             visited.insert(field_i);
             field_i += 1;
@@ -636,7 +629,7 @@ impl ArrowArrayChunk {
                 this_builder.field_builder(field_i).unwrap();
             if matches!(
                 chunk.chunk_encoding,
-                ChunkingStrategy::NumpressLinear { chunk_size }
+                ChunkingStrategy::NumpressLinear { chunk_size: _ }
             ) {
                 b.append_null();
             } else {
@@ -695,7 +688,7 @@ impl ArrowArrayChunk {
                 );
             }
 
-            let mut cb = this_builder.field_builder::<StructBuilder>(field_i).unwrap();
+            let cb = this_builder.field_builder::<StructBuilder>(field_i).unwrap();
             let curie_of = chunk.chunk_encoding.as_curie();
             cb.field_builder::<UInt8Builder>(0)
                 .unwrap()
@@ -708,7 +701,7 @@ impl ArrowArrayChunk {
             field_i += 1;
 
             if include_time {
-                let mut b = this_builder.field_builder::<Float32Builder>(time_index).unwrap();
+                let b = this_builder.field_builder::<Float32Builder>(time_index).unwrap();
                 b.append_option(chunk.series_time);
                 visited.insert(time_index);
             }
@@ -873,7 +866,6 @@ impl ArrowArrayChunk {
         fields: Option<&Fields>,
     ) -> Result<(Vec<Self>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
         let mut chunks = Vec::new();
-        let mut subset_arrays = BinaryArrayMap::new();
 
         let mut arrow_arrays = Vec::new();
         let mut intensity_idx = None;
@@ -894,7 +886,7 @@ impl ArrowArrayChunk {
                 } else {
                     buffer_name.to_field().name().clone()
                 };
-                /// If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
+                // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
                 if !fields.find(&field_name).is_some()
                     && *buffer_name != main_axis
                 {
@@ -940,7 +932,7 @@ impl ArrowArrayChunk {
                     }
                 };
                 let kept_indices: UInt64Array = kept_indices.into();
-                for (k, v) in arrow_arrays.iter_mut() {
+                for (_, v) in arrow_arrays.iter_mut() {
                     if v.len() != n {
                         continue;
                     }
@@ -952,7 +944,7 @@ impl ArrowArrayChunk {
                 if nullify_zero_intensity {
                     let (intensity_name, intensity_array) =
                         arrow_arrays.get(intensity_idx).unwrap();
-                    let (masked, n) = match array_to_arrow_type(intensity_name.dtype) {
+                    let (masked, _) = match array_to_arrow_type(intensity_name.dtype) {
                         DataType::Float32 => {
                             let intensity_array = intensity_array.as_primitive::<Float32Type>();
                             (is_zero_pair_mask(&intensity_array), intensity_array.len())
@@ -987,7 +979,7 @@ impl ArrowArrayChunk {
 
         let (_, main_axis_array) = arrow_arrays
             .iter()
-            .find(|(k, v)| k == main_axis)
+            .find(|(k, _)| k == main_axis)
             .ok_or_else(|| ArrayRetrievalError::NotFound(main_axis.array_type.clone()))?;
 
         let steps = match array_to_arrow_type(main_axis.dtype) {
@@ -1002,7 +994,7 @@ impl ArrowArrayChunk {
             _ => unimplemented!("{}", main_axis),
         };
 
-        let mut main_axis = main_axis.clone().with_format(BufferFormat::Chunked);
+        let main_axis = main_axis.clone().with_format(BufferFormat::Chunked);
 
         for step in steps {
             let slice = main_axis_array.slice(step.start, step.end - step.start);
@@ -1050,13 +1042,13 @@ impl ArrowArrayChunk {
 
 #[cfg(test)]
 mod test {
-    use std::{fs, io};
+    use std::{fs, io::{self, prelude::*}};
 
     use super::*;
-    use mzdata::{MZReader, spectrum::MultiLayerSpectrum};
+    use mzdata::{MZReader, prelude::*};
 
     fn load_chunking_data() -> io::Result<Vec<f64>> {
-        let mut reader = io::BufReader::new(fs::File::open("test/data/chunking_mzs.txt")?);
+        let reader = io::BufReader::new(fs::File::open("test/data/chunking_mzs.txt")?);
 
         let mut mzs: Vec<f64> = Vec::new();
         for line in reader.lines().flatten() {
@@ -1117,7 +1109,7 @@ mod test {
 
         for chunk in chunks.iter() {
             let n = chunk.chunk_values.len();
-            for (k, v) in chunk.arrays.iter() {
+            for (_, v) in chunk.arrays.iter() {
                 assert_eq!(v.len(), n + 1);
             }
         }
@@ -1160,13 +1152,12 @@ mod test {
         )?;
 
         for chunk in chunks.iter() {
-            let n = chunk.chunk_values.len();
-            for (k, v) in chunk.arrays.iter() {
+            for (_, v) in chunk.arrays.iter() {
                 assert_eq!(v.len(), chunk.arrays.values().next().unwrap().len());
             }
         }
 
-        let rendered = ArrowArrayChunk::to_struct_array(
+        ArrowArrayChunk::to_struct_array(
             &chunks,
             BufferContext::Spectrum,
             Schema::empty().fields(),
@@ -1209,15 +1200,6 @@ mod test {
             false,
             None,
         )?;
-
-        let schema = chunks[0].to_schema(
-            BufferContext::Spectrum,
-            &[
-                ChunkingStrategy::Basic { chunk_size: 50.0 },
-                ChunkingStrategy::Delta { chunk_size: 50.0 },
-            ],
-            false,
-        );
 
         let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,

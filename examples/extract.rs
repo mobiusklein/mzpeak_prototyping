@@ -31,7 +31,7 @@ fn main() -> io::Result<()> {
 
     eprintln!("Opening archive took {} seconds", start.elapsed().as_secs_f64());
 
-    let has_ion_mobility = reader.metadata.spectrum_array_indices.has_ion_mobility();
+    let has_ion_mobility = reader.metadata.spectrum_array_indices().has_ion_mobility();
 
     let time_range = SimpleInterval::new(
         args.time_range.start.unwrap_or(0.0) as f32,

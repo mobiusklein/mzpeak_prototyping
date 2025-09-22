@@ -476,7 +476,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                             let start = start.unwrap();
                                             let delta_model =
                                                 delta_model_cache.get(spectrum_idx, || {
-                                                    metadata.model_deltas_for_conv(
+                                                    metadata.model_deltas_for(
                                                         spectrum_idx as usize,
                                                     )
                                                 });
@@ -528,7 +528,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                             let start = start.unwrap();
                                             let delta_model =
                                                 delta_model_cache.get(spectrum_idx, || {
-                                                    metadata.model_deltas_for_conv(
+                                                    metadata.model_deltas_for(
                                                         spectrum_idx as usize,
                                                     )
                                                 });

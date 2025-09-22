@@ -5,7 +5,7 @@ use mzpeak_prototyping::MzPeakReader;
 
 fn fetch(path: &PathBuf, index: usize) -> io::Result<()> {
     let mut reader = MzPeakReader::new(path)?;
-    let mut spec = reader.get_spectrum(index)?;
+    let mut spec = reader.get_spectrum(index).unwrap();
     spec.pick_peaks(1.0).unwrap();
 
     let writer = io::stdout().lock();

@@ -31,7 +31,6 @@ pub(crate) struct MzSpectrumVisitor<'a> {
 
 macro_rules! extract_unit {
     ($metacol:ident, $array:ident) => {{
-
         let units: UnitCollection<'_> = match &$metacol.unit {
             crate::param::PathOrCURIE::Path(items) => {
                 if let Some(val) = $array.column_by_name(items.last().unwrap()) {
@@ -44,13 +43,10 @@ macro_rules! extract_unit {
             crate::param::PathOrCURIE::CURIE(curie) => {
                 UnitCollection::singular(Unit::from_curie(&(*curie).into()))
             }
-            crate::param::PathOrCURIE::None => {
-                UnitCollection::unknown()
-            }
+            crate::param::PathOrCURIE::None => UnitCollection::unknown(),
         };
         units
-        }
-    };
+    }};
 }
 
 impl<'a> VisitorBuilderBase<'a, SpectrumDescription> for MzSpectrumVisitor<'a> {
@@ -104,12 +100,7 @@ impl<'a> MzSpectrumVisitor<'a> {
 
     fn visit_ms_level(&mut self, spec_arr: &StructArray, index: usize) {
         let arr = spec_arr.column(index).as_primitive::<UInt8Type>();
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
+        for (i, descr) in self.iter_instances() {
             if arr.is_null(i) {
                 continue;
             };
@@ -120,12 +111,7 @@ impl<'a> MzSpectrumVisitor<'a> {
 
     fn visit_polarity(&mut self, spec_arr: &StructArray, index: usize) {
         let polarity_arr: &Int8Array = spec_arr.column(index).as_any().downcast_ref().unwrap();
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
+        for (i, descr) in self.iter_instances() {
             let polarity_val = polarity_arr.value(i);
             match polarity_val {
                 1 => descr.polarity = ScanPolarity::Positive,
@@ -142,12 +128,7 @@ impl<'a> MzSpectrumVisitor<'a> {
         let cv_id_arr: &UInt8Array = continuity_array.column(0).as_any().downcast_ref().unwrap();
         let accession_arr: &UInt32Array =
             continuity_array.column(1).as_any().downcast_ref().unwrap();
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
+        for (i, descr) in self.iter_instances() {
             if accession_arr.is_null(i) {
                 continue;
             };
@@ -163,18 +144,13 @@ impl<'a> MzSpectrumVisitor<'a> {
 
     fn visit_spectrum_type(&mut self, spec_arr: &StructArray, index: usize) {
         let spec_type_array = spec_arr.column(index).as_struct();
-        let cv_id_arr: &UInt8Array = spec_type_array.column(0).as_any().downcast_ref().unwrap();
-        let accession_arr: &UInt32Array =
-            spec_type_array.column(1).as_any().downcast_ref().unwrap();
 
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
-            let spec_type_curie = CURIE::new(cv_id_arr.value(i), accession_arr.value(i));
-            let spec_type = SpectrumType::from_accession(spec_type_curie.accession);
+        let curie_array = CURIEArray::from_struct_array(spec_type_array);
+
+        for (i, descr) in self.iter_instances() {
+            let spec_type = curie_array
+                .value(i)
+                .and_then(|v| SpectrumType::from_accession(v.accession));
             if let Some(spec_type) = spec_type {
                 descr.set_spectrum_type(spec_type);
             }
@@ -182,74 +158,100 @@ impl<'a> MzSpectrumVisitor<'a> {
     }
 
     fn visit_lowest_mz(&mut self, spec_arr: &StructArray, index: usize) {
-        let arr: &Float64Array = spec_arr.column(index).as_primitive();
+        let arr = spec_arr.column(index);
         if arr.null_count() == arr.len() {
             return;
         }
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
-            if arr.is_null(i) {
-                continue;
+
+        macro_rules! pack {
+            ($arr:ident) => {
+                for (i, descr) in self.iter_instances()
+                {
+                    if $arr.is_null(i) {
+                        continue;
+                    };
+                    let p = mzdata::Param::builder()
+                        .curie(mzdata::curie!(MS:1000528))
+                        .name("lowest observed m/z")
+                        .unit(Unit::MZ)
+                        .value($arr.value(i))
+                        .build();
+                    descr.add_param(p);
+                }
             };
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000528))
-                .name("lowest observed m/z")
-                .unit(Unit::MZ)
-                .value(arr.value(i))
-                .build();
-            descr.add_param(p);
+        }
+
+        if let Some(arr) = arr.as_primitive_opt::<Float64Type>() {
+            pack!(arr);
+        } else if let Some(arr) = arr.as_primitive_opt::<Float32Type>() {
+            pack!(arr);
+        } else {
+            unimplemented!("{:?} for lowest m/z", arr.data_type())
         }
     }
 
     fn visit_highest_mz(&mut self, spec_arr: &StructArray, index: usize) {
-        let arr: &Float64Array = spec_arr.column(index).as_primitive();
+        let arr = spec_arr.column(index);
         if arr.null_count() == arr.len() {
             return;
         }
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
-            if arr.is_null(i) {
-                continue;
+        macro_rules! pack {
+            ($arr:ident) => {
+                for (i, descr) in self.iter_instances()
+                {
+                    if $arr.is_null(i) {
+                        continue;
+                    };
+                    let p = mzdata::Param::builder()
+                        .curie(mzdata::curie!(MS:1000527))
+                        .name("highest observed m/z")
+                        .unit(Unit::MZ)
+                        .value($arr.value(i))
+                        .build();
+                    descr.add_param(p);
+                }
             };
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000527))
-                .name("highest observed m/z")
-                .unit(Unit::MZ)
-                .value(arr.value(i))
-                .build();
-            descr.add_param(p);
+        }
+
+        if let Some(arr) = arr.as_primitive_opt::<Float64Type>() {
+            pack!(arr);
+        } else if let Some(arr) = arr.as_primitive_opt::<Float32Type>() {
+            pack!(arr);
+        } else {
+            unimplemented!("{:?} for lowest m/z", arr.data_type())
         }
     }
 
     fn visit_base_peak_mz(&mut self, spec_arr: &StructArray, index: usize) {
-        let arr: &Float64Array = spec_arr.column(index).as_primitive();
+        let arr = spec_arr.column(index);
         if arr.null_count() == arr.len() {
             return;
         }
-        for (i, descr) in self
-            .offsets
-            .iter()
-            .copied()
-            .zip(self.descriptions.iter_mut())
-        {
-            if arr.is_null(i) {
-                continue;
+
+        macro_rules! pack {
+            ($arr:ident) => {
+                for (i, descr) in self.iter_instances()
+                {
+                    if $arr.is_null(i) {
+                        continue;
+                    };
+                    let p = mzdata::Param::builder()
+                        .curie(mzdata::curie!(MS:1000504))
+                        .name("base peak m/z")
+                        .unit(Unit::MZ)
+                        .value($arr.value(i))
+                        .build();
+                    descr.add_param(p);
+                }
             };
-            let p = mzdata::Param::builder()
-                .curie(mzdata::curie!(MS:1000504))
-                .name("base peak m/z")
-                .unit(Unit::MZ)
-                .value(arr.value(i))
-                .build();
-            descr.add_param(p);
+        }
+
+        if let Some(arr) = arr.as_primitive_opt::<Float64Type>() {
+            pack!(arr);
+        } else if let Some(arr) = arr.as_primitive_opt::<Float32Type>() {
+            pack!(arr);
+        } else {
+            unimplemented!("{:?} for lowest m/z", arr.data_type())
         }
     }
 
@@ -326,9 +328,10 @@ impl<'a> MzSpectrumVisitor<'a> {
         }
     }
 
-    pub(crate) fn visit(&mut self, spec_arr: &StructArray) {
+    pub(crate) fn visit(&mut self, spec_arr: &StructArray) -> usize {
         let names = spec_arr.column_names();
         let mut visited = vec![false; spec_arr.num_columns()];
+
         // Must visit the index first, to infer null spacing
         if let Some(i) = names.iter().position(|v| *v == "index") {
             self.visit_index(spec_arr, i);
@@ -453,12 +456,14 @@ impl<'a> MzSpectrumVisitor<'a> {
                 _ => {}
             }
         }
+
+        return self.offsets.len()
     }
 }
 
 struct CURIEArray<'a> {
     cv_id: &'a UInt8Array,
-    accession: &'a UInt32Array
+    accession: &'a UInt32Array,
 }
 
 impl<'a> CURIEArray<'a> {
@@ -469,7 +474,7 @@ impl<'a> CURIEArray<'a> {
     fn from_struct_array(unit_series: &'a StructArray) -> Self {
         Self::new(
             unit_series.column(0).as_primitive(),
-            unit_series.column(1).as_primitive()
+            unit_series.column(1).as_primitive(),
         )
     }
 
@@ -483,7 +488,10 @@ impl<'a> CURIEArray<'a> {
         if self.is_null(index) {
             None
         } else {
-            Some(CURIE::new(self.cv_id.value(index), self.accession.value(index)))
+            Some(CURIE::new(
+                self.cv_id.value(index),
+                self.accession.value(index),
+            ))
         }
     }
 }
@@ -497,9 +505,10 @@ impl<'a> UnitArray<'a> {
 
     #[inline(always)]
     fn value(&self, index: usize) -> Unit {
-        self.0.value(index).map(|v| {
-            Unit::from_curie(&(v.into()))
-        }).unwrap_or_default()
+        self.0
+            .value(index)
+            .map(|v| Unit::from_curie(&(v.into())))
+            .unwrap_or_default()
     }
 }
 
@@ -514,7 +523,7 @@ impl UnitScalar {
 
 enum UnitCollection<'a> {
     Array(UnitArray<'a>),
-    Scalar(UnitScalar)
+    Scalar(UnitScalar),
 }
 
 impl<'a> Default for UnitCollection<'a> {
@@ -524,7 +533,6 @@ impl<'a> Default for UnitCollection<'a> {
 }
 
 impl<'a> UnitCollection<'a> {
-
     #[inline(always)]
     fn value(&self, index: usize) -> Unit {
         match self {
@@ -545,7 +553,6 @@ impl<'a> UnitCollection<'a> {
         Self::Scalar(UnitScalar(Unit::Unknown))
     }
 }
-
 
 /// Enclose the parallel arrays of "descriptions" and their offsets so that the borrow
 /// checker knows that method calls on this instance aren't tied to the owning objects
@@ -626,7 +633,10 @@ trait VisitorBuilder1<'a, T: ParamDescribed>: VisitorBuilderBase<'a, T> {
                         continue;
                     };
                     let mut p = mzdata::Param::builder();
-                    p = p.name(&metacol.name).value($arr.value(i)).unit(units.value(i));
+                    p = p
+                        .name(&metacol.name)
+                        .value($arr.value(i))
+                        .unit(units.value(i));
                     if let Some(acc) = accession {
                         p = p.curie(acc)
                     }
@@ -1229,7 +1239,10 @@ impl<'a> MzScanVisitor<'a> {
         let names = spec_arr.column_names();
         let mut visited = vec![false; spec_arr.num_columns()];
         // Must visit the index first, to infer null spacing
-        if let Some(i) = names.iter().position(|v| *v == "spectrum_index" || *v == "source_index") {
+        if let Some(i) = names
+            .iter()
+            .position(|v| *v == "spectrum_index" || *v == "source_index")
+        {
             self.visit_index(spec_arr, i);
             visited[i] = true;
         } else {
@@ -1461,7 +1474,10 @@ impl<'a> MzPrecursorVisitor<'a> {
         let names = spec_arr.column_names();
         let mut visited = vec![false; spec_arr.num_columns()];
         // Must visit the index first, to infer null spacing
-        if let Some(i) = names.iter().position(|v| *v == "spectrum_index" || *v == "source_index") {
+        if let Some(i) = names
+            .iter()
+            .position(|v| *v == "spectrum_index" || *v == "source_index")
+        {
             self.visit_spectrum_index(spec_arr, i);
             visited[i] = true;
         } else {
@@ -1733,7 +1749,10 @@ impl<'a> MzSelectedIonVisitor<'a> {
         let mut visited = vec![false; spec_arr.num_columns()];
 
         // Must visit the index first, to infer null spacing
-        if let Some(i) = names.iter().position(|v| *v == "spectrum_index" || *v == "source_index") {
+        if let Some(i) = names
+            .iter()
+            .position(|v| *v == "spectrum_index" || *v == "source_index")
+        {
             self.visit_spectrum_index(spec_arr, i);
             visited[i] = true;
         } else {
@@ -1893,7 +1912,7 @@ impl<'a> MzChromatogramBuilder<'a> {
                 1 => descr.polarity = ScanPolarity::Positive,
                 -1 => descr.polarity = ScanPolarity::Negative,
                 _ => {
-                    todo!("Don't know how to deal with polarity {polarity_val}")
+                    descr.polarity = ScanPolarity::Unknown;
                 }
             }
         }
@@ -1920,7 +1939,7 @@ impl<'a> MzChromatogramBuilder<'a> {
         }
     }
 
-    pub(crate) fn visit(&mut self, chrom_arr: &StructArray) {
+    pub(crate) fn visit(&mut self, chrom_arr: &StructArray) -> usize {
         // Must visit the index first, to infer null spacing
         self.visit_index(chrom_arr, 0);
         self.visit_id(chrom_arr, 1);
@@ -1970,5 +1989,6 @@ impl<'a> MzChromatogramBuilder<'a> {
                 _ => {}
             }
         }
+        self.offsets.len()
     }
 }
