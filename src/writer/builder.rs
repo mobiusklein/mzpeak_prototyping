@@ -3,7 +3,9 @@ use mzdata::{
     params::Unit,
     spectrum::{ArrayType, BinaryDataArrayType},
 };
+
 use parquet::basic::{Compression, ZstdLevel};
+use std::fmt::Debug;
 use std::{io::prelude::*, sync::Arc};
 
 use crate::{

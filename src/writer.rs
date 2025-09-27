@@ -39,6 +39,7 @@ mod base;
 mod builder;
 mod mini_peak;
 mod split;
+mod visitor;
 
 pub use array_buffer::{
     ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChunkBuffers, PointBuffers,
@@ -46,6 +47,28 @@ pub use array_buffer::{
 pub use base::AbstractMzPeakWriter;
 pub use builder::MzPeakWriterBuilder;
 pub use split::MzPeakSplitWriter;
+
+pub use visitor::{
+    ScanBuilder,
+    ScanWindowBuilder,
+    SelectedIonBuilder,
+    ActivationBuilder,
+    IsolationWindowBuilder,
+    PrecursorBuilder,
+    CURIEBuilder,
+    ParamValueBuilder,
+    ParamBuilder,
+    CustomBuilderFromParameter,
+    ParamListBuilder,
+    AuxiliaryArrayBuilder,
+    SpectrumDetailsBuilder,
+    SpectrumBuilder,
+    StructVisitor,
+    VisitorBase,
+    StructVisitorBuilder,
+    SpectrumVisitor,
+    inflect_cv_term_to_column_name,
+};
 
 pub(crate) use base::implement_mz_metadata;
 pub(crate) use mini_peak::MiniPeakWriterType;

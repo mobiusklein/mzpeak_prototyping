@@ -117,13 +117,13 @@ impl From<&Param> for mzdata::Param {
 #[macro_export]
 macro_rules! curie {
     (MS:$acc:literal) => {
-        CURIE {
+        $crate::CURIE {
             cv_id: 1,
             accession: $acc,
         }
     };
     (UO:$acc:literal) => {
-        CURIE {
+        $crate::CURIE {
             cv_id: 2,
             accession: $acc,
         }
