@@ -1172,7 +1172,13 @@ impl<
     }
 
     pub(crate) fn load_chromatogram_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
-        let builder = self.handle.chromatograms_metadata()?;
+        let builder = match self.handle.chromatograms_metadata() {
+            Ok(builder) => builder,
+            Err(e) => {
+                log::trace!("{e}");
+                return Ok(Vec::new())
+            }
+        };
 
         let schema = builder.parquet_schema();
         let mut index_i = None;

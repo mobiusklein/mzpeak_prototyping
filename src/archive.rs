@@ -448,7 +448,7 @@ impl ZipArchiveReader {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "Chromatogram metadata entry not found",
+                "Chromatogram data entry not found",
             ))
         }
     }

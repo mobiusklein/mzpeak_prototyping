@@ -537,7 +537,7 @@ where
                 }
             }
             NullFillState::NullBounded(start, end) => {
-                let length = (end - start) - 1;
+                let length = (end - start).saturating_sub(1);
                 let real_values = array.slice(start + 1, length);
                 if length == 1 {
                     let val = real_values.value(0);
@@ -545,7 +545,7 @@ where
                     buffer.push(val - delta_at);
                     buffer.push(val);
                     buffer.push(val + delta_at);
-                } else {
+                } else if length > 1 {
                     let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
                     let val0 = real_values.value(0);
                     buffer.push(val0 - local_delta);
