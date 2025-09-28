@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
+use arrow::{array::{ArrayBuilder, AsArray, RecordBatch}, datatypes::{Field, Schema}};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
     arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
@@ -20,11 +20,9 @@ use mzdata::{
     prelude::*,
     spectrum::{ArrayType, Chromatogram, MultiLayerSpectrum, SignalContinuity},
 };
-use serde_arrow::schema::{SchemaLike, TracingOptions};
 
 use crate::{
     archive::{MzPeakArchiveType, ZipArchiveWriter},
-    entry::{ChromatogramMetadataEntry, Entry},
     peak_series::{
         ArrayIndex, BufferContext, BufferName, ToMzPeakDataSeries, array_map_to_schema_arrays,
     },
@@ -68,6 +66,8 @@ pub use visitor::{
     StructVisitorBuilder,
     SpectrumVisitor,
     inflect_cv_term_to_column_name,
+    ChromatogramDetailsBuilder,
+    ChromatogramBuilder,
 };
 
 pub(crate) use base::implement_mz_metadata;
@@ -235,22 +235,14 @@ pub struct MzPeakWriterType<
     spectrum_buffers: ArrayBufferWriterVariants,
     separate_peak_writer: Option<MiniPeakWriterType<fs::File>>,
 
-    #[allow(unused)]
     chromatogram_buffers: ArrayBufferWriterVariants,
 
-    spectrum_metadata_buffer: Vec<Entry>,
-    chromatogram_metadata_buffer: Vec<ChromatogramMetadataEntry>,
+    spectrum_metadata_buffer: SpectrumBuilder,
+    chromatogram_metadata_buffer: ChromatogramBuilder,
 
     use_chunked_encoding: Option<ChunkingStrategy>,
-    metadata_fields: SchemaRef,
 
-    spectrum_counter: u64,
-    spectrum_precursor_counter: u64,
     spectrum_data_point_counter: u64,
-
-    chromatogram_counter: u64,
-    chromatogram_precursor_counter: u64,
-    #[allow(unused)]
     chromatogram_data_point_counter: u64,
 
     buffer_size: usize,
@@ -280,7 +272,7 @@ impl<
         self.use_chunked_encoding.as_ref()
     }
 
-    fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry> {
+    fn spectrum_entry_buffer_mut(&mut self) -> &mut SpectrumBuilder {
         &mut self.spectrum_metadata_buffer
     }
 
@@ -289,26 +281,18 @@ impl<
     }
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
-        if self.spectrum_counter % (self.buffer_size as u64) == 0 {
+        if self.spectrum_counter() % (self.buffer_size as u64) == 0 {
             self.flush_data_arrays()?;
         }
         Ok(())
     }
 
     fn spectrum_counter(&self) -> u64 {
-        self.spectrum_counter
-    }
-
-    fn spectrum_counter_mut(&mut self) -> &mut u64 {
-        &mut self.spectrum_counter
+        self.spectrum_metadata_buffer.index_counter()
     }
 
     fn spectrum_precursor_counter(&self) -> u64 {
-        self.spectrum_precursor_counter
-    }
-
-    fn spectrum_precursor_counter_mut(&mut self) -> &mut u64 {
-        &mut self.spectrum_precursor_counter
+        self.spectrum_metadata_buffer.precursor_index_counter()
     }
 
     fn separate_peak_writer(&mut self) -> Option<&mut MiniPeakWriterType<fs::File>> {
@@ -316,18 +300,10 @@ impl<
     }
 
     fn chromatogram_counter(&self) -> u64 {
-        self.chromatogram_counter
+        self.chromatogram_metadata_buffer.index_counter()
     }
 
-    fn chromatogram_counter_mut(&mut self) -> &mut u64 {
-        &mut self.chromatogram_counter
-    }
-
-    fn chromatogram_precursor_counter_mut(&mut self) -> &mut u64 {
-        &mut self.chromatogram_precursor_counter
-    }
-
-    fn chromatogram_entry_buffer_mut(&mut self) -> &mut Vec<ChromatogramMetadataEntry> {
+    fn chromatogram_entry_buffer_mut(&mut self) -> &mut ChromatogramBuilder {
         &mut self.chromatogram_metadata_buffer
     }
 
@@ -366,8 +342,8 @@ impl<
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
     ) -> Self {
-        let fields: Vec<FieldRef> = SchemaLike::from_type::<Entry>(TracingOptions::new()).unwrap();
-        let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));
+
+        let spectrum_metadata_buffer = SpectrumBuilder::default();
 
         let spectrum_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
             spectrum_buffers_builder
@@ -449,17 +425,12 @@ impl<
             ),
             separate_peak_writer,
             use_chunked_encoding,
-            metadata_fields,
-            spectrum_metadata_buffer: Vec::new(),
+            spectrum_metadata_buffer,
             spectrum_buffers,
             chromatogram_buffers,
-            spectrum_counter: 0,
-            spectrum_precursor_counter: 0,
             spectrum_data_point_counter: 0,
-            chromatogram_counter: 0,
-            chromatogram_precursor_counter: 0,
             chromatogram_data_point_counter: 0,
-            chromatogram_metadata_buffer: Vec::new(),
+            chromatogram_metadata_buffer: Default::default(),
             buffer_size: buffer_size,
             mz_metadata: Default::default(),
             compression,
@@ -490,9 +461,10 @@ impl<
     pub fn write_spectrum<
         A: ToMzPeakDataSeries + CentroidLike,
         B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<A, B> + 'static
     >(
         &mut self,
-        spectrum: &impl SpectrumLike<A, B>,
+        spectrum: &S,
     ) -> io::Result<()> {
         AbstractMzPeakWriter::write_spectrum(self, spectrum)
     }
@@ -518,23 +490,22 @@ impl<
     }
 
     fn flush_spectrum_metadata_records(&mut self) -> io::Result<()> {
-        let batch = serde_arrow::to_record_batch(
-            &self.metadata_fields.fields(),
-            &self.spectrum_metadata_buffer,
-        )
-        .unwrap();
+        // let batch = serde_arrow::to_record_batch(
+        //     &self.metadata_fields.fields(),
+        //     &self.spectrum_metadata_buffer,
+        // )
+        // .unwrap();
+        let arrays = self.spectrum_metadata_buffer.finish();
+        let batch = RecordBatch::from(arrays.as_struct());
         self.archive_writer.as_mut().unwrap().write(&batch)?;
-        self.spectrum_metadata_buffer.clear();
+        // self.spectrum_metadata_buffer.clear();
         Ok(())
     }
 
     fn flush_chromatogram_metadata_records(&mut self) -> io::Result<()> {
-        let schema: Vec<FieldRef> =
-            SchemaLike::from_type::<ChromatogramMetadataEntry>(Default::default()).unwrap();
-        let batch =
-            serde_arrow::to_record_batch(&schema, &self.chromatogram_metadata_buffer).unwrap();
+        let arrays = self.chromatogram_metadata_buffer.finish();
+        let batch = RecordBatch::from(arrays.as_struct());
         self.archive_writer.as_mut().unwrap().write(&batch)?;
-        self.chromatogram_metadata_buffer.clear();
         Ok(())
     }
 
@@ -562,7 +533,7 @@ impl<
             self.flush_data_arrays()?;
             self.append_key_value_metadata(
                 "spectrum_count",
-                Some(self.spectrum_counter.to_string()),
+                Some(self.spectrum_counter().to_string()),
             );
             self.append_key_value_metadata(
                 "spectrum_data_point_count",
@@ -582,17 +553,18 @@ impl<
             }
 
             writer.start_spectrum_metadata().unwrap();
+            let metadata_fields = self.spectrum_metadata_buffer.schema();
             self.archive_writer = Some(ArrowWriter::try_new_with_options(
                 writer,
-                self.metadata_fields.clone(),
+                metadata_fields.clone(),
                 ArrowWriterOptions::new()
-                    .with_properties(Self::spectrum_metadata_writer_props(&self.metadata_fields)),
+                    .with_properties(Self::spectrum_metadata_writer_props(&metadata_fields)),
             )?);
             self.flush_spectrum_metadata_records()?;
             self.append_metadata();
             self.append_key_value_metadata(
                 "spectrum_count",
-                Some(self.spectrum_counter.to_string()),
+                Some(self.spectrum_counter().to_string()),
             );
             self.append_key_value_metadata(
                 "spectrum_data_point_count",
@@ -603,19 +575,18 @@ impl<
 
             if !self.chromatogram_metadata_buffer.is_empty() {
                 writer.start_chromatogram_metadata().unwrap();
-                let schema: Vec<FieldRef> =
-                    SchemaLike::from_type::<ChromatogramMetadataEntry>(Default::default()).unwrap();
+                let metadata_fields = self.chromatogram_metadata_buffer.schema();
                 self.archive_writer = Some(ArrowWriter::try_new_with_options(
                     writer,
-                    Arc::new(Schema::new(schema)),
+                    metadata_fields.clone(),
                     ArrowWriterOptions::new().with_properties(
-                        Self::spectrum_metadata_writer_props(&self.metadata_fields),
+                        Self::spectrum_metadata_writer_props(&metadata_fields),
                     ),
                 )?);
                 self.flush_chromatogram_metadata_records()?;
                 self.append_key_value_metadata(
                     "chromatogram_count",
-                    Some(self.chromatogram_counter.to_string()),
+                    Some(self.chromatogram_counter().to_string()),
                 );
                 self.append_key_value_metadata(
                     "chromatogram_data_point_count",

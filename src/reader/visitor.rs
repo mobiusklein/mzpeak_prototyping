@@ -1,17 +1,21 @@
+use std::collections::HashMap;
+
 use arrow::{
     array::{
         Array, AsArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int32Array,
         Int64Array, LargeListArray, LargeStringArray, StructArray, UInt8Array, UInt32Array,
         UInt64Array,
     },
+    buffer::NullBuffer,
     datatypes::{
-        DataType, FieldRef, Float32Type, Float64Type, Int32Type, Int64Type, UInt8Type, UInt32Type,
-        UInt64Type,
+        DataType, FieldRef, Float32Type, Float64Type, Int32Type, Int64Type, UInt8Type,
+        UInt32Type, UInt64Type,
     },
 };
+use itertools::Itertools;
 use mzdata::{
     meta::SpectrumType,
-    params::Unit,
+    params::{ControlledVocabulary, Unit},
     prelude::*,
     spectrum::{
         ChromatogramDescription, ChromatogramType, Precursor, ScanEvent, ScanPolarity, SelectedIon,
@@ -21,6 +25,147 @@ use mzdata::{
 use serde_arrow::schema::SchemaLike;
 
 use crate::{CURIE, param::MetadataColumn, spectrum::ScanWindowEntry};
+
+pub fn parse_column_to_curie(column_name: &str) -> Option<(mzdata::params::CURIE, String)> {
+    let mut it = column_name.split("_");
+    let prefix = it.next()?;
+    let cv: ControlledVocabulary = prefix.parse().ok()?;
+    if matches!(cv, ControlledVocabulary::Unknown) {
+        return None;
+    }
+    let accession = it.next()?;
+    let ident = mzdata::params::CURIE::new(cv, accession.parse().ok()?);
+    let name = it.join("_");
+    Some((ident, name))
+}
+
+
+pub(crate) fn metadata_columns_to_definition_map(columns: Vec<MetadataColumn>) -> HashMap<String, MetadataColumn> {
+    let mut table = HashMap::with_capacity(columns.len());
+    for col in columns {
+        let key = col.path.last().unwrap().clone();
+        table.insert(key, col);
+    }
+    table
+}
+
+
+pub fn schema_to_metadata_cols<'a>(
+    fields: impl IntoIterator<Item=&'a FieldRef>,
+    prefix: String,
+    defined_columns: Option<&HashMap<String, MetadataColumn>>,
+) -> Vec<MetadataColumn> {
+    let mut columns = Vec::new();
+    for (i, f) in fields.into_iter().enumerate() {
+        if let Some((curie, mangled_name)) = parse_column_to_curie(f.name()) {
+            log::trace!("Adding parsed {curie}|{mangled_name} @ {i} from {prefix}");
+            columns.push(MetadataColumn::new(
+                mangled_name,
+                vec![prefix.clone(), f.name().to_string()],
+                i,
+                Some(curie.into()),
+            ))
+        } else if let Some(defined) = defined_columns {
+            if let Some(defined_col) = defined.get(f.name()) {
+                log::trace!("Adding defined {1}|{0} @ {i} from {prefix}", defined_col.name, defined_col.accession.unwrap());
+                let mut col = defined_col.clone();
+                col.path[0] = prefix.clone();
+                col.index = i;
+                columns.push(col);
+            }
+        }
+    }
+    columns
+}
+
+pub struct ParameterVisitor<'a> {
+    root: &'a StructArray,
+    destination: Vec<mzdata::Param>,
+}
+
+impl<'a> ParameterVisitor<'a> {
+    pub fn new(root: &'a StructArray) -> Self {
+        Self {
+            root,
+            destination: Vec::new(),
+        }
+    }
+
+    pub fn build(mut self) -> Vec<mzdata::Param> {
+        let n = self.root.len();
+        self.destination.resize(n, Default::default());
+
+        if let Some(name) = self.root.column_by_name("name") {
+            let arr = name.as_string::<i64>();
+            for (i, v) in arr.iter().enumerate() {
+                self.destination[i].name = v.unwrap().to_string();
+            }
+        }
+        if let Some(curie) = self.root.column_by_name("curie") {
+            let arr = curie.as_struct();
+            let arr = CURIEArray::from_struct_array(arr);
+            for i in 0..n {
+                if let Some(v) = arr.value(i).map(mzdata::params::CURIE::from) {
+                    let d = &mut self.destination[i];
+                    d.accession = Some(v.accession);
+                    d.controlled_vocabulary = Some(v.controlled_vocabulary);
+                }
+            }
+        }
+        if let Some(unit) = self.root.column_by_name("unit") {
+            let arr = UnitArray::from_struct_array(unit.as_struct());
+            for i in 0..n {
+                self.destination[i].unit = arr.value(i);
+            }
+        }
+        if let Some(values) = self.root.column_by_name("value") {
+            let values = values.as_struct();
+            if let Some(ints) = values.column_by_name("integer") {
+                if ints.null_count() != n {
+                    let ints = ints.as_primitive::<Int64Type>();
+                    for i in 0..n {
+                        if ints.is_valid(i) {
+                            self.destination[i].value = mzdata::params::Value::Int(ints.value(i));
+                        }
+                    }
+                }
+            }
+            if let Some(ints) = values.column_by_name("float") {
+                if ints.null_count() != n {
+                    let ints = ints.as_primitive::<Float64Type>();
+                    for i in 0..n {
+                        if ints.is_valid(i) {
+                            self.destination[i].value = mzdata::params::Value::Float(ints.value(i));
+                        }
+                    }
+                }
+            }
+            if let Some(ints) = values.column_by_name("string") {
+                if ints.null_count() != n {
+                    let ints = ints.as_string::<i64>();
+                    for i in 0..n {
+                        if ints.is_valid(i) {
+                            self.destination[i].value =
+                                mzdata::params::Value::String(ints.value(i).to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(ints) = values.column_by_name("boolean") {
+                if ints.null_count() != n {
+                    let ints = ints.as_boolean();
+                    for i in 0..n {
+                        if ints.is_valid(i) {
+                            self.destination[i].value =
+                                mzdata::params::Value::Boolean(ints.value(i));
+                        }
+                    }
+                }
+            }
+        }
+        self.destination
+    }
+}
 
 pub(crate) struct MzSpectrumVisitor<'a> {
     pub(crate) descriptions: &'a mut [SpectrumDescription],
@@ -457,30 +602,42 @@ impl<'a> MzSpectrumVisitor<'a> {
             }
         }
 
-        return self.offsets.len()
+        return self.offsets.len();
     }
 }
 
 struct CURIEArray<'a> {
     cv_id: &'a UInt8Array,
     accession: &'a UInt32Array,
+    null: Option<&'a NullBuffer>,
 }
 
 impl<'a> CURIEArray<'a> {
-    fn new(cv_id: &'a UInt8Array, accession: &'a UInt32Array) -> Self {
-        Self { cv_id, accession }
+    fn new(
+        cv_id: &'a UInt8Array,
+        accession: &'a UInt32Array,
+        null: Option<&'a NullBuffer>,
+    ) -> Self {
+        Self {
+            cv_id,
+            accession,
+            null,
+        }
     }
 
     fn from_struct_array(unit_series: &'a StructArray) -> Self {
         Self::new(
             unit_series.column(0).as_primitive(),
             unit_series.column(1).as_primitive(),
+            unit_series.nulls(),
         )
     }
 
     #[inline(always)]
     fn is_null(&self, index: usize) -> bool {
-        self.cv_id.is_null(index) || self.accession.is_null(index)
+        self.cv_id.is_null(index)
+            || self.accession.is_null(index)
+            || self.null.is_some_and(|v| v.is_null(index))
     }
 
     #[inline(always)]
@@ -507,7 +664,9 @@ impl<'a> UnitArray<'a> {
     fn value(&self, index: usize) -> Unit {
         self.0
             .value(index)
-            .map(|v| Unit::from_curie(&(v.into())))
+            .map(|v| {
+                Unit::from_curie(&(v.into()))
+            })
             .unwrap_or_default()
     }
 }
@@ -597,16 +756,13 @@ trait VisitorBuilder1<'a, T: ParamDescribed>: VisitorBuilderBase<'a, T> {
     fn visit_parameters(&mut self, struct_arr: &StructArray, skip_params: &[CURIE]) {
         let params_array: &LargeListArray =
             struct_arr.column_by_name("parameters").unwrap().as_list();
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
+
         for (i, descr) in self.iter_instances() {
             let params = params_array.value(i);
-            let params = params.as_struct();
-            let params: Vec<crate::param::Param> =
-                serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
+            let params = ParameterVisitor::new(params.as_struct()).build();
 
             for p in params {
-                if let Some(acc) = p.accession {
+                if let Some(acc) = p.curie().map(CURIE::from) {
                     if !skip_params.contains(&acc) {
                         descr.add_param(p.into());
                     }
@@ -766,16 +922,15 @@ trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
     fn visit_parameters(&mut self, spec_arr: &StructArray) {
         let params_array: &LargeListArray =
             spec_arr.column_by_name("parameters").unwrap().as_list();
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
+
         for (i, (_, descr)) in self.iter_instances() {
             let params = params_array.value(i);
             let params = params.as_struct();
-            let params: Vec<crate::param::Param> =
-                serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
+
+            let params = ParameterVisitor::new(params).build();
 
             for p in params {
-                descr.add_param(p.into());
+                descr.add_param(p);
             }
         }
     }
@@ -867,16 +1022,15 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
     {
         let params_array: &LargeListArray =
             spec_arr.column_by_name("parameters").unwrap().as_list();
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
+
         for (i, (_, _, descr)) in self.iter_instances() {
             let params = params_array.value(i);
             let params = params.as_struct();
-            let params: Vec<crate::param::Param> =
-                serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
+
+            let params = ParameterVisitor::new(params).build();
 
             for p in params {
-                descr.add_param(p.into());
+                descr.add_param(p);
             }
         }
     }
@@ -1428,18 +1582,20 @@ impl<'a> MzPrecursorVisitor<'a> {
         let spec_arr = spec_arr.column(index).as_struct();
         let params_array: &LargeListArray =
             spec_arr.column_by_name("parameters").unwrap().as_list();
-        let param_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<crate::param::Param>(Default::default()).unwrap();
+
         for (i, (_, _, descr)) in self.iter_instances() {
             let params = params_array.value(i);
             let params = params.as_struct();
-            let params: Vec<crate::param::Param> =
-                serde_arrow::from_arrow(&param_fields, params.columns()).unwrap();
+
+            let params = ParameterVisitor::new(params).build();
 
             for p in params {
-                if let Some(acc) = p.accession {
+                if let Some(acc) = p.curie() {
                     match acc {
-                        crate::curie!(MS:1000045) => {
+                        mzdata::params::CURIE {
+                            controlled_vocabulary: mzdata::params::ControlledVocabulary::MS,
+                            accession: 1000045,
+                        } => {
                             let val: mzdata::params::Value = p.value.into();
                             descr.activation.energy = val.to_f32().unwrap();
                         }
@@ -1990,5 +2146,16 @@ impl<'a> MzChromatogramBuilder<'a> {
             }
         }
         self.offsets.len()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parse_name() {
+        let (accession, _name) = parse_column_to_curie("MS_1000511_ms_level").unwrap();
+        assert_eq!(accession, mzdata::curie!(MS:1000511));
     }
 }

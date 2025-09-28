@@ -18,13 +18,7 @@ use parquet::{
 };
 
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries,
-    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
-    entry::{ChromatogramMetadataEntry, Entry},
-    filter::select_delta_model,
-    peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
-    spectrum::{AuxiliaryArray, ChromatogramEntry},
-    writer::{ArrayBufferWriter, ArrayBufferWriterVariants, MiniPeakWriterType},
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy}, entry::ChromatogramMetadataEntry, filter::select_delta_model, peak_series::{array_map_to_schema_arrays_and_excess, MZ_ARRAY}, spectrum::{AuxiliaryArray, ChromatogramEntry}, writer::{ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder}, BufferContext, BufferName, ToMzPeakDataSeries
 };
 
 macro_rules! implement_mz_metadata {
@@ -94,27 +88,50 @@ macro_rules! implement_mz_metadata {
 
             self.append_key_value_metadata(
                 "spectrum_column_metadata_mapping",
-                Some(serde_json::to_string_pretty(&crate::spectrum::SpectrumEntry::metadata_columns()).unwrap())
+                Some(
+                    serde_json::to_string_pretty(
+                        &crate::spectrum::SpectrumEntry::metadata_columns(),
+                    )
+                    .unwrap(),
+                ),
             );
 
             self.append_key_value_metadata(
                 "scan_column_metadata_mapping",
-                Some(serde_json::to_string_pretty(&crate::spectrum::ScanEntry::metadata_columns()).unwrap())
+                Some(
+                    serde_json::to_string_pretty(&crate::spectrum::ScanEntry::metadata_columns())
+                        .unwrap(),
+                ),
             );
 
             self.append_key_value_metadata(
                 "selected_ion_column_metadata_mapping",
-                Some(serde_json::to_string_pretty(&crate::spectrum::SelectedIonEntry::metadata_columns()).unwrap())
+                Some(
+                    serde_json::to_string_pretty(
+                        &crate::spectrum::SelectedIonEntry::metadata_columns(),
+                    )
+                    .unwrap(),
+                ),
             );
 
             self.append_key_value_metadata(
                 "precursor_column_metadata_mapping",
-                Some(serde_json::to_string_pretty(&crate::spectrum::PrecursorEntry::metadata_columns()).unwrap())
+                Some(
+                    serde_json::to_string_pretty(
+                        &crate::spectrum::PrecursorEntry::metadata_columns(),
+                    )
+                    .unwrap(),
+                ),
             );
 
             self.append_key_value_metadata(
                 "chromatogram_column_metadata_mapping",
-                Some(serde_json::to_string_pretty(&crate::spectrum::ChromatogramEntry::metadata_columns()).unwrap())
+                Some(
+                    serde_json::to_string_pretty(
+                        &crate::spectrum::ChromatogramEntry::metadata_columns(),
+                    )
+                    .unwrap(),
+                ),
             );
         }
     };
@@ -137,11 +154,11 @@ pub trait AbstractMzPeakWriter {
 
     /// Get a mutable reference to the buffer of spectrum metadata values,
     /// for appending only
-    fn spectrum_entry_buffer_mut(&mut self) -> &mut Vec<Entry>;
+    fn spectrum_entry_buffer_mut(&mut self) -> &mut SpectrumBuilder;
 
     /// Get a mutable reference to the buffer of chromatogram metadata values,
     /// for appending only
-    fn chromatogram_entry_buffer_mut(&mut self) -> &mut Vec<ChromatogramMetadataEntry>;
+    fn chromatogram_entry_buffer_mut(&mut self) -> &mut ChromatogramBuilder;
 
     /// Get a mutable reference to the buffer of spectrum signal data values,
     /// for appending only
@@ -155,38 +172,10 @@ pub trait AbstractMzPeakWriter {
     /// The current number of spectra having been written to the MzPeak file
     fn spectrum_counter(&self) -> u64;
 
-    /// A mutable reference to the number of spectra having been written to the MzPeak file,
-    /// for incrementing
-    fn spectrum_counter_mut(&mut self) -> &mut u64;
-
     /// The current number of distinct precursors having been written to the MzPeak file
     fn spectrum_precursor_counter(&self) -> u64;
 
-    /// A mutable reference to the number of distinct precursors having been written to the MzPeak file,
-    /// for incrementing
-    fn spectrum_precursor_counter_mut(&mut self) -> &mut u64;
-
     fn chromatogram_counter(&self) -> u64;
-    fn chromatogram_counter_mut(&mut self) -> &mut u64;
-    fn chromatogram_precursor_counter_mut(&mut self) -> &mut u64;
-
-    /// Convert a `spectrum` into one or more [`Entry`] records describing the spectrum and its subsidiary
-    /// structures.
-    ///
-    /// This method will update internal precursor counters if needed.
-    fn spectrum_to_entries<
-        C: ToMzPeakDataSeries + CentroidLike,
-        D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
-    >(
-        &mut self,
-        spectrum: &impl SpectrumLike<C, D>,
-    ) -> Vec<Entry> {
-        Entry::from_spectrum(
-            spectrum,
-            Some(self.spectrum_counter()),
-            Some(self.spectrum_precursor_counter_mut()),
-        )
-    }
 
     fn chromatogram_to_entries(
         &mut self,
@@ -258,15 +247,7 @@ pub trait AbstractMzPeakWriter {
     fn write_chromatogram(&mut self, chromatogram: &Chromatogram) -> io::Result<()> {
         log::trace!("Writing chromatogram {}", chromatogram.id());
         let aux_arrays = self.write_chromatogram_arrays(chromatogram, &chromatogram.arrays)?;
-        let mut entries = self.chromatogram_to_entries(chromatogram);
-        if let Some(entry) = entries.first_mut() {
-            if let Some(ent) = entry.chromatogram.as_mut() {
-                ent.auxiliary_arrays.extend(aux_arrays.unwrap_or_default());
-                ent.number_of_auxiliary_arrays = ent.auxiliary_arrays.len() as u32;
-            }
-        }
-        self.chromatogram_entry_buffer_mut().extend(entries);
-        *self.chromatogram_counter_mut() += 1;
+        self.chromatogram_entry_buffer_mut().append_value(chromatogram, aux_arrays);
         self.check_data_buffer()?;
         Ok(())
     }
@@ -275,24 +256,15 @@ pub trait AbstractMzPeakWriter {
     fn write_spectrum<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
+        S: SpectrumLike<C, D> + 'static,
     >(
         &mut self,
-        spectrum: &impl SpectrumLike<C, D>,
+        spectrum: &S,
     ) -> io::Result<()> {
         log::trace!("Writing spectrum {}", spectrum.id());
         let (mz_delta_model, aux_arrays) = self.write_spectrum_data(spectrum)?;
-        let mut entries = self.spectrum_to_entries(spectrum);
-        if let Some(entry) = entries.first_mut() {
-            if let Some(spec_ent) = entry.spectrum.as_mut() {
-                spec_ent.mz_delta_model = mz_delta_model;
-                spec_ent
-                    .auxiliary_arrays
-                    .extend(aux_arrays.unwrap_or_default());
-                spec_ent.number_of_auxiliary_arrays = spec_ent.auxiliary_arrays.len() as u32;
-            }
-        }
-        self.spectrum_entry_buffer_mut().extend(entries);
-        *self.spectrum_counter_mut() += 1;
+        self.spectrum_entry_buffer_mut()
+            .append_value(spectrum, mz_delta_model, aux_arrays);
         self.check_data_buffer()?;
         Ok(())
     }
@@ -462,7 +434,8 @@ pub trait AbstractMzPeakWriter {
             }
             Ok((None, Some(auxiliary_arrays)))
         } else {
-            self.spectrum_data_buffer_mut().add(spectrum_count, spectrum_time, peaks);
+            self.spectrum_data_buffer_mut()
+                .add(spectrum_count, spectrum_time, peaks);
             Ok((None, None))
         }
     }

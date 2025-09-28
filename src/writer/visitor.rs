@@ -2,27 +2,29 @@ use std::{fmt::Debug, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder,
-        Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, NullBuilder, StructArray,
-        UInt8Builder, UInt32Builder, UInt64Builder,
+        ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder, Int8Builder, LargeListBuilder, LargeStringBuilder, NullBuilder, StructArray, UInt32Builder, UInt64Builder, UInt8Builder
     },
-    datatypes::{DataType, Field, FieldRef},
+    datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
 use mzdata::{
     params::Unit,
     prelude::*,
-    spectrum::{ScanPolarity, SpectrumDescription},
+    spectrum::{Chromatogram, ScanPolarity, SpectrumDescription},
 };
 
 use crate::spectrum::AuxiliaryArray;
 
 pub trait VisitorBase: Debug {
-    fn schema(&self) -> Vec<FieldRef>;
+    fn fields(&self) -> Vec<FieldRef>;
+
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(self.fields()))
+    }
 
     fn append_null(&mut self);
 
     fn as_struct_type(&self) -> DataType {
-        DataType::Struct(self.schema().into())
+        DataType::Struct(self.fields().into())
     }
 }
 
@@ -151,7 +153,7 @@ impl CustomBuilderFromParameter {
 }
 
 impl VisitorBase for CustomBuilderFromParameter {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![self.field.clone()]
     }
 
@@ -276,7 +278,7 @@ pub struct CURIEBuilder {
 }
 
 impl VisitorBase for CURIEBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!("cv_id", DataType::UInt8),
             field!("accession", DataType::UInt32),
@@ -311,7 +313,7 @@ impl ArrayBuilder for CURIEBuilder {
 
     fn finish(&mut self) -> ArrayRef {
         Arc::new(StructArray::new(
-            self.schema().into(),
+            self.fields().into(),
             vec![
                 Arc::new(self.cv_id.finish()),
                 Arc::new(self.accession.finish()),
@@ -322,7 +324,7 @@ impl ArrayBuilder for CURIEBuilder {
 
     fn finish_cloned(&self) -> ArrayRef {
         Arc::new(StructArray::new(
-            self.schema().into(),
+            self.fields().into(),
             vec![
                 Arc::new(self.cv_id.finish_cloned()),
                 Arc::new(self.accession.finish_cloned()),
@@ -343,7 +345,7 @@ pub struct ParamValueBuilder {
 }
 
 impl VisitorBase for ParamValueBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         let fields = vec![
             Arc::new(Field::new("integer", DataType::Int64, true)),
             Arc::new(Field::new("float", DataType::Float64, true)),
@@ -420,7 +422,7 @@ impl ArrayBuilder for ParamValueBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.integer.finish()),
             Arc::new(self.float.finish()),
@@ -431,7 +433,7 @@ impl ArrayBuilder for ParamValueBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.integer.finish_cloned()),
             Arc::new(self.float.finish_cloned()),
@@ -463,7 +465,7 @@ pub struct ParamBuilder {
 }
 
 impl VisitorBase for ParamBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!("value", self.value.as_struct_type()),
             field!("curie", self.curie.as_struct_type()),
@@ -505,7 +507,7 @@ impl ArrayBuilder for ParamBuilder {
 
     fn finish(&mut self) -> ArrayRef {
         Arc::new(StructArray::new(
-            self.schema().into(),
+            self.fields().into(),
             vec![
                 self.value.finish(),
                 self.curie.finish(),
@@ -518,7 +520,7 @@ impl ArrayBuilder for ParamBuilder {
 
     fn finish_cloned(&self) -> ArrayRef {
         Arc::new(StructArray::new(
-            self.schema().into(),
+            self.fields().into(),
             vec![
                 self.value.finish_cloned(),
                 self.curie.finish_cloned(),
@@ -596,7 +598,7 @@ where
 }
 
 impl VisitorBase for ParamListBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![field!(
             "parameters",
             DataType::LargeList(field!("item", self.0.values_ref().as_struct_type()))
@@ -617,13 +619,13 @@ pub struct ScanWindowBuilder {
 }
 
 impl VisitorBase for ScanWindowBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("lower_limit", DataType::Float32),
             field!("upper_limit", DataType::Float32),
             field!("unit", self.unit.as_struct_type()),
         ];
-        fields.extend(self.parameters.schema());
+        fields.extend(self.parameters.fields());
         fields
     }
 
@@ -651,7 +653,7 @@ impl ArrayBuilder for ScanWindowBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let arrays = vec![
             finish_it!(self.lower_limit),
             finish_it!(self.upper_limit),
@@ -663,7 +665,7 @@ impl ArrayBuilder for ScanWindowBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let arrays = vec![
             Arc::new(self.lower_limit.finish_cloned()),
             Arc::new(self.upper_limit.finish_cloned()),
@@ -693,7 +695,7 @@ pub struct ScanBuilder {
 }
 
 impl VisitorBase for ScanBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("spectrum_index", DataType::UInt64),
             field!("scan_start_time", DataType::Float32),
@@ -704,7 +706,7 @@ impl VisitorBase for ScanBuilder {
             field!("ion_mobility_type", self.ion_mobility_type.as_struct_type()),
             field!("instrument_configuration_ref", DataType::UInt32),
         ];
-        fields.extend(self.parameters.schema());
+        fields.extend(self.parameters.fields());
         fields.push(field!(
             "scan_windows",
             DataType::LargeList(field!(
@@ -713,7 +715,7 @@ impl VisitorBase for ScanBuilder {
             ))
         ));
         for e in self.extra.iter() {
-            fields.extend(e.schema());
+            fields.extend(e.fields());
         }
         fields
     }
@@ -773,7 +775,7 @@ impl ArrayBuilder for ScanBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let schema = self.schema();
+        let schema = self.fields();
         let mut arrays: Vec<ArrayRef> = vec![
             finish_it!(self.spectrum_index),
             finish_it!(self.scan_start_time),
@@ -793,7 +795,7 @@ impl ArrayBuilder for ScanBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let schema = self.schema();
+        let schema = self.fields();
         let mut arrays: Vec<ArrayRef> = vec![
             finish_cloned!(self.spectrum_index),
             finish_cloned!(self.scan_start_time),
@@ -830,7 +832,7 @@ impl ArrayBuilder for IsolationWindowBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let schema = self.schema();
+        let schema = self.fields();
         let arrays: Vec<ArrayRef> = vec![
             finish_it!(self.target),
             finish_it!(self.lower_bound),
@@ -842,7 +844,7 @@ impl ArrayBuilder for IsolationWindowBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let schema = self.schema();
+        let schema = self.fields();
         let arrays: Vec<ArrayRef> = vec![
             finish_cloned!(self.target),
             finish_cloned!(self.lower_bound),
@@ -865,13 +867,13 @@ impl StructVisitor<mzdata::spectrum::IsolationWindow> for IsolationWindowBuilder
 }
 
 impl VisitorBase for IsolationWindowBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("target", DataType::Float32),
             field!("lower_bound", DataType::Float32),
             field!("upper_bound", DataType::Float32),
         ];
-        fields.extend(self.parameters.schema());
+        fields.extend(self.parameters.fields());
         fields
     }
 
@@ -897,7 +899,7 @@ impl ArrayBuilder for ActivationBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let mut arrays = vec![self.parameters.finish()];
 
         for e in self.extra.iter_mut() {
@@ -907,7 +909,7 @@ impl ArrayBuilder for ActivationBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let mut arrays = vec![self.parameters.finish_cloned()];
 
         for e in self.extra.iter() {
@@ -946,10 +948,10 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
 }
 
 impl VisitorBase for ActivationBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
-        let mut fields = self.parameters.schema();
+    fn fields(&self) -> Vec<FieldRef> {
+        let mut fields = self.parameters.fields();
         for e in self.extra.iter() {
-            fields.extend(e.schema());
+            fields.extend(e.fields());
         }
         fields
     }
@@ -974,7 +976,7 @@ impl ArrayBuilder for PrecursorBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
 
         let arrays = vec![
             finish_it!(self.spectrum_index),
@@ -987,7 +989,7 @@ impl ArrayBuilder for PrecursorBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
 
         let arrays = vec![
             finish_cloned!(self.spectrum_index),
@@ -1015,7 +1017,7 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::Precursor)> for PrecursorBuilde
 }
 
 impl VisitorBase for PrecursorBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!("spectrum_index", DataType::UInt64),
             field!("precursor_index", DataType::UInt64),
@@ -1051,7 +1053,7 @@ impl ArrayBuilder for SelectedIonBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
 
         let mut arrays = vec![
             finish_it!(self.spectrum_index),
@@ -1072,7 +1074,7 @@ impl ArrayBuilder for SelectedIonBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
 
         let mut arrays = vec![
             finish_cloned!(self.spectrum_index),
@@ -1137,7 +1139,7 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::SelectedIon)> for SelectedIonBu
 }
 
 impl VisitorBase for SelectedIonBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("spectrum_index", DataType::UInt64),
             field!("precursor_index", DataType::UInt64),
@@ -1147,9 +1149,9 @@ impl VisitorBase for SelectedIonBuilder {
             field!("ion_mobility", DataType::Float64),
             field!("ion_mobility_type", self.ion_mobility_type.as_struct_type()),
         ];
-        fields.extend(self.parameters.schema());
+        fields.extend(self.parameters.fields());
         for e in self.extra.iter() {
-            fields.extend(e.schema());
+            fields.extend(e.fields());
         }
         fields
     }
@@ -1199,7 +1201,7 @@ impl Default for AuxiliaryArrayBuilder {
 }
 
 impl VisitorBase for AuxiliaryArrayBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!(
                 "data",
@@ -1207,6 +1209,7 @@ impl VisitorBase for AuxiliaryArrayBuilder {
             ),
             field!("name", self.name.as_struct_type()),
             field!("data_type", self.data_type.as_struct_type()),
+            field!("compression", self.compression.as_struct_type()),
             field!("unit", self.unit.as_struct_type()),
             field!(
                 "parameters",
@@ -1236,7 +1239,8 @@ impl StructVisitor<AuxiliaryArray> for AuxiliaryArrayBuilder {
         self.data.append(true);
         self.name.append_value(&item.name);
         self.data_type.append_value(&item.data_type);
-        self.compression.append_option(item.unit.as_ref());
+        self.compression.append_value(&item.compression);
+        self.unit.append_option(item.unit.as_ref());
         self.parameters.append_value(&item.parameters.as_slice());
         self.data_processing_ref
             .append_option(item.data_processing_ref.as_ref());
@@ -1252,12 +1256,13 @@ impl ArrayBuilder for AuxiliaryArrayBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
 
         let arrays: Vec<ArrayRef> = vec![
             finish_it!(self.data),
             self.name.finish(),
             self.data_type.finish(),
+            self.compression.finish(),
             self.unit.finish(),
             finish_it!(self.parameters),
             finish_it!(self.data_processing_ref),
@@ -1267,12 +1272,13 @@ impl ArrayBuilder for AuxiliaryArrayBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
 
         let arrays: Vec<ArrayRef> = vec![
             finish_cloned!(self.data),
             self.name.finish_cloned(),
             self.data_type.finish_cloned(),
+            self.compression.finish_cloned(),
             self.unit.finish_cloned(),
             finish_cloned!(self.parameters),
             finish_cloned!(self.data_processing_ref),
@@ -1319,9 +1325,9 @@ impl StructVisitor<SpectrumDescription> for SpectrumVisitor {
 }
 
 impl VisitorBase for SpectrumVisitor {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         match self {
-            SpectrumVisitor::Description(struct_visitor_builder) => struct_visitor_builder.schema(),
+            SpectrumVisitor::Description(struct_visitor_builder) => struct_visitor_builder.fields(),
         }
     }
 
@@ -1361,7 +1367,7 @@ pub struct SpectrumDetailsBuilder {
 }
 
 impl VisitorBase for SpectrumDetailsBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("index", DataType::UInt64),
             field!("id", DataType::LargeUtf8),
@@ -1406,7 +1412,7 @@ impl VisitorBase for SpectrumDetailsBuilder {
         ];
 
         for e in self.extra.iter() {
-            fields.extend(e.schema());
+            fields.extend(e.fields());
         }
         fields
     }
@@ -1540,7 +1546,6 @@ impl SpectrumDetailsBuilder {
         };
 
         for e in self.extra.iter_mut() {
-            eprintln!("\nEvaluating extra {e:?}");
             match e {
                 SpectrumVisitor::Description(builder) => {
                     builder.append_value(item.description());
@@ -1560,7 +1565,7 @@ impl ArrayBuilder for SpectrumDetailsBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let schema = self.schema();
+        let schema = self.fields();
 
         let mut arrays: Vec<ArrayRef> = vec![
             finish_it!(self.index),
@@ -1594,7 +1599,7 @@ impl ArrayBuilder for SpectrumDetailsBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        let schema = self.schema();
+        let schema = self.fields();
 
         let mut arrays: Vec<ArrayRef> = vec![
             finish_cloned!(self.index),
@@ -1697,10 +1702,18 @@ impl SpectrumBuilder {
     ) {
         self.scan.extra.push(Box::new(visitor));
     }
+
+    pub fn index_counter(&self) -> u64 {
+        self.spectrum_index_counter
+    }
+
+    pub fn precursor_index_counter(&self) -> u64 {
+        self.precursor_index_counter
+    }
 }
 
 impl VisitorBase for SpectrumBuilder {
-    fn schema(&self) -> Vec<FieldRef> {
+    fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!("spectrum", self.spectrum.as_struct_type()),
             field!("scan", self.scan.as_struct_type()),
@@ -1725,7 +1738,7 @@ impl ArrayBuilder for SpectrumBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        let fields = self.schema();
+        let fields = self.fields();
         let n = self
             .spectrum
             .len()
@@ -1763,6 +1776,254 @@ impl ArrayBuilder for SpectrumBuilder {
         todo!()
     }
 }
+
+#[derive(Debug, Default)]
+pub struct ChromatogramDetailsBuilder {
+    index: UInt64Builder,
+    id: LargeStringBuilder,
+    polarity: Int8Builder,
+    chromatogram_type: CURIEBuilder,
+
+    data_processing_ref: UInt32Builder,
+    parameters: ParamListBuilder,
+    auxiliary_arrays: LargeListBuilder<AuxiliaryArrayBuilder>,
+    number_of_auxiliary_arrays: UInt32Builder,
+
+    extra: Vec<Box<dyn StructVisitorBuilder<Chromatogram>>>,
+}
+
+impl ChromatogramDetailsBuilder {
+    fn append_value(&mut self, index: u64, item: &Chromatogram, auxiliary_arrays: Option<Vec<AuxiliaryArray>>) -> bool {
+        self.index.append_value(index);
+        self.id.append_value(item.id());
+        self.polarity.append_value(match item.polarity() {
+            ScanPolarity::Positive => 1,
+            ScanPolarity::Negative => -1,
+            ScanPolarity::Unknown => 0,
+        });
+        self.chromatogram_type.append_value(&item.chromatogram_type().to_curie());
+        self.data_processing_ref.append_null();
+        let b = self.parameters.as_mut().values();
+        for param in item.params() {
+            b.append_value(param);
+        }
+        self.parameters.as_mut().append(true);
+        if let Some(aux_arrays) = auxiliary_arrays {
+            self.number_of_auxiliary_arrays.append_value(aux_arrays.len() as u32);
+            let b = self.auxiliary_arrays.values();
+            for a in aux_arrays {
+                b.append_value(&a);
+            }
+            self.auxiliary_arrays.append(true);
+        } else {
+            self.number_of_auxiliary_arrays.append_value(0);
+            self.auxiliary_arrays.append_null();
+        }
+
+        for e in self.extra.iter_mut() {
+            e.append_value(item);
+        }
+
+        true
+    }
+}
+
+impl VisitorBase for ChromatogramDetailsBuilder {
+    fn fields(&self) -> Vec<FieldRef> {
+        let mut fields = vec![
+            field!("index", DataType::UInt64),
+            field!("id", DataType::LargeUtf8),
+            field!("polarity", DataType::Int8),
+            field!("chromatogram_type", self.chromatogram_type.as_struct_type()),
+            field!("data_processing_ref", DataType::UInt32),
+        ];
+        fields.extend(self.parameters.fields());
+        fields.extend([
+            field!(
+                "auxiliary_arrays",
+                DataType::LargeList(field!(
+                    "item",
+                    self.auxiliary_arrays.values_ref().as_struct_type()
+                ))
+            ),
+            field!("number_of_auxiliary_arrays", DataType::UInt32),
+        ]);
+        for e in self.extra.iter() {
+            fields.extend(e.fields())
+        }
+        fields
+    }
+
+    fn append_null(&mut self) {
+        self.index.append_null();
+        self.id.append_null();
+        self.polarity.append_null();
+        self.chromatogram_type.append_null();
+        self.data_processing_ref.append_null();
+        self.auxiliary_arrays.append_null();
+        self.number_of_auxiliary_arrays.append_null();
+        for e in self.extra.iter_mut() {
+            e.append_null();
+        }
+    }
+}
+
+impl ArrayBuilder for ChromatogramDetailsBuilder {
+    anyways!();
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        let fields = self.fields();
+
+        let mut arrays = vec![
+            finish_it!(self.index),
+            finish_it!(self.id),
+            finish_it!(self.polarity),
+            self.chromatogram_type.finish(),
+            finish_it!(self.data_processing_ref),
+            self.parameters.finish(),
+            finish_it!(self.auxiliary_arrays),
+            finish_it!(self.number_of_auxiliary_arrays)
+        ];
+
+        for e in self.extra.iter_mut() {
+            arrays.push(e.finish());
+        }
+
+        Arc::new(StructArray::new(fields.into(), arrays, None))
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        let fields = self.fields();
+
+        let mut arrays = vec![
+            finish_cloned!(self.index),
+            finish_cloned!(self.id),
+            finish_cloned!(self.polarity),
+            self.chromatogram_type.finish_cloned(),
+            finish_cloned!(self.data_processing_ref),
+            self.parameters.finish_cloned(),
+            finish_cloned!(self.auxiliary_arrays),
+            finish_cloned!(self.number_of_auxiliary_arrays)
+        ];
+
+        for e in self.extra.iter() {
+            arrays.push(e.finish_cloned());
+        }
+
+        Arc::new(StructArray::new(fields.into(), arrays, None))
+    }
+}
+
+
+#[derive(Default, Debug)]
+pub struct ChromatogramBuilder {
+    chromatogram_index_counter: u64,
+    precursor_index_counter: u64,
+    chromatogram: ChromatogramDetailsBuilder,
+    precursor: PrecursorBuilder,
+    selected_ion: SelectedIonBuilder,
+}
+
+impl VisitorBase for ChromatogramBuilder {
+    fn fields(&self) -> Vec<FieldRef> {
+        vec![
+            field!("chromatogram", self.chromatogram.as_struct_type()),
+            field!("precursor", self.precursor.as_struct_type()),
+            field!("selected_ion", self.selected_ion.as_struct_type())
+        ]
+    }
+
+    fn append_null(&mut self) {
+        self.chromatogram.append_null();
+        self.precursor.append_null();
+        self.selected_ion.append_null();
+    }
+}
+
+impl ChromatogramBuilder {
+    pub fn append_value(
+        &mut self,
+        item: &Chromatogram,
+        auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
+    ) -> bool {
+        let out = self.chromatogram.append_value(
+            self.chromatogram_index_counter,
+            item,
+            auxiliary_arrays,
+        );
+        for precursor in item.precursor_iter() {
+            self.precursor.append_value(&(
+                self.chromatogram_index_counter,
+                self.precursor_index_counter,
+                precursor,
+            ));
+            for ion in precursor.iter() {
+                self.selected_ion.append_value(&(
+                    self.chromatogram_index_counter,
+                    self.precursor_index_counter,
+                    ion,
+                ));
+            }
+            self.precursor_index_counter += 1;
+        }
+        self.chromatogram_index_counter += 1;
+        out
+    }
+
+    pub fn index_counter(&self) -> u64 {
+        self.chromatogram_index_counter
+    }
+
+    pub fn precursor_index_counter(&self) -> u64 {
+        self.precursor_index_counter
+    }
+}
+
+impl ArrayBuilder for ChromatogramBuilder {
+    fn len(&self) -> usize {
+        self.chromatogram.len()
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        let fields = self.fields();
+        let n = self
+            .chromatogram
+            .len()
+            .max(self.precursor.len())
+            .max(self.selected_ion.len());
+
+        while n > self.chromatogram.len() {
+            self.chromatogram.append_null();
+        }
+
+        while n > self.precursor.len() {
+            self.precursor.append_null();
+        }
+
+        while n > self.selected_ion.len() {
+            self.selected_ion.append_null();
+        }
+
+        let arrays = vec![
+            self.chromatogram.finish(),
+            self.precursor.finish(),
+            self.selected_ion.finish(),
+        ];
+
+        Arc::new(StructArray::new(fields.into(), arrays, None))
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        todo!()
+    }
+
+    anyways!();
+}
+
 
 #[cfg(test)]
 mod test {

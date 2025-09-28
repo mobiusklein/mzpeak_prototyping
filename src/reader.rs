@@ -1253,7 +1253,6 @@ impl<
         results
     }
 
-    #[allow(unused)]
     pub(crate) fn load_auxiliary_arrays_for_chromatogram(
         &self,
         index: u64,

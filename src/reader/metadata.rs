@@ -5,9 +5,9 @@ use crate::{
     buffer_descriptors::{ArrayIndex, SerializedArrayIndex},
     filter::RegressionDeltaModel,
     param::MetadataColumn,
-    reader::index::{QueryIndex, SpectrumPointIndex},
+    reader::{index::{QueryIndex, SpectrumPointIndex}, visitor::{metadata_columns_to_definition_map, schema_to_metadata_cols}},
 };
-use arrow::array::{Array, AsArray, UInt64Array};
+use arrow::{array::{Array, AsArray, UInt64Array}, datatypes::DataType};
 use mzdata::{io::OffsetIndex, meta, prelude::*};
 use parquet::{
     arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -183,10 +183,35 @@ pub(crate) fn load_indices_from(
     let mut mz_metadata: meta::FileMetadataConfig = Default::default();
     let mut spectrum_array_indices: ArrayIndex = Default::default();
     let mut chromatogram_array_indices: ArrayIndex = Default::default();
+
     let mut spectrum_metadata_mapping = None;
     let mut scan_metadata_mapping = None;
     let mut selected_ion_metadata_mapping = None;
     let mut chromatogram_metadata_mapping = None;
+
+
+    let arrow_schema = spectrum_metadata_reader.schema();
+    if let Ok(root) = arrow_schema.field_with_name("spectrum") {
+        if let DataType::Struct(fields) = root.data_type() {
+            let defaults = crate::spectrum::SpectrumEntry::metadata_columns();
+            let defined_columns = metadata_columns_to_definition_map(defaults);
+            spectrum_metadata_mapping = Some(schema_to_metadata_cols(fields, "spectrum".into(), Some(&defined_columns)));
+        }
+    }
+    if let Ok(root) = arrow_schema.field_with_name("scan") {
+        if let DataType::Struct(fields) = root.data_type() {
+            let defaults = crate::spectrum::ScanEntry::metadata_columns();
+            let defined_columns = metadata_columns_to_definition_map(defaults);
+            scan_metadata_mapping = Some(schema_to_metadata_cols(fields, "scan".into(), Some(&defined_columns)));
+        }
+    }
+    if let Ok(root) = arrow_schema.field_with_name("selected_ion") {
+        if let DataType::Struct(fields) = root.data_type() {
+            let defaults = crate::spectrum::SelectedIonEntry::metadata_columns();
+            let defined_columns = metadata_columns_to_definition_map(defaults);
+            selected_ion_metadata_mapping = Some(schema_to_metadata_cols(fields, "selected_ion".into(), Some(&defined_columns)));
+        }
+    }
 
     for kv in spectrum_metadata_reader
         .metadata()
@@ -257,24 +282,6 @@ pub(crate) fn load_indices_from(
                     log::warn!("run was empty")
                 }
             }
-            "spectrum_column_metadata_mapping" => {
-                if let Some(val) = kv.value.as_ref() {
-                    let metacols: Vec<MetadataColumn> = serde_json::from_str(&val)?;
-                    spectrum_metadata_mapping = Some(metacols);
-                }
-            }
-            "scan_column_metadata_mapping" => {
-                if let Some(val) = kv.value.as_ref() {
-                    let metacols: Vec<MetadataColumn> = serde_json::from_str(&val)?;
-                    scan_metadata_mapping = Some(metacols);
-                }
-            }
-            "selected_ion_column_metadata_mapping" => {
-                if let Some(val) = kv.value.as_ref() {
-                    let metacols: Vec<MetadataColumn> = serde_json::from_str(&val)?;
-                    selected_ion_metadata_mapping = Some(metacols);
-                }
-            }
             "chromatogram_column_metadata_mapping" => {
                 if let Some(val) = kv.value.as_ref() {
                     let metacols: Vec<MetadataColumn> = serde_json::from_str(&val)?;
@@ -314,6 +321,16 @@ pub(crate) fn load_indices_from(
     query_index.populate_spectrum_data_indices(&spectrum_data_reader, &spectrum_array_indices);
 
     if let Ok(chromatogram_metadata_reader) = handle.chromatograms_metadata() {
+
+        let arrow_schema = chromatogram_metadata_reader.schema();
+        if let Ok(root) = arrow_schema.field_with_name("chromatogram") {
+            if let DataType::Struct(fields) = root.data_type() {
+                let defaults = crate::spectrum::ChromatogramEntry::metadata_columns();
+                let defined_columns = metadata_columns_to_definition_map(defaults);
+                chromatogram_metadata_mapping = Some(schema_to_metadata_cols(fields, "chromatogram".into(), Some(&defined_columns)));
+            }
+        }
+
         for kv in chromatogram_metadata_reader
             .metadata()
             .file_metadata()
@@ -322,12 +339,6 @@ pub(crate) fn load_indices_from(
             .flatten()
         {
             match kv.key.as_str() {
-                "chromatogram_column_metadata_mapping" => {
-                    if let Some(val) = kv.value.as_ref() {
-                        let metacols: Vec<MetadataColumn> = serde_json::from_str(&val)?;
-                        chromatogram_metadata_mapping = Some(metacols);
-                    }
-                }
                 _ => {}
             }
         }
