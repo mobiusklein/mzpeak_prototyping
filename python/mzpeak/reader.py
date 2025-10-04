@@ -5,8 +5,8 @@ import zlib
 
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterable
-from typing import IO
+from collections.abc import Iterable, Sequence
+from typing import IO, Any, Iterator
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
-def value_normalize(val: dict):
+def _value_normalize(val: dict):
     for v in val.values():
         if v is not None:
             return v
@@ -46,7 +46,7 @@ def _format_curie(curie: dict):
 
 def _format_param(param: dict):
     param = param.copy()
-    param["value"] = value_normalize(param["value"])
+    param["value"] = _value_normalize(param["value"])
     param['accession'] = _format_curie(param['accession'])
     if param.get('unit'):
         param["unit"] = _format_curie(param["unit"])
@@ -94,7 +94,10 @@ def _format_curies_batch(bat: pa.RecordBatch) -> pa.RecordBatch:
     return bat
 
 
-class AuxiliaryArrayDecoder:
+class _AuxiliaryArrayDecoder:
+    """
+    A helper class for decoding extra arrays packed in with the metadata table.
+    """
     compression = {
         "MS:1000576": lambda x: x,
         "MS:1000574": zlib.decompress,
@@ -103,7 +106,12 @@ class AuxiliaryArrayDecoder:
         'MS:1002312': pynumpress.decode_linear,
     }
 
-    dtypes = {"MS:1000519": np.int32, 'MS:1000521': np.float32, "MS:1000522": np.int64, "MS:1000523": np.float64, }
+    dtypes = {
+        "MS:1000519": np.int32,
+        'MS:1000521': np.float32,
+        "MS:1000522": np.int64,
+        "MS:1000523": np.float64,
+    }
     ascii_code = "MS:1001479"
 
     @classmethod
@@ -127,12 +135,51 @@ class AuxiliaryArrayDecoder:
 
 @dataclass
 class AuxiliaryArray:
+    """
+    An extra array that was not registered as globally as part of the data schema
+    that has been decoded.
+
+    Attributes
+    ----------
+    name : str
+        The name of the array
+    values : np.ndarray
+        The decoded data associated with the array
+    parameters : list[dict]
+        The parameters, controlled or otherwise, not already covered by the decoded array attributes
+    """
     name: str
     values: np.ndarray
     parameters: list[dict]
 
 
 class MzPeakSpectrumMetadataReader:
+    """
+    A reader for spectrum metadata in an mzPeak file.
+
+    Attributes
+    ----------
+    handle : :class:`pyarrow.parquet.ParquetFile`
+        The underlying Parquet file reader
+    meta : :class:`pyarrow.parquet.FileMetaData`
+        The metadata segment of the underlying Parquet file
+    num_spectra : int
+        The number of distinct spectra in the metadata table
+    spectra : :class:`pandas.DataFrame`
+        A data frame holding spectrum-level metadata like MS level, scan time, centroid status,
+        and polarity.
+    id_index : :class:`pandas.Series`
+        A series mapping spectrum ID to index
+    precursors : :class:`pandas.DataFrame`
+        A data frame holding precursor-level metadata like precursor scan ID, isolation window,
+        and activation parameters. See :attr:`MzPeakFile.selected_ions` for ion-level information.
+    selected_ions : :class:`pandas.Dataframe`
+        A data frame holding selected ions connected to precursors and spectra including selected
+        ion m/z, charge, intensity, and possibly ion mobility.
+    scans : :class:`pandas.Dataframe`
+        A data frame holding scan-level metadata like scan start time, injection time, filter strings
+        and scan ranges.
+    """
     handle: pq.ParquetFile
     meta: pq.FileMetaData
     num_spectra: int
@@ -300,7 +347,7 @@ class MzPeakSpectrumMetadataReader:
         spec["index"] = i
         if 'auxiliary_arrays' in spec:
             for v in spec.pop("auxiliary_arrays"):
-                v = AuxiliaryArrayDecoder.decode(v)
+                v = _AuxiliaryArrayDecoder.decode(v)
                 spec[v.name] = v.values
         return spec
 
@@ -456,12 +503,15 @@ class MzPeakChromatogramMetadataReader:
         spec["index"] = i
         if "auxiliary_arrays" in spec:
             for v in spec.pop("auxiliary_arrays"):
-                v = AuxiliaryArrayDecoder.decode(v)
+                v = _AuxiliaryArrayDecoder.decode(v)
                 spec[v.name] = v.values
         return spec
 
 
-class MzPeakFileIter:
+_SpectrumType = dict[str, Any]
+
+
+class MzPeakFileIter(Iterator[_SpectrumType]):
     archive: "MzPeakFile"
     index: int
     buffer_format: BufferFormat
@@ -525,8 +575,60 @@ class MzPeakFileIter:
         return f"{self.__class__.__name__}({self.index}, {self.archive})"
 
 
-class MzPeakFile:
-    archive: zipfile.ZipFile
+class MzPeakFile(Sequence[_SpectrumType]):
+    """
+    An mzPeak reader for mass spectra, chromatograms, and other
+    data types.
+
+    This may be initialized from a path to a packed zip archive
+    or an unpacked directory.
+
+    This type is an :class:`Iterable` over spectra with support
+    for point and slicing access.
+
+    Attributes
+    ----------
+    spectrum_data : :class:`~.MzPeakArrayDataReader`
+        The facet of the data file for reading spectrum signal data from. This
+        may be profile or centroid data, depending upon what was stored in the
+        file.
+    spectrum_metadata : :class:`~.MzPeakSpectrumMetadataReader`
+        The facet of the data file for reading spectrum descriptive metadata,
+        like scan time, MS level, precursor information, et cetera. Should not
+        be necessary to interact with this attribute directly. Instead, see
+        :attr:`MzPeakFile.spectra`, :attr:`MzPeakFile.precursors`, :attr:`MzPeakFile.scans`
+        and :attr:`MzPeakFile.selected_ions`.
+    spectrum_peak_data : :class:`~.MzPeakArrayDataReader` or :const:`None`
+        The facet of the data file for reading explicitly stored spectrum centroid
+        data from. This will only be present if the file was written with a separate
+        centroid stream to store both centroids and profile data side-by-side, as
+        in some instrument vendor formats.
+    chromatogram_data : :class:`~.MzPeakArrayDataReader` or :const:`None`
+        The facet of the data file for reading chromatogram signal data from. This
+        will only be present if the writer specifically writes chromatogram data.
+    chromatogram_metadata : :class:`~.MzPeakChromatogramMetadataReader`
+        The facet of the data file for reading chromatogram descriptive metadata.
+        Should not be necessary to interact with this attribute directly. Instead, see
+        :attr:`MzPeakFile.chromatograms`
+    file_metadata: dict[str, Any]
+        TODO: document this
+    spectra : :class:`pandas.DataFrame`
+        A data frame holding spectrum-level metadata like MS level, scan time, centroid status,
+        and polarity.
+    precursors : :class:`pandas.DataFrame`
+        A data frame holding precursor-level metadata like precursor scan ID, isolation window,
+        and activation parameters. See :attr:`MzPeakFile.selected_ions` for ion-level information.
+    selected_ions : :class:`pandas.Dataframe`
+        A data frame holding selected ions connected to precursors and spectra including selected
+        ion m/z, charge, intensity, and possibly ion mobility.
+    scans : :class:`pandas.Dataframe`
+        A data frame holding scan-level metadata like scan start time, injection time, filter strings
+        and scan ranges.
+    chromatograms : :class:`pandas.DataFrame` or :const:`None`
+        A data frame holding chromatogram-level metadata. This will only be present if
+        :attr:`chromatogram_metadata` is present.
+    """
+    _archive: zipfile.ZipFile | Path
 
     spectrum_data: MzPeakArrayDataReader
     spectrum_metadata: MzPeakSpectrumMetadataReader
@@ -535,36 +637,83 @@ class MzPeakFile:
     chromatogram_metadata: MzPeakChromatogramMetadataReader | None = None
     chromatogram_data: MzPeakArrayDataReader | None = None
 
-    def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
-        if isinstance(path, zipfile.ZipFile):
-            self.archive = path
-        else:
-            self.archive = zipfile.ZipFile(path)
-        for f in self.archive.filelist:
+    file_metadata: dict[str, Any]
+
+    @property
+    def filename(self) -> str | None:
+        '''The name of the data file'''
+        if isinstance(self._archive, Path):
+            return self._archive.name
+        elif isinstance(self._archive, zipfile.ZipFile):
+            return self._archive.filename
+
+    def _from_directory(self, path: Path):
+        self._archive = path
+        for f in path.glob("*mzpeak"):
+            if not f.is_file():
+                continue
+            if f.name.endswith("spectra_data.mzpeak"):
+                self.spectrum_data = MzPeakArrayDataReader(
+                    pa.OSFile(f),
+                    namespace="spectrum",
+                )
+            elif f.name.endswith("spectra_metadata.mzpeak"):
+                self.spectrum_metadata = MzPeakSpectrumMetadataReader(
+                    pa.OSFile(f),
+                )
+            elif f.name.endswith("spectra_peaks.mzpeak"):
+                self.spectrum_peak_data = MzPeakArrayDataReader(
+                    pa.OSFile(f),
+                    namespace="spectrum",
+                )
+            elif f.name.endswith("chromatograms_metadata.mzpeak"):
+                self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
+                    pa.OSFile(f)
+                )
+            elif f.name.endswith("chromatograms_data.mzpeak"):
+                self.chromatogram_data = MzPeakArrayDataReader(
+                    pa.OSFile(f),
+                    namespace="chromatogram",
+                )
+
+    def _from_zip_archive(self, archive: zipfile.ZipFile):
+        self._archive = archive
+        for f in archive.filelist:
             if f.filename.endswith("spectra_data.mzpeak"):
                 self.spectrum_data = MzPeakArrayDataReader(
-                    pa.PythonFile(self.archive.open(f)),
+                    pa.PythonFile(archive.open(f)),
                     namespace="spectrum",
                 )
             elif f.filename.endswith("spectra_metadata.mzpeak"):
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
-                    pa.PythonFile(self.archive.open(f)),
+                    pa.PythonFile(archive.open(f)),
                 )
             elif f.filename.endswith("spectra_peaks.mzpeak"):
                 self.spectrum_peak_data = MzPeakArrayDataReader(
-                    pa.PythonFile(self.archive.open(f)),
+                    pa.PythonFile(archive.open(f)),
                     namespace="spectrum",
                 )
             elif f.filename.endswith("chromatograms_metadata.mzpeak"):
                 self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
-                    pa.PythonFile(self.archive.open(f))
+                    pa.PythonFile(archive.open(f))
                 )
             elif f.filename.endswith("chromatograms_data.mzpeak"):
                 self.chromatogram_data = MzPeakArrayDataReader(
-                    pa.PythonFile(self.archive.open(f)),
+                    pa.PythonFile(archive.open(f)),
                     namespace="chromatogram",
                 )
 
+    def _from_path(self, path: Path):
+        if path.is_dir():
+            self._from_directory(path)
+        else:
+            archive = zipfile.ZipFile(path)
+            self._from_zip_archive(archive)
+
+    def spectra_signal_for_indices(self, index_range: slice | list[int]) -> dict[str, np.ndarray]:
+        return self.spectrum_data.read_data_for_range(index_range)
+
+    def _init_metadata(self):
         metadata = {}
         if self.spectrum_metadata:
             for k, v in self.spectrum_metadata.meta.metadata.items():
@@ -580,7 +729,19 @@ class MzPeakFile:
                 self.spectrum_metadata._get_mz_delta_model()
             )
 
-    def read_spectrum(self, index: int | str | Iterable[int | str] | slice):
+    def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
+        if isinstance(path, zipfile.ZipFile):
+            self._from_zip_archive(self._archive)
+        elif isinstance(path, (str, Path)):
+            self._from_path(Path(path))
+        else:
+            self._from_zip_archive(zipfile.ZipFile(path))
+
+        self._init_metadata()
+
+    def read_spectrum(
+        self, index: int | str | Iterable[int | str] | slice
+    ) -> _SpectrumType | list[_SpectrumType]:
         if isinstance(index, (int, str)):
             spec = self.spectrum_metadata[index]
             index = spec["index"]
@@ -597,7 +758,9 @@ class MzPeakFile:
             spec = self.read_spectrum(range(start, end, step))
         return spec
 
-    def read_chromatogram(self, index: int | str | Iterable[int | str] | slice):
+    def read_chromatogram(
+        self, index: int | str | Iterable[int | str] | slice
+    ) -> _SpectrumType | list[_SpectrumType]:
         if isinstance(index, (int, str)):
             chrom = self.chromatogram_metadata[index]
             index = chrom["index"]
@@ -615,21 +778,22 @@ class MzPeakFile:
         return chrom
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.archive.filename!r})"
+        return f"{self.__class__.__name__}({self._archive.filename!r})"
 
-    def __getitem__(self, index: int | str | Iterable[int | str] | slice):
+    def __getitem__(self, index: int | str | Iterable[int | str] | slice) -> _SpectrumType | list[_SpectrumType]:
+        '''An alias for :meth:`read_spectrum`.'''
         return self.read_spectrum(index)
 
-    def __iter__(self):
+    def __iter__(self) -> MzPeakFileIter:
         return MzPeakFileIter(self)
 
     def __len__(self):
         return len(self.spectrum_metadata)
 
-    def tic(self):
+    def tic(self) -> tuple[np.ndarray, np.ndarray]:
         return self.spectrum_metadata.tic()
 
-    def bpc(self):
+    def bpc(self) -> tuple[np.ndarray, np.ndarray]:
         return self.spectrum_metadata.bpc()
 
     @property
@@ -637,22 +801,22 @@ class MzPeakFile:
         return self.spectrum_peak_data is not None
 
     @property
-    def spectra(self):
+    def spectra(self) -> pd.DataFrame:
         return self.spectrum_metadata.spectra
 
     @property
-    def precursors(self):
+    def precursors(self) -> pd.DataFrame:
         return self.spectrum_metadata.precursors
 
     @property
-    def selected_ions(self):
+    def selected_ions(self) -> pd.DataFrame:
         return self.spectrum_metadata.selected_ions
 
     @property
-    def scans(self):
+    def scans(self) -> pd.DataFrame:
         return self.spectrum_metadata.scans
 
     @property
-    def chromatograms(self):
+    def chromatograms(self) -> pd.DataFrame | None:
         if self.chromatogram_metadata is not None:
             return self.chromatogram_metadata.chromatograms

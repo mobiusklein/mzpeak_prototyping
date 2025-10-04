@@ -85,54 +85,6 @@ macro_rules! implement_mz_metadata {
                         .unwrap(),
                 ),
             );
-
-            self.append_key_value_metadata(
-                "spectrum_column_metadata_mapping",
-                Some(
-                    serde_json::to_string_pretty(
-                        &crate::spectrum::SpectrumEntry::metadata_columns(),
-                    )
-                    .unwrap(),
-                ),
-            );
-
-            self.append_key_value_metadata(
-                "scan_column_metadata_mapping",
-                Some(
-                    serde_json::to_string_pretty(&crate::spectrum::ScanEntry::metadata_columns())
-                        .unwrap(),
-                ),
-            );
-
-            self.append_key_value_metadata(
-                "selected_ion_column_metadata_mapping",
-                Some(
-                    serde_json::to_string_pretty(
-                        &crate::spectrum::SelectedIonEntry::metadata_columns(),
-                    )
-                    .unwrap(),
-                ),
-            );
-
-            self.append_key_value_metadata(
-                "precursor_column_metadata_mapping",
-                Some(
-                    serde_json::to_string_pretty(
-                        &crate::spectrum::PrecursorEntry::metadata_columns(),
-                    )
-                    .unwrap(),
-                ),
-            );
-
-            self.append_key_value_metadata(
-                "chromatogram_column_metadata_mapping",
-                Some(
-                    serde_json::to_string_pretty(
-                        &crate::spectrum::ChromatogramEntry::metadata_columns(),
-                    )
-                    .unwrap(),
-                ),
-            );
         }
     };
 }

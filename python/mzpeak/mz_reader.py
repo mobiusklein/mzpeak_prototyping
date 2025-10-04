@@ -138,6 +138,13 @@ class _DataIndex:
 
 
 class BufferFormat(Enum):
+    """
+    The different orientations data arrays may be written in.
+
+    - ``Point`` - Each data point is stored as a row in the table as-is. Easy to do filtering random access queries over.
+    - ``Chunk`` - Segments of data in a specific start-stop range are stored in an encoded block. More compact but harder to do queries over.
+    - ``Secondary_Chunk`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
+    """
     Point = 1
     Chunk = 2
     Secondary_Chunk = 3
@@ -249,7 +256,25 @@ psims_dtypes = {
 }
 
 
+_SpectrumArrays = dict[str, np.ndarray]
+
+
 class MzPeakArrayDataReader:
+    """
+    A generic reader for mzPeak data array reading.
+
+    Abstracts reading either point or chunk formats, and
+    provides index-based slicing over spectra.
+
+    Attributes
+    ----------
+    handle : :class:`pyarrow.parquet.ParquetFile`
+        The underlying Parquet file reader
+    meta : :class:`pyarrow.parquet.FileMetaData`
+        The metadata segment of the underlying Parquet file
+    array_index : dict[str, dict]
+        Descriptions of the different arrays stored in the data file
+    """
     handle: pq.ParquetFile
     meta: pq.FileMetaData
     _point_index: _DataIndex
@@ -293,7 +318,7 @@ class MzPeakArrayDataReader:
         self,
         data: pa.RecordBatch | pa.StructArray,
         delta_model: float | np.ndarray | None = None,
-    ):
+    ) -> _SpectrumArrays:
         if isinstance(data, pa.StructArray):
             nulls = []
             for i, name in enumerate(data.type):
@@ -353,7 +378,7 @@ class MzPeakArrayDataReader:
             result[k] = np.asarray(v)
         return result
 
-    def read_data_for_range(self, index_range: slice | list[int]):
+    def read_data_for_range(self, index_range: slice | list[int]) -> _SpectrumArrays:
         prefix = BufferFormat.Point
         rgs = self._point_index.row_groups_for_spectrum_range(index_range)
         if not rgs:
@@ -386,7 +411,7 @@ class MzPeakArrayDataReader:
         chunks: list[dict[str, Any]],
         axis_prefix: str | None = None,
         delta_model: float | np.ndarray | None = None,
-    ) -> dict[str, np.ndarray]:
+    ) -> _SpectrumArrays:
         if axis_prefix is None:
             if self._namespace == "spectrum":
                 axis_prefix = f"{self._namespace}_mz"
@@ -533,7 +558,7 @@ class MzPeakArrayDataReader:
         spectrum_index: int,
         rgs: list[int],
         delta_model: float | list[float] | None,
-    ):
+    ) -> _SpectrumArrays:
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
         block = pc.filter(
             block,
@@ -557,7 +582,7 @@ class MzPeakArrayDataReader:
         spectrum_index_range: list[int] | slice,
         is_slice: bool,
         rgs: list[int],
-    ):
+    ) -> _SpectrumArrays:
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
         idx_col = pc.struct_field(block, f"{self._namespace}_index")
 
@@ -573,7 +598,9 @@ class MzPeakArrayDataReader:
         )
         return self._clean_point_batch(data)
 
-    def _read_chunk(self, index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512):
+    def _read_chunk(
+        self, index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512
+    ) -> _SpectrumArrays:
         chunks = []
         it = _ChunkIterator(
             self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"])
@@ -613,7 +640,7 @@ class MzPeakArrayDataReader:
         index_range: list[int] | slice,
         is_slice: bool,
         rgs: list[int],
-    ):
+    ) -> _SpectrumArrays:
         chunks = []
         for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
             batch = batch["chunk"]
@@ -643,7 +670,7 @@ class MzPeakArrayDataReader:
         chunks = pa.chunked_array(chunks)
         return self._expand_chunks(chunks)
 
-    def _read_data_for(self, index: int):
+    def _read_data_for(self, index: int) -> _SpectrumArrays:
         if self._delta_model_series is not None:
             median_delta = self._delta_model_series[index]
         else:
@@ -665,12 +692,12 @@ class MzPeakArrayDataReader:
         else:
             raise NotImplementedError(prefix)
 
-    def __getitem__(self, index: int | slice):
+    def __getitem__(self, index: int | slice) -> _SpectrumArrays:
         if isinstance(index, slice):
             return self.read_data_for_range(index)
         return self._read_data_for(index)
 
-    def buffer_format(self):
+    def buffer_format(self) -> BufferFormat:
         if self._point_index.init:
             return BufferFormat.Point
         elif self._chunk_index.init:
