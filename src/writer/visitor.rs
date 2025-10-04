@@ -2,7 +2,9 @@ use std::{fmt::Debug, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder, Int8Builder, LargeListBuilder, LargeStringBuilder, NullBuilder, StructArray, UInt32Builder, UInt64Builder, UInt8Builder
+        ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, Float32Builder, Float64Builder,
+        Int8Builder, Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, NullBuilder,
+        StructArray, UInt8Builder, UInt32Builder, UInt64Builder,
     },
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
@@ -15,6 +17,10 @@ use mzdata::{
 use crate::spectrum::AuxiliaryArray;
 
 pub trait VisitorBase: Debug {
+    fn flatten(&self) -> bool {
+        false
+    }
+
     fn fields(&self) -> Vec<FieldRef>;
 
     fn schema(&self) -> SchemaRef {
@@ -26,6 +32,34 @@ pub trait VisitorBase: Debug {
     fn as_struct_type(&self) -> DataType {
         DataType::Struct(self.fields().into())
     }
+}
+
+macro_rules! finish_extra {
+    ($self:ident, $arrays:ident) => {
+        for e in $self.extra.iter_mut() {
+            if e.flatten() {
+                let arr = e.finish();
+                let arr = arr.as_struct();
+                $arrays.extend_from_slice(arr.columns());
+            } else {
+                $arrays.push(e.finish());
+            }
+        }
+    };
+}
+
+macro_rules! finish_cloned_extra {
+    ($self:ident, $arrays:ident) => {
+        for e in $self.extra.iter() {
+            if e.flatten() {
+                let arr = e.finish_cloned();
+                let arr = arr.as_struct();
+                $arrays.extend_from_slice(arr.columns());
+            } else {
+                $arrays.push(e.finish_cloned());
+            }
+        }
+    };
 }
 
 pub trait StructVisitor<T>: VisitorBase {
@@ -41,7 +75,7 @@ pub trait StructVisitor<T>: VisitorBase {
     }
 }
 
-pub trait StructVisitorBuilder<T>: StructVisitor<T> + ArrayBuilder {}
+pub trait StructVisitorBuilder<T>: StructVisitor<T> + ArrayBuilder + VisitorBase {}
 
 impl<T, U> StructVisitorBuilder<T> for U where U: StructVisitor<T> + ArrayBuilder {}
 
@@ -52,7 +86,7 @@ macro_rules! field {
     ($name:literal, $typeexpr:expr, $nullable:expr) => {
         Arc::new(Field::new($name, $typeexpr, $nullable))
     };
-    ($name:ident, $typeexpr:expr) => {
+    ($name:expr, $typeexpr:expr) => {
         Arc::new(Field::new($name, $typeexpr, true))
     };
 }
@@ -109,43 +143,59 @@ pub struct CustomBuilderFromParameter {
     curie: mzdata::params::CURIE,
     value: Box<dyn ArrayBuilder>,
     field: FieldRef,
+    unit: Option<CURIEBuilder>,
 }
 
 impl Debug for CustomBuilderFromParameter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CustomBuilderFromParameter").field("curie", &self.curie).field("value", &"...").field("field", &self.field).finish()
+        f.debug_struct("CustomBuilderFromParameter")
+            .field("curie", &self.curie)
+            .field("value", &"...")
+            .field("field", &self.field)
+            .finish()
     }
 }
 
 impl CustomBuilderFromParameter {
+    pub fn with_unit(mut self) -> Self {
+        self.unit = Some(CURIEBuilder::default());
+        self
+    }
+
     pub fn from_spec(curie: mzdata::params::CURIE, name: &str, dtype: DataType) -> Self {
         let name = inflect_cv_term_to_column_name(curie, name);
         let field = field!(name, dtype.clone());
+        let unit = None;
         match dtype {
             DataType::Null => Self {
                 curie,
                 field,
                 value: Box::new(NullBuilder::new()),
+                unit,
             },
             DataType::Boolean => Self {
                 curie,
                 field,
                 value: Box::new(BooleanBuilder::new()),
+                unit,
             },
             DataType::Int64 => Self {
                 curie,
                 field,
                 value: Box::new(Int64Builder::new()),
+                unit,
             },
             DataType::Float64 => Self {
                 curie,
                 field,
                 value: Box::new(Float64Builder::new()),
+                unit,
             },
             DataType::LargeUtf8 => Self {
                 curie,
                 field,
                 value: Box::new(LargeStringBuilder::new()),
+                unit,
             },
             _ => unimplemented!("{dtype:?} is not supported by CustomBuilderFromParameter"),
         }
@@ -153,11 +203,26 @@ impl CustomBuilderFromParameter {
 }
 
 impl VisitorBase for CustomBuilderFromParameter {
+    fn flatten(&self) -> bool {
+        self.unit.is_some()
+    }
+
     fn fields(&self) -> Vec<FieldRef> {
-        vec![self.field.clone()]
+        if let Some(unit) = self.unit.as_ref() {
+            vec![
+                self.field.clone(),
+                field!(format!("{}_unit", self.field.name()), unit.as_struct_type()),
+            ]
+        } else {
+            vec![self.field.clone()]
+        }
     }
 
     fn append_null(&mut self) {
+        if let Some(unit) = self.unit.as_mut() {
+            unit.append_null();
+        }
+
         match self.field.data_type() {
             DataType::Null => {
                 self.value
@@ -247,6 +312,11 @@ where
                 }
                 _ => panic!("Unsupported value type {:?}", self.field.data_type()),
             }
+
+            if let Some(unit) = self.unit.as_mut() {
+                unit.append_option(val.unit().to_curie().as_ref());
+            }
+
             true
         } else {
             self.append_null();
@@ -263,11 +333,23 @@ impl ArrayBuilder for CustomBuilderFromParameter {
     }
 
     fn finish(&mut self) -> ArrayRef {
-        self.value.finish()
+        let fields = self.fields();
+        if let Some(unit) = self.unit.as_mut() {
+            let arrays = vec![finish_it!(self.value), unit.finish()];
+            Arc::new(StructArray::new(fields.into(), arrays, None))
+        } else {
+            self.value.finish()
+        }
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        self.value.finish_cloned()
+        let fields = self.fields();
+        if let Some(unit) = self.unit.as_ref() {
+            let arrays = vec![finish_cloned!(self.value), unit.finish_cloned()];
+            Arc::new(StructArray::new(fields.into(), arrays, None))
+        } else {
+            self.value.finish_cloned()
+        }
     }
 }
 
@@ -303,6 +385,13 @@ impl StructVisitor<mzdata::params::CURIE> for CURIEBuilder {
     fn append_value(&mut self, item: &mzdata::params::CURIE) -> bool {
         let item: crate::CURIE = (*item).into();
         self.append_value(&item)
+    }
+}
+
+impl StructVisitor<&str> for CURIEBuilder {
+    fn append_value(&mut self, item: &&str) -> bool {
+        let val: mzdata::params::CURIE = item.parse().unwrap();
+        self.append_value(&val)
     }
 }
 
@@ -788,9 +877,7 @@ impl ArrayBuilder for ScanBuilder {
             self.parameters.finish(),
             finish_it!(self.scan_windows),
         ];
-        for e in self.extra.iter_mut() {
-            arrays.push(e.finish());
-        }
+        finish_extra!(self, arrays);
         Arc::new(StructArray::new(schema.into(), arrays, None))
     }
 
@@ -807,9 +894,7 @@ impl ArrayBuilder for ScanBuilder {
             finish_cloned!(self.instrument_configuration_ref),
             self.parameters.finish_cloned(),
         ];
-        for e in self.extra.iter() {
-            arrays.push(e.finish_cloned());
-        }
+        finish_cloned_extra!(self, arrays);
         Arc::new(StructArray::new(schema.into(), arrays, None))
     }
 
@@ -1066,9 +1151,7 @@ impl ArrayBuilder for SelectedIonBuilder {
             self.parameters.finish(),
         ];
 
-        for e in self.extra.iter_mut() {
-            arrays.push(e.finish());
-        }
+        finish_extra!(self, arrays);
 
         Arc::new(StructArray::new(fields.into(), arrays, None))
     }
@@ -1087,9 +1170,7 @@ impl ArrayBuilder for SelectedIonBuilder {
             self.parameters.finish_cloned(),
         ];
 
-        for e in self.extra.iter() {
-            arrays.push(e.finish_cloned());
-        }
+        finish_cloned_extra!(self, arrays);
 
         Arc::new(StructArray::new(fields.into(), arrays, None))
     }
@@ -1288,7 +1369,6 @@ impl ArrayBuilder for AuxiliaryArrayBuilder {
     }
 }
 
-
 #[derive(Debug)]
 pub enum SpectrumVisitor {
     Description(Box<dyn StructVisitorBuilder<SpectrumDescription>>),
@@ -1299,19 +1379,19 @@ impl ArrayBuilder for SpectrumVisitor {
 
     fn len(&self) -> usize {
         match self {
-            Self::Description(builder) => builder.len()
+            Self::Description(builder) => builder.len(),
         }
     }
 
     fn finish(&mut self) -> ArrayRef {
         match self {
-            Self::Description(builder) => builder.finish()
+            Self::Description(builder) => builder.finish(),
         }
     }
 
     fn finish_cloned(&self) -> ArrayRef {
         match self {
-            Self::Description(builder) => builder.finish_cloned()
+            Self::Description(builder) => builder.finish_cloned(),
         }
     }
 }
@@ -1319,12 +1399,20 @@ impl ArrayBuilder for SpectrumVisitor {
 impl StructVisitor<SpectrumDescription> for SpectrumVisitor {
     fn append_value(&mut self, item: &SpectrumDescription) -> bool {
         match self {
-            Self::Description(builder) => builder.append_value(item)
+            Self::Description(builder) => builder.append_value(item),
         }
     }
 }
 
 impl VisitorBase for SpectrumVisitor {
+    fn flatten(&self) -> bool {
+        match self {
+            SpectrumVisitor::Description(struct_visitor_builder) => {
+                struct_visitor_builder.flatten()
+            }
+        }
+    }
+
     fn fields(&self) -> Vec<FieldRef> {
         match self {
             SpectrumVisitor::Description(struct_visitor_builder) => struct_visitor_builder.fields(),
@@ -1333,11 +1421,12 @@ impl VisitorBase for SpectrumVisitor {
 
     fn append_null(&mut self) {
         match self {
-            SpectrumVisitor::Description(struct_visitor_builder) => struct_visitor_builder.append_null(),
+            SpectrumVisitor::Description(struct_visitor_builder) => {
+                struct_visitor_builder.append_null()
+            }
         }
     }
 }
-
 
 #[derive(Default, Debug)]
 pub struct SpectrumDetailsBuilder {
@@ -1479,7 +1568,9 @@ impl SpectrumDetailsBuilder {
             v
         } else {
             match item.ms_level() {
-                0 => panic!("Unsupported ms level"),
+                0 => {
+                    panic!("Couldn't infer spectrum type from MS level, no explicit type specified")
+                }
                 1 => crate::curie!(MS:1000579),
                 _ => crate::curie!(MS:1000580),
             }
@@ -1549,7 +1640,7 @@ impl SpectrumDetailsBuilder {
             match e {
                 SpectrumVisitor::Description(builder) => {
                     builder.append_value(item.description());
-                },
+                }
             }
         }
 
@@ -1592,9 +1683,8 @@ impl ArrayBuilder for SpectrumDetailsBuilder {
             finish_it!(self.mz_delta_model),
         ];
 
-        for e in self.extra.iter_mut() {
-            arrays.push(e.finish());
-        }
+        finish_extra!(self, arrays);
+
         Arc::new(StructArray::new(schema.into(), arrays, None))
     }
 
@@ -1626,9 +1716,8 @@ impl ArrayBuilder for SpectrumDetailsBuilder {
             finish_cloned!(self.mz_delta_model),
         ];
 
-        for e in self.extra.iter() {
-            arrays.push(e.finish_cloned());
-        }
+        finish_cloned_extra!(self, arrays);
+
         Arc::new(StructArray::new(schema.into(), arrays, None))
     }
 }
@@ -1686,7 +1775,9 @@ impl SpectrumBuilder {
         &mut self,
         visitor: T,
     ) {
-        self.spectrum.extra.push(SpectrumVisitor::Description(Box::new(visitor)));
+        self.spectrum
+            .extra
+            .push(SpectrumVisitor::Description(Box::new(visitor)));
     }
 
     pub fn add_selected_ion_field(
@@ -1701,6 +1792,13 @@ impl SpectrumBuilder {
         visitor: impl StructVisitorBuilder<mzdata::spectrum::ScanEvent>,
     ) {
         self.scan.extra.push(Box::new(visitor));
+    }
+
+    pub fn add_activation_field<T: StructVisitorBuilder<mzdata::spectrum::Activation>>(
+        &mut self,
+        builder: Box<T>,
+    ) {
+        self.precursor.activation.extra.push(builder);
     }
 
     pub fn index_counter(&self) -> u64 {
@@ -1793,7 +1891,12 @@ pub struct ChromatogramDetailsBuilder {
 }
 
 impl ChromatogramDetailsBuilder {
-    fn append_value(&mut self, index: u64, item: &Chromatogram, auxiliary_arrays: Option<Vec<AuxiliaryArray>>) -> bool {
+    fn append_value(
+        &mut self,
+        index: u64,
+        item: &Chromatogram,
+        auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
+    ) -> bool {
         self.index.append_value(index);
         self.id.append_value(item.id());
         self.polarity.append_value(match item.polarity() {
@@ -1801,7 +1904,8 @@ impl ChromatogramDetailsBuilder {
             ScanPolarity::Negative => -1,
             ScanPolarity::Unknown => 0,
         });
-        self.chromatogram_type.append_value(&item.chromatogram_type().to_curie());
+        self.chromatogram_type
+            .append_value(&item.chromatogram_type().to_curie());
         self.data_processing_ref.append_null();
         let b = self.parameters.as_mut().values();
         for param in item.params() {
@@ -1809,7 +1913,8 @@ impl ChromatogramDetailsBuilder {
         }
         self.parameters.as_mut().append(true);
         if let Some(aux_arrays) = auxiliary_arrays {
-            self.number_of_auxiliary_arrays.append_value(aux_arrays.len() as u32);
+            self.number_of_auxiliary_arrays
+                .append_value(aux_arrays.len() as u32);
             let b = self.auxiliary_arrays.values();
             for a in aux_arrays {
                 b.append_value(&a);
@@ -1886,12 +1991,10 @@ impl ArrayBuilder for ChromatogramDetailsBuilder {
             finish_it!(self.data_processing_ref),
             self.parameters.finish(),
             finish_it!(self.auxiliary_arrays),
-            finish_it!(self.number_of_auxiliary_arrays)
+            finish_it!(self.number_of_auxiliary_arrays),
         ];
 
-        for e in self.extra.iter_mut() {
-            arrays.push(e.finish());
-        }
+        finish_extra!(self, arrays);
 
         Arc::new(StructArray::new(fields.into(), arrays, None))
     }
@@ -1907,17 +2010,14 @@ impl ArrayBuilder for ChromatogramDetailsBuilder {
             finish_cloned!(self.data_processing_ref),
             self.parameters.finish_cloned(),
             finish_cloned!(self.auxiliary_arrays),
-            finish_cloned!(self.number_of_auxiliary_arrays)
+            finish_cloned!(self.number_of_auxiliary_arrays),
         ];
 
-        for e in self.extra.iter() {
-            arrays.push(e.finish_cloned());
-        }
+        finish_cloned_extra!(self, arrays);
 
         Arc::new(StructArray::new(fields.into(), arrays, None))
     }
 }
-
 
 #[derive(Default, Debug)]
 pub struct ChromatogramBuilder {
@@ -1933,7 +2033,7 @@ impl VisitorBase for ChromatogramBuilder {
         vec![
             field!("chromatogram", self.chromatogram.as_struct_type()),
             field!("precursor", self.precursor.as_struct_type()),
-            field!("selected_ion", self.selected_ion.as_struct_type())
+            field!("selected_ion", self.selected_ion.as_struct_type()),
         ]
     }
 
@@ -1950,11 +2050,9 @@ impl ChromatogramBuilder {
         item: &Chromatogram,
         auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
     ) -> bool {
-        let out = self.chromatogram.append_value(
-            self.chromatogram_index_counter,
-            item,
-            auxiliary_arrays,
-        );
+        let out =
+            self.chromatogram
+                .append_value(self.chromatogram_index_counter, item, auxiliary_arrays);
         for precursor in item.precursor_iter() {
             self.precursor.append_value(&(
                 self.chromatogram_index_counter,
@@ -1980,6 +2078,13 @@ impl ChromatogramBuilder {
 
     pub fn precursor_index_counter(&self) -> u64 {
         self.precursor_index_counter
+    }
+
+    pub fn add_activation_field<T: StructVisitorBuilder<mzdata::spectrum::Activation>>(
+        &mut self,
+        builder: Box<T>,
+    ) {
+        self.precursor.activation.extra.push(builder);
     }
 }
 
@@ -2024,10 +2129,10 @@ impl ArrayBuilder for ChromatogramBuilder {
     anyways!();
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
+    use arrow::{array::AsArray, datatypes::Float64Type};
     use mzdata;
     use std::io;
 
@@ -2035,19 +2140,43 @@ mod test {
     fn test_build_spectra() -> io::Result<()> {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
         let spec = reader.get_spectrum_by_index(2).unwrap();
-        eprintln!("{:?}", spec.description());
 
         let mut builder = SpectrumBuilder::default();
 
-        builder.add_spectrum_param_field(CustomBuilderFromParameter::from_spec(
-            mzdata::curie!(MS:1000504),
-            "base peak m/z",
-            DataType::Float64,
-        ));
+        builder.add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(
+                mzdata::curie!(MS:1000504),
+                "base peak m/z",
+                DataType::Float64,
+            )
+            .with_unit(),
+        );
 
         builder.append_value(&spec, None, None);
         let arrays = builder.finish();
-        eprintln!("{arrays:#?}");
+        let arrays = arrays.as_struct();
+        let arrays = arrays.column_by_name("spectrum").unwrap();
+        let arrays = arrays.as_struct();
+
+        eprintln!("{:?}", arrays.column_names());
+
+        let arr1 = arrays.column_by_name("base_peak_mz").unwrap();
+        let arr2 = arrays.column_by_name("MS_1000504_base_peak_mz").unwrap();
+        let arr1 = arr1.as_primitive::<Float64Type>();
+        let arr2 = arr2.as_primitive::<Float64Type>();
+
+        let x1 = arr1.value(0);
+        let x2 = arr2.value(0);
+        let e = (x1 - x2).abs();
+
+        // They are not identical because the former is computed from the data while the latter
+        // is read as a cvParam from the input.
+        assert!(e < 1e-5, "{x1} - {x2} = {e} > 1e-5");
+
+        let arr3 = arrays
+            .column_by_name("MS_1000504_base_peak_mz_unit")
+            .unwrap();
+        assert_eq!(arr3.len(), 1);
         Ok(())
     }
 }

@@ -606,7 +606,7 @@ impl<'a> MzSpectrumVisitor<'a> {
     }
 }
 
-struct CURIEArray<'a> {
+pub struct CURIEArray<'a> {
     cv_id: &'a UInt8Array,
     accession: &'a UInt32Array,
     null: Option<&'a NullBuffer>,
@@ -625,7 +625,11 @@ impl<'a> CURIEArray<'a> {
         }
     }
 
-    fn from_struct_array(unit_series: &'a StructArray) -> Self {
+    pub fn len(&self) -> usize {
+        self.cv_id.len()
+    }
+
+    pub fn from_struct_array(unit_series: &'a StructArray) -> Self {
         Self::new(
             unit_series.column(0).as_primitive(),
             unit_series.column(1).as_primitive(),
@@ -634,14 +638,14 @@ impl<'a> CURIEArray<'a> {
     }
 
     #[inline(always)]
-    fn is_null(&self, index: usize) -> bool {
+    pub fn is_null(&self, index: usize) -> bool {
         self.cv_id.is_null(index)
             || self.accession.is_null(index)
             || self.null.is_some_and(|v| v.is_null(index))
     }
 
     #[inline(always)]
-    fn value(&self, index: usize) -> Option<CURIE> {
+    pub fn value(&self, index: usize) -> Option<CURIE> {
         if self.is_null(index) {
             None
         } else {
@@ -653,21 +657,29 @@ impl<'a> CURIEArray<'a> {
     }
 }
 
-struct UnitArray<'a>(CURIEArray<'a>);
+pub struct UnitArray<'a>(CURIEArray<'a>);
 
 impl<'a> UnitArray<'a> {
-    fn from_struct_array(unit_series: &'a StructArray) -> Self {
+    pub fn from_struct_array(unit_series: &'a StructArray) -> Self {
         Self(CURIEArray::from_struct_array(unit_series))
     }
 
     #[inline(always)]
-    fn value(&self, index: usize) -> Unit {
+    pub fn value(&self, index: usize) -> Unit {
         self.0
             .value(index)
             .map(|v| {
                 Unit::from_curie(&(v.into()))
             })
             .unwrap_or_default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_null(&self, index: usize) -> bool {
+        self.0.is_null(index)
     }
 }
 

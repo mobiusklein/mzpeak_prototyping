@@ -48,7 +48,7 @@ use crate::{
         point::PointDataReader,
         visitor::{
             MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
-            MzSpectrumVisitor,
+            MzSpectrumVisitor
         },
     },
     spectrum::AuxiliaryArray,
@@ -59,6 +59,8 @@ pub mod index;
 mod metadata;
 mod point;
 mod visitor;
+
+pub use visitor::{CURIEArray, UnitArray};
 
 pub use chunk::SpectrumChunkReader;
 pub use metadata::ReaderMetadata;
@@ -179,7 +181,7 @@ impl<
         self.metadata.spectrum_id_index = index;
     }
 
-    fn iter(&mut self) -> mzdata::io::SpectrumIterator<C, D, MultiLayerSpectrum<C, D>, Self>
+    fn iter(&mut self) -> mzdata::io::SpectrumIterator<'_, C, D, MultiLayerSpectrum<C, D>, Self>
     where
         Self: Sized,
     {
