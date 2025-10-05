@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak metadata instrument configurations",
+  "description": "Describe the JSON format of instrument configurations used to acquire a mass spectrometry experiment",
+  "type": "array",
+  "items": {
+    "$ref": "#/definitions/instrument_configuration"
+  },
+  "definitions": {
+    "instrument_configuration": {
+      "type": "object",
+      "description": "Describes a single instrument configuration that was used. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#instrumentConfiguration",
+      "properties": {
+        "components": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/component_type" }
+        }
+      }
+    },
+    "component_type": {
+      "type": "object",
+      "description": "Describes an instrument component like the ion source, mass analyzer, or detector",
+      "properties": {
+        "component_type": {
+          "enum": ["ionsource", "analyzer", "detector"],
+          "description": "The kind of component this is"
+        },
+        "order": {
+          "type": "integer",
+          "description": "The order in which the analytes travels through the component"
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "https://github.com/mobiusklein/mzpeak_prototyping/schema/param.json"
+          },
+          "description": "Additional parameters describing this component, like the particular hardware type or components"
+        }
+      }
+    }
+  }
+}

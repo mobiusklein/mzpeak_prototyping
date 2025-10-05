@@ -1,7 +1,7 @@
 use std::{io, sync::Arc};
 
 use crate::{
-    archive::ZipArchiveReader,
+    archive::{ArchiveReader, ArchiveSource},
     buffer_descriptors::{ArrayIndex, SerializedArrayIndex},
     filter::RegressionDeltaModel,
     param::MetadataColumn,
@@ -98,8 +98,8 @@ impl MSDataFileMetadata for ReaderMetadata {
     mzdata::delegate_impl_metadata_trait!(mz_metadata);
 }
 
-pub(crate) fn build_spectrum_index(
-    handle: &ZipArchiveReader,
+pub(crate) fn build_spectrum_index<T: ArchiveSource>(
+    handle: &ArchiveReader<T>,
     pq_schema: &SchemaDescriptor,
 ) -> io::Result<OffsetIndex> {
     let mut spectrum_id_index = OffsetIndex::new("spectrum".into());
@@ -174,8 +174,8 @@ impl PeakMetadata {
 }
 
 /// Load the various metadata, indices and reference data
-pub(crate) fn load_indices_from(
-    handle: &mut ZipArchiveReader,
+pub(crate) fn load_indices_from<T: ArchiveSource>(
+    handle: &mut ArchiveReader<T>,
 ) -> io::Result<(ReaderMetadata, QueryIndex)> {
     let spectrum_metadata_reader = handle.spectrum_metadata()?;
     let spectrum_data_reader = handle.spectra_data()?;
@@ -188,7 +188,6 @@ pub(crate) fn load_indices_from(
     let mut scan_metadata_mapping = None;
     let mut selected_ion_metadata_mapping = None;
     let mut chromatogram_metadata_mapping = None;
-
 
     let arrow_schema = spectrum_metadata_reader.schema();
     if let Ok(root) = arrow_schema.field_with_name("spectrum") {

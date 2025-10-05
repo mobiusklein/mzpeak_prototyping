@@ -48,7 +48,7 @@ use crate::{
         point::PointDataReader,
         visitor::{
             MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
-            MzSpectrumVisitor
+            MzSpectrumVisitor,
         },
     },
     spectrum::AuxiliaryArray,
@@ -66,6 +66,7 @@ pub use chunk::SpectrumChunkReader;
 pub use metadata::ReaderMetadata;
 use point::{DataPointCache, PointDataArrayReader};
 
+/// A reader for mzPeak files.
 pub struct MzPeakReaderType<
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap = CentroidPeak,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap = DeconvolutedPeak,
@@ -88,7 +89,7 @@ impl<
 {
     fn get_chromatogram_by_id(&mut self, id: &str) -> Option<Chromatogram> {
         if let Some(chrom) = self.get_chromatogram_by_id(id) {
-            return Some(chrom)
+            return Some(chrom);
         }
         match id {
             "TIC" => self.encoded_tic().ok(),
@@ -99,7 +100,7 @@ impl<
 
     fn get_chromatogram_by_index(&mut self, index: usize) -> Option<Chromatogram> {
         if let Some(chrom) = self.get_chromatogram(index) {
-            return Some(chrom)
+            return Some(chrom);
         }
         match index {
             0 => self.encoded_tic().ok(),
@@ -119,6 +120,9 @@ impl<
     }
 }
 
+/// [`MzPeakReaderType`] implements the [`Iterator`] trait, but the first time `next` is called
+/// will call [`MzPeakReaderType::load_all_spectrum_metadata`], which may produce a brief delay
+/// before the first spectrum is produced.
 impl<
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
@@ -1107,7 +1111,6 @@ impl<
         } else {
             Ok(None)
         }
-
     }
 
     pub(crate) fn load_spectrum_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
@@ -1178,7 +1181,7 @@ impl<
             Ok(builder) => builder,
             Err(e) => {
                 log::trace!("{e}");
-                return Ok(Vec::new())
+                return Ok(Vec::new());
             }
         };
 
@@ -1780,11 +1783,16 @@ impl<
     }
 
     pub fn get_chromatogram_by_id(&mut self, id: &str) -> Option<Chromatogram> {
-        if let Some(description) = self.load_all_chromatgram_metadata_impl().ok()?.into_iter().find(|v| v.id == id) {
+        if let Some(description) = self
+            .load_all_chromatgram_metadata_impl()
+            .ok()?
+            .into_iter()
+            .find(|v| v.id == id)
+        {
             let arrays = if self.detail_level == DetailLevel::Full {
-            self.get_chromatogram_arrays(description.index as u64)
-                .inspect_err(|e| log::error!("Failed to read chromatogram data for {id}: {e}"))
-                .ok()??
+                self.get_chromatogram_arrays(description.index as u64)
+                    .inspect_err(|e| log::error!("Failed to read chromatogram data for {id}: {e}"))
+                    .ok()??
             } else {
                 BinaryArrayMap::new()
             };

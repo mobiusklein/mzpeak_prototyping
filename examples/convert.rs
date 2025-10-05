@@ -31,6 +31,7 @@ use std::{
 // CLI Interface for standalone usage
 // ============================================================================
 
+/// Convert a single mass spectrometry file to mzpeak format
 #[derive(Parser, Debug, Clone)]
 pub struct ConvertCli {
     /// Input file path
@@ -101,7 +102,7 @@ pub struct ConvertArgs {
 
     #[arg(
         long = "intensity-numpress-slof",
-        help = "Encode the intensity values using the Numpress Short Logged Float transform"
+        help = "Encode the intensity values using the Numpress Short Logged Float transform. This requires the chunked encoding."
     )]
     pub intensity_slof: bool,
 
