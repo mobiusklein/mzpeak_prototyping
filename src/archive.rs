@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
+use parquet::file::reader::{ChunkReader, Length};
 use zip::{
     CompressionMethod,
     read::{Config, ZipArchive},
@@ -253,13 +254,13 @@ impl Seek for ArchiveFacetReader {
     }
 }
 
-impl parquet::file::reader::Length for ArchiveFacetReader {
+impl Length for ArchiveFacetReader {
     fn len(&self) -> u64 {
         self.length
     }
 }
 
-impl parquet::file::reader::ChunkReader for ArchiveFacetReader {
+impl ChunkReader for ArchiveFacetReader {
     type T = io::BufReader<ArchiveFacetReader>;
 
     fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
@@ -286,13 +287,13 @@ impl parquet::file::reader::ChunkReader for ArchiveFacetReader {
     }
 }
 
-pub struct ZipArchiveReaderSource {
+pub struct ZipArchiveSource {
     archive_file: fs::File,
     archive_offset: Config,
     pub file_names: Vec<String>,
 }
 
-impl ZipArchiveReaderSource {
+impl ZipArchiveSource {
     pub fn new(archive_file: fs::File) -> io::Result<Self> {
         let arch = ZipArchive::new(archive_file)?;
         let offset = arch.offset();
@@ -380,8 +381,8 @@ struct SchemaMetadataManager {
     chromatogram_data_arrays: Option<MzPeakArchiveEntry>,
 }
 
-pub trait ArchiveSource: Sized {
-    type File: parquet::file::reader::ChunkReader + 'static;
+pub trait ArchiveSource: Sized + 'static {
+    type File: ChunkReader + 'static;
 
     fn from_path(path: PathBuf) -> io::Result<Self>;
     fn file_names(&self) -> &[String];
@@ -411,7 +412,7 @@ pub trait ArchiveSource: Sized {
     }
 }
 
-impl ArchiveSource for ZipArchiveReaderSource {
+impl ArchiveSource for ZipArchiveSource {
     type File = ArchiveFacetReader;
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
@@ -427,12 +428,12 @@ impl ArchiveSource for ZipArchiveReaderSource {
     }
 }
 
-pub struct DirectoryArchiveReaderSource {
+pub struct DirectorySource {
     archive_path: PathBuf,
     pub file_names: Vec<String>,
 }
 
-impl DirectoryArchiveReaderSource {
+impl DirectorySource {
     pub fn new(archive_path: PathBuf) -> io::Result<Self> {
         let read_dir = fs::read_dir(&archive_path)?;
 
@@ -480,7 +481,7 @@ impl DirectoryArchiveReaderSource {
     }
 }
 
-impl ArchiveSource for DirectoryArchiveReaderSource {
+impl ArchiveSource for DirectorySource {
     type File = fs::File;
 
     fn file_names(&self) -> &[String] {
@@ -623,13 +624,20 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
 }
 
 
-pub type ZipArchiveReader = ArchiveReader<ZipArchiveReaderSource>;
-pub type DirectoryArchiveReader = ArchiveReader<DirectoryArchiveReaderSource>;
+pub type ZipArchiveReader = ArchiveReader<ZipArchiveSource>;
+pub type DirectoryArchiveReader = ArchiveReader<DirectorySource>;
 
 
 impl ZipArchiveReader {
     pub fn new(file: fs::File) -> io::Result<Self> {
-        let archive = ZipArchiveReaderSource::new(file)?;
+        let archive = ZipArchiveSource::new(file)?;
+        Self::init_from_archive(archive)
+    }
+}
+
+impl DirectoryArchiveReader {
+    pub fn new(file: PathBuf) -> io::Result<Self> {
+        let archive = DirectorySource::new(file)?;
         Self::init_from_archive(archive)
     }
 }

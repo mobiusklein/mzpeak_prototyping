@@ -5,13 +5,13 @@ use mzdata::{
 };
 
 use parquet::basic::{Compression, ZstdLevel};
-use std::fmt::Debug;
+use std::{fmt::Debug, path::PathBuf};
 use std::{io::prelude::*, sync::Arc};
 
 use crate::{
     BufferContext, BufferName, MzPeakWriterType, ToMzPeakDataSeries,
     chunk_series::ChunkingStrategy,
-    writer::{ArrayBuffersBuilder, MzPeakSplitWriter},
+    writer::{ArrayBuffersBuilder, UnpackedMzPeakWriterType},
 };
 
 #[derive(Debug)]
@@ -140,15 +140,13 @@ impl MzPeakWriterBuilder {
     }
 
     /// Build an unpacked writer
-    pub fn build_unpacked<W: Write + Send>(
+    pub fn build_unpacked(
         self,
-        data_writer: W,
-        metadata_writer: W,
+        path: PathBuf,
         mask_zero_intensity_runs: bool,
-    ) -> MzPeakSplitWriter<W> {
-        MzPeakSplitWriter::new(
-            data_writer,
-            metadata_writer,
+    ) -> UnpackedMzPeakWriterType {
+        UnpackedMzPeakWriterType::new(
+            path,
             self.spectrum_arrays,
             self.chromatogram_arrays,
             self.buffer_size,
@@ -156,6 +154,7 @@ impl MzPeakWriterBuilder {
             self.shuffle_mz,
             self.chunked_encoding,
             self.compression,
+            self.store_peaks_and_profiles_apart,
         )
     }
 

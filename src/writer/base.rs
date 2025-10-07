@@ -18,7 +18,16 @@ use parquet::{
 };
 
 use crate::{
-    chunk_series::{ArrowArrayChunk, ChunkingStrategy}, entry::ChromatogramMetadataEntry, filter::select_delta_model, peak_series::{array_map_to_schema_arrays_and_excess, MZ_ARRAY}, spectrum::{AuxiliaryArray, ChromatogramEntry}, writer::{ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder}, BufferContext, BufferName, ToMzPeakDataSeries
+    BufferContext, BufferName, ToMzPeakDataSeries,
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
+    entry::ChromatogramMetadataEntry,
+    filter::select_delta_model,
+    peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
+    spectrum::{AuxiliaryArray, ChromatogramEntry},
+    writer::{
+        ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType,
+        SpectrumBuilder,
+    },
 };
 
 macro_rules! implement_mz_metadata {
@@ -199,7 +208,8 @@ pub trait AbstractMzPeakWriter {
     fn write_chromatogram(&mut self, chromatogram: &Chromatogram) -> io::Result<()> {
         log::trace!("Writing chromatogram {}", chromatogram.id());
         let aux_arrays = self.write_chromatogram_arrays(chromatogram, &chromatogram.arrays)?;
-        self.chromatogram_entry_buffer_mut().append_value(chromatogram, aux_arrays);
+        self.chromatogram_entry_buffer_mut()
+            .append_value(chromatogram, aux_arrays);
         self.check_data_buffer()?;
         Ok(())
     }

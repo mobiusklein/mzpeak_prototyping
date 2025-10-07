@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    fs::File,
     io,
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -38,11 +37,7 @@ use parquet::arrow::{
 use serde_arrow::schema::SchemaLike;
 
 use crate::{
-    BufferContext,
-    archive::ZipArchiveReader,
-    filter::RegressionDeltaModel,
-    param::MetadataColumn,
-    reader::{
+    archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource}, filter::RegressionDeltaModel, param::MetadataColumn, reader::{
         chunk::DataChunkCache,
         index::{PageQuery, QueryIndex, SpanDynNumeric},
         point::PointDataReader,
@@ -50,8 +45,7 @@ use crate::{
             MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
             MzSpectrumVisitor,
         },
-    },
-    spectrum::AuxiliaryArray,
+    }, spectrum::AuxiliaryArray, BufferContext
 };
 
 mod chunk;
@@ -66,13 +60,14 @@ pub use chunk::SpectrumChunkReader;
 pub use metadata::ReaderMetadata;
 use point::{DataPointCache, PointDataArrayReader};
 
-/// A reader for mzPeak files.
-pub struct MzPeakReaderType<
+/// A reader for mzPeak files, abstract over the source type.
+pub struct MzPeakReaderTypeOfSource<
+    T: ArchiveSource = ZipArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap = CentroidPeak,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap = DeconvolutedPeak,
 > {
     path: PathBuf,
-    handle: ZipArchiveReader,
+    handle: ArchiveReader<T>,
     index: usize,
     detail_level: DetailLevel,
     pub metadata: ReaderMetadata,
@@ -83,9 +78,10 @@ pub struct MzPeakReaderType<
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> ChromatogramSource for MzPeakReaderType<C, D>
+> ChromatogramSource for MzPeakReaderTypeOfSource<T, C, D>
 {
     fn get_chromatogram_by_id(&mut self, id: &str) -> Option<Chromatogram> {
         if let Some(chrom) = self.get_chromatogram_by_id(id) {
@@ -111,9 +107,10 @@ impl<
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> ExactSizeIterator for MzPeakReaderType<C, D>
+> ExactSizeIterator for MzPeakReaderTypeOfSource<T, C, D>
 {
     fn len(&self) -> usize {
         self.len()
@@ -124,9 +121,10 @@ impl<
 /// will call [`MzPeakReaderType::load_all_spectrum_metadata`], which may produce a brief delay
 /// before the first spectrum is produced.
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> Iterator for MzPeakReaderType<C, D>
+> Iterator for MzPeakReaderTypeOfSource<T, C, D>
 {
     type Item = MultiLayerSpectrum<C, D>;
 
@@ -144,9 +142,10 @@ impl<
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> SpectrumSource<C, D> for MzPeakReaderType<C, D>
+> SpectrumSource<C, D> for MzPeakReaderTypeOfSource<T, C, D>
 {
     fn reset(&mut self) {
         self.index = 0;
@@ -195,9 +194,10 @@ impl<
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> RandomAccessSpectrumIterator<C, D> for MzPeakReaderType<C, D>
+> RandomAccessSpectrumIterator<C, D> for MzPeakReaderTypeOfSource<T, C, D>
 {
     fn start_from_id(&mut self, id: &str) -> Result<&mut Self, SpectrumAccessError> {
         let s = self
@@ -228,17 +228,19 @@ impl<
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> MSDataFileMetadata for MzPeakReaderType<C, D>
+> MSDataFileMetadata for MzPeakReaderTypeOfSource<T, C, D>
 {
     mzdata::delegate_impl_metadata_trait!(metadata);
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> PointDataArrayReader for MzPeakReaderType<C, D>
+> PointDataArrayReader for MzPeakReaderTypeOfSource<T, C, D>
 {
 }
 
@@ -290,10 +292,11 @@ impl SpectrumDataCache {
     }
 
     pub fn load_data_for<
+        T: ArchiveSource,
         C: CentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
         D: DeconvolutedCentroidLike + BuildFromArrayMap + BuildArrayMapFrom,
     >(
-        reader: &MzPeakReaderType<C, D>,
+        reader: &MzPeakReaderTypeOfSource<T, C, D>,
         row_group_index: usize,
         spectrum_index: u64,
     ) -> io::Result<Option<Self>> {
@@ -325,16 +328,15 @@ impl SpectrumDataCache {
 }
 
 impl<
+    T: ArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
-> MzPeakReaderType<C, D>
+> MzPeakReaderTypeOfSource<T, C, D>
 {
     /// Open an mzPeak archive found at a specified path
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path = path.as_ref().into();
-        let handle = File::open(&path)?;
-        let mut handle = ZipArchiveReader::new(handle)?;
-
+        let path: PathBuf = path.as_ref().into();
+        let mut handle = ArchiveReader::<T>::from_path(path.clone())?;
         let (metadata, query_indices) = Self::load_indices_from(&mut handle)?;
 
         let mut this = Self {
@@ -378,7 +380,7 @@ impl<
 
     /// Load the various metadata, indices and reference data
     fn load_indices_from(
-        handle: &mut ZipArchiveReader,
+        handle: &mut ArchiveReader<T>,
     ) -> io::Result<(ReaderMetadata, QueryIndex)> {
         metadata::load_indices_from(handle)
     }
@@ -1944,14 +1946,19 @@ impl<
     }
 }
 
-pub type MzPeakReader = MzPeakReaderType<CentroidPeak, DeconvolutedPeak>;
+pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<ZipArchiveSource, C, D>;
+pub type UnpackedMzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DirectorySource, C, D>;
+
+pub type MzPeakReader = MzPeakReaderTypeOfSource<ZipArchiveSource, CentroidPeak, DeconvolutedPeak>;
+pub type UnpackedMzPeakReader = MzPeakReaderTypeOfSource<DirectorySource, CentroidPeak, DeconvolutedPeak>;
+
 
 #[cfg(test)]
 mod test {
     use super::*;
     use mzdata::spectrum::{ChromatogramLike, SignalContinuity};
 
-    #[test]
+    #[test_log::test]
     fn test_read_spectrum() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
         let descr = reader.get_spectrum(0).unwrap();
@@ -1967,7 +1974,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_read_spectrum_chunked() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
         let descr = reader.get_spectrum(0).unwrap();
@@ -1984,7 +1991,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_tic() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
         let tic = reader.encoded_tic()?;
@@ -1993,7 +2000,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_read_chromatogram() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak").unwrap();
         let tic = reader.get_chromatogram(0).unwrap();
@@ -2003,7 +2010,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_load_all_metadata() -> io::Result<()> {
         let reader = MzPeakReader::new("small.mzpeak")?;
         let out = reader.load_all_spectrum_metadata_impl()?;
@@ -2011,7 +2018,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_load_all_chromatogram_metadata() -> io::Result<()> {
         let reader = MzPeakReader::new("small.mzpeak")?;
         let out = reader.load_all_chromatgram_metadata_impl()?;
@@ -2019,7 +2026,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_eic() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
 
@@ -2032,7 +2039,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_eic_chunked() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
 

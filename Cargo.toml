@@ -69,6 +69,7 @@ identity-hash = "0.1.0"
 
 [dev-dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
+test-log = "0.2.12 "
 
 [profile.release]
 debug = true

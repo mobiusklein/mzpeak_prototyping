@@ -44,7 +44,7 @@ pub use array_buffer::{
 };
 pub use base::AbstractMzPeakWriter;
 pub use builder::MzPeakWriterBuilder;
-pub use split::MzPeakSplitWriter;
+pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{
     ScanBuilder,
@@ -490,15 +490,9 @@ impl<
     }
 
     fn flush_spectrum_metadata_records(&mut self) -> io::Result<()> {
-        // let batch = serde_arrow::to_record_batch(
-        //     &self.metadata_fields.fields(),
-        //     &self.spectrum_metadata_buffer,
-        // )
-        // .unwrap();
         let arrays = self.spectrum_metadata_buffer.finish();
         let batch = RecordBatch::from(arrays.as_struct());
         self.archive_writer.as_mut().unwrap().write(&batch)?;
-        // self.spectrum_metadata_buffer.clear();
         Ok(())
     }
 
@@ -634,7 +628,9 @@ impl<
 > Drop for MzPeakWriterType<W, C, D>
 {
     fn drop(&mut self) {
-        if let Err(_) = self.finish() {}
+        if let Err(e) = self.finish() {
+            log::trace!("While dropping MzPeakWriterType: {e}")
+        }
     }
 }
 
