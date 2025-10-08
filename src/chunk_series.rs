@@ -706,13 +706,6 @@ impl ArrowArrayChunk {
             let cb = this_builder.field_builder::<CURIEBuilder>(field_i).unwrap();
             let curie_of = chunk.chunk_encoding.as_curie();
             cb.append_value(&curie_of);
-            // cb.field_builder::<UInt8Builder>(0)
-            //     .unwrap()
-            //     .append_value(curie_of.cv_id);
-            // cb.field_builder::<UInt32Builder>(1)
-            //     .unwrap()
-            //     .append_value(curie_of.accession);
-            // cb.append(true);
             visited.insert(field_i);
             field_i += 1;
 
