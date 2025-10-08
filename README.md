@@ -58,7 +58,7 @@ When storing spectrum data, some vendors will produce arrays with lots of "empty
 
 #### Null Marking
 
-For spectra with many small gaps, even zero run stripping is leaves too much unhelpful information in the data. We can instead replace the flanking zero intensity points with `null` m/z and intensity values and Parquet will skip storing the expensive 32- and/or 64-bit values, retaining only the validity buffer bit flag. We can separately fit a simple m/z spacing model using weighted least squares of the form
+For spectra with many small gaps, even zero run stripping leaves too much unhelpful information in the data. We can instead replace the flanking zero intensity points with `null` m/z and intensity values and Parquet will skip storing the expensive 32- and/or 64-bit values, retaining only the validity buffer bit flag. We can separately fit a simple m/z spacing model using weighted least squares of the form:
 
 $$
     δ mz \sim β_0 + β_1 mz + β_2 mz^2 + ϵ
@@ -72,7 +72,7 @@ or using the following Python code:
 
 Then when reading the the null-marked data, use either the local median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve an very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the minute angle change this would induce are still effectively lossless.
 
-TODO: Insert plot of the point-level and peak δ m/zs on Thermo and Sciex profile data
+#TODO: Insert plot of the point-level and peak δ m/zs on Thermo and Sciex profile data
 
 ### Point Layout for Data Arrays
 
@@ -88,11 +88,11 @@ When storing data arrays, the point layout stores the data as-is in parallel arr
 | 2              | 516.5    | 5002 |
 | 2              | 783.8    | 302 |
 
-This layout is simple, but carries several advantages. Scalar columns are easily filtered along using the page-level range index. This makes performing multi-dimensional queries easier to write and optimize. The arrays are transparently encoded and compressed by Parquet, so the data may still be stored compactly. The data must be stored as-is in order to use the page index so no additional obscuring transformations can be used. The [zero run stripping](#zero-run-stripping) and [null marking](#null-marking) methods may still be employed as they only remove non-meaningful points from the array.
+This layout is simple, but carries several advantages. Scalar columns are easily filtered along the page-level range index. This makes multi-dimensional queries easier to write and optimize. The arrays are transparently encoded and compressed by Parquet, so the data may still be stored compactly. The data must be stored as-is in order to use the page index so no additional obscuring transformations can be used. The [zero run stripping](#zero-run-stripping) and [null marking](#null-marking) methods may still be employed as they only remove non-meaningful points from the array.
 
 ### Chunked Layout for Data Arrays
 
-When storing data arrays, the chunked layout treats one array, which must be sorted, as the "primary" axis, cutting the array into chunks of a fixed size along that coordinate space (e.g. steps of 50 m/z) and taking the same segments from parallel arrays. The primary axis chunk's start, end, and a repeated index are recorded as columns, and then each array may be encoded as-is or with an opaque transform (e.g. δ-encoding, Numpress). The start and end interval permits granular random access along the primary axis as well as the source index.
+When storing data arrays, the chunked layout treats one array, which must be sorted, as the "primary" axis, cutting the array into chunks of a fixed size along that coordinate space (e.g. steps of 50 m/z) and taking the same segments from parallel arrays. The primary axis chunks' start, end, and a repeated index are recorded as columns, and then each array may be encoded as-is or with an opaque transform (e.g. δ-encoding, Numpress). The start and end interval permits granular random access along the primary axis as well as the source index.
 
 | spectrum_index | mz_array_start | mz_array_end | mz_array_chunk_values | intensity_array |
 | :-----:        | :------: | :---------: |:--- | :---
@@ -104,7 +104,7 @@ When storing data arrays, the chunked layout treats one array, which must be sor
 | 2              | 350.0    | 400.0 | [0.0014, ..., 0.0014] | [...]
 | 2              | 400.0    | 450.0 | [0.0013, ..., 0.0014] | [...]
 
-This example uses a δ-encoding for the m/z array chunk's values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_array_chunk_values` list aren't accessible to the page index, but the start and end columns are. The chunk values are still accessible for the Parquet encodings
+This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_array_chunk_values` list aren't accessible to the page index, but the start and end columns are. The chunk values are still accessible for the Parquet encodings.
 
 
 ## Conversion Program
@@ -141,7 +141,7 @@ Options:
   -b, --buffer-size <BUFFER_SIZE>
           The number of spectra to buffer between writes [default: 5000]
   -c, --chunked-encoding [<CHUNKED_ENCODING>]
-          Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress', or 'plain'. You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'
+          Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress', or 'plain'. You can also specify a chunk size like 'delta:50'. [default: 'delta:50']
   -k, --compression-level <COMPRESSION_LEVEL>
           The Zstd compression level to use. Defaults to 3, but ranges from 1-22 [default: 3]
   -p, --write-peaks-and-profiles
