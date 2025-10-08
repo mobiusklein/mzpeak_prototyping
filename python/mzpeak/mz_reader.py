@@ -244,8 +244,12 @@ DELTA_ENCODING = {"cv_id": 1, "accession": 1003089}
 NO_COMPRESSION = {"cv_id": 1, "accession": 1000576}
 NUMPRESS_LINEAR = {"cv_id": 1, "accession": 1002312}
 
-NUMPRESS_SLOF = "MS:1002314"
-NUMPRESS_PIC = "MS:1002313"
+DELTA_ENCODING_CURIE = "MS:1003089"
+NO_COMPRESSION_CURIE = "MS:1000576"
+NUMPRESS_LINEAR_CURIE = "MS:1002312"
+
+NUMPRESS_SLOF_CURIE = "MS:1002314"
+NUMPRESS_PIC_CURIE = "MS:1002313"
 
 psims_dtypes = {
     "MS:1000521": np.float32,
@@ -433,9 +437,9 @@ class MzPeakArrayDataReader:
         for chunk in chunks:
             # The +1 is to account for the starting point
             encoding = chunk["chunk_encoding"].as_py()
-            if encoding == DELTA_ENCODING or encoding == NO_COMPRESSION:
+            if encoding in (DELTA_ENCODING, NO_COMPRESSION, NO_COMPRESSION_CURIE, DELTA_ENCODING_CURIE):
                 n += len(chunk[f"{axis_prefix}_chunk_values"]) + 1
-            elif encoding == NUMPRESS_LINEAR:
+            elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
                 raw = chunk[f"{axis_prefix}_numpress_bytes"].as_py()
                 part = pynumpress.decode_linear(raw)
                 n += len(part)
@@ -470,7 +474,7 @@ class MzPeakArrayDataReader:
             encoding = chunk["chunk_encoding"].as_py()
 
             # Delta encoding
-            if encoding == DELTA_ENCODING:
+            if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):
                 if steps.values.null_count > 0:
                     had_nulls = True
                     # The presence null values leads to sometimes restoring one fewer values because the chunk start is
@@ -491,10 +495,10 @@ class MzPeakArrayDataReader:
                         steps.values
                     )
             # Direct encoding
-            elif encoding == NO_COMPRESSION:
+            elif encoding in (NO_COMPRESSION, NO_COMPRESSION_CURIE):
                 chunk_size = len(steps)
                 main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
-            elif encoding == NUMPRESS_LINEAR:
+            elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
                 part: np.ndarray = next(numpress_chunks_it)
                 chunk_size = len(part)
                 zeros = part == 0
@@ -517,9 +521,9 @@ class MzPeakArrayDataReader:
                 else:
                     values = np.asarray(v.values)
                     if k in has_transforms:
-                        if has_transforms[k] == NUMPRESS_SLOF:
+                        if has_transforms[k] == NUMPRESS_SLOF_CURIE:
                             values = pynumpress.decode_slof(values)
-                        elif has_transforms[k] == NUMPRESS_PIC:
+                        elif has_transforms[k] == NUMPRESS_PIC_CURIE:
                             values = pynumpress.decode_pic(values)
                         else:
                             raise NotImplementedError(has_transforms[k])

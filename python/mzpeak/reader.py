@@ -34,6 +34,8 @@ def _value_normalize(val: dict):
 def _format_curie(curie: dict):
     if curie is None:
         return None
+    elif isinstance(curie, str):
+        return curie
     idx = curie['cv_id']
     acc = curie['accession']
     if idx == 1:

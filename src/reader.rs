@@ -7,9 +7,7 @@ use std::{
 
 use arrow::{
     array::{Array, AsArray, Float32Array, RecordBatch, StructArray, UInt64Array},
-    datatypes::{
-        DataType, FieldRef, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type,
-    },
+    datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type},
     error::ArrowError,
 };
 
@@ -34,18 +32,21 @@ use parquet::arrow::{
     ProjectionMask,
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
-use serde_arrow::schema::SchemaLike;
 
 use crate::{
-    archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource}, filter::RegressionDeltaModel, param::MetadataColumn, reader::{
+    BufferContext,
+    archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource},
+    filter::RegressionDeltaModel,
+    param::MetadataColumn,
+    reader::{
         chunk::DataChunkCache,
         index::{PageQuery, QueryIndex, SpanDynNumeric},
         point::PointDataReader,
         visitor::{
-            MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
-            MzSpectrumVisitor,
+            AuxiliaryArrayVisitor, MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor,
+            MzSelectedIonVisitor, MzSpectrumVisitor,
         },
-    }, spectrum::AuxiliaryArray, BufferContext
+    },
 };
 
 mod chunk;
@@ -1249,18 +1250,13 @@ impl<
 
     fn load_auxiliary_arrays_from(&self, reader: ParquetRecordBatchReader) -> Vec<DataArray> {
         let mut results = Vec::new();
-        let fields: Vec<FieldRef> =
-            SchemaLike::from_type::<AuxiliaryArray>(Default::default()).unwrap();
         for bat in reader.flatten() {
             let root = bat.column(0);
             let root = root.as_struct();
             let data = root.column(1).as_list::<i64>();
             let data = data.values().as_struct();
-            let arrays: Vec<AuxiliaryArray> =
-                serde_arrow::from_arrow(&fields, data.columns()).unwrap();
-            for array in arrays {
-                results.push(array.into());
-            }
+            let arrays = AuxiliaryArrayVisitor::default().visit(data);
+            results.extend(arrays);
         }
 
         results
@@ -1950,8 +1946,8 @@ pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<ZipArchiveSource, C, 
 pub type UnpackedMzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DirectorySource, C, D>;
 
 pub type MzPeakReader = MzPeakReaderTypeOfSource<ZipArchiveSource, CentroidPeak, DeconvolutedPeak>;
-pub type UnpackedMzPeakReader = MzPeakReaderTypeOfSource<DirectorySource, CentroidPeak, DeconvolutedPeak>;
-
+pub type UnpackedMzPeakReader =
+    MzPeakReaderTypeOfSource<DirectorySource, CentroidPeak, DeconvolutedPeak>;
 
 #[cfg(test)]
 mod test {

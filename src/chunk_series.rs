@@ -4,41 +4,37 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, ArrowPrimitiveType, AsArray, Float32Array, Float32Builder,
-    Float64Array, Float64Builder, Int32Builder, Int64Builder,
-    LargeListBuilder, PrimitiveArray,
-    StructArray, StructBuilder, UInt8Array, UInt8Builder, UInt32Builder, UInt64Array,
-    UInt64Builder,
+    Float64Array, Float64Builder, Int32Builder, Int64Builder, LargeListBuilder, PrimitiveArray,
+    StructArray, StructBuilder, UInt8Array, UInt8Builder, UInt64Array, UInt64Builder,
 };
 use arrow::compute::kernels::nullif;
 use arrow::datatypes::{
-    DataType, Field, FieldRef, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Schema,
-    UInt8Type,
+    DataType, Field, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt8Type,
 };
 use itertools::Itertools;
 use mzdata::prelude::ByteArrayView;
-use mzdata::
-    spectrum::{
-        ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray,
-        bindata::ArrayRetrievalError,
-    }
-;
+use mzdata::spectrum::{
+    ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, bindata::ArrayRetrievalError,
+};
 
 use mzpeaks::coordinate::SimpleInterval;
 
 use bytemuck::Pod;
 use num_traits::{Float, NumCast, ToPrimitive};
 
-use crate::buffer_descriptors::BufferTransform;
-use crate::filter::{
-    _skip_zero_runs_gen, RegressionDeltaModel, fill_nulls_for,
-    is_zero_pair_mask, null_chunk_every_k, null_delta_decode, null_delta_encode,
+use crate::writer::StructVisitor;
+use crate::{
+    buffer_descriptors::BufferTransform,
+    filter::{
+        _skip_zero_runs_gen, RegressionDeltaModel, fill_nulls_for, is_zero_pair_mask,
+        null_chunk_every_k, null_delta_decode, null_delta_encode,
+    },
+    peak_series::{
+        BufferContext, BufferFormat, BufferName, array_to_arrow_type, data_array_to_arrow_array,
+    },
+    spectrum::AuxiliaryArray,
+    writer::{CURIEBuilder, VisitorBase},
 };
-use crate::peak_series::{
-    BufferContext, BufferFormat, BufferName, array_to_arrow_type,
-    data_array_to_arrow_array,
-};
-use crate::spectrum::AuxiliaryArray;
-use crate::{CURIE, curie};
 
 pub fn chunk_every_k<T: Float>(data: &[T], k: T) -> Vec<SimpleInterval<usize>> {
     let mut chunks = Vec::new();
@@ -100,11 +96,10 @@ pub fn delta_decode<T: Float + Pod + AddAssign>(
     }
 }
 
-pub const NO_COMPRESSION: CURIE = curie!(MS:1000576);
-pub const DELTA_ENCODE: CURIE = curie!(MS:1003089);
-pub const NUMPRESS_LINEAR: CURIE = curie!(MS:1002312);
-pub const NUMPRESS_SLOF: CURIE = curie!(MS:1002314);
-
+pub const NO_COMPRESSION: mzdata::params::CURIE = mzdata::curie!(MS:1000576);
+pub const DELTA_ENCODE: mzdata::params::CURIE = mzdata::curie!(MS:1003089);
+pub const NUMPRESS_LINEAR: mzdata::params::CURIE = mzdata::curie!(MS:1002312);
+pub const NUMPRESS_SLOF: mzdata::params::CURIE = mzdata::curie!(MS:1002314);
 
 /// Different methods for encoding chunks along a coordinate dimension
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -125,7 +120,7 @@ pub enum ChunkingStrategy {
 
 impl ChunkingStrategy {
     /// Convert the chunking stategy to a CURIE
-    pub const fn as_curie(&self) -> CURIE {
+    pub const fn as_curie(&self) -> mzdata::params::CURIE {
         match self {
             Self::Basic { chunk_size: _ } => NO_COMPRESSION,
             Self::Delta { chunk_size: _ } => DELTA_ENCODE,
@@ -246,7 +241,8 @@ impl ChunkingStrategy {
             }
             ChunkingStrategy::NumpressLinear { chunk_size: _ } => {
                 let bytes_of = if matches!(array.data_type(), DataType::Float64) {
-                    let array: &PrimitiveArray<Float64Type> = array.as_any().downcast_ref().unwrap();
+                    let array: &PrimitiveArray<Float64Type> =
+                        array.as_any().downcast_ref().unwrap();
                     DataArray::compress_numpress_linear(array.values()).unwrap()
                 } else {
                     let values: Vec<_> = array
@@ -285,9 +281,7 @@ impl ChunkingStrategy {
                         let values = fill_nulls_for(&decoded, delta_model);
                         accumulator.extend(&values).unwrap();
                     } else {
-                        log::debug!(
-                            $debug
-                        );
+                        log::debug!($debug);
                         accumulator.extend(decoded.values()).unwrap()
                     }
                 } else {
@@ -313,10 +307,20 @@ impl ChunkingStrategy {
             },
             ChunkingStrategy::Delta { chunk_size: _ } => match array.data_type() {
                 DataType::Float32 => {
-                    decode_delta!(array, Float32Type, f32, "f32 delta decoding contained nulls but no delta model provided");
+                    decode_delta!(
+                        array,
+                        Float32Type,
+                        f32,
+                        "f32 delta decoding contained nulls but no delta model provided"
+                    );
                 }
                 DataType::Float64 => {
-                    decode_delta!(array, Float64Type, f64, "f64 delta decoding contained nulls but no delta model provided");
+                    decode_delta!(
+                        array,
+                        Float64Type,
+                        f64,
+                        "f64 delta decoding contained nulls but no delta model provided"
+                    );
                 }
                 _ => panic!(
                     "Data type {:?} is not supported by chunk decoding",
@@ -365,24 +369,20 @@ impl BufferTransformEncoder {
     pub fn to_buffer_name(&self, buffer_name: &BufferName) -> BufferName {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
-            BufferTransform::NumpressSLOF => {
-                BufferName::new(
-                    buffer_name.context,
-                    ArrayType::nonstandard(format!("{}_numpress_slof_bytes", buffer_name)),
-                    buffer_name.dtype,
-                )
-                .with_format(BufferFormat::ChunkedSecondary)
-                .with_transform(Some(self.0))
-            }
-            BufferTransform::NumpressPIC => {
-                BufferName::new(
-                    buffer_name.context,
-                    ArrayType::nonstandard(format!("{}_numpress_pic_bytes", buffer_name)),
-                    buffer_name.dtype,
-                )
-                .with_format(BufferFormat::ChunkedSecondary)
-                .with_transform(Some(self.0))
-            }
+            BufferTransform::NumpressSLOF => BufferName::new(
+                buffer_name.context,
+                ArrayType::nonstandard(format!("{}_numpress_slof_bytes", buffer_name)),
+                buffer_name.dtype,
+            )
+            .with_format(BufferFormat::ChunkedSecondary)
+            .with_transform(Some(self.0)),
+            BufferTransform::NumpressPIC => BufferName::new(
+                buffer_name.context,
+                ArrayType::nonstandard(format!("{}_numpress_pic_bytes", buffer_name)),
+                buffer_name.dtype,
+            )
+            .with_format(BufferFormat::ChunkedSecondary)
+            .with_transform(Some(self.0)),
         }
     }
 
@@ -426,11 +426,7 @@ impl BufferTransformEncoder {
         // use the full buffer name formatting again
         let f = self.to_field(buffer_name);
         let q = f.name();
-        let idx =  schema
-                .fields()
-                .iter()
-                .position(|p| p.name() == q)
-                .unwrap();
+        let idx = schema.fields().iter().position(|p| p.name() == q).unwrap();
 
         if visited.contains(&idx) {
             return;
@@ -453,7 +449,11 @@ impl BufferTransformEncoder {
         }
     }
 
-    pub fn encode_arrow(&self, _buffer_name: &BufferName, chunk_segment: &impl AsArray) -> ArrayRef {
+    pub fn encode_arrow(
+        &self,
+        _buffer_name: &BufferName,
+        chunk_segment: &impl AsArray,
+    ) -> ArrayRef {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressPIC => {
@@ -508,32 +508,36 @@ impl BufferTransformDecoder {
                     BinaryDataArrayType::Float64 => {
                         let mut acc: Vec<f64> = Vec::new();
                         numpress_rs::decode_slof(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float64Array::from(acc))
-                    },
+                        return Arc::new(Float64Array::from(acc));
+                    }
                     BinaryDataArrayType::Float32 => {
                         let mut acc: Vec<f64> = Vec::new();
                         numpress_rs::decode_slof(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float32Array::from_iter_values(acc.into_iter().map(|v| v as f32)))
-                    },
-                    _ => todo!()
+                        return Arc::new(Float32Array::from_iter_values(
+                            acc.into_iter().map(|v| v as f32),
+                        ));
+                    }
+                    _ => todo!(),
                 }
-            },
+            }
             BufferTransform::NumpressPIC => {
                 let data: &UInt8Array = array.as_primitive();
                 match buffer_name.dtype {
                     BinaryDataArrayType::Float64 => {
                         let mut acc: Vec<f64> = Vec::new();
                         numpress_rs::decode_pic(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float64Array::from(acc))
-                    },
+                        return Arc::new(Float64Array::from(acc));
+                    }
                     BinaryDataArrayType::Float32 => {
                         let mut acc: Vec<f64> = Vec::new();
                         numpress_rs::decode_pic(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float32Array::from_iter_values(acc.into_iter().map(|v| v as f32)))
-                    },
-                    _ => todo!()
+                        return Arc::new(Float32Array::from_iter_values(
+                            acc.into_iter().map(|v| v as f32),
+                        ));
+                    }
+                    _ => todo!(),
                 }
-            },
+            }
         }
     }
 }
@@ -543,8 +547,6 @@ impl From<BufferTransform> for BufferTransformDecoder {
         Self(value)
     }
 }
-
-
 
 #[derive(Debug, Clone)]
 pub struct ArrowArrayChunk {
@@ -600,10 +602,17 @@ impl ArrowArrayChunk {
         let mut this_builder =
             StructBuilder::from_fields(this_schema.fields().clone(), chunks.len());
 
+        this_builder.field_builders_mut()[4] =
+            Box::new(CURIEBuilder::default()) as Box<dyn ArrayBuilder>;
+
         let time_index = if include_time {
             let q = buffer_context.time_field();
             let q = q.name();
-            this_schema.fields().iter().position(|f| *f.name() == *q).unwrap()
+            this_schema
+                .fields()
+                .iter()
+                .position(|f| *f.name() == *q)
+                .unwrap()
         } else {
             0
         };
@@ -612,15 +621,21 @@ impl ArrowArrayChunk {
         for chunk in chunks {
             let mut field_i = 0;
             visited.clear();
-            let b = this_builder.field_builder::<UInt64Builder>(field_i).unwrap();
+            let b = this_builder
+                .field_builder::<UInt64Builder>(field_i)
+                .unwrap();
             b.append_value(chunk.series_index);
             visited.insert(field_i);
             field_i += 1;
-            let b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
+            let b = this_builder
+                .field_builder::<Float64Builder>(field_i)
+                .unwrap();
             b.append_value(chunk.chunk_start);
             visited.insert(field_i);
             field_i += 1;
-            let b = this_builder.field_builder::<Float64Builder>(field_i).unwrap();
+            let b = this_builder
+                .field_builder::<Float64Builder>(field_i)
+                .unwrap();
             b.append_value(chunk.chunk_end);
             visited.insert(field_i);
             field_i += 1;
@@ -688,20 +703,23 @@ impl ArrowArrayChunk {
                 );
             }
 
-            let cb = this_builder.field_builder::<StructBuilder>(field_i).unwrap();
+            let cb = this_builder.field_builder::<CURIEBuilder>(field_i).unwrap();
             let curie_of = chunk.chunk_encoding.as_curie();
-            cb.field_builder::<UInt8Builder>(0)
-                .unwrap()
-                .append_value(curie_of.cv_id);
-            cb.field_builder::<UInt32Builder>(1)
-                .unwrap()
-                .append_value(curie_of.accession);
-            cb.append(true);
+            cb.append_value(&curie_of);
+            // cb.field_builder::<UInt8Builder>(0)
+            //     .unwrap()
+            //     .append_value(curie_of.cv_id);
+            // cb.field_builder::<UInt32Builder>(1)
+            //     .unwrap()
+            //     .append_value(curie_of.accession);
+            // cb.append(true);
             visited.insert(field_i);
             field_i += 1;
 
             if include_time {
-                let b = this_builder.field_builder::<Float32Builder>(time_index).unwrap();
+                let b = this_builder
+                    .field_builder::<Float32Builder>(time_index)
+                    .unwrap();
                 b.append_option(chunk.series_time);
                 visited.insert(time_index);
             }
@@ -715,7 +733,7 @@ impl ArrowArrayChunk {
                 {
                     let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                         this_builder.field_builder(i).unwrap();
-                        if let Some(transform) = buf_name.transform.map(BufferTransformEncoder) {
+                    if let Some(transform) = buf_name.transform.map(BufferTransformEncoder) {
                         transform.visit_builder(
                             &buf_name,
                             chunk,
@@ -791,9 +809,6 @@ impl ArrowArrayChunk {
         encodings: &[ChunkingStrategy],
         include_time: bool,
     ) -> Schema {
-        let curie_fields: Vec<FieldRef> =
-            serde_arrow::schema::SchemaLike::from_type::<CURIE>(Default::default()).unwrap();
-
         let base_name = self.chunk_axis.clone();
 
         let field_meta = base_name.as_field_metadata();
@@ -819,7 +834,7 @@ impl ArrowArrayChunk {
             .into(),
             Field::new(
                 "chunk_encoding",
-                DataType::Struct(curie_fields.into()),
+                CURIEBuilder::default().as_struct_type(),
                 true,
             )
             .into(),
@@ -881,15 +896,14 @@ impl ArrowArrayChunk {
                 overrides.get(&name).unwrap_or(&name)
             };
             if let Some(fields) = fields {
-                let field_name = if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
-                    transform.to_field(buffer_name).name().clone()
-                } else {
-                    buffer_name.to_field().name().clone()
-                };
+                let field_name =
+                    if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
+                        transform.to_field(buffer_name).name().clone()
+                    } else {
+                        buffer_name.to_field().name().clone()
+                    };
                 // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
-                if !fields.find(&field_name).is_some()
-                    && *buffer_name != main_axis
-                {
+                if !fields.find(&field_name).is_some() && *buffer_name != main_axis {
                     log::debug!(
                         "Skipping {:?}, not in schema: {fields:?}",
                         buffer_name.to_field().name()
@@ -1042,7 +1056,10 @@ impl ArrowArrayChunk {
 
 #[cfg(test)]
 mod test {
-    use std::{fs, io::{self, prelude::*}};
+    use std::{
+        fs,
+        io::{self, prelude::*},
+    };
 
     use super::*;
     use mzdata::{MZReader, prelude::*};
