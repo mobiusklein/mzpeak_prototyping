@@ -2,9 +2,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, Float32Builder, Float64Builder,
-        Int8Builder, Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, NullBuilder,
-        StructArray, UInt8Builder, UInt32Builder, UInt64Builder,
+        ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder, Int8Builder, LargeListBuilder, LargeStringBuilder, NullBuilder, StringBuilder, StructArray, UInt32Builder, UInt64Builder, UInt8Builder
     },
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
@@ -140,7 +138,7 @@ pub fn inflect_cv_term_to_column_name(curie: mzdata::params::CURIE, name: &str) 
 }
 
 pub struct CustomBuilderFromParameter {
-    curie: mzdata::params::CURIE,
+    accession: mzdata::params::CURIE,
     value: Box<dyn ArrayBuilder>,
     field: FieldRef,
     unit: Option<CURIEBuilder>,
@@ -149,9 +147,10 @@ pub struct CustomBuilderFromParameter {
 impl Debug for CustomBuilderFromParameter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CustomBuilderFromParameter")
-            .field("curie", &self.curie)
+            .field("accession", &self.accession)
             .field("value", &"...")
             .field("field", &self.field)
+            .field("unit", if self.unit.is_some() { &"yes" } else { &"no" })
             .finish()
     }
 }
@@ -168,31 +167,31 @@ impl CustomBuilderFromParameter {
         let unit = None;
         match dtype {
             DataType::Null => Self {
-                curie,
+                accession: curie,
                 field,
                 value: Box::new(NullBuilder::new()),
                 unit,
             },
             DataType::Boolean => Self {
-                curie,
+                accession: curie,
                 field,
                 value: Box::new(BooleanBuilder::new()),
                 unit,
             },
             DataType::Int64 => Self {
-                curie,
+                accession: curie,
                 field,
                 value: Box::new(Int64Builder::new()),
                 unit,
             },
             DataType::Float64 => Self {
-                curie,
+                accession: curie,
                 field,
                 value: Box::new(Float64Builder::new()),
                 unit,
             },
             DataType::LargeUtf8 => Self {
-                curie,
+                accession: curie,
                 field,
                 value: Box::new(LargeStringBuilder::new()),
                 unit,
@@ -269,7 +268,7 @@ where
     T: ParamDescribed,
 {
     fn append_value(&mut self, item: &T) -> bool {
-        if let Some(val) = item.get_param_by_curie(&self.curie) {
+        if let Some(val) = item.get_param_by_curie(&self.accession) {
             match self.field.data_type() {
                 DataType::Null => {
                     self.value
@@ -353,13 +352,14 @@ impl ArrayBuilder for CustomBuilderFromParameter {
     }
 }
 
+#[allow(unused)]
 #[derive(Debug, Default)]
-pub struct CURIEBuilder {
+pub struct CURIEStructBuilder {
     cv_id: UInt8Builder,
     accession: UInt32Builder,
 }
 
-impl VisitorBase for CURIEBuilder {
+impl VisitorBase for CURIEStructBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!("cv_id", DataType::UInt8),
@@ -373,7 +373,7 @@ impl VisitorBase for CURIEBuilder {
     }
 }
 
-impl StructVisitor<crate::CURIE> for CURIEBuilder {
+impl StructVisitor<crate::CURIE> for CURIEStructBuilder {
     fn append_value(&mut self, item: &crate::CURIE) -> bool {
         self.cv_id.append_value(item.cv_id);
         self.accession.append_value(item.accession);
@@ -381,21 +381,21 @@ impl StructVisitor<crate::CURIE> for CURIEBuilder {
     }
 }
 
-impl StructVisitor<mzdata::params::CURIE> for CURIEBuilder {
+impl StructVisitor<mzdata::params::CURIE> for CURIEStructBuilder {
     fn append_value(&mut self, item: &mzdata::params::CURIE) -> bool {
         let item: crate::CURIE = (*item).into();
         self.append_value(&item)
     }
 }
 
-impl StructVisitor<&str> for CURIEBuilder {
+impl StructVisitor<&str> for CURIEStructBuilder {
     fn append_value(&mut self, item: &&str) -> bool {
         let val: mzdata::params::CURIE = item.parse().unwrap();
         self.append_value(&val)
     }
 }
 
-impl ArrayBuilder for CURIEBuilder {
+impl ArrayBuilder for CURIEStructBuilder {
     fn len(&self) -> usize {
         self.cv_id.len()
     }
@@ -424,6 +424,71 @@ impl ArrayBuilder for CURIEBuilder {
 
     anyways!();
 }
+
+
+#[allow(unused)]
+#[derive(Debug, Default)]
+pub struct CURIEStrBuilder(StringBuilder);
+
+impl VisitorBase for CURIEStrBuilder {
+    fn fields(&self) -> Vec<FieldRef> {
+        vec![
+            field!("accession", DataType::Utf8)
+        ]
+    }
+
+    fn append_null(&mut self) {
+        self.0.append_null();
+    }
+
+    fn as_struct_type(&self) -> DataType {
+        DataType::Utf8
+    }
+}
+
+impl StructVisitor<mzdata::params::CURIE> for CURIEStrBuilder {
+    fn append_value(&mut self, item: &mzdata::params::CURIE) -> bool {
+        let item = item.to_string();
+        self.0.append_value(&item);
+        true
+    }
+}
+
+impl StructVisitor<crate::param::CURIE> for CURIEStrBuilder {
+    fn append_value(&mut self, item: &crate::param::CURIE) -> bool {
+        let item = item.to_string();
+        self.0.append_value(&item);
+        true
+    }
+}
+
+impl StructVisitor<&str> for CURIEStrBuilder {
+    fn append_value(&mut self, item: &&str) -> bool {
+        let val: mzdata::params::CURIE = item.parse().unwrap();
+        self.append_value(&val)
+    }
+}
+
+impl ArrayBuilder for CURIEStrBuilder {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        Arc::new(self.0.finish())
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        Arc::new(self.0.finish_cloned())
+    }
+
+    anyways!();
+}
+
+
+// pub type CURIEBuilder = CURIEStructBuilder;
+pub type CURIEBuilder = CURIEStrBuilder;
+
 
 #[derive(Debug, Default)]
 pub struct ParamValueBuilder {
@@ -557,7 +622,7 @@ impl VisitorBase for ParamBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         vec![
             field!("value", self.value.as_struct_type()),
-            field!("curie", self.curie.as_struct_type()),
+            field!("accession", self.curie.as_struct_type()),
             field!("name", DataType::LargeUtf8),
             field!("unit", self.unit.as_struct_type()),
         ]

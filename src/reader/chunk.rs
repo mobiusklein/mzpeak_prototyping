@@ -1,15 +1,14 @@
-#![allow(unused_imports)]
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    sync::Arc,
-};
+use std::{collections::HashMap, io, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StructArray, UInt64Array, UInt8Array
+        Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array,
+        PrimitiveArray, RecordBatch, StructArray, UInt8Array, UInt64Array,
     },
-    datatypes::{DataType, Field, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Int8Type, Schema, UInt32Type, UInt64Type, UInt8Type},
+    datatypes::{
+        DataType, Field, Fields, Float32Type, Float64Type, Int8Type, Int32Type, Int64Type, Schema,
+        UInt8Type, UInt32Type, UInt64Type,
+    },
     error::ArrowError,
 };
 use parquet::arrow::{
@@ -24,7 +23,7 @@ use mzdata::{
 use mzpeaks::coordinate::SimpleInterval;
 
 use crate::{
-    BufferName, CURIE,
+    BufferName,
     buffer_descriptors::arrow_to_array_type,
     chunk_series::{
         BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR,
@@ -35,6 +34,7 @@ use crate::{
         ReaderMetadata,
         index::{PageQuery, QueryIndex, RangeIndex, SpanDynNumeric},
         point::binary_search_arrow_index,
+        visitor::AnyCURIEArray,
     },
 };
 
@@ -255,7 +255,12 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             .spectrum_index
             .row_selection_overlaps(&index_range);
 
-        let PageQuery { row_group_indices, pages: _ } = query_indices.spectrum_chunk_index.query_pages_overlaps(&index_range);
+        let PageQuery {
+            row_group_indices,
+            pages: _,
+        } = query_indices
+            .spectrum_chunk_index
+            .query_pages_overlaps(&index_range);
 
         let mut up_to_first_row = 0;
         if !row_group_indices.is_empty() {
@@ -356,7 +361,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             let mut buffers: HashMap<BufferName, Vec<ArrayRef>> = HashMap::new();
             let mut main_axis_buffers = Vec::new();
             let mut main_axis_starts = Vec::new();
-            let mut chunk_encodings: Vec<CURIE> = Vec::new();
+            let mut chunk_encodings: Vec<_> = Vec::new();
             let mut spectrum_index = Vec::new();
             let mut main_axis = None;
 
@@ -366,9 +371,7 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                         spectrum_index.push(arr.clone());
                     }
                     "chunk_encoding" => {
-                        let arr = arr.as_struct();
-                        chunk_encodings =
-                            serde_arrow::from_arrow(arr.fields(), arr.columns()).unwrap();
+                        chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec();
                     }
                     s if s.ends_with("chunk_start") => {
                         main_axis_starts.push(arr.clone());
@@ -401,9 +404,8 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
             }
 
             // Accumulate the per-point spectrum association
-            let mut spectrum_idx_acc: Vec<u64> = Vec::with_capacity(
-                spectrum_index.iter().map(|v| v.len()).sum()
-            );
+            let mut spectrum_idx_acc: Vec<u64> =
+                Vec::with_capacity(spectrum_index.iter().map(|v| v.len()).sum());
 
             for (name, chunk_values) in main_axis_buffers.drain(..) {
                 for ((encoding, chunk_starts), spectrum_idxs) in chunk_encodings
@@ -474,11 +476,9 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                     {
                                         if let Some(chunk_vals) = chunk_vals {
                                             let start = start.unwrap();
-                                            let delta_model =
-                                                delta_model_cache.get(spectrum_idx, || {
-                                                    metadata.model_deltas_for(
-                                                        spectrum_idx as usize,
-                                                    )
+                                            let delta_model = delta_model_cache
+                                                .get(spectrum_idx, || {
+                                                    metadata.model_deltas_for(spectrum_idx as usize)
                                                 });
                                             let main_axis_size_before = main_axis
                                                 .as_ref()
@@ -526,11 +526,9 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                                     {
                                         if let Some(chunk_vals) = chunk_vals {
                                             let start = start.unwrap();
-                                            let delta_model =
-                                                delta_model_cache.get(spectrum_idx, || {
-                                                    metadata.model_deltas_for(
-                                                        spectrum_idx as usize,
-                                                    )
+                                            let delta_model = delta_model_cache
+                                                .get(spectrum_idx, || {
+                                                    metadata.model_deltas_for(spectrum_idx as usize)
                                                 });
                                             let main_axis_size_before = main_axis
                                                 .as_ref()
@@ -622,7 +620,9 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                             ($arr:ident, $p:ty, $out:expr) => {
                                 if let Some(arr) = $arr.as_primitive_opt::<$p>() {
                                     let vals = arr.values().clone();
-                                    $out.push(Arc::new(PrimitiveArray::<$p>::new(vals, None)) as ArrayRef);
+                                    $out.push(
+                                        Arc::new(PrimitiveArray::<$p>::new(vals, None)) as ArrayRef
+                                    );
                                     true
                                 } else {
                                     false
@@ -633,21 +633,22 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
                         let had_nulls = chunks.iter().any(|c| c.null_count() > 0);
                         log::trace!("Found nulls in {name:?}");
                         if had_nulls {
-                            let mut chunks_out: Vec<Arc<dyn Array>> = Vec::with_capacity(chunks.len());
+                            let mut chunks_out: Vec<Arc<dyn Array>> =
+                                Vec::with_capacity(chunks.len());
                             for chunk in chunks.iter() {
                                 if chunk.null_count() == 0 {
                                     chunks_out.push((*chunk).clone());
                                     continue;
                                 }
-                                if fill_null!(chunk, Int64Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, UInt64Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, Float64Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, Int32Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, UInt32Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, Float32Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, Int8Type, &mut chunks_out) {}
-                                else if fill_null!(chunk, UInt8Type, &mut chunks_out) {}
-                                else {
+                                if fill_null!(chunk, Int64Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, UInt64Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, Float64Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, Int32Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, UInt32Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, Float32Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, Int8Type, &mut chunks_out) {
+                                } else if fill_null!(chunk, UInt8Type, &mut chunks_out) {
+                                } else {
                                     chunks_out.push((*chunk).clone());
                                 }
                             }
@@ -699,16 +700,17 @@ impl<T: parquet::file::reader::ChunkReader + 'static> SpectrumChunkReader<T> {
         let mut bin_map = BinaryArrayMap::new();
         for batch in reader {
             let root = batch.column(0).as_struct();
-            let mut chunk_encodings: Vec<CURIE> = Vec::new();
+            let mut chunk_encodings: Vec<_> = Vec::new();
             for (f, arr) in root.fields().iter().zip(root.columns()) {
                 match f.name().as_str() {
                     "spectrum_index" => {
                         continue;
                     }
                     "chunk_encoding" => {
-                        let arr = arr.as_struct();
-                        chunk_encodings =
-                            serde_arrow::from_arrow(arr.fields(), arr.columns()).unwrap();
+                        chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec();
+                        // let arr = arr.as_struct();
+                        // chunk_encodings =
+                        //     serde_arrow::from_arrow(arr.fields(), arr.columns()).unwrap();
                     }
                     s if s.ends_with("chunk_start") => {
                         main_axis_starts.push(arr.clone());
