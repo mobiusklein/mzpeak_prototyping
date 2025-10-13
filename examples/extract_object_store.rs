@@ -3,6 +3,7 @@ use arrow::{
 };
 
 use clap::Parser;
+use futures::StreamExt;
 use mzdata::mzpeaks::coordinate::{CoordinateRange, SimpleInterval, Span1D};
 use std::io;
 
@@ -21,12 +22,13 @@ struct App {
     im_range: CoordinateRange<f64>,
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main(flavor="multi_thread", worker_threads=16)]
+async fn main() -> io::Result<()> {
     env_logger::init();
     let args = App::parse();
     let start = std::time::Instant::now();
 
-    let mut reader = mzpeak_prototyping::reader::MzPeakReader::new(&args.filename)?;
+    let mut reader = mzpeak_prototyping::reader::AsyncMzPeakReader::from_url(args.filename.parse().unwrap()).await?;
     // reader.load_all_spectrum_metadata()?;
 
     eprintln!("Opening archive took {} seconds", start.elapsed().as_secs_f64());
@@ -48,17 +50,16 @@ fn main() -> io::Result<()> {
         args.im_range.end.unwrap_or(f64::INFINITY),
     );
 
-    let (it, time_index) = reader.extract_peaks(
+    let (mut it, time_index) = reader.extract_peaks(
         time_range,
         Some(mz_range),
         None
-    )?;
+    ).await?;
 
     let query_range_end = std::time::Instant::now();
     eprintln!("{} seconds elapsed reading indices with {} entries", (query_range_end - start).as_secs_f64(), time_index.len());
 
-    for batch in it {
-        let batch = batch.unwrap();
+    while let Some(batch) = it.next().await.transpose().unwrap() {
         let root = batch.column(0).as_struct();
         let indices: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
         let intensities: &Float32Array = root.column(2).as_any().downcast_ref().unwrap();
@@ -133,6 +134,6 @@ fn main() -> io::Result<()> {
         }
     }
     let end = std::time::Instant::now();
-    eprintln!("{} seconds elapsed. {} total.", (end - query_range_end).as_secs_f64(), start.elapsed().as_secs_f64());
+    eprintln!("{} seconds elapsed", (end - query_range_end).as_secs_f64());
     Ok(())
 }

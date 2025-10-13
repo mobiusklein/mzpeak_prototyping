@@ -2,27 +2,44 @@ use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StructArray, UInt64Array, UInt8Array
+        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StructArray, UInt8Array, UInt64Array,
     },
-    datatypes::DataType, error::ArrowError,
+    datatypes::DataType,
+    error::ArrowError,
 };
 use mzdata::{
     prelude::BuildFromArrayMap,
     spectrum::{ArrayType, BinaryArrayMap, DataArray, PeakDataLevel},
 };
-use mzpeaks::{coordinate::SimpleInterval, CentroidLike, DeconvolutedCentroidLike};
+use mzpeaks::{CentroidLike, DeconvolutedCentroidLike, coordinate::SimpleInterval};
 use parquet::{
     arrow::{
-        arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection}, ProjectionMask
+        ProjectionMask,
+        arrow_reader::{
+            ArrowPredicateFn, ArrowReaderBuilder, ParquetRecordBatchReader,
+            ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
+        },
     },
-    file::reader::ChunkReader,
+    file::{metadata::ParquetMetaData, reader::ChunkReader},
+    schema::types::SchemaDescriptor,
 };
 
+#[cfg(feature = "async")]
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+
 use crate::{
-    filter::{fill_nulls_for, RegressionDeltaModel},
+    BufferContext,
+    filter::{RegressionDeltaModel, fill_nulls_for},
     peak_series::ArrayIndex,
-    reader::{index::{PageQuery, SpanDynNumeric, SpectrumQueryIndex}, metadata::PeakMetadata}, BufferContext,
+    reader::{
+        index::{PageQuery, SpanDynNumeric, SpectrumQueryIndex},
+        metadata::PeakMetadata,
+    },
 };
+
+#[cfg(feature = "async")]
+use futures::StreamExt;
 
 pub(crate) fn binary_search_arrow_index(
     array: &UInt64Array,
@@ -68,7 +85,6 @@ pub(crate) fn binary_search_arrow_index(
 
 /// An internal shared behavior set for reading point-layout data
 pub(crate) trait PointDataArrayReader {
-
     /// Read a [`StructArray`] of parallel array values into a map of [`DataArray`] instances.
     ///
     /// If `incremental` is not true, assume we have all the information available and skip work
@@ -77,10 +93,13 @@ pub(crate) trait PointDataArrayReader {
         points: &StructArray,
         bin_map: &mut HashMap<&String, DataArray>,
         mz_delta_model: Option<&RegressionDeltaModel<f64>>,
-        incremental: bool
+        incremental: bool,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
-            if f.name() == "spectrum_index" || f.name() == "spectrum_time" || f.name() == "chromatogram_index" {
+            if f.name() == "spectrum_index"
+                || f.name() == "spectrum_time"
+                || f.name() == "chromatogram_index"
+            {
                 continue;
             }
 
@@ -152,14 +171,11 @@ pub(crate) trait PointDataArrayReader {
         }
     }
 
-    /// Read a specific Parquet row group into memory as a single [`RecordBatch`]
-    ///
-    /// This may potentially use a lot of memory if row groups are large.
-    fn load_cache_block<T: ChunkReader + 'static>(
+    fn configure_cache_block_reader<T>(
         &self,
-        builder: ParquetRecordBatchReaderBuilder<T>,
+        builder: ArrowReaderBuilder<T>,
         row_group: usize,
-    ) -> io::Result<RecordBatch> {
+    ) -> ArrowReaderBuilder<T> {
         log::trace!("Loading row group {row_group}");
         let schema = builder.parquet_schema();
         let leaves = schema.columns().iter().enumerate().filter_map(|(i, f)| {
@@ -175,10 +191,46 @@ pub(crate) trait PointDataArrayReader {
         let batch = builder
             .with_row_groups(vec![row_group])
             .with_projection(mask)
-            .with_batch_size(usize::MAX)
-            .build()?
-            .flatten()
-            .next();
+            .with_batch_size(usize::MAX);
+
+        batch
+    }
+
+    #[cfg(feature = "async")]
+    fn load_cache_block_async<T: AsyncFileReader + Unpin + Send + 'static>(
+        &self,
+        builder: ParquetRecordBatchStreamBuilder<T>,
+        row_group: usize,
+    ) -> impl Future<Output = io::Result<RecordBatch>> {
+        let builder = self.configure_cache_block_reader(builder, row_group);
+        async move {
+            let mut stream = match builder.build() {
+                Ok(stream) => stream,
+                Err(e) => return Err(e.into()),
+            };
+            let batch = stream.next().await.transpose()?;
+            if let Some(batch) = batch {
+                Ok(batch)
+            } else {
+                Err(parquet::errors::ParquetError::General(format!(
+                    "Couldn't read row group {row_group}"
+                ))
+                .into())
+            }
+        }
+    }
+
+    /// Read a specific Parquet row group into memory as a single [`RecordBatch`]
+    ///
+    /// This may potentially use a lot of memory if row groups are large.
+    fn load_cache_block<T: ChunkReader + 'static>(
+        &self,
+        builder: ParquetRecordBatchReaderBuilder<T>,
+        row_group: usize,
+    ) -> io::Result<RecordBatch> {
+        let builder = self.configure_cache_block_reader(builder, row_group);
+
+        let batch = builder.build()?.flatten().next();
         if let Some(batch) = batch {
             Ok(batch)
         } else {
@@ -319,15 +371,16 @@ impl DataPointCache {
     }
 }
 
+trait PointQuerySource {
+    fn metadata(&self) -> &ParquetMetaData;
 
-/// A facet that wraps the behavior for reading point-layout data.
-pub(crate) struct PointDataReader<T: ChunkReader + 'static>(pub(crate) ParquetRecordBatchReaderBuilder<T>, pub(crate) BufferContext);
+    fn parquet_schema(&self) -> Arc<SchemaDescriptor>;
 
-impl<T: ChunkReader + 'static> PointDataArrayReader for PointDataReader<T> {}
-
-impl<T: ChunkReader + 'static> PointDataReader<T> {
-
-    pub(crate) fn find_row_groups_query<'a, I: SpectrumQueryIndex + 'a>(&self, index: u64, query_index: &'a I) -> (RowSelection, Vec<usize>) {
+    fn find_row_groups_query<'a, I: SpectrumQueryIndex + 'a>(
+        &self,
+        index: u64,
+        query_index: &'a I,
+    ) -> (RowSelection, Vec<usize>) {
         let PageQuery {
             pages,
             row_group_indices,
@@ -337,7 +390,7 @@ impl<T: ChunkReader + 'static> PointDataReader<T> {
         // because all `RowSelection` offsets are w.r.t. the row groups read, not the total possible rows in the table.
         let first_row = if !pages.is_empty() {
             let mut rg_row_skip = 0;
-            let meta = self.0.metadata();
+            let meta = self.metadata();
             for i in 0..row_group_indices[0] {
                 let rg = meta.row_group(i);
                 rg_row_skip += rg.num_rows();
@@ -354,17 +407,28 @@ impl<T: ChunkReader + 'static> PointDataReader<T> {
         (rows, row_group_indices)
     }
 
-    /// Read the arrays associated with the points of `index`
-    pub(crate) fn read_points_of<'a, I: SpectrumQueryIndex + Debug + 'a>(self, index: u64, query_index: &'a I, array_indices: &'a ArrayIndex) -> io::Result<Option<BinaryArrayMap>> {
-        let (rows, row_group_indices) = self.find_row_groups_query(index, query_index);
+    fn prepare_points_of<'a>(
+        schema: Arc<SchemaDescriptor>,
+        index: u64,
+        array_indices: &'a ArrayIndex,
+        context: BufferContext,
+    ) -> (
+        ArrowPredicateFn<
+            impl FnMut(RecordBatch) -> Result<arrow::array::BooleanArray, ArrowError> + 'static,
+        >,
+        ProjectionMask,
+    ) {
         let predicate_mask = ProjectionMask::columns(
-            self.0.parquet_schema(),
-            [
-                match self.1 {
-                    BufferContext::Spectrum => format!("{}.{}", array_indices.prefix, self.1.index_name()),
-                    BufferContext::Chromatogram => format!("{}.{}", array_indices.prefix, self.1.index_name())
-                }.as_str()
-            ],
+            &schema,
+            [match context {
+                BufferContext::Spectrum => {
+                    format!("{}.{}", array_indices.prefix, context.index_name())
+                }
+                BufferContext::Chromatogram => {
+                    format!("{}.{}", array_indices.prefix, context.index_name())
+                }
+            }
+            .as_str()],
         );
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
@@ -383,128 +447,76 @@ impl<T: ChunkReader + 'static> PointDataReader<T> {
             Ok(it.map(Some).collect())
         });
 
-        let proj = ProjectionMask::columns(
-            &self.0.parquet_schema(),
-            [array_indices.prefix.as_str()],
-        );
-
-        log::trace!("{index} spread across row groups {row_group_indices:?}");
-
-        let reader = self
-            .0
-            .with_row_groups(row_group_indices)
-            .with_row_selection(rows)
-            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
-            .with_projection(proj)
-            .build()?;
-
-        let mut bin_map = HashMap::new();
-        for v in array_indices.iter() {
-            bin_map.insert(&v.name, v.as_buffer_name().as_data_array(1024));
-        }
-
-        let batches: Vec<_> = reader.flatten().collect();
-        if !batches.is_empty() {
-            let batch = arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
-            let points = batch.column(0).as_struct();
-            Self::populate_arrays_from_struct_array(points, &mut bin_map, None, false);
-        }
-
-        let mut out = BinaryArrayMap::new();
-        for v in bin_map.into_values() {
-            out.add(v);
-        }
-        Ok(Some(out))
+        let proj = ProjectionMask::columns(&schema, [array_indices.prefix.as_str()]);
+        (predicate, proj)
     }
 
-    pub(crate) fn get_peak_list_for<
-        C: CentroidLike + BuildFromArrayMap,
-        D: DeconvolutedCentroidLike + BuildFromArrayMap,
-    >(
-        self,
-        index: u64,
-        meta_index: &PeakMetadata,
-    ) -> io::Result<Option<PeakDataLevel<C, D>>> {
-        let out = self.read_points_of(index, &meta_index.query_index, &meta_index.array_indices)?;
-        match out {
-            Some(out) => {
-                match PeakDataLevel::try_from(&out) {
-                    Ok(val) => return Ok(Some(val)),
-                    Err(e) => return Err(e.into()),
-                }
-            },
-            None => Ok(None)
-        }
-    }
-
-    pub(crate) fn query_points<'a, I: SpectrumQueryIndex + 'a>(
-        self,
+    fn prepare_query<'a, I: SpectrumQueryIndex + 'a>(
+        &self,
         index_range: SimpleInterval<u64>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
         query_index: &'a I,
         array_indices: &'a ArrayIndex,
-    ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a>> {
-        let mut rows = query_index
-            .index_overlaps(&index_range);
+    ) -> Option<(
+        RowSelection,
+        Vec<usize>,
+        ProjectionMask,
+        ArrowPredicateFn<
+            impl FnMut(RecordBatch) -> Result<arrow::array::BooleanArray, ArrowError> + 'static,
+        >,
+    )> {
+        let mut rows = query_index.index_overlaps(&index_range);
 
-        let PageQuery { row_group_indices, pages } = query_index.query_pages_overlaps(&index_range);
+        let PageQuery {
+            row_group_indices,
+            pages,
+        } = query_index.query_pages_overlaps(&index_range);
 
         if pages.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
+            return None;
         }
 
         let mut up_to_first_row = 0;
-        let meta = self.0.metadata();
+        let meta = self.metadata();
         for i in 0..row_group_indices[0] {
             let rg = meta.row_group(i);
             up_to_first_row += rg.num_rows();
         }
 
         if let Some(mz_range) = mz_range.as_ref() {
-            rows = rows.intersection(
-                &query_index.mz_overlaps(mz_range),
-            );
+            rows = rows.intersection(&query_index.mz_overlaps(mz_range));
         }
 
         if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
-            rows = rows.union(
-                &query_index
-                    .im_overlaps(&ion_mobility_range),
-            );
+            rows = rows.union(&query_index.im_overlaps(&ion_mobility_range));
         }
 
         rows.split_off(up_to_first_row as usize);
 
-        let sidx = format!(
-            "{}.spectrum_index",
-            array_indices.prefix
-        );
+        let sidx = format!("{}.spectrum_index", array_indices.prefix);
 
-        let mut fields: Vec<&str> = Vec::new();
+        let mut fields = Vec::new();
 
-        fields.push(&sidx);
+        fields.push(sidx);
 
-        if let Some(e) = array_indices
-            .get(&ArrayType::MZArray)
-        {
-            fields.push(e.path.as_str());
+        if let Some(e) = array_indices.get(&ArrayType::MZArray) {
+            fields.push(e.path.to_string());
         }
 
-        if let Some(e) = array_indices
-            .get(&ArrayType::IntensityArray)
-        {
-            fields.push(e.path.as_str());
+        if let Some(e) = array_indices.get(&ArrayType::IntensityArray) {
+            fields.push(e.path.to_string());
         }
 
         for v in array_indices.iter() {
             if v.is_ion_mobility() {
-                fields.push(v.path.as_str());
+                fields.push(v.path.to_string());
                 break;
             }
         }
 
-        let proj = ProjectionMask::columns(self.0.parquet_schema(), fields.iter().copied());
+        let proj =
+            ProjectionMask::columns(&self.parquet_schema(), fields.iter().map(|s| s.as_str()));
         let predicate_mask = proj.clone();
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
@@ -533,14 +545,287 @@ impl<T: ChunkReader + 'static> PointDataReader<T> {
             }
         });
 
-        let reader: ParquetRecordBatchReader = self.0
-            .with_row_groups(row_group_indices)
-            .with_row_selection(rows)
-            .with_projection(proj)
-            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
-            .with_batch_size(10_000)
-            .build()?;
-
-        Ok(Box::new(reader))
+        Some((rows, row_group_indices, proj, predicate))
     }
 }
+
+#[cfg(feature = "async")]
+mod async_impl {
+    use super::*;
+
+    use futures::stream::BoxStream;
+
+    pub(crate) struct AsyncPointDataReader<T: AsyncFileReader + Unpin + Send + 'static>(
+        pub(crate) ParquetRecordBatchStreamBuilder<T>,
+        pub(crate) BufferContext,
+    );
+
+    impl<T: AsyncFileReader + Unpin + Send + 'static> PointQuerySource for AsyncPointDataReader<T> {
+        fn metadata(&self) -> &ParquetMetaData {
+            self.0.metadata()
+        }
+
+        fn parquet_schema(&self) -> Arc<SchemaDescriptor> {
+            self.0.metadata().file_metadata().schema_descr_ptr()
+        }
+    }
+
+    impl<T: AsyncFileReader + Unpin + Send + 'static> PointDataArrayReader for AsyncPointDataReader<T> {}
+
+    impl<T: AsyncFileReader + Unpin + Send + 'static> AsyncPointDataReader<T> {
+        /// Read the arrays associated with the points of `index`
+        pub(crate) async fn read_points_of<'a, I: SpectrumQueryIndex + Debug + 'a>(
+            self,
+            index: u64,
+            query_index: &'a I,
+            array_indices: &'a ArrayIndex,
+            mz_delta_model: Option<&RegressionDeltaModel<f64>>,
+        ) -> io::Result<Option<BinaryArrayMap>> {
+            let (rows, row_group_indices) = self.find_row_groups_query(index, query_index);
+            let schem = self.parquet_schema();
+            let (predicate, proj) = Self::prepare_points_of(schem, index, array_indices, self.1);
+
+            log::trace!("{index} spread across row groups {row_group_indices:?}");
+
+            let mut reader = self
+                .0
+                .with_row_groups(row_group_indices)
+                .with_row_selection(rows)
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .with_projection(proj)
+                .build()?;
+
+            let mut bin_map = HashMap::new();
+            for v in array_indices.iter() {
+                bin_map.insert(&v.name, v.as_buffer_name().as_data_array(1024));
+            }
+
+            let mut batches = Vec::new();
+            while let Some(batch) = reader.next().await.transpose()? {
+                batches.push(batch);
+            }
+
+            if !batches.is_empty() {
+                let batch =
+                    arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
+                let points = batch.column(0).as_struct();
+                Self::populate_arrays_from_struct_array(
+                    points,
+                    &mut bin_map,
+                    mz_delta_model,
+                    false,
+                );
+            }
+
+            let mut out = BinaryArrayMap::new();
+            for v in bin_map.into_values() {
+                out.add(v);
+            }
+            Ok(Some(out))
+        }
+
+        pub(crate) async fn get_peak_list_for<
+            C: CentroidLike + BuildFromArrayMap,
+            D: DeconvolutedCentroidLike + BuildFromArrayMap,
+        >(
+            self,
+            index: u64,
+            meta_index: &PeakMetadata,
+        ) -> io::Result<Option<PeakDataLevel<C, D>>> {
+            let out = self
+                .read_points_of(
+                    index,
+                    &meta_index.query_index,
+                    &meta_index.array_indices,
+                    None,
+                )
+                .await?;
+            match out {
+                Some(out) => match PeakDataLevel::try_from(&out) {
+                    Ok(val) => return Ok(Some(val)),
+                    Err(e) => return Err(e.into()),
+                },
+                None => Ok(None),
+            }
+        }
+
+        pub(crate) async fn query_points<'a, I: SpectrumQueryIndex + 'a>(
+            self,
+            index_range: SimpleInterval<u64>,
+            mz_range: Option<SimpleInterval<f64>>,
+            ion_mobility_range: Option<SimpleInterval<f64>>,
+            query_index: &'a I,
+            array_indices: &'a ArrayIndex,
+        ) -> io::Result<BoxStream<'a, Result<RecordBatch, ArrowError>>> {
+            if let Some((rows, row_group_indices, proj, predicate)) = self.prepare_query(
+                index_range,
+                mz_range,
+                ion_mobility_range,
+                query_index,
+                array_indices,
+            ) {
+                let mut reader = self
+                    .0
+                    .with_row_groups(row_group_indices)
+                    .with_row_selection(rows)
+                    .with_projection(proj)
+                    .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                    .with_batch_size(10_000)
+                    .build()?;
+
+                let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+
+                let mut row_groups = Vec::new();
+
+                while let Some(batch_reader) = reader.next_row_group().await? {
+                    row_groups.push(tokio::task::spawn(async move {
+                        let batches: Vec<_> = batch_reader.collect();
+                        batches
+                    }));
+                }
+
+                for task in row_groups {
+                    let bats = task.await?;
+                    for bat in bats {
+                        send.send(bat).unwrap();
+                    }
+                }
+
+                let reader = tokio_stream::wrappers::UnboundedReceiverStream::new(recv);
+                Ok(reader.boxed())
+                // Ok(reader.map_err(|e| e.into()).boxed())
+            } else {
+                Ok(futures::stream::empty().boxed())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+pub(crate) use async_impl::*;
+
+mod sync_impl {
+    use super::*;
+
+    /// A facet that wraps the behavior for reading point-layout data.
+    pub(crate) struct PointDataReader<T: ChunkReader + 'static>(
+        pub(crate) ParquetRecordBatchReaderBuilder<T>,
+        pub(crate) BufferContext,
+    );
+
+    impl<T: ChunkReader + 'static> PointQuerySource for PointDataReader<T> {
+        fn metadata(&self) -> &ParquetMetaData {
+            self.0.metadata()
+        }
+
+        fn parquet_schema(&self) -> Arc<SchemaDescriptor> {
+            self.metadata().file_metadata().schema_descr_ptr()
+        }
+    }
+
+    impl<T: ChunkReader + 'static> PointDataArrayReader for PointDataReader<T> {}
+
+    impl<T: ChunkReader + 'static> PointDataReader<T> {
+        /// Read the arrays associated with the points of `index`
+        pub(crate) fn read_points_of<'a, I: SpectrumQueryIndex + Debug + 'a>(
+            self,
+            index: u64,
+            query_index: &'a I,
+            array_indices: &'a ArrayIndex,
+            mz_delta_model: Option<&RegressionDeltaModel<f64>>,
+        ) -> io::Result<Option<BinaryArrayMap>> {
+            let (rows, row_group_indices) = self.find_row_groups_query(index, query_index);
+            let schem = self.parquet_schema();
+            let (predicate, proj) = Self::prepare_points_of(schem, index, array_indices, self.1);
+
+            log::trace!("{index} spread across row groups {row_group_indices:?}");
+
+            let reader = self
+                .0
+                .with_row_groups(row_group_indices)
+                .with_row_selection(rows)
+                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .with_projection(proj)
+                .build()?;
+
+            let mut bin_map = HashMap::new();
+            for v in array_indices.iter() {
+                bin_map.insert(&v.name, v.as_buffer_name().as_data_array(1024));
+            }
+
+            let batches: Vec<_> = reader.flatten().collect();
+            if !batches.is_empty() {
+                let batch =
+                    arrow::compute::concat_batches(batches[0].schema_ref(), &batches).unwrap();
+                let points = batch.column(0).as_struct();
+                Self::populate_arrays_from_struct_array(
+                    points,
+                    &mut bin_map,
+                    mz_delta_model,
+                    false,
+                );
+            }
+
+            let mut out = BinaryArrayMap::new();
+            for v in bin_map.into_values() {
+                out.add(v);
+            }
+            Ok(Some(out))
+        }
+
+        pub(crate) fn get_peak_list_for<
+            C: CentroidLike + BuildFromArrayMap,
+            D: DeconvolutedCentroidLike + BuildFromArrayMap,
+        >(
+            self,
+            index: u64,
+            meta_index: &PeakMetadata,
+        ) -> io::Result<Option<PeakDataLevel<C, D>>> {
+            let out = self.read_points_of(
+                index,
+                &meta_index.query_index,
+                &meta_index.array_indices,
+                None,
+            )?;
+            match out {
+                Some(out) => match PeakDataLevel::try_from(&out) {
+                    Ok(val) => return Ok(Some(val)),
+                    Err(e) => return Err(e.into()),
+                },
+                None => Ok(None),
+            }
+        }
+
+        pub(crate) fn query_points<'a, I: SpectrumQueryIndex + 'a>(
+            self,
+            index_range: SimpleInterval<u64>,
+            mz_range: Option<SimpleInterval<f64>>,
+            ion_mobility_range: Option<SimpleInterval<f64>>,
+            query_index: &'a I,
+            array_indices: &'a ArrayIndex,
+        ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a>> {
+            if let Some((rows, row_group_indices, proj, predicate)) = self.prepare_query(
+                index_range,
+                mz_range,
+                ion_mobility_range,
+                query_index,
+                array_indices,
+            ) {
+                let reader: ParquetRecordBatchReader = self
+                    .0
+                    .with_row_groups(row_group_indices)
+                    .with_row_selection(rows)
+                    .with_projection(proj)
+                    .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                    .with_batch_size(10_000)
+                    .build()?;
+
+                Ok(Box::new(reader))
+            } else {
+                Ok(Box::new(std::iter::empty()))
+            }
+        }
+    }
+}
+
+pub(crate) use sync_impl::*;

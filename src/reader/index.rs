@@ -7,9 +7,9 @@ use arrow::array::{
 use mzdata::spectrum::ArrayType;
 use mzpeaks::coordinate::SimpleInterval;
 use mzpeaks::prelude::HasProximity;
+use parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use parquet::file::metadata::ParquetMetaData;
 
-use parquet::file::reader::ChunkReader;
 use parquet::{
     self,
     arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
@@ -688,8 +688,8 @@ impl ChromatogramPointIndex {
         }
     }
 
-    pub fn from_reader<T: ChunkReader>(
-        chromatogram_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+    pub fn from_reader<T>(
+        chromatogram_data_reader: &ArrowReaderBuilder<T>,
         chromatogram_array_indices: &ArrayIndex,
     ) -> Self {
         let peak_pq_schema = chromatogram_data_reader.parquet_schema();
@@ -766,8 +766,8 @@ impl SpectrumPointIndex {
         }
     }
 
-    pub fn from_reader<T: ChunkReader>(
-        spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+    pub fn from_reader<T>(
+        spectrum_data_reader: &ArrowReaderBuilder<T>,
         spectrum_array_indices: &ArrayIndex,
     ) -> Self {
         let peak_pq_schema = spectrum_data_reader.parquet_schema();
@@ -899,8 +899,8 @@ impl SpectrumChunkIndex {
         }
     }
 
-    pub fn from_reader<T: ChunkReader>(
-        spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+    pub fn from_reader<T>(
+        spectrum_data_reader: &ArrowReaderBuilder<T>,
         spectrum_array_indices: &ArrayIndex,
     ) -> Self {
         let peak_pq_schema = spectrum_data_reader.parquet_schema();
@@ -1063,9 +1063,9 @@ pub struct QueryIndex {
 
 impl QueryIndex {
     /// Populate the indices for spectrum metadata
-    pub fn populate_spectrum_metadata_indices<T: ChunkReader>(
+    pub fn populate_spectrum_metadata_indices<T>(
         &mut self,
-        spectrum_metadata_reader: &ParquetRecordBatchReaderBuilder<T>,
+        spectrum_metadata_reader: &ArrowReaderBuilder<T>,
     ) {
         let pq_schema = spectrum_metadata_reader.parquet_schema();
 
@@ -1107,9 +1107,9 @@ impl QueryIndex {
         .unwrap_or_default();
     }
 
-    pub fn populate_chromatogram_metadata_indices<T: ChunkReader>(
+    pub fn populate_chromatogram_metadata_indices<T>(
         &mut self,
-        chromatogram_metadata_reader: &ParquetRecordBatchReaderBuilder<T>,
+        chromatogram_metadata_reader: &ArrowReaderBuilder<T>,
     ) {
         let pq_schema = chromatogram_metadata_reader.parquet_schema();
 
@@ -1134,9 +1134,9 @@ impl QueryIndex {
     }
 
     /// Populate the indices for spectrum signal data
-    pub fn populate_spectrum_data_indices<T: ChunkReader>(
+    pub fn populate_spectrum_data_indices<T>(
         &mut self,
-        spectrum_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        spectrum_data_reader: &ArrowReaderBuilder<T>,
         spectrum_array_indices: &ArrayIndex,
     ) {
         if BufferFormat::Point.prefix() == spectrum_array_indices.prefix {
@@ -1159,9 +1159,9 @@ impl QueryIndex {
         );
     }
 
-    pub fn populate_chromatogram_data_indices<T: ChunkReader>(
+    pub fn populate_chromatogram_data_indices<T>(
         &mut self,
-        chromatogram_data_reader: &ParquetRecordBatchReaderBuilder<T>,
+        chromatogram_data_reader: &ArrowReaderBuilder<T>,
         chromatogram_array_indices: &ArrayIndex,
     ) {
         self.chromatogram_point_index = ChromatogramPointIndex::from_reader(

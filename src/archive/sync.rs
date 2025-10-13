@@ -3,7 +3,6 @@ use std::io::{self, prelude::*};
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-
 use parquet::file::reader::{ChunkReader, Length};
 use zip::{
     CompressionMethod,
@@ -373,12 +372,12 @@ pub struct MzPeakArchiveEntry {
 }
 
 #[derive(Debug, Default, Clone)]
-struct SchemaMetadataManager {
-    spectrum_data_arrays: Option<MzPeakArchiveEntry>,
-    spectrum_metadata: Option<MzPeakArchiveEntry>,
-    peaks_data_arrays: Option<MzPeakArchiveEntry>,
-    chromatogram_metadata: Option<MzPeakArchiveEntry>,
-    chromatogram_data_arrays: Option<MzPeakArchiveEntry>,
+pub(crate) struct SchemaMetadataManager {
+    pub(crate) spectrum_data_arrays: Option<MzPeakArchiveEntry>,
+    pub(crate) spectrum_metadata: Option<MzPeakArchiveEntry>,
+    pub(crate) peaks_data_arrays: Option<MzPeakArchiveEntry>,
+    pub(crate) chromatogram_metadata: Option<MzPeakArchiveEntry>,
+    pub(crate) chromatogram_data_arrays: Option<MzPeakArchiveEntry>,
 }
 
 pub trait ArchiveSource: Sized + 'static {
@@ -448,13 +447,16 @@ impl DirectorySource {
         })
     }
 
-    pub fn open_entry_by_index(&self, index: usize) -> io::Result<fs::File> {
+    pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let name = self
             .file_names
             .get(index)
             .ok_or(io::Error::new(io::ErrorKind::NotFound, format!("file at {index} not found in directory")))?;
         let path = self.archive_path.join(name);
-        fs::File::open(path)
+        let fh = fs::File::open(&path)?;
+        let meta = fs::metadata(&path)?;
+        let length = meta.len();
+        Ok(ArchiveFacetReader::new(fh, 0, length, 0))
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -467,7 +469,7 @@ impl DirectorySource {
         &self,
         index: usize,
         metadata: Option<ArrowReaderMetadata>,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<fs::File>> {
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
         let metadata = if let Some(metadata) = metadata {
             metadata
         } else {
@@ -482,7 +484,7 @@ impl DirectorySource {
 }
 
 impl ArchiveSource for DirectorySource {
-    type File = fs::File;
+    type File = ArchiveFacetReader;
 
     fn file_names(&self) -> &[String] {
         &self.file_names
@@ -621,12 +623,55 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
             ))
         }
     }
-}
 
+}
 
 pub type ZipArchiveReader = ArchiveReader<ZipArchiveSource>;
 pub type DirectoryArchiveReader = ArchiveReader<DirectorySource>;
+pub type AnyArchiveReader = ArchiveReader<DispatchArchiveSource>;
 
+pub enum DispatchArchiveSource {
+    Zip(ZipArchiveSource),
+    Directory(DirectorySource)
+}
+
+macro_rules! dispatch {
+    ($d:ident, $r:ident, $e:expr) => {
+        match $d {
+            DispatchArchiveSource::Zip($r) => $e,
+            DispatchArchiveSource::Directory($r) => $e,
+        }
+    };
+}
+
+impl ArchiveSource for DispatchArchiveSource {
+    type File = ArchiveFacetReader;
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        if fs::metadata(&path)?.is_dir() {
+            return Ok(Self::Directory(DirectorySource::from_path(path)?))
+        } else {
+            return Ok(Self::Zip(ZipArchiveSource::from_path(path)?))
+        }
+    }
+
+    fn file_names(&self) -> &[String] {
+        dispatch!(self, src, { src.file_names() })
+    }
+
+    fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
+        dispatch!(self, src, { src.open_entry_by_index(index)} )
+    }
+}
+
+impl ArchiveReader<DispatchArchiveSource> {
+    pub fn new(file: fs::File) -> io::Result<Self> {
+        let archive = DispatchArchiveSource::Zip(
+            ZipArchiveSource::new(file)?
+        );
+        Self::init_from_archive(archive)
+    }
+}
 
 impl ZipArchiveReader {
     pub fn new(file: fs::File) -> io::Result<Self> {
