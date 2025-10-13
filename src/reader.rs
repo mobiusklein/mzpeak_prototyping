@@ -19,8 +19,7 @@ use mzdata::{
     prelude::*,
     spectrum::{
         ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, DataArray,
-        MultiLayerSpectrum, PeakDataLevel, SpectrumDescription,
-        bindata::BuildFromArrayMap,
+        MultiLayerSpectrum, PeakDataLevel, SpectrumDescription, bindata::BuildFromArrayMap,
     },
 };
 use mzpeaks::{
@@ -38,22 +37,21 @@ use crate::{
     archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource},
     filter::RegressionDeltaModel,
     reader::{
-        chunk::DataChunkCache,
+        chunk::{DataChunkCache, SpectrumChunkReader},
         index::{PageQuery, QueryIndex, SpanDynNumeric},
         metadata::{
             ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource,
             ChromatogramMetadataReader, SpectrumMetadataDecoder, SpectrumMetadataQuerySource,
-            SpectrumMetadataReader,
+            SpectrumMetadataReader, TimeIndexDecoder,
         },
         point::PointDataReader,
-        chunk::SpectrumChunkReader,
         visitor::AuxiliaryArrayVisitor,
     },
 };
 
 mod chunk;
-mod point;
 mod metadata;
+mod point;
 
 pub mod index;
 pub mod visitor;
@@ -457,21 +455,21 @@ impl<
             index,
             &self.query_indices.spectrum_point_index,
             self.metadata.spectrum_array_indices(),
-            delta_model.as_ref()
+            delta_model.as_ref(),
         )? {
             for v in self.load_auxiliary_arrays_for_spectrum(index)? {
                 out.add(v);
             }
-            return Ok(Some(out))
+            return Ok(Some(out));
         } else {
             if let Ok(arrays) = self.load_auxiliary_arrays_for_spectrum(index) {
                 let mut out = BinaryArrayMap::new();
                 for arr in arrays {
                     out.add(arr);
                 }
-                return Ok(Some(out))
+                return Ok(Some(out));
             } else {
-                return Ok(None)
+                return Ok(None);
             }
         }
     }
@@ -483,69 +481,10 @@ impl<
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
         SimpleInterval<u64>,
     )> {
+        let mut time_indexer = TimeIndexDecoder::new(time_range);
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
-            let mut times: HashMap<u64, f32, _> = HashMap::default();
-            let mut min = u64::MAX;
-            let mut max = 0;
-
-            let n = cache.len();
-
-            let offset_start = match cache.binary_search_by(|descr| {
-                time_range
-                    .start()
-                    .total_cmp(&(descr.acquisition.start_time() as f32))
-                    .reverse()
-            }) {
-                Ok(i) => i,
-                Err(i) => i.min(n),
-            }
-            .saturating_sub(1);
-            let offset = offset_start;
-
-            // TODO: Rewrite the output data structure and maybe this will be faster
-            // let mut i = offset_start;
-            // while i > 0 {
-            //     if time_range.start >= cache[i].acquisition.start_time()  as f32 {
-            //         i -= 1;
-            //     }
-            //     break;
-            // }
-            // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
-            //     i += 1;
-            // }
-            // offset_start = i;
-
-            // let mut offset_end = match cache.binary_search_by(|descr| {
-            //     time_range.end().total_cmp(&(descr.acquisition.start_time() as f32)).reverse()
-            // }) {
-            //     Ok(i) => i,
-            //     Err(i) => i.min(n),
-            // };
-
-            // i = offset_end;
-            // while i < n {
-            //     if time_range.end <= cache[i].acquisition.start_time()  as f32 {
-            //         i += 1;
-            //     }
-            //     break;
-            // }
-            // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
-            //     i = i.saturating_sub(1);
-            // }
-            // offset_end = i;
-
-            for (i, descr) in cache.iter().enumerate().skip(offset) {
-                let i = i as u64;
-                let t = descr.acquisition.start_time() as f32;
-                if time_range.contains(&t) {
-                    min = min.min(i);
-                    max = max.max(i);
-                    times.insert(i, t);
-                } else if !times.is_empty() {
-                    break;
-                }
-            }
-            return Ok((times, SimpleInterval::new(min, max)));
+            time_indexer.from_descriptions(cache.as_slice());
+            return Ok(time_indexer.finish());
         }
 
         let rows = self
@@ -573,40 +512,10 @@ impl<
             .with_projection(proj)
             .build()?;
 
-        let mut min = u64::MAX;
-        let mut max = 0;
-
-        let mut times: HashMap<u64, f32, _> = HashMap::default();
-
         for batch in reader.flatten() {
-            let root = batch.column(0).as_struct();
-            let arr: &UInt64Array = root.column(0).as_primitive();
-            let time_arr = root.column(1);
-            if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
-                for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
-                    min = min.min(val);
-                    max = max.max(val);
-                    times.insert(val, time);
-                }
-            } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float64Type>() {
-                for (val, time) in arr
-                    .iter()
-                    .flatten()
-                    .zip(time_arr.iter().flatten().map(|v| v as f32))
-                {
-                    min = min.min(val);
-                    max = max.max(val);
-                    times.insert(val, time);
-                }
-            } else {
-                return Err(parquet::errors::ParquetError::ArrowError(format!(
-                    "Invalid time array data type: {:?}",
-                    time_arr.data_type()
-                ))
-                .into());
-            }
+            time_indexer.decode_batch(batch)?;
         }
-        Ok((times, SimpleInterval::new(min, max)))
+        Ok(time_indexer.finish())
     }
 
     /// Read all signal data within the specified `time_range`, optionally constrained to `mz_range` m/z values and/or
@@ -1408,7 +1317,7 @@ pub type UnpackedMzPeakReader =
     MzPeakReaderTypeOfSource<DirectorySource, CentroidPeak, DeconvolutedPeak>;
 
 #[cfg(feature = "async")]
-pub use object_store_async::{AsyncMzPeakReaderType, AsyncMzPeakReader};
+pub use object_store_async::{AsyncMzPeakReader, AsyncMzPeakReaderType};
 
 #[cfg(test)]
 mod test {

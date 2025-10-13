@@ -1019,7 +1019,6 @@ pub struct SpectrumMetadataIndex {
     pub spectrum_selected_ion_index: PageIndex<u64>,
 }
 
-
 #[derive(Debug, Default, Clone)]
 pub struct ChromatogramMetadataIndex {
     pub chromatogram_index_index: PageIndex<u64>,

@@ -2,7 +2,9 @@ use std::{fmt::Debug, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, Float32Builder, Float64Builder, Int32Builder, Int64Builder, Int8Builder, LargeListBuilder, LargeStringBuilder, NullBuilder, StringBuilder, StructArray, UInt32Builder, UInt64Builder, UInt8Builder
+        ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, Float32Builder, Float64Builder,
+        Int8Builder, Int32Builder, Int64Builder, LargeListBuilder, LargeStringBuilder, NullBuilder,
+        StringBuilder, StructArray, UInt8Builder, UInt32Builder, UInt64Builder,
     },
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
@@ -425,16 +427,13 @@ impl ArrayBuilder for CURIEStructBuilder {
     anyways!();
 }
 
-
 #[allow(unused)]
 #[derive(Debug, Default)]
 pub struct CURIEStrBuilder(StringBuilder);
 
 impl VisitorBase for CURIEStrBuilder {
     fn fields(&self) -> Vec<FieldRef> {
-        vec![
-            field!("accession", DataType::Utf8)
-        ]
+        vec![field!("accession", DataType::Utf8)]
     }
 
     fn append_null(&mut self) {
@@ -485,10 +484,8 @@ impl ArrayBuilder for CURIEStrBuilder {
     anyways!();
 }
 
-
 // pub type CURIEBuilder = CURIEStructBuilder;
 pub type CURIEBuilder = CURIEStrBuilder;
-
 
 #[derive(Debug, Default)]
 pub struct ParamValueBuilder {

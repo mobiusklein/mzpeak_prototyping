@@ -37,7 +37,7 @@ use url::Url;
 
 use crate::{
     BufferContext,
-    archive::{AsyncArchiveSource, AsyncZipArchiveSource, ObjectStoreReader},
+    archive::{AsyncArchiveReader, AsyncArchiveSource, AsyncZipArchiveSource},
     filter::RegressionDeltaModel,
     reader::{
         CHUNK_CACHE_BLOCK_SIZE, ReaderMetadata,
@@ -46,6 +46,7 @@ use crate::{
         metadata::{
             BaseMetadataQuerySource, ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource,
             ParquetIndexExtractor, SpectrumMetadataDecoder, SpectrumMetadataQuerySource,
+            TimeIndexDecoder,
         },
         point::{AsyncPointDataReader, DataPointCache, PointDataArrayReader},
         visitor::AuxiliaryArrayVisitor,
@@ -87,7 +88,7 @@ impl<T: AsyncFileReader + 'static + Unpin + Send> BaseMetadataQuerySource
 }
 
 pub(crate) async fn build_spectrum_index<T: AsyncArchiveSource>(
-    handle: &ObjectStoreReader<T>,
+    handle: &AsyncArchiveReader<T>,
     pq_schema: &SchemaDescriptor,
 ) -> io::Result<OffsetIndex> {
     let mut spectrum_id_index = OffsetIndex::new("spectrum".into());
@@ -122,7 +123,7 @@ pub(crate) async fn build_spectrum_index<T: AsyncArchiveSource>(
 
 /// Load the various metadata, indices and reference data
 pub(crate) async fn load_indices_from<T: AsyncArchiveSource>(
-    handle: &ObjectStoreReader<T>,
+    handle: &AsyncArchiveReader<T>,
 ) -> io::Result<(ReaderMetadata, QueryIndex)> {
     let spectrum_metadata_reader = handle.spectrum_metadata().await?;
     let spectrum_data_reader = handle.spectra_data().await?;
@@ -251,7 +252,7 @@ pub struct AsyncMzPeakReaderType<
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap + Send + Sync = DeconvolutedPeak,
 > {
     url: Option<url::Url>,
-    handle: ObjectStoreReader<T>,
+    handle: AsyncArchiveReader<T>,
     index: usize,
     detail_level: DetailLevel,
     pub metadata: Arc<ReaderMetadata>,
@@ -394,7 +395,7 @@ impl<
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap + Send + Sync,
 > AsyncMzPeakReaderType<T, C, D>
 {
-    async fn init_from_store(handle: ObjectStoreReader<T>, url: Option<Url>) -> io::Result<Self> {
+    async fn init_from_store(handle: AsyncArchiveReader<T>, url: Option<Url>) -> io::Result<Self> {
         let (metadata, query_indices) = load_indices_from(&handle).await?;
         let mut this = Self {
             url,
@@ -425,12 +426,12 @@ impl<
         handle: Arc<dyn ObjectStore>,
         path: ObjectPath,
     ) -> io::Result<Self> {
-        let handle = ObjectStoreReader::from_store_path(handle, path).await?;
+        let handle = AsyncArchiveReader::from_store_path(handle, path).await?;
         Self::init_from_store(handle, None).await
     }
 
     pub async fn from_url(url: Url) -> io::Result<Self> {
-        let handle = ObjectStoreReader::<T>::from_url(&url).await?;
+        let handle = AsyncArchiveReader::<T>::from_url(&url).await?;
         Self::init_from_store(handle, Some(url)).await
     }
 
@@ -606,7 +607,6 @@ impl<
             .await?;
         let builder = self.handle.spectra_data().await?;
 
-
         let ion_mobility_range = if !self.metadata.spectrum_array_indices().has_ion_mobility() {
             None
         } else {
@@ -642,7 +642,9 @@ impl<
                     });
                     it.boxed()
                 } else {
-                    log::warn!("An ion mobility range was requested, but no ion mobility array was found");
+                    log::warn!(
+                        "An ion mobility range was requested, but no ion mobility array was found"
+                    );
                     it.boxed()
                 }
             } else {
@@ -721,37 +723,10 @@ impl<
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
         SimpleInterval<u64>,
     )> {
+        let mut time_indexer = TimeIndexDecoder::new(time_range);
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
-            let mut times: HashMap<u64, f32, _> = HashMap::default();
-            let mut min = u64::MAX;
-            let mut max = 0;
-
-            let n = cache.len();
-
-            let offset_start = match cache.binary_search_by(|descr| {
-                time_range
-                    .start()
-                    .total_cmp(&(descr.acquisition.start_time() as f32))
-                    .reverse()
-            }) {
-                Ok(i) => i,
-                Err(i) => i.min(n),
-            }
-            .saturating_sub(1);
-            let offset = offset_start;
-
-            for (i, descr) in cache.iter().enumerate().skip(offset) {
-                let i = i as u64;
-                let t = descr.acquisition.start_time() as f32;
-                if time_range.contains(&t) {
-                    min = min.min(i);
-                    max = max.max(i);
-                    times.insert(i, t);
-                } else if !times.is_empty() {
-                    break;
-                }
-            }
-            return Ok((times, SimpleInterval::new(min, max)));
+            time_indexer.from_descriptions(cache.as_slice());
+            return Ok(time_indexer.finish());
         }
 
         let rows = self
@@ -779,40 +754,11 @@ impl<
             .with_projection(proj)
             .build()?;
 
-        let mut min = u64::MAX;
-        let mut max = 0;
-
-        let mut times: HashMap<u64, f32, _> = HashMap::default();
-
         while let Some(batch) = reader.next().await.transpose()? {
-            let root = batch.column(0).as_struct();
-            let arr: &UInt64Array = root.column(0).as_primitive();
-            let time_arr = root.column(1);
-            if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
-                for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
-                    min = min.min(val);
-                    max = max.max(val);
-                    times.insert(val, time);
-                }
-            } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float64Type>() {
-                for (val, time) in arr
-                    .iter()
-                    .flatten()
-                    .zip(time_arr.iter().flatten().map(|v| v as f32))
-                {
-                    min = min.min(val);
-                    max = max.max(val);
-                    times.insert(val, time);
-                }
-            } else {
-                return Err(parquet::errors::ParquetError::ArrowError(format!(
-                    "Invalid time array data type: {:?}",
-                    time_arr.data_type()
-                ))
-                .into());
-            }
+            time_indexer.decode_batch(batch)?;
         }
-        Ok((times, SimpleInterval::new(min, max)))
+
+        Ok(time_indexer.finish())
     }
 
     pub(crate) async fn load_all_spectrum_metadata_impl(
@@ -1242,7 +1188,7 @@ impl<
                 index,
                 &self.query_indices.spectrum_point_index,
                 self.metadata.spectrum_array_indices(),
-                delta_model.as_ref()
+                delta_model.as_ref(),
             )
             .await?
         {
@@ -1295,14 +1241,16 @@ pub type AsyncMzPeakReader =
 
 #[cfg(test)]
 mod test {
-    use object_store::{local::LocalFileSystem};
+    use object_store::local::LocalFileSystem;
 
     use super::*;
 
     #[tokio::test]
     async fn test_url() -> io::Result<()> {
         let store = LocalFileSystem::new_with_prefix(".")?;
-        let mut handle = AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from("small.mzpeak")).await?;
+        let mut handle =
+            AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from("small.mzpeak"))
+                .await?;
         let spec = handle.get_spectrum(0).await.unwrap();
         eprintln!("{spec:?}");
         Ok(())

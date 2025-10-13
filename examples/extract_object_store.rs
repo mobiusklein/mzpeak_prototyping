@@ -1,6 +1,4 @@
-use arrow::{
-    array::{AsArray, Float32Array, Float64Array, UInt64Array},
-};
+use arrow::array::{AsArray, Float32Array, Float64Array, UInt64Array};
 
 use clap::Parser;
 use futures::StreamExt;
@@ -22,16 +20,21 @@ struct App {
     im_range: CoordinateRange<f64>,
 }
 
-#[tokio::main(flavor="multi_thread", worker_threads=16)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> io::Result<()> {
     env_logger::init();
     let args = App::parse();
     let start = std::time::Instant::now();
 
-    let mut reader = mzpeak_prototyping::reader::AsyncMzPeakReader::from_url(args.filename.parse().unwrap()).await?;
+    let mut reader =
+        mzpeak_prototyping::reader::AsyncMzPeakReader::from_url(args.filename.parse().unwrap())
+            .await?;
     // reader.load_all_spectrum_metadata()?;
 
-    eprintln!("Opening archive took {} seconds", start.elapsed().as_secs_f64());
+    eprintln!(
+        "Opening archive took {} seconds",
+        start.elapsed().as_secs_f64()
+    );
 
     let has_ion_mobility = reader.metadata.spectrum_array_indices().has_ion_mobility();
 
@@ -50,14 +53,16 @@ async fn main() -> io::Result<()> {
         args.im_range.end.unwrap_or(f64::INFINITY),
     );
 
-    let (mut it, time_index) = reader.extract_peaks(
-        time_range,
-        Some(mz_range),
-        None
-    ).await?;
+    let (mut it, time_index) = reader
+        .extract_peaks(time_range, Some(mz_range), None)
+        .await?;
 
     let query_range_end = std::time::Instant::now();
-    eprintln!("{} seconds elapsed reading indices with {} entries", (query_range_end - start).as_secs_f64(), time_index.len());
+    eprintln!(
+        "{} seconds elapsed reading indices with {} entries",
+        (query_range_end - start).as_secs_f64(),
+        time_index.len()
+    );
 
     while let Some(batch) = it.next().await.transpose().unwrap() {
         let root = batch.column(0).as_struct();
@@ -66,11 +71,11 @@ async fn main() -> io::Result<()> {
 
         macro_rules! iter {
             ($mzs:expr, $ims:expr, $mz_range:expr, $im_range:expr) => {
-                let it = indices.iter().flatten().zip(
-                    $mzs.iter().flatten()
-                ).zip(
-                    intensities.iter().flatten()
-                );
+                let it = indices
+                    .iter()
+                    .flatten()
+                    .zip($mzs.iter().flatten())
+                    .zip(intensities.iter().flatten());
 
                 let mut last_index = 0;
                 let mut last_time = 0.0;
@@ -106,28 +111,63 @@ async fn main() -> io::Result<()> {
         if has_ion_mobility {
             if let Some(mzs) = root.column(1).as_any().downcast_ref::<Float64Array>() {
                 if let Some(ims) = root.column(3).as_any().downcast_ref::<Float64Array>() {
-                    iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f64, mz_range.end as f64), SimpleInterval::new(im_range.start as f64, im_range.end as f64));
+                    iter!(
+                        mzs,
+                        Some(ims),
+                        SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
+                        SimpleInterval::new(im_range.start as f64, im_range.end as f64)
+                    );
                 } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
-                    iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f64, mz_range.end as f64), SimpleInterval::new(im_range.start as f32, im_range.end as f32));
+                    iter!(
+                        mzs,
+                        Some(ims),
+                        SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
+                        SimpleInterval::new(im_range.start as f32, im_range.end as f32)
+                    );
                 } else {
                     iter!(mzs, Option::<Float64Array>::None, mz_range, im_range);
                 }
             } else if let Some(mzs) = root.column(1).as_any().downcast_ref::<Float32Array>() {
                 if let Some(ims) = root.column(3).as_any().downcast_ref::<Float64Array>() {
-                    iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), SimpleInterval::new(im_range.start as f64, im_range.end as f64));
+                    iter!(
+                        mzs,
+                        Some(ims),
+                        SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
+                        SimpleInterval::new(im_range.start as f64, im_range.end as f64)
+                    );
                 } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
-                    iter!(mzs, Some(ims), SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), SimpleInterval::new(im_range.start as f32, im_range.end as f32));
+                    iter!(
+                        mzs,
+                        Some(ims),
+                        SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
+                        SimpleInterval::new(im_range.start as f32, im_range.end as f32)
+                    );
                 } else {
-                    iter!(mzs, Option::<Float64Array>::None, SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), im_range);
+                    iter!(
+                        mzs,
+                        Option::<Float64Array>::None,
+                        SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
+                        im_range
+                    );
                 }
             } else {
                 unimplemented!()
             }
         } else {
             if let Some(mzs) = root.column(1).as_any().downcast_ref::<Float64Array>() {
-                iter!(mzs, Option::<Float64Array>::None, SimpleInterval::new(mz_range.start as f64, mz_range.end as f64), im_range);
+                iter!(
+                    mzs,
+                    Option::<Float64Array>::None,
+                    SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
+                    im_range
+                );
             } else if let Some(mzs) = root.column(1).as_any().downcast_ref::<Float32Array>() {
-                iter!(mzs, Option::<Float64Array>::None, SimpleInterval::new(mz_range.start as f32, mz_range.end as f32), im_range);
+                iter!(
+                    mzs,
+                    Option::<Float64Array>::None,
+                    SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
+                    im_range
+                );
             } else {
                 unimplemented!()
             }

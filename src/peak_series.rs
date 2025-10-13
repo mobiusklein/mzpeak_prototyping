@@ -77,7 +77,10 @@ pub fn array_map_to_schema_arrays_and_excess(
     arrays.push(index_array as ArrayRef);
     if let Some(spectrum_time) = spectrum_time {
         fields.push(context.time_field());
-        arrays.push(Arc::new(Float32Array::from_value(spectrum_time, primary_array_len)));
+        arrays.push(Arc::new(Float32Array::from_value(
+            spectrum_time,
+            primary_array_len,
+        )));
     }
 
     for (_, v) in array_map.iter() {

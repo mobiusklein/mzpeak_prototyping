@@ -60,7 +60,7 @@ impl Entry {
             match entries.iter_mut().find(|v| v.precursor.is_none()) {
                 Some(ent) => {
                     ent.precursor = Some(prec.into());
-                },
+                }
                 None => {
                     entries.push(prec.into());
                 }
@@ -73,13 +73,13 @@ impl Entry {
                     prec_index,
                 );
                 match entries.iter_mut().find(|v| v.selected_ion.is_none()) {
-                Some(ent) => {
-                    ent.selected_ion = Some(part.into());
-                },
-                None => {
-                    entries.push(part.into());
+                    Some(ent) => {
+                        ent.selected_ion = Some(part.into());
+                    }
+                    None => {
+                        entries.push(part.into());
+                    }
                 }
-            }
             }
         }
         entries
@@ -120,14 +120,12 @@ impl From<SelectedIonEntry> for Entry {
     }
 }
 
-
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct ChromatogramMetadataEntry {
     pub chromatogram: Option<Box<ChromatogramEntry>>,
     pub precursor: Option<Box<PrecursorEntry>>,
     pub selected_ion: Option<Box<SelectedIonEntry>>,
 }
-
 
 impl From<ChromatogramEntry> for ChromatogramMetadataEntry {
     fn from(value: ChromatogramEntry) -> Self {

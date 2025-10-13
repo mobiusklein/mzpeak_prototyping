@@ -10,8 +10,8 @@ mod examples {
         include!("../examples/benchmark.rs");
     }
 }
-use examples::convert::{ConvertCli, run_convert as convert_run_convert};
 use examples::benchmark::{BenchmarkArgs, run_benchmark as benchmark_run_benchmark};
+use examples::convert::{ConvertCli, run_convert as convert_run_convert};
 
 #[derive(Parser)]
 #[command(name = "mzpeak_prototyping")]
@@ -29,15 +29,15 @@ enum Commands {
     Benchmark(BenchmarkArgs),
 }
 
-
 fn main() -> io::Result<()> {
     env_logger::init();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Convert(cli_args) => convert_run_convert(&cli_args.filename, cli_args.convert_args),
+        Commands::Convert(cli_args) => {
+            convert_run_convert(&cli_args.filename, cli_args.convert_args)
+        }
         Commands::Benchmark(args) => benchmark_run_benchmark(args),
     }
 }
-

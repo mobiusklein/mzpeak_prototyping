@@ -24,10 +24,14 @@ struct PeakError {
 
 impl PeakError {
     fn new(spectrum_index: usize, spec_mz: f64, diff: f64, numpress_diff: f64) -> Self {
-        Self { spectrum_index, spec_mz, diff, numpress_diff }
+        Self {
+            spectrum_index,
+            spec_mz,
+            diff,
+            numpress_diff,
+        }
     }
 }
-
 
 #[derive(Parser)]
 struct App {
@@ -39,14 +43,23 @@ struct App {
     outfile: PathBuf,
 }
 
-fn numpress_peaks(raw_arrays: &mzdata::spectrum::BinaryArrayMap) -> Vec<mzdata::mzsignal::FittedPeak> {
-    let mut raw_mzs = raw_arrays.get(&mzdata::spectrum::ArrayType::MZArray).unwrap().clone();
-    raw_mzs.store_compressed(mzdata::spectrum::bindata::BinaryCompressionType::NumpressLinear).unwrap();
+fn numpress_peaks(
+    raw_arrays: &mzdata::spectrum::BinaryArrayMap,
+) -> Vec<mzdata::mzsignal::FittedPeak> {
+    let mut raw_mzs = raw_arrays
+        .get(&mzdata::spectrum::ArrayType::MZArray)
+        .unwrap()
+        .clone();
+    raw_mzs
+        .store_compressed(mzdata::spectrum::bindata::BinaryCompressionType::NumpressLinear)
+        .unwrap();
     let raw_mzs = raw_mzs.to_f64().unwrap();
     let intensities = raw_arrays.intensities().unwrap();
     let picker = PeakPicker::default();
     let mut peaks = Vec::new();
-    picker.discover_peaks(&raw_mzs, &intensities, &mut peaks).unwrap();
+    picker
+        .discover_peaks(&raw_mzs, &intensities, &mut peaks)
+        .unwrap();
     peaks
 }
 
@@ -105,7 +118,9 @@ fn main() -> io::Result<()> {
 
     let cmpr = thread::spawn(move || -> io::Result<()> {
         let mut errors = Vec::new();
-        for (i, ((spec, spec_peaks), (ref_spec, ref_peaks))) in mp_recv.into_iter().zip(ref_recv.into_iter()).enumerate() {
+        for (i, ((spec, spec_peaks), (ref_spec, ref_peaks))) in
+            mp_recv.into_iter().zip(ref_recv.into_iter()).enumerate()
+        {
             if i % 1000 == 0 {
                 log::info!(
                     "Working on spectrum {i}/{n} ({:0.2}%), {n_peaks} peaks processed so far.",
@@ -135,7 +150,11 @@ fn main() -> io::Result<()> {
                 ref_peaks.len()
             );
 
-            for ((up, rp), np) in spec_peaks.iter().zip(ref_peaks.iter()).zip(numpress_peaks.iter()) {
+            for ((up, rp), np) in spec_peaks
+                .iter()
+                .zip(ref_peaks.iter())
+                .zip(numpress_peaks.iter())
+            {
                 let e = PeakError::new(spec.index(), rp.mz, rp.mz - up.mz, rp.mz - np.mz);
                 errors.push(e);
                 if (rp.mz - up.mz).abs() > 0.001 {

@@ -1,7 +1,7 @@
-use std::io::{SeekFrom, self};
+use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 
@@ -10,22 +10,27 @@ use object_store::parse_url;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 
+use async_zip::{StoredZipEntry, base::read::seek::ZipFileReader};
+use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncSeek, ReadBuf};
-use object_store::{ObjectStore, ObjectMeta, path::Path as ObjectPath};
-use async_zip::{base::read::seek::ZipFileReader, StoredZipEntry};
 use url::Url;
 
-use super::sync::{MzPeakArchiveType, SchemaMetadataManager, MzPeakArchiveEntry};
-
+use super::sync::{MzPeakArchiveEntry, MzPeakArchiveType, SchemaMetadataManager};
 
 pub trait AsyncArchiveSource: Clone + 'static {
     type File: parquet::arrow::async_reader::AsyncFileReader + Unpin + Send;
 
-    fn from_store_path(handle: Arc<dyn ObjectStore>, path: ObjectPath) -> impl Future<Output = io::Result<Self>>;
+    fn from_store_path(
+        handle: Arc<dyn ObjectStore>,
+        path: ObjectPath,
+    ) -> impl Future<Output = io::Result<Self>>;
     fn file_names(&self) -> &[String];
     fn open_entry_by_index(&self, index: usize) -> impl Future<Output = io::Result<Self::File>>;
 
-    fn metadata_for_index(&self, index: usize) -> impl Future<Output = io::Result<ArrowReaderMetadata>> {
+    fn metadata_for_index(
+        &self,
+        index: usize,
+    ) -> impl Future<Output = io::Result<ArrowReaderMetadata>> {
         async move {
             let mut handle = self.open_entry_by_index(index).await?;
             let opts = ArrowReaderOptions::new().with_page_index(true);
@@ -46,7 +51,9 @@ pub trait AsyncArchiveSource: Clone + 'static {
             };
 
             let handle = self.open_entry_by_index(index).await?;
-            Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(handle, metadata))
+            Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
+                handle, metadata,
+            ))
         }
     }
 }
@@ -56,7 +63,7 @@ pub struct AsyncZipArchiveSource {
     handle: Arc<dyn ObjectStore>,
     root: ObjectMeta,
     file_names: Vec<String>,
-    entries: Vec<StoredZipEntry>
+    entries: Vec<StoredZipEntry>,
 }
 
 impl AsyncZipArchiveSource {
@@ -66,9 +73,7 @@ impl AsyncZipArchiveSource {
 
         let reader = match ZipFileReader::with_tokio(reader).await {
             Ok(reader) => reader,
-            Err(e) => {
-                return Err(io::Error::other(e))
-            },
+            Err(e) => return Err(io::Error::other(e)),
         };
 
         let all_entries = reader.file().entries().to_vec();
@@ -84,14 +89,21 @@ impl AsyncZipArchiveSource {
             }
         }
 
-        Ok(Self { handle, root, entries, file_names })
+        Ok(Self {
+            handle,
+            root,
+            entries,
+            file_names,
+        })
     }
 
     pub async fn open_entry_by_index(&self, index: usize) -> io::Result<AsyncArchiveFacetReader> {
-        let entry = self.entries.get(index).ok_or(io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry with index {index}")))?;
+        let entry = self.entries.get(index).ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Could not find an entry with index {index}"),
+        ))?;
         let start_offset = entry.header_offset() + entry.header_size();
         let length = entry.uncompressed_size();
-
 
         if !matches!(entry.compression(), async_zip::Compression::Stored) {
             return Err(io::Error::new(
@@ -131,7 +143,9 @@ impl AsyncZipArchiveSource {
         };
 
         let handle = self.open_entry_by_index(index).await?;
-        Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(handle, metadata))
+        Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
+            handle, metadata,
+        ))
     }
 
     pub fn file_names(&self) -> &[String] {
@@ -142,7 +156,10 @@ impl AsyncZipArchiveSource {
 impl AsyncArchiveSource for AsyncZipArchiveSource {
     type File = AsyncArchiveFacetReader;
 
-    fn from_store_path(handle: Arc<dyn ObjectStore>, path: ObjectPath) -> impl Future<Output = io::Result<Self>> {
+    fn from_store_path(
+        handle: Arc<dyn ObjectStore>,
+        path: ObjectPath,
+    ) -> impl Future<Output = io::Result<Self>> {
         Self::new(handle, path)
     }
 
@@ -174,8 +191,22 @@ pub struct AsyncArchiveFacetReader {
 }
 
 impl AsyncArchiveFacetReader {
-    pub fn new(store: Arc<dyn ObjectStore>, target: ObjectMeta, start_offset: u64, length: u64, at: u64) -> Self {
-        Self { store, target, start_offset, length, at, buffer: Buffer::Empty, capacity: 1024 * 1024 }
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        target: ObjectMeta,
+        start_offset: u64,
+        length: u64,
+        at: u64,
+    ) -> Self {
+        Self {
+            store,
+            target,
+            start_offset,
+            length,
+            at,
+            buffer: Buffer::Empty,
+            capacity: 1024 * 1024,
+        }
     }
 
     fn poll_fill_buf_impl(
@@ -191,7 +222,8 @@ impl AsyncArchiveFacetReader {
                     let path = self.target.location.clone();
                     let offset_from = self.start_offset;
                     let start = self.at.min(self.length) as u64 + offset_from;
-                    let end = self.at.saturating_add(amnt as u64).min(self.length) as u64 + offset_from;
+                    let end =
+                        self.at.saturating_add(amnt as u64).min(self.length) as u64 + offset_from;
 
                     if start == end {
                         return Poll::Ready(Ok(&[]));
@@ -209,7 +241,6 @@ impl AsyncArchiveFacetReader {
             }
         }
     }
-
 }
 
 impl AsyncSeek for AsyncArchiveFacetReader {
@@ -225,18 +256,15 @@ impl AsyncSeek for AsyncArchiveFacetReader {
                     ),
                 )
             })?,
-            SeekFrom::Current(offset) => {
-
-                self.at.checked_add_signed(offset).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "Seeking {offset} from current offset of {} would result in overflow",
-                            self.at
-                        ),
-                    )
-                })?
-            }
+            SeekFrom::Current(offset) => self.at.checked_add_signed(offset).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Seeking {offset} from current offset of {} would result in overflow",
+                        self.at
+                    ),
+                )
+            })?,
         };
         self.buffer = Buffer::Empty;
         Ok(())
@@ -289,13 +317,12 @@ impl AsyncBufRead for AsyncArchiveFacetReader {
 }
 
 #[derive(Clone)]
-pub struct ObjectStoreReader<T: AsyncArchiveSource + 'static> {
+pub struct AsyncArchiveReader<T: AsyncArchiveSource + 'static> {
     archive: T,
     members: Arc<SchemaMetadataManager>,
 }
 
-impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
-
+impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     async fn init_from_archive(archive: T) -> io::Result<Self> {
         let mut members = SchemaMetadataManager::default();
         for (i, name) in archive.file_names().iter().enumerate() {
@@ -338,10 +365,16 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
                 MzPeakArchiveType::Other => {}
             }
         }
-        Ok(Self { archive, members: Arc::new(members) })
+        Ok(Self {
+            archive,
+            members: Arc::new(members),
+        })
     }
 
-    pub async fn from_store_path(store: Arc<dyn ObjectStore>, path: ObjectPath) -> io::Result<Self> {
+    pub async fn from_store_path(
+        store: Arc<dyn ObjectStore>,
+        path: ObjectPath,
+    ) -> io::Result<Self> {
         let archive = T::from_store_path(store, path).await?;
         Self::init_from_archive(archive).await
     }
@@ -357,7 +390,8 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
     ) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_metadata.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone())).await
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -366,12 +400,11 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
         }
     }
 
-    pub async  fn chromatograms_data(
-        &self,
-    ) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
+    pub async fn chromatograms_data(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone())).await
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -383,7 +416,8 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
     pub async fn spectra_data(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone())).await
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -392,12 +426,11 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
         }
     }
 
-    pub async fn spectrum_peaks(
-        &self,
-    ) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
+    pub async fn spectrum_peaks(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.peaks_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone())).await
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -406,12 +439,11 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
         }
     }
 
-    pub async fn spectrum_metadata(
-        &self,
-    ) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
+    pub async fn spectrum_metadata(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_metadata.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone())).await
+                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .await
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -419,9 +451,7 @@ impl<T: AsyncArchiveSource + 'static> ObjectStoreReader<T> {
             ))
         }
     }
-
 }
-
 
 #[cfg(test)]
 mod test {
@@ -429,7 +459,7 @@ mod test {
 
     use super::*;
 
-     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_local() -> io::Result<()> {
         let store = object_store::local::LocalFileSystem::new_with_prefix(".")?;
         let v = store.path_to_filesystem(&ObjectPath::from("small.mzpeak"))?;

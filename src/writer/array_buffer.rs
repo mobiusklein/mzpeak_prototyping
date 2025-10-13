@@ -403,7 +403,7 @@ impl ChunkBuffers {
             drop_zero_column,
             null_zeros,
             is_profile_buffer,
-            include_time
+            include_time,
         }
     }
 }
@@ -528,7 +528,6 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
             }
         }
     }
-
 
     fn schema(&self) -> &SchemaRef {
         match self {

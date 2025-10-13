@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 use crate::{
     archive::{ArchiveReader, ArchiveSource},
@@ -15,14 +15,16 @@ use crate::{
 };
 use arrow::{
     array::{Array, AsArray, RecordBatch, StructArray, UInt64Array},
-    datatypes::DataType,
+    datatypes::{DataType, Float32Type},
 };
+use identity_hash::BuildIdentityHasher;
 use mzdata::{
     io::OffsetIndex,
     meta,
     prelude::*,
     spectrum::{ChromatogramDescription, Precursor, ScanEvent, SelectedIon, SpectrumDescription},
 };
+use mzpeaks::coordinate::SimpleInterval;
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -804,9 +806,11 @@ impl<'a> SpectrumMetadataDecoder<'a> {
             }
         }
 
-
         if let Some(scan_arr) = batch.column_by_name("scan").map(|arr| arr.as_struct()) {
-            let index_arr: &UInt64Array = scan_arr.column_by_name("spectrum_index").unwrap().as_primitive();
+            let index_arr: &UInt64Array = scan_arr
+                .column_by_name("spectrum_index")
+                .unwrap()
+                .as_primitive();
             for scan_arr in segment_by_index_array(scan_arr, index_arr, spectrum_index).unwrap() {
                 let mut acc = Vec::new();
                 self.load_scan_events_from(&scan_arr, &mut acc);
@@ -819,8 +823,13 @@ impl<'a> SpectrumMetadataDecoder<'a> {
         }
 
         if let Some(precursor_arr) = batch.column_by_name("precursor").map(|v| v.as_struct()) {
-            let index_arr: &UInt64Array = precursor_arr.column_by_name("spectrum_index").unwrap().as_primitive();
-            for precursor_arr in segment_by_index_array(precursor_arr, index_arr, spectrum_index).unwrap() {
+            let index_arr: &UInt64Array = precursor_arr
+                .column_by_name("spectrum_index")
+                .unwrap()
+                .as_primitive();
+            for precursor_arr in
+                segment_by_index_array(precursor_arr, index_arr, spectrum_index).unwrap()
+            {
                 let mut precursor_acc = Vec::new();
                 self.load_precursors_from(&precursor_arr, &mut precursor_acc);
                 if self.precursors.is_empty() {
@@ -833,8 +842,13 @@ impl<'a> SpectrumMetadataDecoder<'a> {
 
         if let Some(selected_ion_arr) = batch.column_by_name("selected_ion").map(|v| v.as_struct())
         {
-            let index_arr: &UInt64Array = selected_ion_arr.column_by_name("spectrum_index").unwrap().as_primitive();
-            for selected_ion_arr in segment_by_index_array(selected_ion_arr, &index_arr, spectrum_index).unwrap() {
+            let index_arr: &UInt64Array = selected_ion_arr
+                .column_by_name("spectrum_index")
+                .unwrap()
+                .as_primitive();
+            for selected_ion_arr in
+                segment_by_index_array(selected_ion_arr, &index_arr, spectrum_index).unwrap()
+            {
                 let mut acc = Vec::new();
                 self.load_selected_ions_from(&selected_ion_arr, &mut acc);
                 if self.selected_ions.is_empty() {
@@ -1120,7 +1134,6 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
             .downcast_ref()
             .unwrap();
 
-
         let n_spec = index_arr.len() - index_arr.null_count();
         let mut local_descr = vec![ChromatogramDescription::default(); n_spec];
         let mut builder = MzChromatogramBuilder::new(
@@ -1175,5 +1188,129 @@ impl<T: ChunkReader + 'static> ChromatogramMetadataQuerySource for ChromatogramM
 impl<T: ChunkReader + 'static> BaseMetadataQuerySource for ChromatogramMetadataReader<T> {
     fn metadata(&self) -> &ParquetMetaData {
         self.0.metadata()
+    }
+}
+
+pub struct TimeIndexDecoder {
+    times: HashMap<u64, f32, BuildIdentityHasher<u64>>,
+    time_range: SimpleInterval<f32>,
+    min: u64,
+    max: u64,
+}
+
+impl TimeIndexDecoder {
+    pub fn new(time_range: SimpleInterval<f32>) -> Self {
+        Self {
+            time_range,
+            min: u64::MAX,
+            max: 0,
+            times: Default::default(),
+        }
+    }
+
+    pub fn from_descriptions(&mut self, descriptions: &[SpectrumDescription]) {
+        let n = descriptions.len();
+
+        let offset_start = match descriptions.binary_search_by(|descr| {
+            self.time_range
+                .start()
+                .total_cmp(&(descr.acquisition.start_time() as f32))
+                .reverse()
+        }) {
+            Ok(i) => i,
+            Err(i) => i.min(n),
+        }
+        .saturating_sub(1);
+        let offset = offset_start;
+
+        // TODO: Rewrite the output data structure and maybe this will be faster
+        // let mut i = offset_start;
+        // while i > 0 {
+        //     if time_range.start >= cache[i].acquisition.start_time()  as f32 {
+        //         i -= 1;
+        //     }
+        //     break;
+        // }
+        // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
+        //     i += 1;
+        // }
+        // offset_start = i;
+
+        // let mut offset_end = match cache.binary_search_by(|descr| {
+        //     time_range.end().total_cmp(&(descr.acquisition.start_time() as f32)).reverse()
+        // }) {
+        //     Ok(i) => i,
+        //     Err(i) => i.min(n),
+        // };
+
+        // i = offset_end;
+        // while i < n {
+        //     if time_range.end <= cache[i].acquisition.start_time()  as f32 {
+        //         i += 1;
+        //     }
+        //     break;
+        // }
+        // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
+        //     i = i.saturating_sub(1);
+        // }
+        // offset_end = i;
+
+        for (i, descr) in descriptions.iter().enumerate().skip(offset) {
+            let i = i as u64;
+            let t = descr.acquisition.start_time() as f32;
+            if self.time_range.contains(&t) {
+                self.min = self.min.min(i);
+                self.max = self.max.max(i);
+                self.times.insert(i, t);
+            } else if !self.times.is_empty() {
+                break;
+            }
+        }
+    }
+
+    pub fn decode_batch(
+        &mut self,
+        batch: RecordBatch,
+    ) -> Result<(), parquet::errors::ParquetError> {
+        let root = batch.column(0).as_struct();
+        let arr: &UInt64Array = root.column(0).as_primitive();
+        let time_arr = root.column(1);
+        if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
+            for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
+                if self.time_range.contains(&time) {
+                    self.min = self.min.min(val);
+                    self.max = self.max.max(val);
+                    self.times.insert(val, time);
+                }
+            }
+        } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
+            for (val, time) in arr
+                .iter()
+                .flatten()
+                .zip(time_arr.iter().flatten().map(|v| v as f32))
+            {
+                if self.time_range.contains(&time) {
+                    self.min = self.min.min(val);
+                    self.max = self.max.max(val);
+                    self.times.insert(val, time);
+                }
+            }
+        } else {
+            return Err(parquet::errors::ParquetError::ArrowError(format!(
+                "Invalid time array data type: {:?}",
+                time_arr.data_type()
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn finish(
+        self,
+    ) -> (
+        HashMap<u64, f32, BuildIdentityHasher<u64>>,
+        SimpleInterval<u64>,
+    ) {
+        (self.times, SimpleInterval::new(self.min, self.max))
     }
 }

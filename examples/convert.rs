@@ -159,7 +159,11 @@ pub struct ConvertArgs {
     )]
     write_peaks_and_profiles: bool,
 
-    #[arg(short='t', long, help="Include an extra 'spectrum_time' array alongside the 'spectrum_index' array.")]
+    #[arg(
+        short = 't',
+        long,
+        help = "Include an extra 'spectrum_time' array alongside the 'spectrum_index' array."
+    )]
     include_time_with_spectrum_data: bool,
 }
 
@@ -245,12 +249,8 @@ impl ConvertArgs {
                             ArrayType::IntensityArray,
                             BinaryDataArrayType::Float32,
                         ),
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Int32,
-                        )
-                        .with_transform(intensity_transform),
+                        BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
+                            .with_transform(intensity_transform),
                     );
                     overrides.insert(
                         BufferName::new(
@@ -258,12 +258,8 @@ impl ConvertArgs {
                             ArrayType::IntensityArray,
                             BinaryDataArrayType::Float64,
                         ),
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Int32,
-                        )
-                        .with_transform(intensity_transform),
+                        BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
+                            .with_transform(intensity_transform),
                     );
                 }
             }

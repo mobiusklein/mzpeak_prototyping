@@ -448,10 +448,10 @@ impl DirectorySource {
     }
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
-        let name = self
-            .file_names
-            .get(index)
-            .ok_or(io::Error::new(io::ErrorKind::NotFound, format!("file at {index} not found in directory")))?;
+        let name = self.file_names.get(index).ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("file at {index} not found in directory"),
+        ))?;
         let path = self.archive_path.join(name);
         let fh = fs::File::open(&path)?;
         let meta = fs::metadata(&path)?;
@@ -498,7 +498,6 @@ impl ArchiveSource for DirectorySource {
         Self::new(path)
     }
 }
-
 
 pub struct ArchiveReader<T: ArchiveSource + 'static> {
     archive: T,
@@ -556,9 +555,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         Self::init_from_archive(archive)
     }
 
-    pub fn chromatograms_metadata(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn chromatograms_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -570,9 +567,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn chromatograms_data(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn chromatograms_data(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_data_arrays.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -596,9 +591,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn spectrum_peaks(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn spectrum_peaks(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.peaks_data_arrays.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -610,9 +603,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn spectrum_metadata(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn spectrum_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -623,7 +614,6 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
             ))
         }
     }
-
 }
 
 pub type ZipArchiveReader = ArchiveReader<ZipArchiveSource>;
@@ -632,7 +622,7 @@ pub type AnyArchiveReader = ArchiveReader<DispatchArchiveSource>;
 
 pub enum DispatchArchiveSource {
     Zip(ZipArchiveSource),
-    Directory(DirectorySource)
+    Directory(DirectorySource),
 }
 
 macro_rules! dispatch {
@@ -649,9 +639,9 @@ impl ArchiveSource for DispatchArchiveSource {
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
         if fs::metadata(&path)?.is_dir() {
-            return Ok(Self::Directory(DirectorySource::from_path(path)?))
+            return Ok(Self::Directory(DirectorySource::from_path(path)?));
         } else {
-            return Ok(Self::Zip(ZipArchiveSource::from_path(path)?))
+            return Ok(Self::Zip(ZipArchiveSource::from_path(path)?));
         }
     }
 
@@ -660,15 +650,13 @@ impl ArchiveSource for DispatchArchiveSource {
     }
 
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
-        dispatch!(self, src, { src.open_entry_by_index(index)} )
+        dispatch!(self, src, { src.open_entry_by_index(index) })
     }
 }
 
 impl ArchiveReader<DispatchArchiveSource> {
     pub fn new(file: fs::File) -> io::Result<Self> {
-        let archive = DispatchArchiveSource::Zip(
-            ZipArchiveSource::new(file)?
-        );
+        let archive = DispatchArchiveSource::Zip(ZipArchiveSource::new(file)?);
         Self::init_from_archive(archive)
     }
 }
@@ -686,7 +674,6 @@ impl DirectoryArchiveReader {
         Self::init_from_archive(archive)
     }
 }
-
 
 #[cfg(test)]
 mod test {

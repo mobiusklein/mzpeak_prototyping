@@ -106,7 +106,11 @@ impl<'a> ParameterVisitor<'a> {
                 self.destination[i].name = v.unwrap().to_string();
             }
         }
-        if let Some(curie) = self.root.column_by_name("curie").or_else(|| self.root.column_by_name("accession")) {
+        if let Some(curie) = self
+            .root
+            .column_by_name("curie")
+            .or_else(|| self.root.column_by_name("accession"))
+        {
             let arr = AnyCURIEArray::try_from(curie).unwrap();
             for i in 0..n {
                 if let Some(v) = arr.value(i).map(mzdata::params::CURIE::from) {
@@ -736,7 +740,7 @@ impl<'a> AnyCURIEArray<'a> {
                     acc.push(curiearray.value(i).unwrap().into())
                 }
                 acc
-            },
+            }
             AnyCURIEArray::String(curiestr_array) => {
                 let n = curiestr_array.len();
                 let mut acc: Vec<_> = Vec::with_capacity(n);
@@ -744,7 +748,7 @@ impl<'a> AnyCURIEArray<'a> {
                     acc.push(curiestr_array.value(i).unwrap())
                 }
                 acc
-            },
+            }
         }
     }
 

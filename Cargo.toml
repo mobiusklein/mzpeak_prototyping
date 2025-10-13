@@ -28,7 +28,7 @@ name = "read"
 path = "examples/read.rs"
 
 [[example]]
-name = "extract_refs"
+name = "extract-ref"
 path = "examples/extract_ref.rs"
 
 [[example]]
@@ -40,6 +40,10 @@ name = "extract-object-store"
 path = "examples/extract_object_store.rs"
 required-features = ["async"]
 
+[[example]]
+name = "extract-ref-object-store"
+path = "examples/extract_ref_object_store.rs"
+required-features = ["async"]
 
 [features]
 default = ["async"]

@@ -2,16 +2,18 @@ use std::{fmt::Debug, ops::AddAssign, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrowPrimitiveType, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array
+        Array, ArrowPrimitiveType, AsArray, BooleanArray, Float32Array, Float64Array, Int32Array,
+        Int64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
     },
     buffer::NullBuffer,
     compute::{nullif, take_record_batch},
-    datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt32Type, UInt64Type},
+    datatypes::{
+        DataType, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt32Type, UInt64Type,
+    },
 };
 
 use mzpeaks::coordinate::SimpleInterval;
 use num_traits::{Float, NumCast, One, Zero};
-
 
 /// Compute the deltas of a sequence of sorted floating point numbers.
 ///
@@ -33,7 +35,6 @@ pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) 
     deltas
 }
 
-
 /// Compute the median value of a sorted slice
 pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
     let n = deltas.len();
@@ -49,7 +50,6 @@ pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
     };
     median
 }
-
 
 /// Compute the median-below-median delta value of a series of sorted floating point numbers.
 ///
@@ -130,7 +130,6 @@ where
     }
 }
 
-
 /// Fit one or more [`MZDeltaModel`] types and pick the one that minimizes the error.
 ///
 /// If `weights` are provided, they are assumed to square-root transformed.
@@ -188,10 +187,8 @@ where
     }
 }
 
-
 /// A model of the m/z delta or spacing used for filling missing value information
 pub trait MZDeltaModel<T: Float + AddAssign>: Sized {
-
     /// Predict the m/z delta for a given `mz` value
     fn predict<U: Float + AddAssign + NumCast>(&self, mz: U) -> U;
 
@@ -215,7 +212,7 @@ pub trait MZDeltaModel<T: Float + AddAssign>: Sized {
         acc
     }
 
-    fn from_f64_iter(iter: impl Iterator<Item=f64>) -> Self {
+    fn from_f64_iter(iter: impl Iterator<Item = f64>) -> Self {
         let val: Vec<_> = iter.collect();
         Self::from_float64_array(&val.into())
     }
@@ -226,7 +223,6 @@ pub trait MZDeltaModel<T: Float + AddAssign>: Sized {
     /// Reconstruct the model from the parameters in a `Float64Array`
     fn from_float64_array(data: &Float64Array) -> Self;
 }
-
 
 /// A fixed m/z spacing value
 #[derive(Debug, Default, Clone)]
@@ -322,7 +318,9 @@ where
                 sel_weights.push(*weight);
             }
             if sel_mzs.len() < 3 {
-                return Err("Insufficient data to fit regression delta model, fewer than 3 data points available after filtering")
+                return Err(
+                    "Insufficient data to fit regression delta model, fewer than 3 data points available after filtering",
+                );
             }
             let x = fit_delta_model(&sel_mzs, &sel_deltas, Some(&sel_weights), 2)?;
             Ok(Self::from(x))
@@ -334,7 +332,9 @@ where
                 .filter(|(d, _m)| *d <= threshold)
                 .collect();
             if sel_mzs.len() < 3 {
-                return Err("Insufficient data to fit regression delta model, fewer than 3 data points available after filtering")
+                return Err(
+                    "Insufficient data to fit regression delta model, fewer than 3 data points available after filtering",
+                );
             }
             let x = fit_delta_model(&sel_mzs, &sel_deltas, None, 2)?;
             Ok(Self::from(x))
@@ -350,7 +350,7 @@ where
         Self::from(vals)
     }
 
-    fn from_f64_iter(iter: impl Iterator<Item=f64>) -> Self {
+    fn from_f64_iter(iter: impl Iterator<Item = f64>) -> Self {
         let betas: Vec<_> = iter.map(|i| T::from(i).unwrap()).collect();
         Self::from(betas)
     }
@@ -481,7 +481,6 @@ impl<'a> NullTokenizer<'a> {
         state
     }
 }
-
 
 /// Fill null m/z values of `array` with values inferred from adjacent populated values and
 /// either a local median delta value or a common model
@@ -631,7 +630,6 @@ where
     acc.into()
 }
 
-
 /// Find indices where `array` is not a consecutive run of zeros.
 ///
 /// This kernel is only implemented for `Float32Array` and `Float64Array`
@@ -640,20 +638,18 @@ pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
         Some(_skip_zero_runs_gen(array))
     } else if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<Int32Array>(){
+    } else if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>(){
+    } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<UInt32Array>(){
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<UInt64Array>(){
+    } else if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
         Some(_skip_zero_runs_gen(array))
-    }
-    else {
+    } else {
         None
     }
 }
-
 
 pub fn drop_where_column_is_zero(
     batch: &RecordBatch,
@@ -666,7 +662,6 @@ pub fn drop_where_column_is_zero(
         Ok(batch.clone())
     }
 }
-
 
 /// Construct a boolean mask marking all positions where two consecutive values were zero
 pub fn is_zero_pair_mask<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>) -> BooleanArray
@@ -699,7 +694,6 @@ where
     assert_eq!(acc.len(), n);
     acc.into()
 }
-
 
 /// Find all positions which satisfy `is_zero_pair` in the `column_index`th column in `batch`
 /// in `target_indices` columns.
@@ -779,11 +773,13 @@ where
     PrimitiveArray::from(buffer)
 }
 
-
 /// Decode an Arrow array that was delta-encoded *with* nulls.
 ///
 /// This is necessarily a copying operation.
-pub fn null_delta_decode<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>, start: T::Native) -> PrimitiveArray<T>
+pub fn null_delta_decode<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>,
+    start: T::Native,
+) -> PrimitiveArray<T>
 where
     T::Native: Float,
     PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
@@ -821,7 +817,6 @@ where
     }
     PrimitiveArray::from(buffer)
 }
-
 
 /// Partition a sorted numerical array into segments spanning no more than `k` units.
 ///
@@ -913,17 +908,13 @@ mod test {
 
     #[test]
     fn test_null_singleton() {
-        let data = Float64Array::from(vec![
-            None, Some(50.0), None
-        ]);
+        let data = Float64Array::from(vec![None, Some(50.0), None]);
         let it = NullTokenizer::new(data.nulls().unwrap());
         let vals: Vec<_> = it.collect();
         assert_eq!(vals.len(), 1);
         assert_eq!(vals[0], NullFillState::NullBounded(0, 2));
 
-        let data = Float64Array::from(vec![
-            None, Some(50.0)
-        ]);
+        let data = Float64Array::from(vec![None, Some(50.0)]);
         let it = NullTokenizer::new(data.nulls().unwrap());
         let vals: Vec<_> = it.collect();
         assert_eq!(vals.len(), 1);
@@ -940,7 +931,7 @@ mod test {
             Some(0.01864710288123206),
             Some(0.018647880570824782),
             Some(0.018648658303959564),
-            None
+            None,
         ]);
 
         let it = NullTokenizer::new(data.nulls().unwrap());

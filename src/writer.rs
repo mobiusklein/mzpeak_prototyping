@@ -6,7 +6,10 @@ use std::{
     sync::Arc,
 };
 
-use arrow::{array::{ArrayBuilder, AsArray, RecordBatch}, datatypes::{Field, Schema}};
+use arrow::{
+    array::{ArrayBuilder, AsArray, RecordBatch},
+    datatypes::{Field, Schema},
+};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
     arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
@@ -47,27 +50,11 @@ pub use builder::MzPeakWriterBuilder;
 pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{
-    ScanBuilder,
-    ScanWindowBuilder,
-    SelectedIonBuilder,
-    ActivationBuilder,
-    IsolationWindowBuilder,
-    PrecursorBuilder,
-    CURIEBuilder,
-    ParamValueBuilder,
-    ParamBuilder,
-    CustomBuilderFromParameter,
-    ParamListBuilder,
-    AuxiliaryArrayBuilder,
-    SpectrumDetailsBuilder,
-    SpectrumBuilder,
-    StructVisitor,
-    VisitorBase,
-    StructVisitorBuilder,
-    SpectrumVisitor,
-    inflect_cv_term_to_column_name,
-    ChromatogramDetailsBuilder,
-    ChromatogramBuilder,
+    ActivationBuilder, AuxiliaryArrayBuilder, CURIEBuilder, ChromatogramBuilder,
+    ChromatogramDetailsBuilder, CustomBuilderFromParameter, IsolationWindowBuilder, ParamBuilder,
+    ParamListBuilder, ParamValueBuilder, PrecursorBuilder, ScanBuilder, ScanWindowBuilder,
+    SelectedIonBuilder, SpectrumBuilder, SpectrumDetailsBuilder, SpectrumVisitor, StructVisitor,
+    StructVisitorBuilder, VisitorBase, inflect_cv_term_to_column_name,
 };
 
 pub(crate) use base::implement_mz_metadata;
@@ -342,7 +329,6 @@ impl<
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
     ) -> Self {
-
         let spectrum_metadata_buffer = SpectrumBuilder::default();
 
         let spectrum_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
@@ -384,11 +370,9 @@ impl<
         {
             let peak_buffer_file =
                 tempfile::tempfile().expect("Failed to create temporary file to write peaks to");
-            let peak_buffer = peak_buffer_builder.include_time(spectrum_buffers.include_time()).build(
-                Arc::new(Schema::empty()),
-                BufferContext::Spectrum,
-                false,
-            );
+            let peak_buffer = peak_buffer_builder
+                .include_time(spectrum_buffers.include_time())
+                .build(Arc::new(Schema::empty()), BufferContext::Spectrum, false);
 
             let data_props = Self::spectrum_data_writer_props(
                 &peak_buffer,
@@ -461,7 +445,7 @@ impl<
     pub fn write_spectrum<
         A: ToMzPeakDataSeries + CentroidLike,
         B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
-        S: SpectrumLike<A, B> + 'static
+        S: SpectrumLike<A, B> + 'static,
     >(
         &mut self,
         spectrum: &S,
@@ -573,9 +557,8 @@ impl<
                 self.archive_writer = Some(ArrowWriter::try_new_with_options(
                     writer,
                     metadata_fields.clone(),
-                    ArrowWriterOptions::new().with_properties(
-                        Self::spectrum_metadata_writer_props(&metadata_fields),
-                    ),
+                    ArrowWriterOptions::new()
+                        .with_properties(Self::spectrum_metadata_writer_props(&metadata_fields)),
                 )?);
                 self.flush_chromatogram_metadata_records()?;
                 self.append_key_value_metadata(

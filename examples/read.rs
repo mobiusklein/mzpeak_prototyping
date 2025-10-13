@@ -1,16 +1,14 @@
-use std::{
-    io, path, time
-};
+use std::{io, path, time};
 
-use mzdata::prelude::SpectrumLike;
-use mzpeak_prototyping::MzPeakReader;
 use clap::Parser;
 use env_logger;
+use mzdata::prelude::SpectrumLike;
+use mzpeak_prototyping::MzPeakReader;
 
 #[derive(Parser)]
 struct App {
     #[arg()]
-    filename: path::PathBuf
+    filename: path::PathBuf,
 }
 
 fn main() -> io::Result<()> {
@@ -33,11 +31,17 @@ fn main() -> io::Result<()> {
                 points += arr.len();
             }
             Err(e) => {
-                eprintln!("Failed to retrieve arrays for spectrum {}: {e}", spec.index());
+                eprintln!(
+                    "Failed to retrieve arrays for spectrum {}: {e}",
+                    spec.index()
+                );
             }
         }
     }
     let dur = start.elapsed();
-    eprintln!("Read {i} spectra and {points} points. Elapsed: {} seconds", dur.as_secs_f64());
+    eprintln!(
+        "Read {i} spectra and {points} points. Elapsed: {} seconds",
+        dur.as_secs_f64()
+    );
     Ok(())
 }

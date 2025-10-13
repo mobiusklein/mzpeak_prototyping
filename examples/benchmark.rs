@@ -1,15 +1,18 @@
 use clap::Parser;
 use csv::Writer;
 use indicatif::{ProgressBar, ProgressStyle};
-use mzdata::{self, io::{MassSpectrometryFormat, infer_format}};
+use mzdata::{
+    self,
+    io::{MassSpectrometryFormat, infer_format},
+};
 use std::{
     collections::VecDeque,
     fs, io,
-    path::{Path, PathBuf},
     panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Instant
+    time::Instant,
 };
 use tempfile::TempDir;
 use walkdir::WalkDir;
@@ -27,16 +30,24 @@ pub struct BenchmarkArgs {
     /// Directory to scan for mass spectrometry files
     pub directory: PathBuf,
 
-    #[arg(short = 'O', long = "output-csv", help="Path to save benchmark results CSV")]
+    #[arg(
+        short = 'O',
+        long = "output-csv",
+        help = "Path to save benchmark results CSV"
+    )]
     pub output_csv: Option<PathBuf>,
 
-    #[arg(short = 't', long = "threads", help="Number of threads to use (default: number of CPU cores)")]
+    #[arg(
+        short = 't',
+        long = "threads",
+        help = "Number of threads to use (default: number of CPU cores)"
+    )]
     pub threads: Option<usize>,
 
-    #[arg(long = "temp-dir", help="Temporary directory for converted files")]
+    #[arg(long = "temp-dir", help = "Temporary directory for converted files")]
     pub temp_dir: Option<PathBuf>,
 
-    #[arg(long = "no-progress", help="Disable progress bar")]
+    #[arg(long = "no-progress", help = "Disable progress bar")]
     pub no_progress: bool,
 
     // Include all conversion options
@@ -72,7 +83,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
     let files = discover_supported_files(&args.directory)?;
 
     if files.is_empty() {
-        eprintln!("No supported mass spectrometry files found in {}", args.directory.display());
+        eprintln!(
+            "No supported mass spectrometry files found in {}",
+            args.directory.display()
+        );
         return Ok(());
     }
 
@@ -91,10 +105,18 @@ pub fn run_benchmark(args: BenchmarkArgs) -> io::Result<()> {
     };
 
     // Process files in parallel
-    let results = process_files_parallel(files, temp_dir.path(), &args.convert_args, threads, progress.as_ref())?;
+    let results = process_files_parallel(
+        files,
+        temp_dir.path(),
+        &args.convert_args,
+        threads,
+        progress.as_ref(),
+    )?;
 
     // Write CSV output
-    let output_path = args.output_csv.unwrap_or_else(|| PathBuf::from("benchmark_results.csv"));
+    let output_path = args
+        .output_csv
+        .unwrap_or_else(|| PathBuf::from("benchmark_results.csv"));
     write_csv_results(&results, &output_path)?;
 
     let end = Instant::now();
@@ -171,14 +193,17 @@ pub fn process_files_parallel(
                             Ok(result) => result,
                             Err(_) => {
                                 // Thread panicked, create error result
-                                let filename = path.file_name()
+                                let filename = path
+                                    .file_name()
                                     .unwrap_or_default()
                                     .to_string_lossy()
                                     .to_string();
                                 eprintln!("PANIC: Conversion failed for file: {}", path.display());
                                 BenchmarkResult {
                                     filename,
-                                    original_size: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                                    original_size: fs::metadata(&path)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0),
                                     final_size: 0,
                                     time_taken: 0.0,
                                     status: "error: conversion panicked".to_string(),
@@ -218,7 +243,8 @@ pub fn process_single_file(
     temp_dir: &Path,
     convert_args: &ConvertArgs,
 ) -> BenchmarkResult {
-    let filename = file_path.file_name()
+    let filename = file_path
+        .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
@@ -284,7 +310,13 @@ pub fn write_csv_results(results: &[BenchmarkResult], output_path: &Path) -> io:
     let mut writer = Writer::from_path(output_path)?;
 
     // Write header
-    writer.write_record(&["filename", "originalsize", "finalsize", "timetaken", "status"])?;
+    writer.write_record(&[
+        "filename",
+        "originalsize",
+        "finalsize",
+        "timetaken",
+        "status",
+    ])?;
 
     // Write results
     for result in results {
