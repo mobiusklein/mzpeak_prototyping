@@ -660,6 +660,7 @@ impl<
                 ion_mobility_range,
                 &self.query_indices.spectrum_point_index,
                 &self.metadata.spectrum_array_indices,
+                &self.metadata
             )
             .await?
             .boxed();
@@ -711,6 +712,7 @@ impl<
                 ion_mobility_range,
                 &meta_index.query_index,
                 &meta_index.array_indices,
+                &self.metadata
             )
             .await?;
         Ok((iter, time_index))

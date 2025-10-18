@@ -32,13 +32,11 @@ use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
 
+#[allow(unused_imports)]
 use crate::{
-    BufferContext,
-    archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource},
-    filter::RegressionDeltaModel,
-    reader::{
+    archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource, SplittingZipArchiveSource}, filter::RegressionDeltaModel, reader::{
         chunk::{DataChunkCache, SpectrumChunkReader},
-        index::{PageQuery, QueryIndex, SpanDynNumeric},
+        index::{PageQuery, QueryIndex, SpanDynNumeric, SpectrumQueryIndex},
         metadata::{
             ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource,
             ChromatogramMetadataReader, SpectrumMetadataDecoder, SpectrumMetadataQuerySource,
@@ -46,12 +44,13 @@ use crate::{
         },
         point::PointDataReader,
         visitor::AuxiliaryArrayVisitor,
-    },
+    }, BufferContext
 };
 
 mod chunk;
 mod metadata;
 mod point;
+pub(crate) mod utils;
 
 pub mod index;
 pub mod visitor;
@@ -64,7 +63,7 @@ use point::{DataPointCache, PointDataArrayReader};
 
 /// A reader for mzPeak files, abstract over the source type.
 pub struct MzPeakReaderTypeOfSource<
-    T: ArchiveSource = ZipArchiveSource,
+    T: ArchiveSource = SplittingZipArchiveSource,
     C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap = CentroidPeak,
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap = DeconvolutedPeak,
 > {
@@ -584,12 +583,62 @@ impl<
             return Ok((it, time_index));
         }
 
-        let reader = PointDataReader(builder, BufferContext::Spectrum).query_points(
+        let reader = PointDataReader(builder, BufferContext::Spectrum);
+
+        let query = self.query_indices.query_pages_overlaps(&index_range);
+
+        if query.can_split() && self.handle.can_split() {
+            let mut index_range1 = index_range.clone();
+            index_range1.end = index_range1.start + (index_range1.end - index_range1.start) / 2;
+            let mut index_range2 = index_range.clone();
+            index_range2.start = index_range1.end + 1;
+            if index_range2.end >= index_range2.start {
+                log::trace!("Splitting query");
+                {
+                    let builder2 = self.handle.spectra_data()?;
+                    let reader2 = PointDataReader(builder2, BufferContext::Spectrum);
+
+                    let reader = std::thread::scope(|ctx| -> io::Result<_> {
+                        let handle = ctx.spawn(|| {
+                            reader.query_points(
+                                index_range1,
+                                mz_range,
+                                ion_mobility_range,
+                                &self.query_indices,
+                                &self.metadata.spectrum_array_indices,
+                                &self.metadata,
+                                None,
+                            )
+                        });
+                        let handle2 = ctx.spawn(|| {
+                            reader2.query_points(
+                                index_range2,
+                                mz_range,
+                                ion_mobility_range,
+                                &self.query_indices,
+                                &self.metadata.spectrum_array_indices,
+                                &self.metadata,
+                                None,
+                            )
+                        });
+                        let reader = handle.join().unwrap()?;
+                        let reader2 = handle2.join().unwrap()?;
+                        Ok(Box::new(reader.chain(reader2)))
+                    });
+
+                    return Ok((reader?, time_index))
+                }
+
+            }
+        }
+        let reader = reader.query_points(
             index_range,
             mz_range,
             ion_mobility_range,
             &self.query_indices,
             &self.metadata.spectrum_array_indices,
+            &self.metadata,
+            Some(query),
         )?;
         Ok((reader, time_index))
     }
@@ -666,6 +715,8 @@ impl<
             ion_mobility_range,
             &meta_index.query_index,
             &meta_index.array_indices,
+            &self.metadata,
+            None,
         )?;
         Ok((iter, time_index))
     }
@@ -1309,10 +1360,10 @@ impl<
     }
 }
 
-pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<ZipArchiveSource, C, D>;
+pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<SplittingZipArchiveSource, C, D>;
 pub type UnpackedMzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DirectorySource, C, D>;
 
-pub type MzPeakReader = MzPeakReaderTypeOfSource<ZipArchiveSource, CentroidPeak, DeconvolutedPeak>;
+pub type MzPeakReader = MzPeakReaderTypeOfSource<SplittingZipArchiveSource, CentroidPeak, DeconvolutedPeak>;
 pub type UnpackedMzPeakReader =
     MzPeakReaderTypeOfSource<DirectorySource, CentroidPeak, DeconvolutedPeak>;
 

@@ -292,8 +292,7 @@ pub struct ZipArchiveSource {
     pub file_names: Vec<String>,
 }
 
-impl ZipArchiveSource {
-    pub fn new(archive_file: fs::File) -> io::Result<Self> {
+fn zip_archive_to_config(archive_file: fs::File) -> io::Result<(fs::File, Vec<String>, Config)> {
         let arch = ZipArchive::new(archive_file)?;
         let offset = arch.offset();
         let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();
@@ -301,6 +300,38 @@ impl ZipArchiveSource {
         let archive_offset = Config {
             archive_offset: zip::read::ArchiveOffset::Known(offset),
         };
+        Ok((archive_file, file_names, archive_offset))
+}
+
+fn zip_archive_open_entry(handle: fs::File, index: usize, archive_offset: Config) -> io::Result<ArchiveFacetReader> {
+    let mut archive = ZipArchive::with_config(archive_offset, handle)?;
+    let handle = archive.by_index(index)?;
+    match handle.compression() {
+        CompressionMethod::Stored => {}
+        method => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "Compression method {method:?} isn't supported. Only Stored is supported"
+                ),
+            ));
+        }
+    }
+    let start_offset = handle.data_start();
+    let length = handle.size();
+    drop(handle);
+    let handle = archive.into_inner();
+    Ok(ArchiveFacetReader::new(
+        handle,
+        start_offset,
+        length,
+        0,
+    ))
+}
+
+impl ZipArchiveSource {
+    pub fn new(archive_file: fs::File) -> io::Result<Self> {
+        let (archive_file, file_names, archive_offset, ) = zip_archive_to_config(archive_file)?;
         Ok(Self {
             archive_file,
             archive_offset,
@@ -308,35 +339,55 @@ impl ZipArchiveSource {
         })
     }
 
-    pub fn archive(&self) -> io::Result<ZipArchive<fs::File>> {
+    pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = self.archive_file.try_clone()?;
-        let archive = ZipArchive::with_config(self.archive_offset.clone(), handle)?;
-        Ok(archive)
+        zip_archive_open_entry(handle, index, self.archive_offset.clone())
+    }
+
+    pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
+        let handle = self.open_entry_by_index(index)?;
+        let opts = ArrowReaderOptions::new().with_page_index(true);
+        Ok(ArrowReaderMetadata::load(&handle, opts)?)
+    }
+
+    pub fn read_index(
+        &self,
+        index: usize,
+        metadata: Option<ArrowReaderMetadata>,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
+        let metadata = if let Some(metadata) = metadata {
+            metadata
+        } else {
+            self.metadata_for_index(index)?
+        };
+
+        let handle = self.open_entry_by_index(index)?;
+        Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+            handle, metadata,
+        ))
+    }
+}
+
+pub struct SplittingZipArchiveSource {
+    archive_file: PathBuf,
+    archive_offset: Config,
+    pub file_names: Vec<String>,
+}
+
+impl SplittingZipArchiveSource {
+    pub fn new(archive_path: PathBuf) -> io::Result<Self> {
+        let archive_file = fs::File::open(archive_path.as_path())?;
+        let (_, file_names, archive_offset, ) = zip_archive_to_config(archive_file)?;
+        Ok(Self {
+            archive_file: archive_path,
+            archive_offset,
+            file_names,
+        })
     }
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
-        let handle = self.archive_file.try_clone()?;
-        let mut archive = ZipArchive::with_config(self.archive_offset.clone(), handle)?;
-        let handle = archive.by_index(index)?;
-        match handle.compression() {
-            CompressionMethod::Stored => {}
-            method => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "Compression method {method:?} isn't supported. Only Stored is supported"
-                    ),
-                ));
-            }
-        }
-        let start_offset = handle.data_start();
-        let length = handle.size();
-        Ok(ArchiveFacetReader::new(
-            self.archive_file.try_clone()?,
-            start_offset,
-            length,
-            0,
-        ))
+        let handle = fs::File::open(self.archive_file.as_path())?;
+        zip_archive_open_entry(handle, index, self.archive_offset.clone())
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -383,6 +434,10 @@ pub(crate) struct SchemaMetadataManager {
 pub trait ArchiveSource: Sized + 'static {
     type File: ChunkReader + 'static;
 
+    fn can_split(&self) -> bool {
+        false
+    }
+
     fn from_path(path: PathBuf) -> io::Result<Self>;
     fn file_names(&self) -> &[String];
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File>;
@@ -416,6 +471,26 @@ impl ArchiveSource for ZipArchiveSource {
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
         Self::new(fs::File::open(path)?)
+    }
+
+    fn file_names(&self) -> &[String] {
+        &self.file_names
+    }
+
+    fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
+        self.open_entry_by_index(index)
+    }
+}
+
+impl ArchiveSource for SplittingZipArchiveSource {
+    type File = ArchiveFacetReader;
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        Self::new(path)
     }
 
     fn file_names(&self) -> &[String] {
@@ -486,6 +561,10 @@ impl DirectorySource {
 impl ArchiveSource for DirectorySource {
     type File = ArchiveFacetReader;
 
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn file_names(&self) -> &[String] {
         &self.file_names
     }
@@ -553,6 +632,10 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     pub fn from_path(archive_path: PathBuf) -> io::Result<Self> {
         let archive = T::from_path(archive_path)?;
         Self::init_from_archive(archive)
+    }
+
+    pub fn can_split(&self) -> bool {
+        self.archive.can_split()
     }
 
     pub fn chromatograms_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
@@ -623,6 +706,7 @@ pub type AnyArchiveReader = ArchiveReader<DispatchArchiveSource>;
 pub enum DispatchArchiveSource {
     Zip(ZipArchiveSource),
     Directory(DirectorySource),
+    SplittingZip(SplittingZipArchiveSource),
 }
 
 macro_rules! dispatch {
@@ -630,6 +714,7 @@ macro_rules! dispatch {
         match $d {
             DispatchArchiveSource::Zip($r) => $e,
             DispatchArchiveSource::Directory($r) => $e,
+            DispatchArchiveSource::SplittingZip($r) => $e,
         }
     };
 }
@@ -643,6 +728,10 @@ impl ArchiveSource for DispatchArchiveSource {
         } else {
             return Ok(Self::Zip(ZipArchiveSource::from_path(path)?));
         }
+    }
+
+    fn can_split(&self) -> bool {
+        dispatch!(self, src, { src.can_split() })
     }
 
     fn file_names(&self) -> &[String] {

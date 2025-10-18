@@ -71,7 +71,7 @@ impl<T: HasProximity> PageIndexType<T> for PageIndexEntry<T> {
     }
 
     fn row_group(&self) -> usize {
-        self.page_i
+        self.row_group_i
     }
 }
 
@@ -657,100 +657,6 @@ pub struct SpectrumPointIndex {
     pub time_index: Option<PageIndex<f32>>,
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ChromatogramPointIndex {
-    pub chromatogram_index: PageIndex<u64>,
-    pub time_index: PageIndex<f64>,
-}
-
-impl ChromatogramQueryIndex for ChromatogramPointIndex {
-    fn query_chromatrogram_pages(&self, chromatogram_index: u64) -> PageQuery {
-        self.query_pages(chromatogram_index)
-    }
-
-    fn query_chromatogram_pages_overlaps(
-        &self,
-        index_range: &impl Span1D<DimType = u64>,
-    ) -> PageQuery {
-        self.query_pages_overlaps(index_range)
-    }
-
-    fn chromatogram_data_index(&self) -> &PageIndex<u64> {
-        &self.chromatogram_index
-    }
-}
-
-impl ChromatogramPointIndex {
-    pub fn new(chromatogram_index: PageIndex<u64>, time_index: PageIndex<f64>) -> Self {
-        Self {
-            chromatogram_index,
-            time_index,
-        }
-    }
-
-    pub fn from_reader<T>(
-        chromatogram_data_reader: &ArrowReaderBuilder<T>,
-        chromatogram_array_indices: &ArrayIndex,
-    ) -> Self {
-        let peak_pq_schema = chromatogram_data_reader.parquet_schema();
-        let mut this = Self::default();
-
-        this.chromatogram_index = read_u64_page_index_from(
-            &chromatogram_data_reader.metadata(),
-            &peak_pq_schema,
-            &format!("{}.chromatogram_index", chromatogram_array_indices.prefix),
-        )
-        .unwrap_or_default();
-
-        for entry in chromatogram_array_indices.iter() {
-            if matches!(entry.array_type, ArrayType::TimeArray) {
-                this.time_index = read_f64_page_index_from(
-                    &chromatogram_data_reader.metadata(),
-                    &peak_pq_schema,
-                    &entry.path,
-                )
-                .unwrap_or_default();
-            }
-        }
-
-        this
-    }
-
-    pub fn query_pages(&self, chromatogram_index: u64) -> PageQuery {
-        let mut rg_idx_acc = Vec::new();
-        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
-
-        for page in self.chromatogram_index.pages_contains(chromatogram_index) {
-            if !rg_idx_acc.contains(&page.row_group_i) {
-                rg_idx_acc.push(page.row_group_i);
-            }
-            pages.push(*page);
-        }
-        PageQuery::new(rg_idx_acc, pages)
-    }
-
-    pub fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
-        let mut rg_idx_acc = Vec::new();
-        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
-
-        for page in self.chromatogram_index.pages_overlaps(index_range) {
-            if !rg_idx_acc.contains(&page.row_group_i) {
-                rg_idx_acc.push(page.row_group_i);
-            }
-            pages.push(*page);
-        }
-        PageQuery::new(rg_idx_acc, pages)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.chromatogram_index.is_empty()
-    }
-
-    pub fn is_populated(&self) -> bool {
-        !self.chromatogram_index.is_empty()
-    }
-}
-
 impl SpectrumPointIndex {
     pub fn new(
         spectrum_index: PageIndex<u64>,
@@ -1008,6 +914,102 @@ impl SpectrumQueryIndex for SpectrumChunkIndex {
         &self.spectrum_index
     }
 }
+
+
+#[derive(Debug, Default, Clone)]
+pub struct ChromatogramPointIndex {
+    pub chromatogram_index: PageIndex<u64>,
+    pub time_index: PageIndex<f64>,
+}
+
+impl ChromatogramQueryIndex for ChromatogramPointIndex {
+    fn query_chromatrogram_pages(&self, chromatogram_index: u64) -> PageQuery {
+        self.query_pages(chromatogram_index)
+    }
+
+    fn query_chromatogram_pages_overlaps(
+        &self,
+        index_range: &impl Span1D<DimType = u64>,
+    ) -> PageQuery {
+        self.query_pages_overlaps(index_range)
+    }
+
+    fn chromatogram_data_index(&self) -> &PageIndex<u64> {
+        &self.chromatogram_index
+    }
+}
+
+impl ChromatogramPointIndex {
+    pub fn new(chromatogram_index: PageIndex<u64>, time_index: PageIndex<f64>) -> Self {
+        Self {
+            chromatogram_index,
+            time_index,
+        }
+    }
+
+    pub fn from_reader<T>(
+        chromatogram_data_reader: &ArrowReaderBuilder<T>,
+        chromatogram_array_indices: &ArrayIndex,
+    ) -> Self {
+        let peak_pq_schema = chromatogram_data_reader.parquet_schema();
+        let mut this = Self::default();
+
+        this.chromatogram_index = read_u64_page_index_from(
+            &chromatogram_data_reader.metadata(),
+            &peak_pq_schema,
+            &format!("{}.chromatogram_index", chromatogram_array_indices.prefix),
+        )
+        .unwrap_or_default();
+
+        for entry in chromatogram_array_indices.iter() {
+            if matches!(entry.array_type, ArrayType::TimeArray) {
+                this.time_index = read_f64_page_index_from(
+                    &chromatogram_data_reader.metadata(),
+                    &peak_pq_schema,
+                    &entry.path,
+                )
+                .unwrap_or_default();
+            }
+        }
+
+        this
+    }
+
+    pub fn query_pages(&self, chromatogram_index: u64) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.chromatogram_index.pages_contains(chromatogram_index) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
+    pub fn query_pages_overlaps(&self, index_range: &impl Span1D<DimType = u64>) -> PageQuery {
+        let mut rg_idx_acc = Vec::new();
+        let mut pages: Vec<PageIndexEntry<u64>> = Vec::new();
+
+        for page in self.chromatogram_index.pages_overlaps(index_range) {
+            if !rg_idx_acc.contains(&page.row_group_i) {
+                rg_idx_acc.push(page.row_group_i);
+            }
+            pages.push(*page);
+        }
+        PageQuery::new(rg_idx_acc, pages)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chromatogram_index.is_empty()
+    }
+
+    pub fn is_populated(&self) -> bool {
+        !self.chromatogram_index.is_empty()
+    }
+}
+
 
 #[derive(Debug, Default, Clone)]
 pub struct SpectrumMetadataIndex {
@@ -1327,5 +1329,74 @@ impl PageQuery {
             row_group_indices,
             pages,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    pub fn num_pages(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn num_row_groups(&self) -> usize {
+        self.row_group_indices.len()
+    }
+
+    pub fn can_split(&self) -> bool {
+        self.row_group_indices.len() > 1
+    }
+
+    // This looks correct but still needs work. "selection contains less than the number of selected rows"
+    pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = u64>) -> RowSelection {
+        let mut selectors = Vec::new();
+        let mut last_row = 0;
+        for page in self.pages.iter() {
+            if page.start_row() != last_row {
+                selectors.push(RowSelector::skip((page.start_row() - last_row) as usize));
+            }
+            if page.overlaps(&query) {
+                selectors.push(RowSelector::select(page.row_len() as usize));
+            } else {
+                selectors.push(RowSelector::skip(page.row_len() as usize))
+            }
+            last_row = page.end_row();
+        }
+        selectors.into()
+    }
+
+    // This looks correct but still needs work. "selection contains less than the number of selected rows"
+    pub fn split_row_groups(&mut self) -> Option<Self> {
+        if !self.can_split() {
+            return None
+        }
+        let i = self.row_group_indices.len() / 2;
+        if let Some(_) = self.row_group_indices.get(i).copied() {
+            let split_row_groups = self.row_group_indices.split_off(i);
+            let row_group_i = split_row_groups.first().copied().unwrap();
+            let page_i = self.pages.iter().position(|p| p.row_group() >= row_group_i).unwrap();
+            let split_pages = self.pages.split_off(page_i);
+            Some(PageQuery::new(split_row_groups, split_pages))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_num_rows_to_skip_for_row_groups(&self, meta: &ParquetMetaData) -> u64 {
+        let mut up_to_first_row = 0;
+        for i in 0..self.row_group_indices[0] {
+            let rg = meta.row_group(i);
+            up_to_first_row += rg.num_rows();
+        }
+        up_to_first_row as u64
+    }
+
+    pub fn value_range(&self) -> Option<SimpleInterval<u64>> {
+        if self.is_empty() {
+            return None
+        }
+        let start = self.pages.first().map(|p| p.min).unwrap();
+        let end = self.pages.last().map(|p| p.max).unwrap();
+        Some(SimpleInterval::new(start, end))
     }
 }

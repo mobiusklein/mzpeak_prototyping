@@ -1,11 +1,16 @@
-use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    io,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
-        Array, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StructArray, UInt8Array, UInt64Array,
+        Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+        RecordBatchReader, StructArray, UInt8Array, UInt64Array,
     },
-    datatypes::DataType,
+    datatypes::{DataType, Float32Type, Float64Type, SchemaRef},
     error::ArrowError,
 };
 use mzdata::{
@@ -33,6 +38,7 @@ use crate::{
     filter::{RegressionDeltaModel, fill_nulls_for},
     peak_series::ArrayIndex,
     reader::{
+        ReaderMetadata,
         index::{PageQuery, SpanDynNumeric, SpectrumQueryIndex},
         metadata::PeakMetadata,
     },
@@ -451,6 +457,8 @@ trait PointQuerySource {
         (predicate, proj)
     }
 
+    fn buffer_context(&self) -> BufferContext;
+
     fn prepare_query<'a, I: SpectrumQueryIndex + 'a>(
         &self,
         index_range: SimpleInterval<u64>,
@@ -458,6 +466,7 @@ trait PointQuerySource {
         ion_mobility_range: Option<SimpleInterval<f64>>,
         query_index: &'a I,
         array_indices: &'a ArrayIndex,
+        query: Option<PageQuery>,
     ) -> Option<(
         RowSelection,
         Vec<usize>,
@@ -468,21 +477,18 @@ trait PointQuerySource {
     )> {
         let mut rows = query_index.index_overlaps(&index_range);
 
-        let PageQuery {
-            row_group_indices,
-            pages,
-        } = query_index.query_pages_overlaps(&index_range);
+        let query = query.unwrap_or_else(|| query_index.query_pages_overlaps(&index_range));
 
-        if pages.is_empty() {
+        if query.is_empty() {
             return None;
         }
 
-        let mut up_to_first_row = 0;
-        let meta = self.metadata();
-        for i in 0..row_group_indices[0] {
-            let rg = meta.row_group(i);
-            up_to_first_row += rg.num_rows();
-        }
+        let up_to_first_row = query.get_num_rows_to_skip_for_row_groups(self.metadata());
+
+        let PageQuery {
+            row_group_indices,
+            pages: _,
+        } = query;
 
         if let Some(mz_range) = mz_range.as_ref() {
             rows = rows.intersection(&query_index.mz_overlaps(mz_range));
@@ -494,7 +500,11 @@ trait PointQuerySource {
 
         rows.split_off(up_to_first_row as usize);
 
-        let sidx = format!("{}.spectrum_index", array_indices.prefix);
+        let sidx = format!(
+            "{}.{}",
+            array_indices.prefix,
+            self.buffer_context().index_name()
+        );
 
         let mut fields = Vec::new();
 
@@ -553,6 +563,7 @@ trait PointQuerySource {
 mod async_impl {
     use super::*;
 
+    use arrow::array::RecordBatchIterator;
     use futures::stream::BoxStream;
 
     pub(crate) struct AsyncPointDataReader<T: AsyncFileReader + Unpin + Send + 'static>(
@@ -567,6 +578,10 @@ mod async_impl {
 
         fn parquet_schema(&self) -> Arc<SchemaDescriptor> {
             self.0.metadata().file_metadata().schema_descr_ptr()
+        }
+
+        fn buffer_context(&self) -> BufferContext {
+            self.1
         }
     }
 
@@ -656,6 +671,7 @@ mod async_impl {
             ion_mobility_range: Option<SimpleInterval<f64>>,
             query_index: &'a I,
             array_indices: &'a ArrayIndex,
+            metadata: &'a ReaderMetadata,
         ) -> io::Result<BoxStream<'a, Result<RecordBatch, ArrowError>>> {
             if let Some((rows, row_group_indices, proj, predicate)) = self.prepare_query(
                 index_range,
@@ -663,7 +679,32 @@ mod async_impl {
                 ion_mobility_range,
                 query_index,
                 array_indices,
+                None,
             ) {
+                let schema = self.0.schema().clone();
+                let (_, subset) = schema.column_with_name(&array_indices.prefix).unwrap();
+                let subset = match subset.data_type() {
+                    DataType::Struct(subset) => subset,
+                    _ => panic!("Invalid point type"),
+                };
+
+                let context = self.1;
+
+                let mut index_column_idx = None;
+                let mut mz_column_idx = None;
+
+                if matches!(context, BufferContext::Spectrum) {
+                    let subset = arrow::datatypes::Schema::new(subset.clone());
+                    index_column_idx = subset
+                        .column_with_name(BufferContext::Spectrum.index_name())
+                        .map(|(i, _)| i);
+                    if let Some(mz_array_idx) = array_indices.get(&ArrayType::MZArray) {
+                        mz_column_idx = subset
+                            .column_with_name(&mz_array_idx.path.split(".").last().unwrap())
+                            .map(|(i, _)| i);
+                    }
+                }
+
                 let mut reader = self
                     .0
                     .with_row_groups(row_group_indices)
@@ -675,25 +716,38 @@ mod async_impl {
 
                 let (send, recv) = tokio::sync::mpsc::unbounded_channel();
 
-                let mut row_groups = Vec::new();
+                let mut row_groups = futures::stream::FuturesOrdered::new();
 
                 while let Some(batch_reader) = reader.next_row_group().await? {
-                    row_groups.push(tokio::task::spawn(async move {
+                    row_groups.push_back(tokio::task::spawn_blocking(|| {
                         let batches: Vec<_> = batch_reader.collect();
                         batches
                     }));
                 }
 
-                for task in row_groups {
-                    let bats = task.await?;
-                    for bat in bats {
-                        send.send(bat).unwrap();
+                while let Some(bats) = row_groups.next().await.transpose()? {
+                    if !matches!(context, BufferContext::Spectrum)
+                        || index_column_idx.is_none()
+                        || mz_column_idx.is_none()
+                    {
+                        for bat in bats {
+                            send.send(bat).unwrap();
+                        }
+                    } else {
+                        let it = InterpolateIter::new(
+                            RecordBatchIterator::new(bats.into_iter(), schema.clone()),
+                            metadata,
+                            index_column_idx.unwrap(),
+                            mz_column_idx.unwrap(),
+                        );
+                        for bat in it {
+                            send.send(bat).unwrap();
+                        }
                     }
                 }
 
                 let reader = tokio_stream::wrappers::UnboundedReceiverStream::new(recv);
                 Ok(reader.boxed())
-                // Ok(reader.map_err(|e| e.into()).boxed())
             } else {
                 Ok(futures::stream::empty().boxed())
             }
@@ -703,6 +757,208 @@ mod async_impl {
 
 #[cfg(feature = "async")]
 pub(crate) use async_impl::*;
+
+#[derive(Debug)]
+pub(crate) struct IndexSplittingIter {
+    source: VecDeque<RecordBatch>,
+    schema: SchemaRef,
+}
+
+impl Iterator for IndexSplittingIter {
+    type Item = Result<RecordBatch, arrow::error::ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next()
+    }
+}
+
+impl IndexSplittingIter {
+    #[allow(unused)]
+    pub fn new(
+        batch: RecordBatch,
+        spectrum_index_array_idx: usize,
+    ) -> Result<Self, arrow::error::ArrowError> {
+        let root = batch.column(0);
+        let root = root.as_struct();
+        let indices = root.column(spectrum_index_array_idx);
+        let parts = arrow::compute::partition(std::slice::from_ref(indices))?;
+        let slices = parts.ranges();
+        let source = slices
+            .into_iter()
+            .map(|batch_idx| batch.slice(batch_idx.start, batch_idx.end - batch_idx.start))
+            .collect();
+        Ok(Self {
+            source,
+            schema: batch.schema(),
+        })
+    }
+
+    fn next(&mut self) -> Option<Result<RecordBatch, arrow::error::ArrowError>> {
+        self.source.pop_front().map(Ok)
+    }
+
+    pub fn empty(schema: SchemaRef) -> Self {
+        Self {
+            source: Default::default(),
+            schema,
+        }
+    }
+
+    pub fn add_and_split(
+        &mut self,
+        batch: RecordBatch,
+        spectrum_index_array_idx: usize,
+    ) -> Result<(), ArrowError> {
+        let root = batch.column(0);
+        let root = root.as_struct();
+        let indices = root.column(spectrum_index_array_idx);
+        let parts = arrow::compute::partition(std::slice::from_ref(indices))?;
+        let slices = parts.ranges();
+        self.source.extend(
+            slices
+                .into_iter()
+                .map(|batch_idx| batch.slice(batch_idx.start, batch_idx.end - batch_idx.start)),
+        );
+        Ok(())
+    }
+}
+
+impl RecordBatchReader for IndexSplittingIter {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+pub(crate) struct BatchIterpolater<'a> {
+    metadata: &'a ReaderMetadata,
+    spectrum_index_idx: usize,
+    mz_array_idx: usize,
+}
+
+impl<'a> BatchIterpolater<'a> {
+    pub fn new(
+        metadata: &'a ReaderMetadata,
+        spectrum_index_idx: usize,
+        mz_array_idx: usize,
+    ) -> Self {
+        Self {
+            metadata,
+            spectrum_index_idx,
+            mz_array_idx,
+        }
+    }
+
+    fn check_batch_has_nulls(&self, batch: &RecordBatch) -> bool {
+        let root = batch.column(0);
+        let root_as = root.as_struct();
+        let mz_arr = root_as.column(self.mz_array_idx);
+        mz_arr.null_count() > 0
+    }
+
+    fn process_batch(&mut self, batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+        let root = batch.column(0);
+        let root_as = root.as_struct();
+        let index_arr: &UInt64Array = root_as.column(self.spectrum_index_idx).as_primitive();
+        let mz_arr = root_as.column(self.mz_array_idx);
+
+        if index_arr.is_empty() {
+            return Ok(batch);
+        }
+
+        let spec_index = index_arr.value(0);
+        let model = match self.metadata.model_deltas_for(spec_index as usize) {
+            Some(model) => model,
+            None => return Ok(batch),
+        };
+
+        let mz_arr = if let Some(mz_arr) = mz_arr.as_primitive_opt::<Float32Type>() {
+            let mz_arr: Float32Array = fill_nulls_for(mz_arr, &model).into();
+            Arc::new(mz_arr) as ArrayRef
+        } else if let Some(mz_arr) = mz_arr.as_primitive_opt::<Float64Type>() {
+            let mz_arr: Float64Array = fill_nulls_for(mz_arr, &model).into();
+            Arc::new(mz_arr) as ArrayRef
+        } else {
+            todo!()
+        };
+
+        let mut cols: Vec<_> = root_as.columns().iter().cloned().collect();
+        cols[self.mz_array_idx] = mz_arr;
+        let new_root: ArrayRef = Arc::new(StructArray::new(
+            root_as.fields().clone(),
+            cols,
+            root_as.nulls().cloned(),
+        ));
+
+        let (schema, mut batch_parts, _n_rows) = batch.into_parts();
+        batch_parts[0] = new_root;
+        let batch = RecordBatch::try_new(schema, batch_parts).unwrap();
+        return Ok(batch);
+    }
+}
+
+pub struct InterpolateIter<'a, I: Iterator<Item = Result<RecordBatch, ArrowError>>> {
+    source: I,
+    spectrum_index_idx: usize,
+    interpolator: BatchIterpolater<'a>,
+    splitter: IndexSplittingIter,
+}
+
+impl<'a, I: Iterator<Item = Result<RecordBatch, ArrowError>> + RecordBatchReader> Iterator
+    for InterpolateIter<'a, I>
+{
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch()
+    }
+}
+
+impl<'a, I: Iterator<Item = Result<RecordBatch, ArrowError>> + RecordBatchReader>
+    InterpolateIter<'a, I>
+{
+    pub fn new(
+        source: I,
+        metadata: &'a ReaderMetadata,
+        spectrum_index_idx: usize,
+        mz_array_idx: usize,
+    ) -> Self {
+        let interpolator = BatchIterpolater::new(metadata, spectrum_index_idx, mz_array_idx);
+        let schema = source.schema();
+        Self {
+            source,
+            spectrum_index_idx,
+            interpolator,
+            splitter: IndexSplittingIter::empty(schema),
+        }
+    }
+
+    pub fn next_batch(&mut self) -> Option<Result<RecordBatch, ArrowError>> {
+        let batch = match self.splitter.next() {
+            Some(batch) => batch,
+            None => {
+                let batch = self.source.next()?;
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(e) => return Some(Err(e)),
+                };
+                if !self.interpolator.check_batch_has_nulls(&batch) {
+                    return Some(Ok(batch));
+                }
+                if let Err(e) = self.splitter.add_and_split(batch, self.spectrum_index_idx) {
+                    return Some(Err(e));
+                }
+                self.splitter.next()?
+            }
+        };
+
+        let batch = match batch {
+            Err(_) => return Some(batch),
+            Ok(batch) => batch,
+        };
+
+        Some(self.interpolator.process_batch(batch))
+    }
+}
 
 mod sync_impl {
     use super::*;
@@ -720,6 +976,10 @@ mod sync_impl {
 
         fn parquet_schema(&self) -> Arc<SchemaDescriptor> {
             self.metadata().file_metadata().schema_descr_ptr()
+        }
+
+        fn buffer_context(&self) -> BufferContext {
+            self.1
         }
     }
 
@@ -803,15 +1063,42 @@ mod sync_impl {
             ion_mobility_range: Option<SimpleInterval<f64>>,
             query_index: &'a I,
             array_indices: &'a ArrayIndex,
-        ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a>> {
+            metadata: &'a ReaderMetadata,
+            query: Option<PageQuery>,
+        ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a + Send>> {
             if let Some((rows, row_group_indices, proj, predicate)) = self.prepare_query(
                 index_range,
                 mz_range,
                 ion_mobility_range,
                 query_index,
                 array_indices,
+                query,
             ) {
-                let reader: ParquetRecordBatchReader = self
+                let schema = self.0.schema();
+                let (_, subset) = schema.column_with_name(&array_indices.prefix).unwrap();
+                let subset = match subset.data_type() {
+                    DataType::Struct(subset) => subset,
+                    _ => panic!("Invalid point type"),
+                };
+
+                let context = self.1;
+
+                let mut index_column_idx = None;
+                let mut mz_column_idx = None;
+
+                if matches!(context, BufferContext::Spectrum) {
+                    let subset = arrow::datatypes::Schema::new(subset.clone());
+                    index_column_idx = subset
+                        .column_with_name(BufferContext::Spectrum.index_name())
+                        .map(|(i, _)| i);
+                    if let Some(mz_array_idx) = array_indices.get(&ArrayType::MZArray) {
+                        mz_column_idx = subset
+                            .column_with_name(&mz_array_idx.path.split(".").last().unwrap())
+                            .map(|(i, _)| i);
+                    }
+                }
+
+                let it: ParquetRecordBatchReader = self
                     .0
                     .with_row_groups(row_group_indices)
                     .with_row_selection(rows)
@@ -820,7 +1107,19 @@ mod sync_impl {
                     .with_batch_size(10_000)
                     .build()?;
 
-                Ok(Box::new(reader))
+                if !matches!(context, BufferContext::Spectrum)
+                    || index_column_idx.is_none()
+                    || mz_column_idx.is_none()
+                {
+                    return Ok(Box::new(it));
+                }
+
+                Ok(Box::new(InterpolateIter::new(
+                    it,
+                    metadata,
+                    index_column_idx.unwrap(),
+                    mz_column_idx.unwrap(),
+                )))
             } else {
                 Ok(Box::new(std::iter::empty()))
             }
