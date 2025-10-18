@@ -36,21 +36,13 @@ use parquet::{
 use url::Url;
 
 use crate::{
-    BufferContext,
-    archive::{AsyncArchiveReader, AsyncArchiveSource, AsyncZipArchiveSource},
-    filter::RegressionDeltaModel,
-    reader::{
-        CHUNK_CACHE_BLOCK_SIZE, ReaderMetadata,
-        chunk::{AsyncSpectrumChunkReader, DataChunkCache},
-        index::{PageQuery, QueryIndex, SpanDynNumeric},
-        metadata::{
+    archive::{AsyncArchiveReader, AsyncArchiveSource, AsyncZipArchiveSource}, filter::RegressionDeltaModel, reader::{
+        chunk::{AsyncSpectrumChunkReader, DataChunkCache}, index::{PageQuery, QueryIndex, SpanDynNumeric}, metadata::{
             BaseMetadataQuerySource, ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource,
             ParquetIndexExtractor, SpectrumMetadataDecoder, SpectrumMetadataQuerySource,
             TimeIndexDecoder,
-        },
-        point::{AsyncPointDataReader, DataPointCache, PointDataArrayReader},
-        visitor::AuxiliaryArrayVisitor,
-    },
+        }, point::{AsyncPointDataReader, DataPointCache, PointDataArrayReader}, utils::MaskSet, visitor::AuxiliaryArrayVisitor, ReaderMetadata, CHUNK_CACHE_BLOCK_SIZE
+    }, BufferContext
 };
 
 pub(crate) struct SpectrumMetadataReader<T: AsyncFileReader + 'static + Unpin + Send>(
@@ -598,12 +590,13 @@ impl<
         time_range: SimpleInterval<f32>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
+        ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
         BoxStream<'_, Result<RecordBatch, ArrowError>>,
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
     )> {
         let (time_index, index_range) = self
-            .get_spectrum_index_range_for_time_range(time_range)
+            .get_spectrum_index_range_for_time_range(time_range, ms_level_range)
             .await?;
         let builder = self.handle.spectra_data().await?;
 
@@ -615,7 +608,7 @@ impl<
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
             let it = AsyncSpectrumChunkReader::new(builder).scan_chunks_for(
-                index_range,
+                index_range.into(),
                 mz_range,
                 &self.metadata,
                 &self.query_indices,
@@ -655,7 +648,7 @@ impl<
 
         let reader = AsyncPointDataReader(builder, BufferContext::Spectrum)
             .query_points(
-                index_range,
+                index_range.into(),
                 mz_range,
                 ion_mobility_range,
                 &self.query_indices.spectrum_point_index,
@@ -685,6 +678,7 @@ impl<
         time_range: SimpleInterval<f32>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
+        ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
         BoxStream<'_, Result<RecordBatch, ArrowError>>,
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
@@ -702,12 +696,12 @@ impl<
         };
 
         let (time_index, index_range) = self
-            .get_spectrum_index_range_for_time_range(time_range)
+            .get_spectrum_index_range_for_time_range(time_range, ms_level_range)
             .await?;
 
         let iter = AsyncPointDataReader(builder, BufferContext::Spectrum)
             .query_points(
-                index_range,
+                index_range.into(),
                 mz_range,
                 ion_mobility_range,
                 &meta_index.query_index,
@@ -721,11 +715,12 @@ impl<
     pub async fn get_spectrum_index_range_for_time_range(
         &self,
         time_range: SimpleInterval<f32>,
+        ms_level_range: Option<SimpleInterval<u8>>
     ) -> io::Result<(
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
-        SimpleInterval<u64>,
+        MaskSet,
     )> {
-        let mut time_indexer = TimeIndexDecoder::new(time_range);
+        let mut time_indexer = TimeIndexDecoder::new(time_range, ms_level_range);
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
             time_indexer.from_descriptions(cache.as_slice());
             return Ok(time_indexer.finish());
@@ -738,11 +733,27 @@ impl<
 
         let builder = self.handle.spectrum_metadata().await?;
 
-        let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.time"]);
+        let has_ms_level_range = ms_level_range.is_some();
+        let ms_level_range = ms_level_range.unwrap_or_default();
+        let columns_for_predicate: &[&str] = if has_ms_level_range {
+            &["spectrum.time", "spectrum.ms_level"]
+        } else {
+            &["spectrum.time"]
+        };
+
+        let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), columns_for_predicate.into_iter().copied());
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let times = batch.column(0).as_struct().column(0);
-            Ok(time_range.contains_dy(times))
+            let times = batch.column(0).as_struct().column_by_name("time").unwrap();
+            if has_ms_level_range {
+                let ms_levels = batch.column(0).as_struct().column_by_name("ms_level").unwrap();
+                arrow::compute::and(
+                    &time_range.contains_dy(times),
+                    &ms_level_range.contains_dy(ms_levels)
+                )
+            } else {
+                Ok(time_range.contains_dy(times))
+            }
         });
 
         let proj = ProjectionMask::columns(

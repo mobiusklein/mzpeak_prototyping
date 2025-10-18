@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
+};
 
 use crate::{
     archive::{ArchiveReader, ArchiveSource},
@@ -7,6 +11,7 @@ use crate::{
     param::MetadataColumn,
     reader::{
         index::{QueryIndex, SpectrumPointIndex},
+        utils::MaskSet,
         visitor::{
             MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
             MzSpectrumVisitor, metadata_columns_to_definition_map, schema_to_metadata_cols,
@@ -15,7 +20,7 @@ use crate::{
 };
 use arrow::{
     array::{Array, AsArray, RecordBatch, StructArray, UInt64Array},
-    datatypes::{DataType, Float32Type},
+    datatypes::{DataType, Float32Type, Float64Type},
 };
 use identity_hash::BuildIdentityHasher;
 use mzdata::{
@@ -1191,20 +1196,28 @@ impl<T: ChunkReader + 'static> BaseMetadataQuerySource for ChromatogramMetadataR
     }
 }
 
+#[derive(Debug)]
 pub struct TimeIndexDecoder {
     times: HashMap<u64, f32, BuildIdentityHasher<u64>>,
     time_range: SimpleInterval<f32>,
     min: u64,
     max: u64,
+    ms_level_range: Option<SimpleInterval<u8>>,
+    indices: HashSet<u64, BuildIdentityHasher<u64>>,
 }
 
 impl TimeIndexDecoder {
-    pub fn new(time_range: SimpleInterval<f32>) -> Self {
+    pub fn new(
+        time_range: SimpleInterval<f32>,
+        ms_level_range: Option<SimpleInterval<u8>>,
+    ) -> Self {
         Self {
             time_range,
             min: u64::MAX,
             max: 0,
             times: Default::default(),
+            ms_level_range,
+            indices: Default::default(),
         }
     }
 
@@ -1254,16 +1267,35 @@ impl TimeIndexDecoder {
         //     i = i.saturating_sub(1);
         // }
         // offset_end = i;
-
-        for (i, descr) in descriptions.iter().enumerate().skip(offset) {
-            let i = i as u64;
-            let t = descr.acquisition.start_time() as f32;
-            if self.time_range.contains(&t) {
-                self.min = self.min.min(i);
-                self.max = self.max.max(i);
-                self.times.insert(i, t);
-            } else if !self.times.is_empty() {
-                break;
+        if let Some(ms_level_range) = self.ms_level_range {
+            for (i, descr) in descriptions
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .filter(|(_, v)| ms_level_range.contains(&v.ms_level))
+            {
+                let i = i as u64;
+                let t = descr.acquisition.start_time() as f32;
+                if self.time_range.contains(&t) {
+                    self.min = self.min.min(i);
+                    self.max = self.max.max(i);
+                    self.times.insert(i, t);
+                    self.indices.insert(i);
+                } else if !self.times.is_empty() {
+                    break;
+                }
+            }
+        } else {
+            for (i, descr) in descriptions.iter().enumerate().skip(offset) {
+                let i = i as u64;
+                let t = descr.acquisition.start_time() as f32;
+                if self.time_range.contains(&t) {
+                    self.min = self.min.min(i);
+                    self.max = self.max.max(i);
+                    self.times.insert(i, t);
+                } else if !self.times.is_empty() {
+                    break;
+                }
             }
         }
     }
@@ -1275,25 +1307,35 @@ impl TimeIndexDecoder {
         let root = batch.column(0).as_struct();
         let arr: &UInt64Array = root.column(0).as_primitive();
         let time_arr = root.column(1);
+
+        macro_rules! add {
+            ($val:ident, $time:ident) => {
+                // Re-check the time interval constraint for consistency, but the predicate should have
+                // dealt with this
+                if self.time_range.contains(&$time) {
+                    self.min = self.min.min($val);
+                    self.max = self.max.max($val);
+                    self.times.insert($val, $time);
+                    // We assume that if we are building a sparse index set, then the batches have been pre-filtered
+                    // exactly for the ms level range constraint.
+                    if self.ms_level_range.is_some() {
+                        self.indices.insert($val);
+                    }
+                }
+            };
+        }
+
         if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
             for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
-                if self.time_range.contains(&time) {
-                    self.min = self.min.min(val);
-                    self.max = self.max.max(val);
-                    self.times.insert(val, time);
-                }
+                add!(val, time);
             }
-        } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
+        } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float64Type>() {
             for (val, time) in arr
                 .iter()
                 .flatten()
                 .zip(time_arr.iter().flatten().map(|v| v as f32))
             {
-                if self.time_range.contains(&time) {
-                    self.min = self.min.min(val);
-                    self.max = self.max.max(val);
-                    self.times.insert(val, time);
-                }
+                add!(val, time);
             }
         } else {
             return Err(parquet::errors::ParquetError::ArrowError(format!(
@@ -1305,12 +1347,13 @@ impl TimeIndexDecoder {
         Ok(())
     }
 
-    pub fn finish(
-        self,
-    ) -> (
-        HashMap<u64, f32, BuildIdentityHasher<u64>>,
-        SimpleInterval<u64>,
-    ) {
-        (self.times, SimpleInterval::new(self.min, self.max))
+    pub fn finish(self) -> (HashMap<u64, f32, BuildIdentityHasher<u64>>, MaskSet) {
+        let range = SimpleInterval::new(self.min, self.max);
+        if self.ms_level_range.is_some() {
+            log::debug!("Building mask set with {:?}", self.indices);
+            (self.times, MaskSet::new(range, Some(self.indices)))
+        } else {
+            (self.times, MaskSet::new(range, None))
+        }
     }
 }

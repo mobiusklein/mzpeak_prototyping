@@ -34,11 +34,12 @@ use crate::{
         BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR,
     },
     filter::RegressionDeltaModel,
-    peak_series::{ArrayIndex, BufferFormat, data_array_to_arrow_array},
+    peak_series::{ArrayIndex, ArrayIndexEntry, BufferFormat, data_array_to_arrow_array},
     reader::{
         ReaderMetadata,
         index::{PageQuery, QueryIndex, RangeIndex, SpanDynNumeric},
         point::binary_search_arrow_index,
+        utils::MaskSet,
         visitor::AnyCURIEArray,
     },
 };
@@ -176,7 +177,7 @@ trait ChunkQuerySource {
 
     fn prepare_scan(
         &self,
-        index_range: SimpleInterval<u64>,
+        index_range: MaskSet,
         query_range: Option<SimpleInterval<f64>>,
         metadata: &ReaderMetadata,
         query_indices: &QueryIndex,
@@ -1048,7 +1049,7 @@ impl<T: ChunkReader + 'static> SpectrumChunkReader<T> {
 
     pub fn scan_chunks_for(
         self,
-        index_range: SimpleInterval<u64>,
+        index_range: MaskSet,
         query_range: Option<SimpleInterval<f64>>,
         metadata: &ReaderMetadata,
         query_indices: &QueryIndex,
@@ -1136,7 +1137,7 @@ mod async_impl {
 
         pub fn scan_chunks_for<'a>(
             self,
-            index_range: SimpleInterval<u64>,
+            index_range: MaskSet,
             query_range: Option<SimpleInterval<f64>>,
             metadata: &'a ReaderMetadata,
             query_indices: &'a QueryIndex,
@@ -1241,3 +1242,21 @@ mod async_impl {
 
 #[cfg(feature = "async")]
 pub use async_impl::AsyncSpectrumChunkReader;
+
+pub(crate) fn make_ion_mobility_filter<'a>(
+    it: Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a>,
+    ion_mobility_range: SimpleInterval<f64>,
+    im_name: &'a ArrayIndexEntry,
+) -> Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a> {
+    let it = it.map(move |bat| -> Result<RecordBatch, ArrowError> {
+        let bat = bat?;
+        let arr = bat
+            .column(0)
+            .as_struct()
+            .column_by_name(&im_name.name)
+            .unwrap();
+        let mask = ion_mobility_range.contains_dy(&arr);
+        arrow::compute::filter_record_batch(&bat, &mask)
+    });
+    Box::new(it)
+}

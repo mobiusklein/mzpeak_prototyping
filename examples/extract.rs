@@ -17,6 +17,9 @@ struct App {
 
     #[arg(short, long, default_value = "0.8-1.2")]
     im_range: CoordinateRange<f64>,
+
+    #[arg(short='l', long)]
+    ms_level_range: Option<CoordinateRange<u8>>,
 }
 
 fn main() -> io::Result<()> {
@@ -25,7 +28,6 @@ fn main() -> io::Result<()> {
     let start = std::time::Instant::now();
 
     let mut reader = mzpeak_prototyping::reader::MzPeakReader::new(&args.filename)?;
-    // reader.load_all_spectrum_metadata()?;
 
     eprintln!(
         "Opening archive took {} seconds",
@@ -49,7 +51,15 @@ fn main() -> io::Result<()> {
         args.im_range.end.unwrap_or(f64::INFINITY),
     );
 
-    let (it, time_index) = reader.extract_peaks(time_range, Some(mz_range), None)?;
+    let ms_level_range = args.ms_level_range.map(|r| {
+        SimpleInterval::new(
+            r.start.unwrap_or_default() as u8,
+            r.end.map(|v| v as u8).unwrap_or(u8::MAX),
+        )
+    });
+
+    let (it, time_index) =
+        reader.extract_peaks(time_range, Some(mz_range), None, ms_level_range)?;
 
     let query_range_end = std::time::Instant::now();
     eprintln!(

@@ -17,6 +17,9 @@ struct App {
 
     #[arg(short, long, default_value = "0.8-1.2")]
     im_range: CoordinateRange<f64>,
+
+    #[arg(short='l', long)]
+    ms_level_range: Option<CoordinateRange<u8>>
 }
 
 fn main() -> io::Result<()> {
@@ -30,10 +33,23 @@ fn main() -> io::Result<()> {
     let mz_range = SimpleInterval::new(args.mz_range.start.unwrap(), args.mz_range.end.unwrap());
     let im_range = SimpleInterval::new(args.im_range.start.unwrap(), args.im_range.end.unwrap());
 
+    let ms_level_range = args.ms_level_range.map(|r| {
+        SimpleInterval::new(
+            r.start.unwrap_or_default() as u8,
+            r.end.map(|v| v as u8).unwrap_or(u8::MAX),
+        )
+    }).unwrap_or(SimpleInterval::new(0, u8::MAX));
+
     let it = reader.start_from_time(time_range.start as f64)?;
     let mut k = 0;
     while let Some(spec) = it.next() {
         k += 1;
+        if !ms_level_range.contains(&spec.ms_level()) {
+            if spec.start_time() > time_range.end && !spec.start_time().is_close(&time_range.end) {
+                break;
+            }
+            continue;
+        }
         if let Some(arrays) = spec.arrays.as_ref() {
             let mzs = arrays.mzs()?;
             let ints = arrays.intensities()?;

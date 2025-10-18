@@ -7,6 +7,7 @@ use arrow::array::{
 use mzdata::spectrum::ArrayType;
 use mzpeaks::coordinate::SimpleInterval;
 use mzpeaks::prelude::HasProximity;
+use mzpeaks::CoordinateRange;
 use parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -585,7 +586,8 @@ where
     }
 }
 
-impl<T: Span1D> SpanDynNumeric for T where T::DimType: num_traits::NumCast {}
+impl<T: PartialEq + PartialOrd + HasProximity> SpanDynNumeric for SimpleInterval<T> where <mzpeaks::coordinate::SimpleInterval<T> as mzdata::prelude::Span1D>::DimType: num_traits::NumCast {}
+impl<T: PartialEq + PartialOrd + HasProximity> SpanDynNumeric for CoordinateRange<T> where <mzpeaks::coordinate::CoordinateRange<T> as mzdata::prelude::Span1D>::DimType: num_traits::NumCast {}
 
 pub struct RangeIndex<'a, T: HasProximity> {
     start_index: &'a PageIndex<T>,
@@ -1344,7 +1346,7 @@ impl PageQuery {
     }
 
     pub fn can_split(&self) -> bool {
-        self.row_group_indices.len() > 1
+        self.row_group_indices.len() > 5
     }
 
     // This looks correct but still needs work. "selection contains less than the number of selected rows"

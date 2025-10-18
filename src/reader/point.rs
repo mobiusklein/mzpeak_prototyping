@@ -44,6 +44,8 @@ use crate::{
     },
 };
 
+use super::utils::MaskSet;
+
 #[cfg(feature = "async")]
 use futures::StreamExt;
 
@@ -461,7 +463,7 @@ trait PointQuerySource {
 
     fn prepare_query<'a, I: SpectrumQueryIndex + 'a>(
         &self,
-        index_range: SimpleInterval<u64>,
+        index_range: MaskSet,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
         query_index: &'a I,
@@ -475,7 +477,7 @@ trait PointQuerySource {
             impl FnMut(RecordBatch) -> Result<arrow::array::BooleanArray, ArrowError> + 'static,
         >,
     )> {
-        let mut rows = query_index.index_overlaps(&index_range);
+        let mut rows = query_index.index_overlaps(&index_range.range);
 
         let query = query.unwrap_or_else(|| query_index.query_pages_overlaps(&index_range));
 
@@ -666,7 +668,7 @@ mod async_impl {
 
         pub(crate) async fn query_points<'a, I: SpectrumQueryIndex + 'a>(
             self,
-            index_range: SimpleInterval<u64>,
+            index_range: MaskSet,
             mz_range: Option<SimpleInterval<f64>>,
             ion_mobility_range: Option<SimpleInterval<f64>>,
             query_index: &'a I,
@@ -865,6 +867,7 @@ impl<'a> BatchIterpolater<'a> {
             return Ok(batch);
         }
 
+        // Assume that the batch is a single index wide
         let spec_index = index_arr.value(0);
         let model = match self.metadata.model_deltas_for(spec_index as usize) {
             Some(model) => model,
@@ -1058,7 +1061,7 @@ mod sync_impl {
 
         pub(crate) fn query_points<'a, I: SpectrumQueryIndex + 'a>(
             self,
-            index_range: SimpleInterval<u64>,
+            index_range: MaskSet,
             mz_range: Option<SimpleInterval<f64>>,
             ion_mobility_range: Option<SimpleInterval<f64>>,
             query_index: &'a I,
@@ -1067,7 +1070,7 @@ mod sync_impl {
             query: Option<PageQuery>,
         ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a + Send>> {
             if let Some((rows, row_group_indices, proj, predicate)) = self.prepare_query(
-                index_range,
+                index_range.into(),
                 mz_range,
                 ion_mobility_range,
                 query_index,

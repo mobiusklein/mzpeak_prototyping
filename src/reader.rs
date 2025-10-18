@@ -32,6 +32,7 @@ use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
 
+use crate::{archive::DispatchArchiveSource, reader::utils::MaskSet};
 #[allow(unused_imports)]
 use crate::{
     archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource, SplittingZipArchiveSource}, filter::RegressionDeltaModel, reader::{
@@ -476,11 +477,12 @@ impl<
     pub fn get_spectrum_index_range_for_time_range(
         &self,
         time_range: SimpleInterval<f32>,
+        ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
-        SimpleInterval<u64>,
+        MaskSet,
     )> {
-        let mut time_indexer = TimeIndexDecoder::new(time_range);
+        let mut time_indexer = TimeIndexDecoder::new(time_range, ms_level_range);
         if let Some(cache) = self.spectrum_metadata_cache.as_ref() {
             time_indexer.from_descriptions(cache.as_slice());
             return Ok(time_indexer.finish());
@@ -493,11 +495,27 @@ impl<
 
         let builder = self.handle.spectrum_metadata()?;
 
-        let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), ["spectrum.time"]);
+        let has_ms_level_range = ms_level_range.is_some();
+        let ms_level_range = ms_level_range.unwrap_or_default();
+        let columns_for_predicate: &[&str] = if has_ms_level_range {
+            &["spectrum.time", "spectrum.ms_level"]
+        } else {
+            &["spectrum.time"]
+        };
+
+        let predicate_mask = ProjectionMask::columns(builder.parquet_schema(), columns_for_predicate.into_iter().copied());
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let times = batch.column(0).as_struct().column(0);
-            Ok(time_range.contains_dy(times))
+            let times = batch.column(0).as_struct().column_by_name("time").unwrap();
+            if has_ms_level_range {
+                let ms_levels = batch.column(0).as_struct().column_by_name("ms_level").unwrap();
+                arrow::compute::and(
+                    &time_range.contains_dy(times),
+                    &ms_level_range.contains_dy(ms_levels)
+                )
+            } else {
+                Ok(time_range.contains_dy(times))
+            }
         });
 
         let proj = ProjectionMask::columns(
@@ -514,6 +532,7 @@ impl<
         for batch in reader.flatten() {
             time_indexer.decode_batch(batch)?;
         }
+
         Ok(time_indexer.finish())
     }
 
@@ -533,11 +552,12 @@ impl<
         time_range: SimpleInterval<f32>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
+        ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
         Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>,
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
     )> {
-        let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
+        let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?;
         let builder = self.handle.spectra_data()?;
 
         let ion_mobility_range = if !self.metadata.spectrum_array_indices().has_ion_mobility() {
@@ -547,14 +567,58 @@ impl<
         };
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
-            let it = Box::new(SpectrumChunkReader::new(builder).scan_chunks_for(
-                index_range,
-                mz_range,
-                &self.metadata,
-                &self.query_indices,
-            )?);
+            let reader = SpectrumChunkReader::new(builder);
+
+            let query = self.query_indices
+                .spectrum_chunk_index
+                .query_pages_overlaps(&index_range);
+
+            let it: Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_> = if query.can_split() && self.handle.can_split() {
+                let mut index_range1 = index_range.clone();
+                if let Some(index_range2) = index_range1.split() {
+                    log::trace!("Splitting chunk query");
+                    let builder2 = self.handle.spectra_data()?;
+                    let reader2 = SpectrumChunkReader::new(builder2);
+                    std::thread::scope(|ctx| -> io::Result<_> {
+                        let handle = ctx.spawn(|| {
+                            reader.scan_chunks_for(
+                                index_range1,
+                                mz_range,
+                                &self.metadata,
+                                &self.query_indices,
+                            )
+                        });
+                        let handle2 = ctx.spawn(|| {
+                            reader2.scan_chunks_for(
+                                index_range2,
+                                mz_range,
+                                &self.metadata,
+                                &self.query_indices,
+                            )
+                        });
+                        let reader = handle.join().unwrap()?;
+                        let reader2 = handle2.join().unwrap()?;
+                        Ok(Box::new(reader.chain(reader2)))
+                    })?
+                } else {
+                    Box::new(reader.scan_chunks_for(
+                        index_range,
+                        mz_range,
+                        &self.metadata,
+                        &self.query_indices,
+                    )?)
+                }
+            } else {
+                Box::new(reader.scan_chunks_for(
+                    index_range,
+                    mz_range,
+                    &self.metadata,
+                    &self.query_indices,
+                )?)
+            };
+
             let it: Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_> =
-                if ion_mobility_range.is_some() {
+                if let Some(ion_mobility_range) = ion_mobility_range {
                     // If there is an ion mobility array constraint, the chunked encoding doesn't support filtering on this
                     // dimension directly.
                     if let Some(im_name) = self
@@ -563,17 +627,7 @@ impl<
                         .iter()
                         .find(|v| v.is_ion_mobility())
                     {
-                        let it = it.map(move |bat| -> Result<RecordBatch, ArrowError> {
-                            let bat = bat?;
-                            let arr = bat
-                                .column(0)
-                                .as_struct()
-                                .column_by_name(&im_name.name)
-                                .unwrap();
-                            let mask = ion_mobility_range.unwrap().contains_dy(&arr);
-                            arrow::compute::filter_record_batch(&bat, &mask)
-                        });
-                        Box::new(it)
+                        chunk::make_ion_mobility_filter(it, ion_mobility_range, im_name)
                     } else {
                         it
                     }
@@ -589,11 +643,8 @@ impl<
 
         if query.can_split() && self.handle.can_split() {
             let mut index_range1 = index_range.clone();
-            index_range1.end = index_range1.start + (index_range1.end - index_range1.start) / 2;
-            let mut index_range2 = index_range.clone();
-            index_range2.start = index_range1.end + 1;
-            if index_range2.end >= index_range2.start {
-                log::trace!("Splitting query");
+            if let Some(index_range2) = index_range1.split() {
+                log::trace!("Splitting point query");
                 {
                     let builder2 = self.handle.spectra_data()?;
                     let reader2 = PointDataReader(builder2, BufferContext::Spectrum);
@@ -691,6 +742,7 @@ impl<
         time_range: SimpleInterval<f32>,
         mz_range: Option<SimpleInterval<f64>>,
         ion_mobility_range: Option<SimpleInterval<f64>>,
+        ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
         Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>,
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
@@ -707,7 +759,7 @@ impl<
             ion_mobility_range
         };
 
-        let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range)?;
+        let (time_index, index_range) = self.get_spectrum_index_range_for_time_range(time_range, ms_level_range)?;
 
         let iter = PointDataReader(builder, BufferContext::Spectrum).query_points(
             index_range,
@@ -1360,10 +1412,10 @@ impl<
     }
 }
 
-pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<SplittingZipArchiveSource, C, D>;
+pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DispatchArchiveSource, C, D>;
 pub type UnpackedMzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DirectorySource, C, D>;
 
-pub type MzPeakReader = MzPeakReaderTypeOfSource<SplittingZipArchiveSource, CentroidPeak, DeconvolutedPeak>;
+pub type MzPeakReader = MzPeakReaderTypeOfSource<DispatchArchiveSource, CentroidPeak, DeconvolutedPeak>;
 pub type UnpackedMzPeakReader =
     MzPeakReaderTypeOfSource<DirectorySource, CentroidPeak, DeconvolutedPeak>;
 
@@ -1448,7 +1500,7 @@ mod test {
         let mut reader = MzPeakReader::new("small.mzpeak")?;
 
         let (it, _time_index) =
-            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None)?;
+            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
 
         for batch in it.flatten() {
             eprintln!("{:?}", batch);
@@ -1461,7 +1513,7 @@ mod test {
         let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
 
         let (it, _time_index) =
-            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None)?;
+            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
 
         for batch in it.flatten() {
             eprintln!("{:?}", batch);

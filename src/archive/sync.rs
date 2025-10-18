@@ -434,14 +434,25 @@ pub(crate) struct SchemaMetadataManager {
 pub trait ArchiveSource: Sized + 'static {
     type File: ChunkReader + 'static;
 
+    /// Can this archive source be split into multiple independent streams that can be seeked
+    /// independently. This is useful for processing multiple (sets of) row groups in parallel
     fn can_split(&self) -> bool {
         false
     }
 
+    /// Create from a file system path
     fn from_path(path: PathBuf) -> io::Result<Self>;
+
+    /// Get the list of file names in the archive
     fn file_names(&self) -> &[String];
+
+    /// Open a file stream by it's index
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File>;
 
+    /// Load the Parquet metadata for the specified index.
+    ///
+    /// # Note
+    /// This fails if the requested file is *not* a Parquet file.
     fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
         let handle = self.open_entry_by_index(index)?;
         let opts = ArrowReaderOptions::new().with_page_index(true);
@@ -726,7 +737,7 @@ impl ArchiveSource for DispatchArchiveSource {
         if fs::metadata(&path)?.is_dir() {
             return Ok(Self::Directory(DirectorySource::from_path(path)?));
         } else {
-            return Ok(Self::Zip(ZipArchiveSource::from_path(path)?));
+            return Ok(Self::SplittingZip(SplittingZipArchiveSource::from_path(path)?));
         }
     }
 
