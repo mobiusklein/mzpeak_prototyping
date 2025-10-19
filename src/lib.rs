@@ -1,18 +1,18 @@
-pub mod peak_series;
 pub mod chunk_series;
-pub mod param;
-pub mod spectrum;
 pub mod entry;
+pub mod param;
+pub mod peak_series;
+pub mod spectrum;
 
 pub mod reader;
 pub mod writer;
 
 pub mod archive;
-pub mod filter;
 pub mod buffer_descriptors;
+pub mod filter;
 
 pub use param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID};
-pub use spectrum::{SpectrumEntry, SelectedIonEntry, PrecursorEntry, ScanEntry};
 pub use peak_series::{BufferContext, BufferName, ToMzPeakDataSeries};
-pub use writer::MzPeakWriterType;
 pub use reader::MzPeakReader;
+pub use spectrum::{PrecursorEntry, ScanEntry, SelectedIonEntry, SpectrumEntry};
+pub use writer::MzPeakWriterType;

@@ -20,11 +20,7 @@ pub struct MiniPeakWriterType<W: Write + Send + Seek> {
 }
 
 impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
-    pub fn new(
-        writer: ArrowWriter<W>,
-        spectrum_buffers: PointBuffers,
-        buffer_size: usize,
-    ) -> Self {
+    pub fn new(writer: ArrowWriter<W>, spectrum_buffers: PointBuffers, buffer_size: usize) -> Self {
         let mut this = Self {
             writer,
             spectrum_buffers,
@@ -65,10 +61,12 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
         };
         match peaks {
             RefPeakDataLevel::Centroid(peaks) => {
-                self.spectrum_buffers.add(spectrum_count, spectrum_time, peaks.as_slice());
+                self.spectrum_buffers
+                    .add(spectrum_count, spectrum_time, peaks.as_slice());
             }
             RefPeakDataLevel::Deconvoluted(peaks) => {
-                self.spectrum_buffers.add(spectrum_count, spectrum_time, peaks.as_slice());
+                self.spectrum_buffers
+                    .add(spectrum_count, spectrum_time, peaks.as_slice());
             }
             RefPeakDataLevel::Missing => unimplemented!(),
             RefPeakDataLevel::RawData(_) => unimplemented!(),
@@ -92,7 +90,10 @@ impl<W: Write + Send + Seek> MiniPeakWriterType<W> {
 
     pub fn finish(mut self) -> Result<W, parquet::errors::ParquetError> {
         self.append_key_value_metadata("spectrum_count", Some(self.n_spectra.to_string()));
-        self.append_key_value_metadata("spectrum_data_point_count", Some(self.n_points.to_string()));
+        self.append_key_value_metadata(
+            "spectrum_data_point_count",
+            Some(self.n_points.to_string()),
+        );
         self.flush()?;
         self.writer.into_inner()
     }

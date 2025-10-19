@@ -28,15 +28,27 @@ name = "read"
 path = "examples/read.rs"
 
 [[example]]
-name = "extract_refs"
+name = "extract-ref"
 path = "examples/extract_ref.rs"
 
 [[example]]
 name = "extract"
 path = "examples/extract.rs"
 
-[features]
+[[example]]
+name = "extract-object-store"
+path = "examples/extract_object_store.rs"
+required-features = ["async"]
 
+[[example]]
+name = "extract-ref-object-store"
+path = "examples/extract_ref_object_store.rs"
+required-features = ["async"]
+
+[features]
+default = ["async"]
+
+async = ["dep:tokio", "dep:async_zip", "dep:object_store", "parquet/async", "dep:futures", "mzdata/async_partial", "dep:url"]
 thermo = ["mzdata/thermo"]
 
 [dependencies]
@@ -44,8 +56,8 @@ arrow = "55.2.0"
 env_logger = "0.11.8"
 itertools = "0.14.0"
 log = "0.4.27"
-mzdata = { version = "0.60.1", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress"] }
-parquet = "55.2.0"
+mzdata = { version = "0.60.3", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress"] }
+parquet = { version = "55.2.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_arrow = { version = "0.13.3", features = ["arrow-55"] }
 mzpeaks = "1.0.9"
@@ -67,9 +79,17 @@ base64-simd = "0.8.0"
 numpress-rs = "1.1.0"
 identity-hash = "0.1.0"
 
+tokio = { version = "1.47.1", optional = true }
+object_store = { version = "0.12.4", optional = true }
+futures = { version = "0.3.31", optional = true}
+async_zip = { version = "0.0.18", features = ["tokio"], optional = true }
+url = { version = "2.5.7", optional = true }
+tokio-stream = "0.1.17"
+
 [dev-dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
 test-log = "0.2.12 "
+tokio = { version = "1.47.1", features = ["rt-multi-thread"]}
 
 [profile.release]
 debug = true

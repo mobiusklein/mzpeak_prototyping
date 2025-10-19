@@ -3,7 +3,6 @@ use std::io::{self, prelude::*};
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-
 use parquet::file::reader::{ChunkReader, Length};
 use zip::{
     CompressionMethod,
@@ -293,8 +292,7 @@ pub struct ZipArchiveSource {
     pub file_names: Vec<String>,
 }
 
-impl ZipArchiveSource {
-    pub fn new(archive_file: fs::File) -> io::Result<Self> {
+fn zip_archive_to_config(archive_file: fs::File) -> io::Result<(fs::File, Vec<String>, Config)> {
         let arch = ZipArchive::new(archive_file)?;
         let offset = arch.offset();
         let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();
@@ -302,6 +300,38 @@ impl ZipArchiveSource {
         let archive_offset = Config {
             archive_offset: zip::read::ArchiveOffset::Known(offset),
         };
+        Ok((archive_file, file_names, archive_offset))
+}
+
+fn zip_archive_open_entry(handle: fs::File, index: usize, archive_offset: Config) -> io::Result<ArchiveFacetReader> {
+    let mut archive = ZipArchive::with_config(archive_offset, handle)?;
+    let handle = archive.by_index(index)?;
+    match handle.compression() {
+        CompressionMethod::Stored => {}
+        method => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "Compression method {method:?} isn't supported. Only Stored is supported"
+                ),
+            ));
+        }
+    }
+    let start_offset = handle.data_start();
+    let length = handle.size();
+    drop(handle);
+    let handle = archive.into_inner();
+    Ok(ArchiveFacetReader::new(
+        handle,
+        start_offset,
+        length,
+        0,
+    ))
+}
+
+impl ZipArchiveSource {
+    pub fn new(archive_file: fs::File) -> io::Result<Self> {
+        let (archive_file, file_names, archive_offset, ) = zip_archive_to_config(archive_file)?;
         Ok(Self {
             archive_file,
             archive_offset,
@@ -309,35 +339,55 @@ impl ZipArchiveSource {
         })
     }
 
-    pub fn archive(&self) -> io::Result<ZipArchive<fs::File>> {
+    pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = self.archive_file.try_clone()?;
-        let archive = ZipArchive::with_config(self.archive_offset.clone(), handle)?;
-        Ok(archive)
+        zip_archive_open_entry(handle, index, self.archive_offset.clone())
+    }
+
+    pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
+        let handle = self.open_entry_by_index(index)?;
+        let opts = ArrowReaderOptions::new().with_page_index(true);
+        Ok(ArrowReaderMetadata::load(&handle, opts)?)
+    }
+
+    pub fn read_index(
+        &self,
+        index: usize,
+        metadata: Option<ArrowReaderMetadata>,
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
+        let metadata = if let Some(metadata) = metadata {
+            metadata
+        } else {
+            self.metadata_for_index(index)?
+        };
+
+        let handle = self.open_entry_by_index(index)?;
+        Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
+            handle, metadata,
+        ))
+    }
+}
+
+pub struct SplittingZipArchiveSource {
+    archive_file: PathBuf,
+    archive_offset: Config,
+    pub file_names: Vec<String>,
+}
+
+impl SplittingZipArchiveSource {
+    pub fn new(archive_path: PathBuf) -> io::Result<Self> {
+        let archive_file = fs::File::open(archive_path.as_path())?;
+        let (_, file_names, archive_offset, ) = zip_archive_to_config(archive_file)?;
+        Ok(Self {
+            archive_file: archive_path,
+            archive_offset,
+            file_names,
+        })
     }
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
-        let handle = self.archive_file.try_clone()?;
-        let mut archive = ZipArchive::with_config(self.archive_offset.clone(), handle)?;
-        let handle = archive.by_index(index)?;
-        match handle.compression() {
-            CompressionMethod::Stored => {}
-            method => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "Compression method {method:?} isn't supported. Only Stored is supported"
-                    ),
-                ));
-            }
-        }
-        let start_offset = handle.data_start();
-        let length = handle.size();
-        Ok(ArchiveFacetReader::new(
-            self.archive_file.try_clone()?,
-            start_offset,
-            length,
-            0,
-        ))
+        let handle = fs::File::open(self.archive_file.as_path())?;
+        zip_archive_open_entry(handle, index, self.archive_offset.clone())
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -373,21 +423,36 @@ pub struct MzPeakArchiveEntry {
 }
 
 #[derive(Debug, Default, Clone)]
-struct SchemaMetadataManager {
-    spectrum_data_arrays: Option<MzPeakArchiveEntry>,
-    spectrum_metadata: Option<MzPeakArchiveEntry>,
-    peaks_data_arrays: Option<MzPeakArchiveEntry>,
-    chromatogram_metadata: Option<MzPeakArchiveEntry>,
-    chromatogram_data_arrays: Option<MzPeakArchiveEntry>,
+pub(crate) struct SchemaMetadataManager {
+    pub(crate) spectrum_data_arrays: Option<MzPeakArchiveEntry>,
+    pub(crate) spectrum_metadata: Option<MzPeakArchiveEntry>,
+    pub(crate) peaks_data_arrays: Option<MzPeakArchiveEntry>,
+    pub(crate) chromatogram_metadata: Option<MzPeakArchiveEntry>,
+    pub(crate) chromatogram_data_arrays: Option<MzPeakArchiveEntry>,
 }
 
 pub trait ArchiveSource: Sized + 'static {
     type File: ChunkReader + 'static;
 
+    /// Can this archive source be split into multiple independent streams that can be seeked
+    /// independently. This is useful for processing multiple (sets of) row groups in parallel
+    fn can_split(&self) -> bool {
+        false
+    }
+
+    /// Create from a file system path
     fn from_path(path: PathBuf) -> io::Result<Self>;
+
+    /// Get the list of file names in the archive
     fn file_names(&self) -> &[String];
+
+    /// Open a file stream by it's index
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File>;
 
+    /// Load the Parquet metadata for the specified index.
+    ///
+    /// # Note
+    /// This fails if the requested file is *not* a Parquet file.
     fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
         let handle = self.open_entry_by_index(index)?;
         let opts = ArrowReaderOptions::new().with_page_index(true);
@@ -428,6 +493,26 @@ impl ArchiveSource for ZipArchiveSource {
     }
 }
 
+impl ArchiveSource for SplittingZipArchiveSource {
+    type File = ArchiveFacetReader;
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        Self::new(path)
+    }
+
+    fn file_names(&self) -> &[String] {
+        &self.file_names
+    }
+
+    fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
+        self.open_entry_by_index(index)
+    }
+}
+
 pub struct DirectorySource {
     archive_path: PathBuf,
     pub file_names: Vec<String>,
@@ -448,13 +533,16 @@ impl DirectorySource {
         })
     }
 
-    pub fn open_entry_by_index(&self, index: usize) -> io::Result<fs::File> {
-        let name = self
-            .file_names
-            .get(index)
-            .ok_or(io::Error::new(io::ErrorKind::NotFound, format!("file at {index} not found in directory")))?;
+    pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
+        let name = self.file_names.get(index).ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("file at {index} not found in directory"),
+        ))?;
         let path = self.archive_path.join(name);
-        fs::File::open(path)
+        let fh = fs::File::open(&path)?;
+        let meta = fs::metadata(&path)?;
+        let length = meta.len();
+        Ok(ArchiveFacetReader::new(fh, 0, length, 0))
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -467,7 +555,7 @@ impl DirectorySource {
         &self,
         index: usize,
         metadata: Option<ArrowReaderMetadata>,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<fs::File>> {
+    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
         let metadata = if let Some(metadata) = metadata {
             metadata
         } else {
@@ -482,7 +570,11 @@ impl DirectorySource {
 }
 
 impl ArchiveSource for DirectorySource {
-    type File = fs::File;
+    type File = ArchiveFacetReader;
+
+    fn can_split(&self) -> bool {
+        true
+    }
 
     fn file_names(&self) -> &[String] {
         &self.file_names
@@ -496,7 +588,6 @@ impl ArchiveSource for DirectorySource {
         Self::new(path)
     }
 }
-
 
 pub struct ArchiveReader<T: ArchiveSource + 'static> {
     archive: T,
@@ -554,9 +645,11 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         Self::init_from_archive(archive)
     }
 
-    pub fn chromatograms_metadata(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn can_split(&self) -> bool {
+        self.archive.can_split()
+    }
+
+    pub fn chromatograms_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -568,9 +661,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn chromatograms_data(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn chromatograms_data(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_data_arrays.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -594,9 +685,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn spectrum_peaks(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn spectrum_peaks(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.peaks_data_arrays.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -608,9 +697,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         }
     }
 
-    pub fn spectrum_metadata(
-        &self,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
+    pub fn spectrum_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_metadata.as_ref() {
             self.archive
                 .read_index(meta.entry_index, Some(meta.metadata.clone()))
@@ -623,10 +710,56 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     }
 }
 
-
 pub type ZipArchiveReader = ArchiveReader<ZipArchiveSource>;
 pub type DirectoryArchiveReader = ArchiveReader<DirectorySource>;
+pub type AnyArchiveReader = ArchiveReader<DispatchArchiveSource>;
 
+pub enum DispatchArchiveSource {
+    Zip(ZipArchiveSource),
+    Directory(DirectorySource),
+    SplittingZip(SplittingZipArchiveSource),
+}
+
+macro_rules! dispatch {
+    ($d:ident, $r:ident, $e:expr) => {
+        match $d {
+            DispatchArchiveSource::Zip($r) => $e,
+            DispatchArchiveSource::Directory($r) => $e,
+            DispatchArchiveSource::SplittingZip($r) => $e,
+        }
+    };
+}
+
+impl ArchiveSource for DispatchArchiveSource {
+    type File = ArchiveFacetReader;
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        if fs::metadata(&path)?.is_dir() {
+            return Ok(Self::Directory(DirectorySource::from_path(path)?));
+        } else {
+            return Ok(Self::SplittingZip(SplittingZipArchiveSource::from_path(path)?));
+        }
+    }
+
+    fn can_split(&self) -> bool {
+        dispatch!(self, src, { src.can_split() })
+    }
+
+    fn file_names(&self) -> &[String] {
+        dispatch!(self, src, { src.file_names() })
+    }
+
+    fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
+        dispatch!(self, src, { src.open_entry_by_index(index) })
+    }
+}
+
+impl ArchiveReader<DispatchArchiveSource> {
+    pub fn new(file: fs::File) -> io::Result<Self> {
+        let archive = DispatchArchiveSource::Zip(ZipArchiveSource::new(file)?);
+        Self::init_from_archive(archive)
+    }
+}
 
 impl ZipArchiveReader {
     pub fn new(file: fs::File) -> io::Result<Self> {
@@ -641,7 +774,6 @@ impl DirectoryArchiveReader {
         Self::init_from_archive(archive)
     }
 }
-
 
 #[cfg(test)]
 mod test {

@@ -1,6 +1,7 @@
 use arrow::array::{AsArray, Float32Array, Float64Array, UInt64Array};
 
 use clap::Parser;
+use futures::StreamExt;
 use mzdata::mzpeaks::coordinate::{CoordinateRange, SimpleInterval, Span1D};
 use std::io;
 
@@ -19,15 +20,19 @@ struct App {
     im_range: CoordinateRange<f64>,
 
     #[arg(short='l', long)]
-    ms_level_range: Option<CoordinateRange<u8>>,
+    ms_level_range: Option<CoordinateRange<u8>>
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+async fn main() -> io::Result<()> {
     env_logger::init();
     let args = App::parse();
     let start = std::time::Instant::now();
 
-    let mut reader = mzpeak_prototyping::reader::MzPeakReader::new(&args.filename)?;
+    let mut reader =
+        mzpeak_prototyping::reader::AsyncMzPeakReader::from_url(args.filename.parse().unwrap())
+            .await?;
+    // reader.load_all_spectrum_metadata()?;
 
     eprintln!(
         "Opening archive took {} seconds",
@@ -58,8 +63,9 @@ fn main() -> io::Result<()> {
         )
     });
 
-    let (it, time_index) =
-        reader.extract_peaks(time_range, Some(mz_range), None, ms_level_range)?;
+    let (mut it, time_index) = reader
+        .extract_peaks(time_range, Some(mz_range), None, ms_level_range)
+        .await?;
 
     let query_range_end = std::time::Instant::now();
     eprintln!(
@@ -68,8 +74,7 @@ fn main() -> io::Result<()> {
         time_index.len()
     );
 
-    for batch in it {
-        let batch = batch.unwrap();
+    while let Some(batch) = it.next().await.transpose().unwrap() {
         let root = batch.column(0).as_struct();
         let indices: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
         let intensities: &Float32Array = root.column(2).as_any().downcast_ref().unwrap();
@@ -178,11 +183,7 @@ fn main() -> io::Result<()> {
             }
         }
     }
-
-    eprintln!(
-        "{} seconds elapsed. {} total.",
-        query_range_end.elapsed().as_secs_f64(),
-        start.elapsed().as_secs_f64()
-    );
+    let end = std::time::Instant::now();
+    eprintln!("{} seconds elapsed", (end - query_range_end).as_secs_f64());
     Ok(())
 }

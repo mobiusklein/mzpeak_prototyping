@@ -158,7 +158,10 @@ impl From<CURIE> for mzdata::params::CURIE {
             controlled_vocabulary: match value.cv_id {
                 1 => mzdata::params::ControlledVocabulary::MS,
                 2 => mzdata::params::ControlledVocabulary::UO,
-                _ => todo!("Could not infer controlled vocabulary from {} yet", value.cv_id),
+                _ => todo!(
+                    "Could not infer controlled vocabulary from {} yet",
+                    value.cv_id
+                ),
             },
             accession: value.accession,
         }

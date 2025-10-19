@@ -1,7 +1,10 @@
-use std::{io::{self, prelude::*}, path::PathBuf, env};
 use mzdata::{io::mgf::MGFWriter, prelude::SpectrumLike};
 use mzpeak_prototyping::MzPeakReader;
-
+use std::{
+    env,
+    io::{self, prelude::*},
+    path::PathBuf,
+};
 
 fn fetch(path: &PathBuf, index: usize) -> io::Result<()> {
     let mut reader = MzPeakReader::new(path)?;

@@ -32,7 +32,7 @@ pub struct AuxiliaryArray {
     pub compression: CURIE,
     pub unit: Option<CURIE>,
     pub parameters: Vec<Param>,
-    pub data_processing_ref: Option<Box<str>>
+    pub data_processing_ref: Option<Box<str>>,
 }
 
 impl From<AuxiliaryArray> for DataArray {
@@ -204,13 +204,15 @@ impl SpectrumEntry {
                 vec!["spectrum".into(), "lowest_observed_mz".into()],
                 7,
                 Some(curie!(MS:1000528)),
-            ).with_unit(Unit::MZ),
+            )
+            .with_unit(Unit::MZ),
             MetadataColumn::new(
                 "highest observed m/z".into(),
                 vec!["spectrum".into(), "highest_observed_mz".into()],
                 8,
                 Some(curie!(MS:1000527)),
-            ).with_unit(Unit::MZ),
+            )
+            .with_unit(Unit::MZ),
             MetadataColumn::new(
                 "lowest observed wavelength".into(),
                 vec!["spectrum".into(), "lowest_observed_wavelength".into()],
@@ -246,7 +248,8 @@ impl SpectrumEntry {
                 vec!["spectrum".into(), "base_peak_mz".into()],
                 14,
                 Some(curie!(MS:1000504)),
-            ).with_unit(Unit::MZ),
+            )
+            .with_unit(Unit::MZ),
             MetadataColumn::new(
                 "base peak intensity".into(),
                 vec!["spectrum".into(), "base_peak_intensity".into()],
@@ -333,16 +336,26 @@ pub struct ScanWindowEntry {
     pub lower_limit: f32,
     pub upper_limit: f32,
     pub unit: CURIE,
-    pub parameters: Vec<Param>
+    pub parameters: Vec<Param>,
 }
 
 impl ScanWindowEntry {
     pub fn new(lower_limit: f32, upper_limit: f32, unit: CURIE, parameters: Vec<Param>) -> Self {
-        Self { lower_limit, upper_limit,  unit, parameters }
+        Self {
+            lower_limit,
+            upper_limit,
+            unit,
+            parameters,
+        }
     }
 
     pub fn from_mzdata(source: &mzdata::spectrum::ScanWindow) -> Self {
-        Self::new(source.lower_bound, source.upper_bound, Unit::MZ.to_curie().unwrap().into(), Vec::new())
+        Self::new(
+            source.lower_bound,
+            source.upper_bound,
+            Unit::MZ.to_curie().unwrap().into(),
+            Vec::new(),
+        )
     }
 }
 
@@ -357,7 +370,6 @@ impl From<&ScanWindowEntry> for mzdata::spectrum::ScanWindow {
         Self::new(value.lower_limit, value.upper_limit)
     }
 }
-
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub struct ScanEntry {
@@ -381,7 +393,8 @@ impl ScanEntry {
                 ["scan", "scan_start_time"],
                 1,
                 crate::curie!(MS:1000016)
-            ).with_unit(Unit::Minute),
+            )
+            .with_unit(Unit::Minute),
             metacol!(
                 "preset scan configuration",
                 ["scan", "preset_scan_configuration"],
@@ -399,7 +412,8 @@ impl ScanEntry {
                 ["scan", "ion_injection_time"],
                 4,
                 crate::curie!(MS:1000927)
-            ).with_unit(Unit::Millisecond),
+            )
+            .with_unit(Unit::Millisecond),
         ]
     }
 
@@ -422,28 +436,38 @@ impl ScanEntry {
             None => None,
         };
 
-        const PARAMS_TO_SKIP: &[mzdata::params::CURIE] = &[
-            mzdata::curie!(MS:1000616),
-            mzdata::curie!(MS:1000512),
-        ];
+        const PARAMS_TO_SKIP: &[mzdata::params::CURIE] =
+            &[mzdata::curie!(MS:1000616), mzdata::curie!(MS:1000512)];
 
         Self {
             spectrum_index,
             ion_injection_time: Some(event.injection_time),
             scan_start_time: Some(event.start_time as f32),
-            preset_scan_configuration: event.scan_configuration().map(|v| v.to_i32().unwrap() as u32),
+            preset_scan_configuration: event
+                .scan_configuration()
+                .map(|v| v.to_i32().unwrap() as u32),
             filter_string: event.filter_string().map(|s| s.to_string()),
             ion_mobility_value: ion_mobility,
             ion_mobility_type,
-            parameters: event.params().iter().filter(|v| {
-                if let Some(c) = v.curie() {
-                    !ION_MOBILITY_SCAN_TERMS.contains(&c) && !PARAMS_TO_SKIP.contains(&c)
-                } else {
-                    true
-                }
-            }).cloned().map(Param::from).collect(),
+            parameters: event
+                .params()
+                .iter()
+                .filter(|v| {
+                    if let Some(c) = v.curie() {
+                        !ION_MOBILITY_SCAN_TERMS.contains(&c) && !PARAMS_TO_SKIP.contains(&c)
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .map(Param::from)
+                .collect(),
             instrument_configuration_ref: Some(event.instrument_configuration_id),
-            scan_windows: event.scan_windows.iter().map(ScanWindowEntry::from_mzdata).collect(),
+            scan_windows: event
+                .scan_windows
+                .iter()
+                .map(ScanWindowEntry::from_mzdata)
+                .collect(),
             ..Default::default()
         }
     }
@@ -627,7 +651,8 @@ impl SelectedIonEntry {
                 vec!["selected_ion", "selected_ion_mz"],
                 2,
                 curie!(MS:1000744)
-            ).with_unit(Unit::MZ),
+            )
+            .with_unit(Unit::MZ),
             metacol!(
                 "charge state",
                 vec!["selected_ion", "charge_state"],
@@ -639,7 +664,8 @@ impl SelectedIonEntry {
                 vec!["selected_ion", "intensity"],
                 4,
                 curie!(MS:1000042)
-            ).with_unit(Unit::DetectorCounts),
+            )
+            .with_unit(Unit::DetectorCounts),
         ]
     }
 

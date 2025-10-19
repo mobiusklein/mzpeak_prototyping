@@ -1,8 +1,11 @@
-use std::io;
-
 use clap::Parser;
+use futures::StreamExt;
+use mzdata::io::AsyncRandomAccessSpectrumIterator;
+use mzdata::mzpeaks::coordinate::{CoordinateRange, SimpleInterval, Span1D};
 use mzdata::prelude::*;
-use mzpeaks::{CoordinateRange, coordinate::SimpleInterval};
+use std::{io, sync::Arc};
+
+use object_store::ObjectStore;
 
 #[derive(clap::Parser)]
 struct App {
@@ -22,17 +25,27 @@ struct App {
     ms_level_range: Option<CoordinateRange<u8>>
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+async fn main() -> io::Result<()> {
+    env_logger::init();
     let args = App::parse();
-    let mut reader = mzdata::MZReader::open_path(args.filename)?;
-
     let start = std::time::Instant::now();
+    let (store, path) = object_store::parse_url(&args.filename.parse().unwrap()).unwrap();
+    let store = Arc::new(store);
+    let meta = store.head(&path).await?;
+
+    let handle = object_store::buffered::BufReader::new(store, &meta);
+
+    let mut reader = mzdata::io::AsyncMZReader::open_read_seek(handle).await?;
+    eprintln!(
+        "Opening reader took {} seconds",
+        start.elapsed().as_secs_f64()
+    );
 
     let time_range =
         SimpleInterval::new(args.time_range.start.unwrap(), args.time_range.end.unwrap());
     let mz_range = SimpleInterval::new(args.mz_range.start.unwrap(), args.mz_range.end.unwrap());
     let im_range = SimpleInterval::new(args.im_range.start.unwrap(), args.im_range.end.unwrap());
-
     let ms_level_range = args.ms_level_range.map(|r| {
         SimpleInterval::new(
             r.start.unwrap_or_default() as u8,
@@ -40,9 +53,10 @@ fn main() -> io::Result<()> {
         )
     }).unwrap_or(SimpleInterval::new(0, u8::MAX));
 
-    let it = reader.start_from_time(time_range.start as f64)?;
+    reader.start_from_time(time_range.start as f64).await?;
+    let mut it = reader.as_stream();
     let mut k = 0;
-    while let Some(spec) = it.next() {
+    while let Some(spec) = it.next().await {
         k += 1;
         if !ms_level_range.contains(&spec.ms_level()) {
             if spec.start_time() > time_range.end && !spec.start_time().is_close(&time_range.end) {
@@ -69,14 +83,13 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        if spec.start_time() > time_range.end && !spec.start_time().is_close(&time_range.end) {
+        if spec.start_time() > time_range.end {
             break;
         }
     }
-    let end = std::time::Instant::now();
     eprintln!(
         "{} seconds elapsed, read {k} spectra",
-        (end - start).as_secs_f64()
+        start.elapsed().as_secs_f64()
     );
     Ok(())
 }

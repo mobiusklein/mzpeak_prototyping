@@ -29,11 +29,7 @@ impl BufferContext {
     }
 
     pub fn index_field(&self) -> FieldRef {
-        Arc::new(Field::new(
-            self.index_name(),
-            DataType::UInt64,
-            true,
-        ))
+        Arc::new(Field::new(self.index_name(), DataType::UInt64, true))
     }
 
     pub fn time_field(&self) -> FieldRef {
@@ -402,7 +398,11 @@ impl BufferName {
     }
 
     pub fn as_data_array(&self, size: usize) -> DataArray {
-        let mut da = DataArray::from_name_type_size(&self.array_type, self.dtype, size * self.dtype.size_of());
+        let mut da = DataArray::from_name_type_size(
+            &self.array_type,
+            self.dtype,
+            size * self.dtype.size_of(),
+        );
         da.unit = self.unit;
         da
     }
@@ -503,9 +503,7 @@ impl BufferName {
                         .ok()
                         .and_then(|v| BufferTransform::from_curie(v));
                 }
-                "data_processing_id" => {
-                    data_processing_id = Some(v.clone().into_boxed_str())
-                }
+                "data_processing_id" => data_processing_id = Some(v.clone().into_boxed_str()),
                 _ => {}
             }
         }
@@ -728,10 +726,12 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
                 .buffer_format
                 .parse::<BufferFormat>()
                 .unwrap_or(BufferFormat::Point),
-            transform: value.transform.and_then(|t| BufferTransform::from_curie(t).or_else(|| {
-                log::warn!("Failed to translate {t} into a buffer transform");
-                None
-            })),
+            transform: value.transform.and_then(|t| {
+                BufferTransform::from_curie(t).or_else(|| {
+                    log::warn!("Failed to translate {t} into a buffer transform");
+                    None
+                })
+            }),
         }
     }
 }
@@ -814,8 +814,9 @@ impl ArrayIndexEntry {
             self.array_type.clone(),
             arrow_to_array_type(&self.data_type).unwrap(),
             self.buffer_format,
-        ).with_transform(self.transform)
-         .with_unit(self.unit)
+        )
+        .with_transform(self.transform)
+        .with_unit(self.unit)
     }
 
     pub const fn is_ion_mobility(&self) -> bool {
@@ -836,7 +837,10 @@ pub struct ArrayIndex {
 
 impl ArrayIndex {
     pub fn new(prefix: String, entries: HashMap<ArrayType, ArrayIndexEntry>) -> Self {
-        Self { prefix, entries: entries.into_values().collect() }
+        Self {
+            prefix,
+            entries: entries.into_values().collect(),
+        }
     }
 
     pub fn get(&self, key: &ArrayType) -> Option<&ArrayIndexEntry> {
