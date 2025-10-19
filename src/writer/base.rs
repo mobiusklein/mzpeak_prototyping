@@ -20,10 +20,9 @@ use parquet::{
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
-    entry::ChromatogramMetadataEntry,
     filter::select_delta_model,
     peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
-    spectrum::{AuxiliaryArray, ChromatogramEntry},
+    spectrum::AuxiliaryArray,
     writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType,
         SpectrumBuilder,
@@ -137,15 +136,6 @@ pub trait AbstractMzPeakWriter {
     fn spectrum_precursor_counter(&self) -> u64;
 
     fn chromatogram_counter(&self) -> u64;
-
-    fn chromatogram_to_entries(
-        &mut self,
-        chromatogram: &impl ChromatogramLike,
-    ) -> Vec<ChromatogramMetadataEntry> {
-        let mut ent = ChromatogramEntry::from_chromatogram(chromatogram);
-        ent.index = Some(self.chromatogram_counter());
-        vec![ent.into()]
-    }
 
     fn write_chromatogram_arrays(
         &mut self,
