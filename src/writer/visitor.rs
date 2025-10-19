@@ -9,7 +9,7 @@ use arrow::{
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
 use mzdata::{
-    params::Unit,
+    params::{Unit, CURIE},
     prelude::*,
     spectrum::{Chromatogram, ScanPolarity, SpectrumDescription},
 };
@@ -73,6 +73,10 @@ pub trait StructVisitor<T>: VisitorBase {
             false
         }
     }
+
+    fn associated_curie_to_skip(&self) -> Option<CURIE> {
+        None
+    }
 }
 
 pub trait StructVisitorBuilder<T>: StructVisitor<T> + ArrayBuilder + VisitorBase {}
@@ -124,7 +128,7 @@ macro_rules! anyways {
 /// This involves `${cv}_${accession}_${formatted_name}` where formatted name
 /// is the name of the term with all non alphanumeric characters are replaced
 /// with '_'.
-pub fn inflect_cv_term_to_column_name(curie: mzdata::params::CURIE, name: &str) -> String {
+pub fn inflect_cv_term_to_column_name(curie: CURIE, name: &str) -> String {
     let cv_part = curie.to_string().replace(":", "_");
     let mut buffer = String::with_capacity(name.len() + cv_part.len() + 1);
     buffer.push_str(&cv_part);
@@ -140,7 +144,7 @@ pub fn inflect_cv_term_to_column_name(curie: mzdata::params::CURIE, name: &str) 
 }
 
 pub struct CustomBuilderFromParameter {
-    accession: mzdata::params::CURIE,
+    accession: CURIE,
     value: Box<dyn ArrayBuilder>,
     field: FieldRef,
     unit: Option<CURIEBuilder>,
@@ -163,7 +167,11 @@ impl CustomBuilderFromParameter {
         self
     }
 
-    pub fn from_spec(curie: mzdata::params::CURIE, name: &str, dtype: DataType) -> Self {
+    pub fn accession(&self) -> CURIE {
+        self.accession
+    }
+
+    pub fn from_spec(curie: CURIE, name: &str, dtype: DataType) -> Self {
         let name = inflect_cv_term_to_column_name(curie, name);
         let field = field!(name, dtype.clone());
         let unit = None;
@@ -706,6 +714,15 @@ impl ParamListBuilder {
     pub fn as_mut(&mut self) -> &mut LargeListBuilder<ParamBuilder> {
         &mut self.0
     }
+
+    pub fn append_iter<'a, T: 'a>(&mut self, iter: impl IntoIterator<Item=&'a T>) -> bool where ParamBuilder: StructVisitor<T> + Sized {
+        let inner = self.0.values();
+        for v in iter {
+            inner.append_value(v);
+        }
+        self.0.append(true);
+        true
+    }
 }
 
 impl ArrayBuilder for ParamListBuilder {
@@ -843,6 +860,7 @@ pub struct ScanBuilder {
     parameters: ParamListBuilder,
     scan_windows: LargeListBuilder<ScanWindowBuilder>,
     extra: Vec<Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>>>,
+    curies_to_mask: Vec<CURIE>,
 }
 
 impl VisitorBase for ScanBuilder {
@@ -905,7 +923,6 @@ impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
             .append_option(item.ion_mobility_type().and_then(|v| v.curie()).as_ref());
         self.instrument_configuration_ref
             .append_value(item.instrument_configuration_id);
-        self.parameters.append_value(&item.params());
 
         let val = self.scan_windows.values();
         for window in item.scan_windows.iter() {
@@ -914,8 +931,18 @@ impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
         self.scan_windows.append(true);
 
         for e in self.extra.iter_mut() {
-            e.append_value(item);
+            if e.append_value(item) {
+                self.curies_to_mask.extend(e.associated_curie_to_skip());
+            }
         }
+        self.parameters.append_iter(item.params().iter().filter(|p| {
+            if let Some(c) = p.curie() {
+                !self.curies_to_mask.contains(&c)
+            } else {
+                true
+            }
+        }));
+        self.curies_to_mask.clear();
         true
     }
 }
@@ -1036,6 +1063,7 @@ impl VisitorBase for IsolationWindowBuilder {
 pub struct ActivationBuilder {
     parameters: ParamListBuilder,
     extra: Vec<Box<dyn StructVisitorBuilder<mzdata::spectrum::Activation>>>,
+    curies_to_mask: Vec<CURIE>,
 }
 
 impl ArrayBuilder for ActivationBuilder {
@@ -1080,16 +1108,21 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
             .value(item.energy)
             .unit(Unit::Electronvolt)
             .build();
-        params.append_value(&energy);
 
-        for p in item.params() {
-            params.append_value(p);
-        }
-
-        self.parameters.as_mut().append(true);
         for e in self.extra.iter_mut() {
-            e.append_value(item);
+            if e.append_value(item) {
+                self.curies_to_mask.extend(e.associated_curie_to_skip());
+            }
         }
+
+        self.parameters.append_iter(item.params().iter().chain([&energy]).filter(|p| {
+            if let Some(c) = p.curie() {
+                !self.curies_to_mask.contains(&c)
+            } else {
+                true
+            }
+        }));
+        self.curies_to_mask.clear();
         true
     }
 }
@@ -1192,6 +1225,7 @@ pub struct SelectedIonBuilder {
     ion_mobility_type: CURIEBuilder,
     parameters: ParamListBuilder,
     extra: Vec<Box<dyn StructVisitorBuilder<mzdata::spectrum::SelectedIon>>>,
+    curies_to_mask: Vec<CURIE>,
 }
 
 impl ArrayBuilder for SelectedIonBuilder {
@@ -1248,35 +1282,30 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::SelectedIon)> for SelectedIonBu
         self.selected_ion_mz.append_value(item.mz);
         self.charge_state.append_option(item.charge());
         self.intensity.append_value(item.intensity);
-        let im_curie = if let Some(im_val) = item.ion_mobility_type() {
+
+        if let Some(im_val) = item.ion_mobility_type() {
             self.ion_mobility.append_value(im_val.to_f64().unwrap());
             let c = im_val.curie();
             self.ion_mobility_type.append_option(c.as_ref());
-            c
+            self.curies_to_mask.extend(c);
         } else {
             self.ion_mobility.append_null();
             self.ion_mobility_type.append_null();
-            None
         };
 
-        let b = self.parameters.as_mut().values();
-        for param in item.params() {
-            if im_curie.is_some() {
-                if param.curie() == im_curie {
-                    continue;
-                }
-                b.append_value(param);
-            } else {
-                b.append_value(param);
+        for e in self.extra.iter_mut() {
+            if e.append_value(item) {
+                self.curies_to_mask.extend(e.associated_curie_to_skip());
             }
         }
-
-        self.parameters.as_mut().append(true);
-
-        for e in self.extra.iter_mut() {
-            e.append_value(item);
-        }
-
+        self.parameters.append_iter(item.params().iter().filter(|p| {
+            if let Some(c) = p.curie() {
+                !self.curies_to_mask.contains(&c)
+            } else {
+                true
+            }
+        }));
+        self.curies_to_mask.clear();
         true
     }
 }
@@ -1515,6 +1544,8 @@ pub struct SpectrumDetailsBuilder {
     number_of_auxiliary_arrays: UInt32Builder,
     mz_delta_model: LargeListBuilder<Float64Builder>,
     extra: Vec<SpectrumVisitor>,
+
+    curies_to_mask: Vec<mzdata::params::CURIE>,
 }
 
 impl VisitorBase for SpectrumDetailsBuilder {
@@ -1609,6 +1640,8 @@ impl SpectrumDetailsBuilder {
         mz_delta_model_params: Option<Vec<f64>>,
         auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
     ) -> bool {
+        self.curies_to_mask.clear();
+
         let summaries = item.peaks().fetch_summaries();
 
         let n_pts = summaries.len();
@@ -1668,9 +1701,6 @@ impl SpectrumDetailsBuilder {
         self.base_peak_mz.append_option(base_peak_mz);
         self.base_peak_intensity.append_option(base_peak_intensity);
         self.total_ion_current.append_value(summaries.tic);
-
-        self.parameters.append_value(&item.params());
-
         self.number_of_data_points.append_value(n_pts as u64);
 
         self.data_processing_ref.append_null();
@@ -1701,11 +1731,21 @@ impl SpectrumDetailsBuilder {
         for e in self.extra.iter_mut() {
             match e {
                 SpectrumVisitor::Description(builder) => {
-                    builder.append_value(item.description());
+                    if builder.append_value(item.description()) {
+                        self.curies_to_mask.extend(builder.associated_curie_to_skip());
+                    }
                 }
             }
         }
 
+        self.parameters.append_iter(item.params().iter().filter(|p| {
+            if let Some(c) = p.curie() {
+                !self.curies_to_mask.contains(&c)
+            } else {
+                true
+            }
+        }));
+        self.curies_to_mask.clear();
         true
     }
 }
@@ -1950,6 +1990,7 @@ pub struct ChromatogramDetailsBuilder {
     number_of_auxiliary_arrays: UInt32Builder,
 
     extra: Vec<Box<dyn StructVisitorBuilder<Chromatogram>>>,
+    curies_to_mask: Vec<CURIE>,
 }
 
 impl ChromatogramDetailsBuilder {
@@ -1969,11 +2010,7 @@ impl ChromatogramDetailsBuilder {
         self.chromatogram_type
             .append_value(&item.chromatogram_type().to_curie());
         self.data_processing_ref.append_null();
-        let b = self.parameters.as_mut().values();
-        for param in item.params() {
-            b.append_value(param);
-        }
-        self.parameters.as_mut().append(true);
+
         if let Some(aux_arrays) = auxiliary_arrays {
             self.number_of_auxiliary_arrays
                 .append_value(aux_arrays.len() as u32);
@@ -1988,9 +2025,18 @@ impl ChromatogramDetailsBuilder {
         }
 
         for e in self.extra.iter_mut() {
-            e.append_value(item);
+            if e.append_value(item) {
+                self.curies_to_mask.extend(e.associated_curie_to_skip());
+            }
         }
-
+        self.parameters.append_iter(item.params().iter().filter(|p| {
+            if let Some(c) = p.curie() {
+                !self.curies_to_mask.contains(&c)
+            } else {
+                true
+            }
+        }));
+        self.curies_to_mask.clear();
         true
     }
 }
