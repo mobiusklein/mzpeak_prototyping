@@ -111,6 +111,10 @@ impl From<Vec<FileEntry>> for FileIndex {
 }
 
 impl FileIndex {
+    pub const fn index_file_name() -> &'static str {
+        "mzpeak_index.json"
+    }
+
     pub fn new(files: Vec<FileEntry>, metadata: HashMap<String, serde_json::Value>) -> Self {
         Self { files, metadata }
     }

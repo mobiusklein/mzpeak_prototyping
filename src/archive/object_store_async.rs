@@ -90,7 +90,7 @@ impl AsyncZipArchiveSource {
 
         for (i, entry) in all_entries.into_iter().enumerate() {
             if let Ok(name) = entry.filename().as_str() {
-                if name == "index.json" {
+                if name == FileIndex::index_file_name() {
                     let mut handle = reader
                         .reader_without_entry(i)
                         .await

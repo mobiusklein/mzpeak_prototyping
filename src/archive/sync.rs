@@ -172,7 +172,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
 
     pub fn finish(mut self) -> ZipResult<W> {
         self.archive_writer
-            .start_file("index.json", file_options())?;
+            .start_file(FileIndex::index_file_name(), file_options())?;
         serde_json::to_writer_pretty(&mut self.archive_writer, &self.index)
             .map_err(|e| -> io::Error { e.into() })?;
         let val = self.archive_writer.finish()?;
@@ -330,7 +330,7 @@ fn zip_archive_to_config(
     let offset = arch.offset();
     let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();
     let index: Option<FileIndex> =
-        if let Some(i) = file_names.iter().position(|s| s == "index.json") {
+        if let Some(i) = file_names.iter().position(|s| s == FileIndex::index_file_name()) {
             serde_json::from_reader(arch.by_index(i)?).ok()
         } else {
             None
@@ -578,7 +578,7 @@ impl DirectorySource {
             .map(|p| p.file_name().to_string_lossy().to_string())
             .collect();
 
-        let index_path = archive_path.join("index.json");
+        let index_path = archive_path.join(FileIndex::index_file_name());
         let file_index = if index_path.exists() {
             serde_json::from_reader(io::BufReader::new(fs::File::open(index_path)?)).ok()
         } else {
