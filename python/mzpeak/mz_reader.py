@@ -646,6 +646,8 @@ class MzPeakArrayDataReader:
         rgs: list[int],
     ) -> _SpectrumArrays:
         chunks = []
+        if not is_slice:
+            index_range = pa.array(index_range)
         for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
             batch = batch["chunk"]
             idx_col = pc.struct_field(batch, f"{self._namespace}_index")
@@ -657,7 +659,7 @@ class MzPeakArrayDataReader:
                     pc.less_equal(idx_col, end), pc.greater_equal(idx_col, start)
                 )
             else:
-                mask = pc.is_in(idx_col, pa.array(index_range))
+                mask = pc.is_in(idx_col, index_range)
             batch = pc.filter(
                 batch,
                 mask,
