@@ -49,6 +49,8 @@ required-features = ["async"]
 default = ["async"]
 
 async = ["dep:tokio", "dep:async_zip", "dep:object_store", "parquet/async", "dep:futures", "mzdata/async_partial", "dep:url"]
+s3 = ["object_store/aws", "async"]
+
 thermo = ["mzdata/thermo"]
 
 [dependencies]
@@ -80,7 +82,7 @@ numpress-rs = "1.1.0"
 identity-hash = "0.1.0"
 
 tokio = { version = "1.47.1", optional = true }
-object_store = { version = "0.12.4", optional = true }
+object_store = { version = "0.12.4", optional = true, features = ["http"] }
 futures = { version = "0.3.31", optional = true}
 async_zip = { version = "0.0.18", features = ["tokio"], optional = true }
 url = { version = "2.5.7", optional = true }

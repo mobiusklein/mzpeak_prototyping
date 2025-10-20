@@ -15,6 +15,8 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 
+use crate::archive::{FileEntry, FileIndex};
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ArchiveState {
     #[default]
@@ -37,6 +39,7 @@ fn file_options() -> SimpleFileOptions {
 pub struct ZipArchiveWriter<W: Write + Send + Seek> {
     archive_writer: ZipWriter<W>,
     state: ArchiveState,
+    index: FileIndex,
 }
 
 impl<W: Write + Send + Seek> Write for ZipArchiveWriter<W> {
@@ -56,6 +59,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         Self {
             archive_writer,
             state,
+            index: Default::default(),
         }
     }
 
@@ -65,6 +69,8 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             file_options(),
         )?;
         self.state = ArchiveState::SpectrumDataArrays;
+        self.index
+            .push(FileEntry::from(MzPeakArchiveType::SpectrumDataArrays));
         Ok(())
     }
 
@@ -74,6 +80,8 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             file_options(),
         )?;
         self.state = ArchiveState::SpectrumMetadata;
+        self.index
+            .push(FileEntry::from(MzPeakArchiveType::SpectrumMetadata));
         Ok(())
     }
 
@@ -83,6 +91,8 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             file_options(),
         )?;
         self.state = ArchiveState::ChromatogramMetadata;
+        self.index
+            .push(FileEntry::from(MzPeakArchiveType::ChromatogramMetadata));
         Ok(())
     }
 
@@ -92,22 +102,33 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             file_options(),
         )?;
         self.state = ArchiveState::ChromatogramDataArrays;
+        self.index
+            .push(FileEntry::from(MzPeakArchiveType::ChromatogramDataArrays));
         Ok(())
     }
 
     pub fn start_other<S: AsRef<str>>(&mut self, name: Option<&S>) -> ZipResult<()> {
-        self.archive_writer.start_file(
-            name.map(|s| s.as_ref())
-                .unwrap_or_else(|| MzPeakArchiveType::Other.tag_file_suffix().as_ref()),
-            file_options(),
-        )?;
+        let name = name
+            .map(|s| s.as_ref())
+            .unwrap_or_else(|| MzPeakArchiveType::Other.tag_file_suffix().as_ref());
+        self.archive_writer.start_file(name, file_options())?;
         self.state = ArchiveState::Other;
+        self.index.push(FileEntry::new(
+            name.to_string(),
+            super::EntityType::Other("other".into()),
+            super::DataKind::Other("other".into()),
+        ));
         Ok(())
     }
 
     pub fn add_other_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
         let p = path.file_name().map(|p| p.to_string_lossy().to_string());
+        self.index.push(FileEntry::new(
+            p.as_ref().unwrap().to_string(),
+            super::EntityType::Other("other".into()),
+            super::DataKind::Other("other".into()),
+        ));
         let mut handle = fs::File::open(&path)?;
         self.add_file_from_read(&mut handle, p.as_ref())
     }
@@ -122,6 +143,11 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             .file_name()
             .map(|p| p.to_string_lossy().to_string() + archive_type.tag_file_suffix());
         let mut handle = fs::File::open(&path)?;
+
+        let mut index_entry: FileEntry = archive_type.into();
+        index_entry.name = p.as_ref().unwrap().to_string();
+        self.index.push(index_entry);
+
         self.add_file_from_read(&mut handle, p.as_ref())
     }
 
@@ -144,7 +170,11 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         Ok(())
     }
 
-    pub fn finish(self) -> ZipResult<W> {
+    pub fn finish(mut self) -> ZipResult<W> {
+        self.archive_writer
+            .start_file("index.json", file_options())?;
+        serde_json::to_writer_pretty(&mut self.archive_writer, &self.index)
+            .map_err(|e| -> io::Error { e.into() })?;
         let val = self.archive_writer.finish()?;
         Ok(val)
     }
@@ -290,20 +320,33 @@ pub struct ZipArchiveSource {
     archive_file: fs::File,
     archive_offset: Config,
     pub file_names: Vec<String>,
+    pub file_index: FileIndex,
 }
 
-fn zip_archive_to_config(archive_file: fs::File) -> io::Result<(fs::File, Vec<String>, Config)> {
-        let arch = ZipArchive::new(archive_file)?;
-        let offset = arch.offset();
-        let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();
-        let archive_file = arch.into_inner();
-        let archive_offset = Config {
-            archive_offset: zip::read::ArchiveOffset::Known(offset),
+fn zip_archive_to_config(
+    archive_file: fs::File,
+) -> io::Result<(fs::File, Vec<String>, Config, Option<FileIndex>)> {
+    let mut arch = ZipArchive::new(archive_file)?;
+    let offset = arch.offset();
+    let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();
+    let index: Option<FileIndex> =
+        if let Some(i) = file_names.iter().position(|s| s == "index.json") {
+            serde_json::from_reader(arch.by_index(i)?).ok()
+        } else {
+            None
         };
-        Ok((archive_file, file_names, archive_offset))
+    let archive_file = arch.into_inner();
+    let archive_offset = Config {
+        archive_offset: zip::read::ArchiveOffset::Known(offset),
+    };
+    Ok((archive_file, file_names, archive_offset, index))
 }
 
-fn zip_archive_open_entry(handle: fs::File, index: usize, archive_offset: Config) -> io::Result<ArchiveFacetReader> {
+fn zip_archive_open_entry(
+    handle: fs::File,
+    index: usize,
+    archive_offset: Config,
+) -> io::Result<ArchiveFacetReader> {
     let mut archive = ZipArchive::with_config(archive_offset, handle)?;
     let handle = archive.by_index(index)?;
     match handle.compression() {
@@ -311,9 +354,7 @@ fn zip_archive_open_entry(handle: fs::File, index: usize, archive_offset: Config
         method => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!(
-                    "Compression method {method:?} isn't supported. Only Stored is supported"
-                ),
+                format!("Compression method {method:?} isn't supported. Only Stored is supported"),
             ));
         }
     }
@@ -321,21 +362,18 @@ fn zip_archive_open_entry(handle: fs::File, index: usize, archive_offset: Config
     let length = handle.size();
     drop(handle);
     let handle = archive.into_inner();
-    Ok(ArchiveFacetReader::new(
-        handle,
-        start_offset,
-        length,
-        0,
-    ))
+    Ok(ArchiveFacetReader::new(handle, start_offset, length, 0))
 }
 
 impl ZipArchiveSource {
     pub fn new(archive_file: fs::File) -> io::Result<Self> {
-        let (archive_file, file_names, archive_offset, ) = zip_archive_to_config(archive_file)?;
+        let (archive_file, file_names, archive_offset, file_index) =
+            zip_archive_to_config(archive_file)?;
         Ok(Self {
             archive_file,
             archive_offset,
             file_names,
+            file_index: file_index.unwrap_or_default(),
         })
     }
 
@@ -372,16 +410,18 @@ pub struct SplittingZipArchiveSource {
     archive_file: PathBuf,
     archive_offset: Config,
     pub file_names: Vec<String>,
+    pub file_index: FileIndex,
 }
 
 impl SplittingZipArchiveSource {
     pub fn new(archive_path: PathBuf) -> io::Result<Self> {
         let archive_file = fs::File::open(archive_path.as_path())?;
-        let (_, file_names, archive_offset, ) = zip_archive_to_config(archive_file)?;
+        let (_, file_names, archive_offset, file_index) = zip_archive_to_config(archive_file)?;
         Ok(Self {
             archive_file: archive_path,
             archive_offset,
             file_names,
+            file_index: file_index.unwrap_or_default(),
         })
     }
 
@@ -416,7 +456,7 @@ impl SplittingZipArchiveSource {
 
 #[derive(Debug, Clone)]
 pub struct MzPeakArchiveEntry {
-    pub metadata: ArrowReaderMetadata,
+    pub metadata: Option<ArrowReaderMetadata>,
     pub entry_index: usize,
     pub name: String,
     pub entry_type: MzPeakArchiveType,
@@ -439,6 +479,8 @@ pub trait ArchiveSource: Sized + 'static {
     fn can_split(&self) -> bool {
         false
     }
+
+    fn file_index(&self) -> &FileIndex;
 
     /// Create from a file system path
     fn from_path(path: PathBuf) -> io::Result<Self>;
@@ -491,6 +533,10 @@ impl ArchiveSource for ZipArchiveSource {
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
         self.open_entry_by_index(index)
     }
+
+    fn file_index(&self) -> &FileIndex {
+        &self.file_index
+    }
 }
 
 impl ArchiveSource for SplittingZipArchiveSource {
@@ -511,11 +557,16 @@ impl ArchiveSource for SplittingZipArchiveSource {
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
         self.open_entry_by_index(index)
     }
+
+    fn file_index(&self) -> &FileIndex {
+        &self.file_index
+    }
 }
 
 pub struct DirectorySource {
     archive_path: PathBuf,
     pub file_names: Vec<String>,
+    pub file_index: FileIndex,
 }
 
 impl DirectorySource {
@@ -527,9 +578,17 @@ impl DirectorySource {
             .map(|p| p.file_name().to_string_lossy().to_string())
             .collect();
 
+        let index_path = archive_path.join("index.json");
+        let file_index = if index_path.exists() {
+            serde_json::from_reader(io::BufReader::new(fs::File::open(index_path)?)).ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             archive_path,
             file_names,
+            file_index: file_index.unwrap_or_default(),
         })
     }
 
@@ -587,6 +646,10 @@ impl ArchiveSource for DirectorySource {
     fn from_path(path: PathBuf) -> io::Result<Self> {
         Self::new(path)
     }
+
+    fn file_index(&self) -> &FileIndex {
+        &self.file_index
+    }
 }
 
 pub struct ArchiveReader<T: ArchiveSource + 'static> {
@@ -598,20 +661,43 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     fn init_from_archive(archive: T) -> io::Result<Self> {
         let mut members = SchemaMetadataManager::default();
         for (i, name) in archive.file_names().iter().enumerate() {
-            let metadata = archive.metadata_for_index(i)?;
-            let tp = if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
-                MzPeakArchiveType::SpectrumDataArrays
-            } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
-                MzPeakArchiveType::SpectrumMetadata
-            } else if name.ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()) {
-                MzPeakArchiveType::SpectrumPeakDataArrays
-            } else if name.ends_with(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix()) {
-                MzPeakArchiveType::ChromatogramMetadata
-            } else if name.ends_with(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix()) {
-                MzPeakArchiveType::ChromatogramDataArrays
-            } else {
-                MzPeakArchiveType::Other
-            };
+            let tp = archive
+                .file_index()
+                .iter()
+                .find(|s| s.name == *name)
+                .map(|s| s.archive_type());
+
+            let tp = tp.unwrap_or_else(|| {
+                if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
+                    MzPeakArchiveType::SpectrumDataArrays
+                } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
+                    MzPeakArchiveType::SpectrumMetadata
+                } else if name
+                    .ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix())
+                {
+                    MzPeakArchiveType::SpectrumPeakDataArrays
+                } else if name.ends_with(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix())
+                {
+                    MzPeakArchiveType::ChromatogramMetadata
+                } else if name
+                    .ends_with(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix())
+                {
+                    MzPeakArchiveType::ChromatogramDataArrays
+                } else {
+                    MzPeakArchiveType::Other
+                }
+            });
+
+            let metadata = archive.metadata_for_index(i).ok();
+            if !matches!(tp, MzPeakArchiveType::Other) && metadata.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{name} classified as {tp:?} was expected to be a Parquet file, but was not"
+                    ),
+                ));
+            }
+
             let entry = MzPeakArchiveEntry {
                 entry_index: i,
                 metadata,
@@ -652,7 +738,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     pub fn chromatograms_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_metadata.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -664,7 +750,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     pub fn chromatograms_data(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -676,7 +762,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     pub fn spectra_data(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -688,7 +774,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     pub fn spectrum_peaks(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.peaks_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -700,7 +786,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
     pub fn spectrum_metadata(&self) -> io::Result<ParquetRecordBatchReaderBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_metadata.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -737,7 +823,9 @@ impl ArchiveSource for DispatchArchiveSource {
         if fs::metadata(&path)?.is_dir() {
             return Ok(Self::Directory(DirectorySource::from_path(path)?));
         } else {
-            return Ok(Self::SplittingZip(SplittingZipArchiveSource::from_path(path)?));
+            return Ok(Self::SplittingZip(SplittingZipArchiveSource::from_path(
+                path,
+            )?));
         }
     }
 
@@ -751,6 +839,10 @@ impl ArchiveSource for DispatchArchiveSource {
 
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
         dispatch!(self, src, { src.open_entry_by_index(index) })
+    }
+
+    fn file_index(&self) -> &FileIndex {
+        dispatch!(self, src, { src.file_index() })
     }
 }
 

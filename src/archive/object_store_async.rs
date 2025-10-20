@@ -5,7 +5,7 @@ use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 
-use futures::FutureExt;
+use futures::{AsyncReadExt, FutureExt};
 use object_store::parse_url;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -14,6 +14,8 @@ use async_zip::{StoredZipEntry, base::read::seek::ZipFileReader};
 use object_store::{ObjectMeta, ObjectStore, path::Path as ObjectPath};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncSeek, ReadBuf};
 use url::Url;
+
+use crate::archive::FileIndex;
 
 use super::sync::{MzPeakArchiveEntry, MzPeakArchiveType, SchemaMetadataManager};
 
@@ -56,6 +58,8 @@ pub trait AsyncArchiveSource: Clone + 'static {
             ))
         }
     }
+
+    fn file_index(&self) -> &FileIndex;
 }
 
 #[derive(Clone)]
@@ -64,6 +68,7 @@ pub struct AsyncZipArchiveSource {
     root: ObjectMeta,
     file_names: Vec<String>,
     entries: Vec<StoredZipEntry>,
+    file_index: FileIndex,
 }
 
 impl AsyncZipArchiveSource {
@@ -71,7 +76,7 @@ impl AsyncZipArchiveSource {
         let root = handle.head(&prefix).await?;
         let reader = object_store::buffered::BufReader::new(handle.clone(), &root);
 
-        let reader = match ZipFileReader::with_tokio(reader).await {
+        let mut reader = match ZipFileReader::with_tokio(reader).await {
             Ok(reader) => reader,
             Err(e) => return Err(io::Error::other(e)),
         };
@@ -81,8 +86,19 @@ impl AsyncZipArchiveSource {
         let mut entries = Vec::with_capacity(all_entries.len());
         let mut file_names = Vec::new();
 
-        for entry in all_entries {
+        let mut file_index = FileIndex::default();
+
+        for (i, entry) in all_entries.into_iter().enumerate() {
             if let Ok(name) = entry.filename().as_str() {
+                if name == "index.json" {
+                    let mut handle = reader
+                        .reader_without_entry(i)
+                        .await
+                        .map_err(io::Error::other)?;
+                    let mut buf = String::new();
+                    handle.read_to_string(&mut buf).await?;
+                    file_index = serde_json::from_str(&buf)?;
+                }
                 let name = name.to_string();
                 file_names.push(name);
                 entries.push(entry);
@@ -94,6 +110,7 @@ impl AsyncZipArchiveSource {
             root,
             entries,
             file_names,
+            file_index,
         })
     }
 
@@ -169,6 +186,10 @@ impl AsyncArchiveSource for AsyncZipArchiveSource {
 
     fn open_entry_by_index(&self, index: usize) -> impl Future<Output = io::Result<Self::File>> {
         self.open_entry_by_index(index)
+    }
+
+    fn file_index(&self) -> &FileIndex {
+        &self.file_index
     }
 }
 
@@ -326,8 +347,13 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     async fn init_from_archive(archive: T) -> io::Result<Self> {
         let mut members = SchemaMetadataManager::default();
         for (i, name) in archive.file_names().iter().enumerate() {
-            let metadata = archive.metadata_for_index(i).await?;
-            let tp = if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
+            let tp = archive
+                .file_index()
+                .iter()
+                .find(|s| s.name == *name)
+                .map(|s| s.archive_type());
+            let metadata = archive.metadata_for_index(i).await.ok();
+            let tp = tp.unwrap_or_else(|| if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
                 MzPeakArchiveType::SpectrumDataArrays
             } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
                 MzPeakArchiveType::SpectrumMetadata
@@ -339,7 +365,17 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
                 MzPeakArchiveType::ChromatogramDataArrays
             } else {
                 MzPeakArchiveType::Other
-            };
+            });
+
+            if !matches!(tp, MzPeakArchiveType::Other) && metadata.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{name} classified as {tp:?} was expected to be a Parquet file, but was not"
+                    ),
+                ));
+            }
+
             let entry = MzPeakArchiveEntry {
                 entry_index: i,
                 metadata,
@@ -390,7 +426,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     ) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_metadata.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
                 .await
         } else {
             Err(io::Error::new(
@@ -403,7 +439,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     pub async fn chromatograms_data(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.chromatogram_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
                 .await
         } else {
             Err(io::Error::new(
@@ -416,7 +452,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     pub async fn spectra_data(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
                 .await
         } else {
             Err(io::Error::new(
@@ -429,7 +465,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     pub async fn spectrum_peaks(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.peaks_data_arrays.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
                 .await
         } else {
             Err(io::Error::new(
@@ -442,7 +478,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
     pub async fn spectrum_metadata(&self) -> io::Result<ParquetRecordBatchStreamBuilder<T::File>> {
         if let Some(meta) = self.members.spectrum_metadata.as_ref() {
             self.archive
-                .read_index(meta.entry_index, Some(meta.metadata.clone()))
+                .read_index(meta.entry_index, Some(meta.metadata.clone().unwrap()))
                 .await
         } else {
             Err(io::Error::new(
@@ -477,4 +513,22 @@ mod test {
         }
         Ok(())
     }
+
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // async fn test_http() -> io::Result<()> {
+    //     let store = object_store::http::HttpBuilder::new()
+    //         .with_url("http://127.0.0.1:8000/")
+    //         .with_client_options(
+    //             ClientOptions::new()
+    //                 .with_allow_http(true)
+    //                 .with_timeout(std::time::Duration::new(10, 0))
+    //         )
+    //         .build()?;
+
+    //     let path = ObjectPath::from("small.mzpeak");
+    //     let handle = AsyncZipArchiveSource::new(Arc::new(store), path).await?;
+
+    //     eprintln!("{:?}",handle.file_names());
+    //     Ok(())
+    // }
 }

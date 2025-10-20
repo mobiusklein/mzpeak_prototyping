@@ -7,7 +7,6 @@ use std::{
 
 use arrow::{
     array::{Array, AsArray, Float32Array, RecordBatch, UInt64Array},
-    datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type},
     error::ArrowError,
 };
 
@@ -32,7 +31,7 @@ use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
 
-use crate::{archive::DispatchArchiveSource, reader::utils::MaskSet};
+use crate::{archive::DispatchArchiveSource, reader::{metadata::{AuxiliaryArrayCountDecoder, DeltaModelDecoder}, utils::MaskSet}};
 #[allow(unused_imports)]
 use crate::{
     archive::{ArchiveReader, ArchiveSource, DirectorySource, ZipArchiveSource, SplittingZipArchiveSource}, filter::RegressionDeltaModel, reader::{
@@ -835,64 +834,22 @@ impl<
     pub(crate) fn load_spectrum_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
         let builder = self.handle.spectrum_metadata()?;
 
-        let schema = builder.parquet_schema();
-        let mut index_i = None;
-        let mut auxiliary_count_i = None;
-        for (i, c) in schema.columns().iter().enumerate() {
-            let parts = c.path().parts();
-            if parts == ["spectrum", "index"] {
-                index_i = Some(i);
-            }
-            if parts
-                .iter()
-                .zip(["spectrum", "number_of_auxiliary_arrays"])
-                .all(|(a, b)| a == b)
-            {
-                auxiliary_count_i = Some(i);
-            }
-        }
+        let mut decoder = AuxiliaryArrayCountDecoder::new(BufferContext::Spectrum);
 
-        let proj = match (index_i, auxiliary_count_i) {
-            (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
-            _ => return Ok(Vec::new()),
+        let proj = match decoder.build_projection(&builder) {
+            Some(proj) => proj,
+            None => return Ok(Vec::new())
         };
 
         let reader = builder.with_projection(proj).build()?;
         let n = self.len();
-        let mut number_of_auxiliary_arrays = Vec::new();
-        number_of_auxiliary_arrays.resize(n, 0);
-
-        macro_rules! unpack {
-            ($index_array:ident, $values_array:ident, $dtype:ty) => {
-                if let Some(values) = $values_array.as_primitive_opt::<$dtype>() {
-                    for (i, c) in $index_array.iter().zip(values.iter()) {
-                        number_of_auxiliary_arrays[i.unwrap() as usize] =
-                            c.unwrap_or_default() as u32;
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-        }
+        decoder.resize(n);
 
         for batch in reader.flatten() {
-            let root = batch.column(0).as_struct();
-            let index_array: &UInt64Array = root.column(0).as_primitive();
-            let values_array = root.column(1);
-
-            if unpack!(index_array, values_array, UInt32Type) {
-            } else if unpack!(index_array, values_array, UInt64Type) {
-            } else if unpack!(index_array, values_array, Int32Type) {
-            } else if unpack!(index_array, values_array, Int64Type) {
-            } else {
-                unimplemented!(
-                    "auxiliary array count stored as {:?}",
-                    values_array.data_type()
-                )
-            }
+            decoder.decode_batch(&batch);
         }
-        Ok(number_of_auxiliary_arrays)
+
+        Ok(decoder.finish())
     }
 
     pub(crate) fn load_chromatogram_auxiliary_array_count(&self) -> io::Result<Vec<u32>> {
@@ -904,64 +861,22 @@ impl<
             }
         };
 
-        let schema = builder.parquet_schema();
-        let mut index_i = None;
-        let mut auxiliary_count_i = None;
-        for (i, c) in schema.columns().iter().enumerate() {
-            let parts = c.path().parts();
-            if parts == ["chromatogram", "index"] {
-                index_i = Some(i);
-            }
-            if parts
-                .iter()
-                .zip(["chromatogram", "number_of_auxiliary_arrays"])
-                .all(|(a, b)| a == b)
-            {
-                auxiliary_count_i = Some(i);
-            }
-        }
+        let mut decoder = AuxiliaryArrayCountDecoder::new(BufferContext::Chromatogram);
 
-        let proj = match (index_i, auxiliary_count_i) {
-            (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
-            _ => return Ok(Vec::new()),
+        let proj = match decoder.build_projection(&builder) {
+            Some(proj) => proj,
+            None => return Ok(Vec::new())
         };
 
         let reader = builder.with_projection(proj).build()?;
         let n = self.len();
-        let mut number_of_auxiliary_arrays = Vec::new();
-        number_of_auxiliary_arrays.resize(n, 0);
-
-        macro_rules! unpack {
-            ($index_array:ident, $values_array:ident, $dtype:ty) => {
-                if let Some(values) = $values_array.as_primitive_opt::<$dtype>() {
-                    for (i, c) in $index_array.iter().zip(values.iter()) {
-                        number_of_auxiliary_arrays[i.unwrap() as usize] =
-                            c.unwrap_or_default() as u32;
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-        }
+        decoder.resize(n);
 
         for batch in reader.flatten() {
-            let root = batch.column(0).as_struct();
-            let index_array: &UInt64Array = root.column(0).as_primitive();
-            let values_array = root.column(1);
-
-            if unpack!(index_array, values_array, UInt32Type) {
-            } else if unpack!(index_array, values_array, UInt64Type) {
-            } else if unpack!(index_array, values_array, Int32Type) {
-            } else if unpack!(index_array, values_array, Int64Type) {
-            } else {
-                unimplemented!(
-                    "auxiliary array count stored as {:?}",
-                    values_array.data_type()
-                )
-            }
+            decoder.decode_batch(&batch);
         }
-        Ok(number_of_auxiliary_arrays)
+
+        Ok(decoder.finish())
     }
 
     fn load_auxiliary_arrays_from(&self, reader: ParquetRecordBatchReader) -> Vec<DataArray> {
@@ -1070,30 +985,10 @@ impl<
     pub(crate) fn load_delta_models(&mut self) -> io::Result<Vec<Option<Vec<f64>>>> {
         let builder = self.handle.spectrum_metadata()?;
 
-        let schema = builder.parquet_schema();
-        let mut index_i = None;
-        let mut median_i = None;
-        for (i, c) in schema.columns().iter().enumerate() {
-            let parts = c.path().parts();
-            if parts == ["spectrum", "index"] {
-                index_i = Some(i);
-            }
-            if parts
-                .iter()
-                .zip(["spectrum", "median_delta"])
-                .all(|(a, b)| a == b)
-                || parts
-                    .iter()
-                    .zip(["spectrum", "mz_delta_model"])
-                    .all(|(a, b)| a == b)
-            {
-                median_i = Some(i);
-            }
-        }
-
-        let proj = match (index_i, median_i) {
-            (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
-            _ => return Ok(Vec::new()),
+        let mut decoder = DeltaModelDecoder::default();
+        let proj = match decoder.build_projection(&builder) {
+            Some(proj) => proj,
+            None => return Ok(Vec::new()),
         };
 
         let reader = builder
@@ -1101,54 +996,11 @@ impl<
             .with_batch_size(10_000)
             .build()?;
         let n = self.len();
-        let mut medians = Vec::new();
-        medians.resize(n, None);
+        decoder.resize(n);
         for batch in reader.flatten() {
-            let root = batch.column(0).as_struct();
-            let index_array: &UInt64Array = root.column(0).as_primitive();
-
-            if let Some(val_array) = root.column(1).as_list_opt::<i64>() {
-                match val_array.value_type() {
-                    DataType::Float32 => {
-                        for (i, val) in index_array.iter().zip(val_array.iter()) {
-                            if let Some(i) = i {
-                                medians[i as usize] = val.map(|v| -> Vec<f64> {
-                                    v.as_primitive::<Float32Type>()
-                                        .iter()
-                                        .map(|i| i.unwrap() as f64)
-                                        .collect()
-                                });
-                            }
-                        }
-                    }
-                    DataType::Float64 => {
-                        for (i, val) in index_array.iter().zip(val_array.iter()) {
-                            if let Some(i) = i {
-                                medians[i as usize] = val.map(|v| -> Vec<f64> {
-                                    let val = v.as_primitive::<Float64Type>();
-                                    val.values().to_vec()
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            } else if let Some(val_array) = root.column(1).as_primitive_opt::<Float32Type>() {
-                for (i, val) in index_array.iter().zip(val_array) {
-                    if let Some(i) = i {
-                        medians[i as usize] = val.map(|v| vec![v as f64]);
-                    }
-                }
-            } else if let Some(val_array) = root.column(1).as_primitive_opt::<Float64Type>() {
-                for (i, val) in index_array.iter().zip(val_array) {
-                    if let Some(i) = i {
-                        medians[i as usize] = val.map(|v| vec![v]);
-                    }
-                }
-            }
+            decoder.decode_batch(&batch);
         }
-
-        Ok(medians)
+        Ok(decoder.finish())
     }
 
     pub(crate) fn load_all_spectrum_metadata_impl(&self) -> io::Result<Vec<SpectrumDescription>> {
