@@ -18,7 +18,7 @@ from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
 from .mz_reader import _ChunkIterator, MzPeakArrayDataReader, BufferFormat
-
+from .file_index import FileIndex, DataKind, EntityType
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -612,6 +612,9 @@ class MzPeakFile(Sequence[_SpectrumType]):
         The facet of the data file for reading chromatogram descriptive metadata.
         Should not be necessary to interact with this attribute directly. Instead, see
         :attr:`MzPeakFile.chromatograms`
+    file_index : :class:`~.FileIndex`
+        A listing of the recorded files within the archive, mapping names to specific
+        data content types.
     file_metadata: dict[str, Any]
         TODO: document this
     spectra : :class:`pandas.DataFrame`
@@ -632,14 +635,16 @@ class MzPeakFile(Sequence[_SpectrumType]):
     """
     _archive: zipfile.ZipFile | Path
 
-    spectrum_data: MzPeakArrayDataReader
-    spectrum_metadata: MzPeakSpectrumMetadataReader
+    spectrum_data: MzPeakArrayDataReader | None = None
+    spectrum_metadata: MzPeakSpectrumMetadataReader | None = None
     spectrum_peak_data: MzPeakArrayDataReader | None = None
 
     chromatogram_metadata: MzPeakChromatogramMetadataReader | None = None
     chromatogram_data: MzPeakArrayDataReader | None = None
 
     file_metadata: dict[str, Any]
+
+    file_index: FileIndex
 
     @property
     def filename(self) -> str | None:
@@ -651,28 +656,65 @@ class MzPeakFile(Sequence[_SpectrumType]):
 
     def _from_directory(self, path: Path):
         self._archive = path
+        index_path = path / FileIndex.FILE_NAME
+        if index_path.exists():
+            self.file_index = FileIndex.from_json(json.load(index_path.open()))
+            for e in self.file_index:
+                f = path / e.name
+                match e.entry_type():
+                    case (EntityType.Spectrum, DataKind.DataArrays):
+                        self.spectrum_data = MzPeakArrayDataReader(
+                            pa.OSFile(f),
+                            namespace="spectrum",
+                        )
+                    case (EntityType.Spectrum, DataKind.Metadata):
+                        self.spectrum_metadata = MzPeakSpectrumMetadataReader(
+                            pa.OSFile(f),
+                        )
+                    case (EntityType.Spectrum, DataKind.Peaks):
+                        self.spectrum_peak_data = MzPeakArrayDataReader(
+                            pa.OSFile(f),
+                            namespace="spectrum",
+                        )
+                    case (EntityType.Chromatogram, DataKind.DataArrays):
+                        self.chromatogram_data = MzPeakArrayDataReader(
+                            pa.OSFile(f),
+                            namespace="chromatogram",
+                        )
+                    case (EntityType.Chromatogram, DataKind.Metadata):
+                        self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
+                            pa.OSFile(f)
+                        )
+                    case _:
+                        pass
+
         for f in path.glob("*mzpeak"):
             if not f.is_file():
                 continue
-            if f.name.endswith("spectra_data.mzpeak"):
+            if f.name.endswith("spectra_data.mzpeak") and not self.spectrum_data:
                 self.spectrum_data = MzPeakArrayDataReader(
                     pa.OSFile(f),
                     namespace="spectrum",
                 )
-            elif f.name.endswith("spectra_metadata.mzpeak"):
+            elif f.name.endswith("spectra_metadata.mzpeak") and not self.spectrum_metadata:
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
                     pa.OSFile(f),
                 )
-            elif f.name.endswith("spectra_peaks.mzpeak"):
+            elif f.name.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data:
                 self.spectrum_peak_data = MzPeakArrayDataReader(
                     pa.OSFile(f),
                     namespace="spectrum",
                 )
-            elif f.name.endswith("chromatograms_metadata.mzpeak"):
+            elif (
+                f.name.endswith("chromatograms_metadata.mzpeak")
+                and not self.chromatogram_metadata
+            ):
                 self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
                     pa.OSFile(f)
                 )
-            elif f.name.endswith("chromatograms_data.mzpeak"):
+            elif (
+                f.name.endswith("chromatograms_data.mzpeak") and not self.chromatogram_data
+            ):
                 self.chromatogram_data = MzPeakArrayDataReader(
                     pa.OSFile(f),
                     namespace="chromatogram",
@@ -680,26 +722,68 @@ class MzPeakFile(Sequence[_SpectrumType]):
 
     def _from_zip_archive(self, archive: zipfile.ZipFile):
         self._archive = archive
+        try:
+            f = archive.getinfo(FileIndex.FILE_NAME)
+            self.file_index = FileIndex.from_json(json.load(archive.open(f)))
+            for e in self.file_index:
+                f = archive.open(e.name)
+                match e.entry_type():
+                    case (EntityType.Spectrum, DataKind.DataArrays):
+                        self.spectrum_data = MzPeakArrayDataReader(
+                            pa.PythonFile(f),
+                            namespace="spectrum",
+                        )
+                    case (EntityType.Spectrum, DataKind.Metadata):
+                        self.spectrum_metadata = MzPeakSpectrumMetadataReader(
+                            pa.PythonFile(f),
+                        )
+                    case (EntityType.Spectrum, DataKind.Peaks):
+                        self.spectrum_peak_data = MzPeakArrayDataReader(
+                            pa.PythonFile(f),
+                            namespace="spectrum",
+                        )
+                    case (EntityType.Chromatogram, DataKind.DataArrays):
+                        self.chromatogram_data = MzPeakArrayDataReader(
+                            pa.PythonFile(f),
+                            namespace="chromatogram",
+                        )
+                    case (EntityType.Chromatogram, DataKind.Metadata):
+                        self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
+                            pa.PythonFile(f)
+                        )
+                    case _:
+                        pass
+        except KeyError:
+            pass
         for f in archive.filelist:
-            if f.filename.endswith("spectra_data.mzpeak"):
+            if f.filename.endswith("spectra_data.mzpeak") and not self.spectrum_data:
                 self.spectrum_data = MzPeakArrayDataReader(
                     pa.PythonFile(archive.open(f)),
                     namespace="spectrum",
                 )
-            elif f.filename.endswith("spectra_metadata.mzpeak"):
+            elif (
+                f.filename.endswith("spectra_metadata.mzpeak")
+                and not self.spectrum_metadata
+            ):
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
                     pa.PythonFile(archive.open(f)),
                 )
-            elif f.filename.endswith("spectra_peaks.mzpeak"):
+            elif f.filename.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data:
                 self.spectrum_peak_data = MzPeakArrayDataReader(
                     pa.PythonFile(archive.open(f)),
                     namespace="spectrum",
                 )
-            elif f.filename.endswith("chromatograms_metadata.mzpeak"):
+            elif (
+                f.filename.endswith("chromatograms_metadata.mzpeak")
+                and not self.chromatogram_metadata
+            ):
                 self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
                     pa.PythonFile(archive.open(f))
                 )
-            elif f.filename.endswith("chromatograms_data.mzpeak"):
+            elif (
+                f.filename.endswith("chromatograms_data.mzpeak")
+                and not self.chromatogram_data
+            ):
                 self.chromatogram_data = MzPeakArrayDataReader(
                     pa.PythonFile(archive.open(f)),
                     namespace="chromatogram",
@@ -732,6 +816,7 @@ class MzPeakFile(Sequence[_SpectrumType]):
             )
 
     def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
+        self.file_index = FileIndex()
         if isinstance(path, zipfile.ZipFile):
             self._from_zip_archive(self._archive)
         elif isinstance(path, (str, Path)):
