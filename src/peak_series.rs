@@ -149,6 +149,8 @@ pub fn array_map_to_schema_arrays(
 }
 
 /// Convert a peak list to a collection of Arrow Arrays
+///
+/// An Arrow equivalent to [`mzdata::spectrum::bindata::BuildArrayMapFrom`]
 pub trait ToMzPeakDataSeries: Sized + BuildArrayMapFrom {
     /// Get the definition of Arrow arrays that this will be stored as for populating
     /// the schema

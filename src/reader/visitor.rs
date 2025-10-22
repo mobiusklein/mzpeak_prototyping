@@ -24,7 +24,6 @@ use mzdata::{
         bindata::BinaryCompressionType,
     },
 };
-use serde_arrow::schema::SchemaLike;
 
 use crate::{CURIE, param::MetadataColumn};
 
@@ -1500,11 +1499,8 @@ impl<'a> MzScanVisitor<'a> {
         if arr.null_count() == arr.len() {
             return;
         }
-        let curie_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<Option<CURIE>>(Default::default()).unwrap();
-        let ion_mobility_types = spec_arr.column(ion_mobility_type_index).as_struct();
-        let ion_mobility_types: Vec<Option<CURIE>> =
-            serde_arrow::from_arrow(&curie_fields, ion_mobility_types.columns()).unwrap();
+        let ion_mobility_types = spec_arr.column(ion_mobility_type_index);
+        let ion_mobility_types = AnyCURIEArray::try_from(ion_mobility_types).unwrap();
 
         macro_rules! pack {
             ($arr:ident) => {
@@ -1518,7 +1514,7 @@ impl<'a> MzScanVisitor<'a> {
                 continue;
             };
             let im_val = $arr.value(i);
-            let im_tp = ion_mobility_types[i].unwrap();
+            let im_tp = ion_mobility_types.value(i).unwrap();
             match im_tp {
                 // ion mobility drift time
                 curie!(MS:1002476) => descr.add_param(
@@ -2011,11 +2007,9 @@ impl<'a> MzSelectedIonVisitor<'a> {
         if arr.null_count() == arr.len() {
             return;
         }
-        let curie_fields: Vec<FieldRef> =
-            SchemaLike::from_type::<Option<CURIE>>(Default::default()).unwrap();
-        let ion_mobility_types = spec_arr.column(ion_mobility_type_index).as_struct();
-        let ion_mobility_types: Vec<Option<CURIE>> =
-            serde_arrow::from_arrow(&curie_fields, ion_mobility_types.columns()).unwrap();
+
+        let ion_mobility_types = spec_arr.column(ion_mobility_type_index);
+        let ion_mobility_types = AnyCURIEArray::try_from(ion_mobility_types).unwrap();
 
         macro_rules! pack {
             ($arr:ident) => {
@@ -2029,7 +2023,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
                 continue;
             };
             let im_val = $arr.value(i);
-            let im_tp = ion_mobility_types[i].unwrap();
+            let im_tp = ion_mobility_types.value(i).unwrap();
             match im_tp {
                 // ion mobility drift time
                 curie!(MS:1002476) => descr.add_param(
