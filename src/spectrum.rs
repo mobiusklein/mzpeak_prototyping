@@ -1,5 +1,6 @@
 use mzdata::{
-    params::Unit,
+    curie,
+    params::{CURIE, Param, Unit},
     spectrum::{
         ArrayType, BinaryDataArrayType, DataArray,
         bindata::{ArrayRetrievalError, BinaryCompressionType},
@@ -7,9 +8,7 @@ use mzdata::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    param::{CURIE, MetadataColumn, Param, curie},
-};
+use crate::param::MetadataColumn;
 
 macro_rules! metacol {
     ($name:literal, $path:expr, $index:literal, $accession:expr) => {
@@ -69,7 +68,7 @@ impl AuxiliaryArray {
         let dtype_acc: mzdata::params::CURIE = self.data_type.into();
         let dtype = BinaryDataArrayType::from_accession(dtype_acc).unwrap();
 
-        let name: mzdata::Param = self.name.into();
+        let name: Param = self.name.into();
         let name = if let Some(name_acc) = name.curie() {
             if let Some(name_t) = ArrayType::from_accession(name_acc) {
                 if matches!(name_t, ArrayType::NonStandardDataArray { name: _ }) {
@@ -88,10 +87,7 @@ impl AuxiliaryArray {
         result.compression = chosen_compression;
         if !self.parameters.is_empty() {
             result.params = Some(Box::new(
-                self.parameters
-                    .into_iter()
-                    .map(mzdata::Param::from)
-                    .collect(),
+                self.parameters.into_iter().map(Param::from).collect(),
             ));
         }
         result
@@ -130,8 +126,7 @@ impl AuxiliaryArray {
             data_processing_ref: None,
         };
         if let Some(params) = source.params {
-            this.parameters
-                .extend(params.iter().map(|p| Param::from(p.clone())));
+            this.parameters.extend(params.iter().cloned());
         }
         Ok(this)
     }
@@ -234,7 +229,6 @@ impl SpectrumEntry {
 }
 
 pub struct ScanWindowEntry {}
-
 
 pub struct ScanEntry {}
 

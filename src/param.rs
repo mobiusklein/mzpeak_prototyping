@@ -18,55 +18,8 @@ pub const ION_MOBILITY_SCAN_TERMS: [mzdata::params::CURIE; 4] = [
     mzdata::curie!(MS:1003371),
 ];
 
-/// A controlled vocabulary or user parameter similar to [`mzdata::params::Param`]
-///
-/// This can be inter-converted with [`mzdata::params::Param`], though it is not a
-/// zero-copy operation.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Param {
-    /// The name, if given
-    pub name: Option<String>,
-    /// The accession code for the term
-    pub accession: Option<CURIE>,
-    /// A wide variant value type
-    pub value: ParamValueSplit,
-    /// The accession code for the unit
-    pub unit: Option<CURIE>,
-}
 
 pub type CURIE = mzdata::params::CURIE;
-
-impl From<Param> for mzdata::Param {
-    fn from(value: Param) -> Self {
-        let mut builder = mzdata::Param::builder();
-        if let Some(curie) = value.accession {
-            builder = builder.curie(curie.into())
-        }
-        if let Some(name) = value.name {
-            builder = builder.name(name)
-        }
-        if let Some(unit) = value.unit {
-            builder = builder.unit(Unit::from_curie(&unit.into()))
-        }
-        builder.value(value.value).build()
-    }
-}
-
-impl From<&Param> for mzdata::Param {
-    fn from(value: &Param) -> Self {
-        let mut builder = mzdata::Param::builder();
-        if let Some(curie) = value.accession {
-            builder = builder.curie(curie.into())
-        }
-        if let Some(name) = value.name.clone() {
-            builder = builder.name(name)
-        }
-        if let Some(unit) = value.unit {
-            builder = builder.unit(Unit::from_curie(&unit.into()))
-        }
-        builder.value(value.value.clone()).build()
-    }
-}
 
 pub use mzdata::curie;
 
@@ -224,63 +177,6 @@ where
     deserializer.deserialize_str(CURIEVisit {})
 }
 
-/// A wide-variant of [`mzdata::params::Value`] that can hold any strongly typed
-/// parameter value.
-///
-/// The space of the other type variants is still allocated, which makes this structure
-/// inefficient.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
-pub struct ParamValueSplit {
-    pub integer: Option<i64>,
-    pub float: Option<f64>,
-    pub boolean: Option<bool>,
-    pub string: Option<String>,
-}
-
-impl From<ParamValueSplit> for mzdata::params::Value {
-    fn from(value: ParamValueSplit) -> Self {
-        if let Some(val) = value.boolean {
-            mzdata::params::Value::Boolean(val)
-        } else if let Some(val) = value.float {
-            mzdata::params::Value::Float(val)
-        } else if let Some(val) = value.integer {
-            mzdata::params::Value::Int(val)
-        } else if let Some(val) = value.string {
-            mzdata::params::Value::String(val)
-        } else {
-            mzdata::params::Value::Empty
-        }
-    }
-}
-
-impl From<mzdata::params::Value> for ParamValueSplit {
-    fn from(value: mzdata::params::Value) -> Self {
-        let mut this = Self::default();
-        match value {
-            mzdata::params::Value::String(val) => this.string = Some(val),
-            mzdata::params::Value::Float(val) => this.float = Some(val),
-            mzdata::params::Value::Int(val) => this.integer = Some(val),
-            mzdata::params::Value::Buffer(_) => todo!(),
-            mzdata::params::Value::Boolean(val) => this.boolean = Some(val),
-            mzdata::params::Value::Empty => {}
-        }
-        this
-    }
-}
-
-impl From<mzdata::Param> for Param {
-    fn from(value: mzdata::Param) -> Self {
-        let curie = value.curie().map(CURIE::from);
-        let val = ParamValueSplit::from(value.value);
-        Self {
-            name: Some(value.name),
-            accession: curie,
-            value: val,
-            unit: value.unit.to_curie().map(CURIE::from),
-        }
-    }
-}
-
 /// A [`serde_json`]-friendly version of [`Param`] that uses
 /// [`serde_json::Value`] instead of [`ParamValueSplit`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
@@ -355,76 +251,6 @@ impl From<mzdata::Param> for MetaParam {
     }
 }
 
-impl From<ParamValueSplit> for serde_json::Value {
-    fn from(value: ParamValueSplit) -> Self {
-        if let Some(val) = value.boolean {
-            Self::from(val)
-        } else if let Some(val) = value.float {
-            Self::from(val)
-        } else if let Some(val) = value.integer {
-            Self::Number(serde_json::Number::from_i128(val as i128).unwrap())
-        } else if let Some(val) = value.string {
-            Self::from(val)
-        } else {
-            Self::Null
-        }
-    }
-}
-
-impl From<serde_json::Value> for ParamValueSplit {
-    fn from(value: serde_json::Value) -> Self {
-        match value {
-            serde_json::Value::Null => Self::default(),
-            serde_json::Value::Bool(x) => Self {
-                boolean: Some(x),
-                ..Default::default()
-            },
-            serde_json::Value::Number(number) => {
-                if let Some(val) = number.as_f64() {
-                    Self {
-                        float: Some(val),
-                        ..Default::default()
-                    }
-                } else if let Some(val) = number.as_i64() {
-                    Self {
-                        integer: Some(val),
-                        ..Default::default()
-                    }
-                } else {
-                    todo!()
-                }
-            }
-            serde_json::Value::String(x) => Self {
-                string: Some(x),
-                ..Default::default()
-            },
-            serde_json::Value::Array(_values) => todo!(),
-            serde_json::Value::Object(_map) => todo!(),
-        }
-    }
-}
-
-impl From<MetaParam> for Param {
-    fn from(value: MetaParam) -> Self {
-        Self {
-            name: value.name,
-            accession: value.accession,
-            value: value.value.into(),
-            unit: value.unit,
-        }
-    }
-}
-
-impl From<Param> for MetaParam {
-    fn from(value: Param) -> Self {
-        Self {
-            name: value.name,
-            accession: value.accession,
-            value: value.value.into(),
-            unit: value.unit,
-        }
-    }
-}
 
 /// An adaptation of [`mzdata::meta::SourceFile`]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

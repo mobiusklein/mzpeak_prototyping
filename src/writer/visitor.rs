@@ -483,16 +483,6 @@ impl StructVisitor<mzdata::params::Value> for ParamValueBuilder {
     }
 }
 
-impl StructVisitor<crate::param::ParamValueSplit> for ParamValueBuilder {
-    fn append_value(&mut self, item: &crate::param::ParamValueSplit) -> bool {
-        self.string.append_option(item.string.as_ref());
-        self.integer.append_option(item.integer);
-        self.float.append_option(item.float);
-        self.boolean.append_option(item.boolean);
-        true
-    }
-}
-
 impl ArrayBuilder for ParamValueBuilder {
     fn len(&self) -> usize {
         self.string.len()
@@ -556,15 +546,6 @@ impl VisitorBase for ParamBuilder {
         self.curie.append_null();
         self.name.append_null();
         self.unit.append_null();
-    }
-}
-
-impl StructVisitor<crate::param::Param> for ParamBuilder {
-    fn append_value(&mut self, item: &crate::param::Param) -> bool {
-        self.name.append_option(item.name.as_ref());
-        self.curie.append_option(item.accession.as_ref());
-        self.unit.append_option(item.unit.as_ref());
-        self.value.append_value(&item.value)
     }
 }
 
