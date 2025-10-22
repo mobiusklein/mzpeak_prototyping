@@ -9,6 +9,7 @@ use arrow::{
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
 use mzdata::{
+    curie,
     params::{Unit, CURIE},
     prelude::*,
     spectrum::{Chromatogram, ScanPolarity, SpectrumDescription},
@@ -362,80 +363,6 @@ impl ArrayBuilder for CustomBuilderFromParameter {
     }
 }
 
-#[allow(unused)]
-#[derive(Debug, Default)]
-pub struct CURIEStructBuilder {
-    cv_id: UInt8Builder,
-    accession: UInt32Builder,
-}
-
-impl VisitorBase for CURIEStructBuilder {
-    fn fields(&self) -> Vec<FieldRef> {
-        vec![
-            field!("cv_id", DataType::UInt8),
-            field!("accession", DataType::UInt32),
-        ]
-    }
-
-    fn append_null(&mut self) {
-        self.cv_id.append_null();
-        self.accession.append_null();
-    }
-}
-
-impl StructVisitor<crate::CURIE> for CURIEStructBuilder {
-    fn append_value(&mut self, item: &crate::CURIE) -> bool {
-        self.cv_id.append_value(item.cv_id);
-        self.accession.append_value(item.accession);
-        true
-    }
-}
-
-impl StructVisitor<mzdata::params::CURIE> for CURIEStructBuilder {
-    fn append_value(&mut self, item: &mzdata::params::CURIE) -> bool {
-        let item: crate::CURIE = (*item).into();
-        self.append_value(&item)
-    }
-}
-
-impl StructVisitor<&str> for CURIEStructBuilder {
-    fn append_value(&mut self, item: &&str) -> bool {
-        let val: mzdata::params::CURIE = item.parse().unwrap();
-        self.append_value(&val)
-    }
-}
-
-impl ArrayBuilder for CURIEStructBuilder {
-    fn len(&self) -> usize {
-        self.cv_id.len()
-    }
-
-    fn finish(&mut self) -> ArrayRef {
-        Arc::new(StructArray::new(
-            self.fields().into(),
-            vec![
-                Arc::new(self.cv_id.finish()),
-                Arc::new(self.accession.finish()),
-            ],
-            None,
-        ))
-    }
-
-    fn finish_cloned(&self) -> ArrayRef {
-        Arc::new(StructArray::new(
-            self.fields().into(),
-            vec![
-                Arc::new(self.cv_id.finish_cloned()),
-                Arc::new(self.accession.finish_cloned()),
-            ],
-            None,
-        ))
-    }
-
-    anyways!();
-}
-
-#[allow(unused)]
 #[derive(Debug, Default)]
 pub struct CURIEStrBuilder(StringBuilder);
 
@@ -455,14 +382,6 @@ impl VisitorBase for CURIEStrBuilder {
 
 impl StructVisitor<mzdata::params::CURIE> for CURIEStrBuilder {
     fn append_value(&mut self, item: &mzdata::params::CURIE) -> bool {
-        let item = item.to_string();
-        self.0.append_value(&item);
-        true
-    }
-}
-
-impl StructVisitor<crate::param::CURIE> for CURIEStrBuilder {
-    fn append_value(&mut self, item: &crate::param::CURIE) -> bool {
         let item = item.to_string();
         self.0.append_value(&item);
         true
@@ -492,7 +411,6 @@ impl ArrayBuilder for CURIEStrBuilder {
     anyways!();
 }
 
-// pub type CURIEBuilder = CURIEStructBuilder;
 pub type CURIEBuilder = CURIEStrBuilder;
 
 #[derive(Debug, Default)]
@@ -1666,8 +1584,8 @@ impl SpectrumDetailsBuilder {
                 0 => {
                     panic!("Couldn't infer spectrum type from MS level, no explicit type specified")
                 }
-                1 => crate::curie!(MS:1000579),
-                _ => crate::curie!(MS:1000580),
+                1 => curie!(MS:1000579),
+                _ => curie!(MS:1000580),
             }
         };
 
@@ -1682,9 +1600,9 @@ impl SpectrumDetailsBuilder {
         });
         self.mz_signal_continuity
             .append_value(&match item.signal_continuity() {
-                mzdata::spectrum::SignalContinuity::Unknown => crate::curie!(MS:1000525),
-                mzdata::spectrum::SignalContinuity::Centroid => crate::curie!(MS:1000127),
-                mzdata::spectrum::SignalContinuity::Profile => crate::curie!(MS:1000128),
+                mzdata::spectrum::SignalContinuity::Unknown => curie!(MS:1000525),
+                mzdata::spectrum::SignalContinuity::Centroid => curie!(MS:1000127),
+                mzdata::spectrum::SignalContinuity::Profile => curie!(MS:1000128),
             });
 
         self.spectrum_type.append_value(&spectrum_type);

@@ -14,6 +14,7 @@ use arrow::{
 };
 use itertools::Itertools;
 use mzdata::{
+    curie,
     meta::SpectrumType,
     params::{ControlledVocabulary, Unit},
     prelude::*,
@@ -285,9 +286,9 @@ impl<'a> MzSpectrumVisitor<'a> {
             };
             let continuity_curie = continuity_array.value(i).unwrap();
             descr.signal_continuity = match continuity_curie {
-                crate::curie!(MS:1000525) => mzdata::spectrum::SignalContinuity::Unknown,
-                crate::curie!(MS:1000127) => mzdata::spectrum::SignalContinuity::Centroid,
-                crate::curie!(MS:1000128) => mzdata::spectrum::SignalContinuity::Profile,
+                curie!(MS:1000525) => mzdata::spectrum::SignalContinuity::Unknown,
+                curie!(MS:1000127) => mzdata::spectrum::SignalContinuity::Centroid,
+                curie!(MS:1000128) => mzdata::spectrum::SignalContinuity::Profile,
                 _ => todo!("Don't know how to deal with {continuity_curie}"),
             };
         }
@@ -503,43 +504,43 @@ impl<'a> MzSpectrumVisitor<'a> {
             log::trace!("Visiting spectrum {col:?}");
             if let Some(accession) = col.accession {
                 match accession {
-                    crate::curie!(MS:1000511) => {
+                    curie!(MS:1000511) => {
                         self.visit_ms_level(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000465) => {
+                    curie!(MS:1000465) => {
                         self.visit_polarity(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000525) => {
+                    curie!(MS:1000525) => {
                         self.visit_mz_signal_continuity(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000559) => {
+                    curie!(MS:1000559) => {
                         self.visit_spectrum_type(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000528) => {
+                    curie!(MS:1000528) => {
                         self.visit_lowest_mz(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000527) => {
+                    curie!(MS:1000527) => {
                         self.visit_highest_mz(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000504) => {
+                    curie!(MS:1000504) => {
                         self.visit_base_peak_mz(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000505) => {
+                    curie!(MS:1000505) => {
                         self.visit_base_peak_intensity(spec_arr, col.index, col);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000285) => {
+                    curie!(MS:1000285) => {
                         self.visit_total_ion_current(spec_arr, col.index, col);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1003060) => {
+                    curie!(MS:1003060) => {
                         // number of data points
                         visited[col.index] = true;
                     }
@@ -551,12 +552,12 @@ impl<'a> MzSpectrumVisitor<'a> {
             }
         }
         const SKIP_PARAMS: [CURIE; 6] = [
-            crate::curie!(MS:1000505),
-            crate::curie!(MS:1000504),
-            crate::curie!(MS:1000257),
-            crate::curie!(MS:1000285),
-            crate::curie!(MS:1000527),
-            crate::curie!(MS:1000528),
+            curie!(MS:1000505),
+            curie!(MS:1000504),
+            curie!(MS:1000257),
+            curie!(MS:1000285),
+            curie!(MS:1000527),
+            curie!(MS:1000528),
         ];
 
         for (_, (index, colname)) in visited
@@ -695,7 +696,11 @@ impl<'a> CURIEArray<'a> {
             None
         } else {
             Some(CURIE::new(
-                self.cv_id.value(index),
+                match self.cv_id.value(index) {
+                    1 => ControlledVocabulary::MS,
+                    2 => ControlledVocabulary::UO,
+                    x => panic!("Bad old CV ID {x}"),
+                },
                 self.accession.value(index),
             ))
         }
@@ -1516,7 +1521,7 @@ impl<'a> MzScanVisitor<'a> {
             let im_tp = ion_mobility_types[i].unwrap();
             match im_tp {
                 // ion mobility drift time
-                crate::curie!(MS:1002476) => descr.add_param(
+                curie!(MS:1002476) => descr.add_param(
                     mzdata::Param::builder()
                         .name("ion mobility drift time")
                         .curie(mzdata::curie!(MS:1002476))
@@ -1525,7 +1530,7 @@ impl<'a> MzScanVisitor<'a> {
                         .build(),
                 ),
                 // inverse reduced ion mobility drift time
-                crate::curie!(MS:1002815) => {
+                curie!(MS:1002815) => {
                     descr.add_param(
                         mzdata::Param::builder()
                             .name("inverse reduced ion mobility drift time")
@@ -1536,7 +1541,7 @@ impl<'a> MzScanVisitor<'a> {
                     )
                 }
                 // FAIMS compensation voltage
-                crate::curie!(MS:1001581) => {
+                curie!(MS:1001581) => {
                     descr.add_param(
                         mzdata::Param::builder()
                             .name("FAIMS compensation voltage")
@@ -1547,7 +1552,7 @@ impl<'a> MzScanVisitor<'a> {
                     )
                 }
                 // SELEXION compensation voltage
-                crate::curie!(MS:1003371) => {
+                curie!(MS:1003371) => {
                     descr.add_param(
                         mzdata::Param::builder()
                             .name("SELEXION compensation voltage")
@@ -1591,15 +1596,15 @@ impl<'a> MzScanVisitor<'a> {
             log::trace!("Visiting scan {col:?}");
             if let Some(accession) = col.accession {
                 match accession {
-                    crate::curie!(MS:1000512) => {
+                    curie!(MS:1000512) => {
                         self.visit_filter_string(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000616) => {
+                    curie!(MS:1000616) => {
                         self.visit_preset_scan_configuration(spec_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000016) => {
+                    curie!(MS:1000016) => {
                         let unit = match &col.unit {
                             crate::param::PathOrCURIE::Path(_items) => todo!(),
                             crate::param::PathOrCURIE::CURIE(curie) => {
@@ -1610,7 +1615,7 @@ impl<'a> MzScanVisitor<'a> {
                         self.visit_scan_start_time(spec_arr, col.index, unit);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000927) => {
+                    curie!(MS:1000927) => {
                         self.visit_injection_time(spec_arr, col.index);
                         visited[col.index] = true;
                     }
@@ -2027,7 +2032,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
             let im_tp = ion_mobility_types[i].unwrap();
             match im_tp {
                 // ion mobility drift time
-                crate::curie!(MS:1002476) => descr.add_param(
+                curie!(MS:1002476) => descr.add_param(
                     mzdata::Param::builder()
                         .name("ion mobility drift time")
                         .curie(mzdata::curie!(MS:1002476))
@@ -2036,7 +2041,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
                         .build(),
                 ),
                 // inverse reduced ion mobility drift time
-                crate::curie!(MS:1002815) => {
+                curie!(MS:1002815) => {
                     descr.add_param(
                         mzdata::Param::builder()
                             .name("inverse reduced ion mobility drift time")
@@ -2047,7 +2052,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
                     )
                 }
                 // FAIMS compensation voltage
-                crate::curie!(MS:1001581) => {
+                curie!(MS:1001581) => {
                     descr.add_param(
                         mzdata::Param::builder()
                             .name("FAIMS compensation voltage")
@@ -2058,7 +2063,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
                     )
                 }
                 // SELEXION compensation voltage
-                crate::curie!(MS:1003371) => {
+                curie!(MS:1003371) => {
                     descr.add_param(
                         mzdata::Param::builder()
                             .name("SELEXION compensation voltage")
@@ -2110,15 +2115,15 @@ impl<'a> MzSelectedIonVisitor<'a> {
             log::trace!("Visiting selected ion {col:?}");
             if let Some(accession) = col.accession {
                 match accession {
-                    crate::curie!(MS:1000744) => {
+                    curie!(MS:1000744) => {
                         self.visit_selected_ion_mz(spec_arr, col.index);
                         visited[col.index];
                     }
-                    crate::curie!(MS:1000041) => {
+                    curie!(MS:1000041) => {
                         self.visit_charge(spec_arr, col.index);
                         visited[col.index];
                     }
-                    crate::curie!(MS:1000042) => {
+                    curie!(MS:1000042) => {
                         self.visit_peak_intensity(spec_arr, col.index);
                         visited[col.index];
                     }
@@ -2288,16 +2293,16 @@ impl<'a> MzChromatogramBuilder<'a> {
             log::trace!("Visiting chromatogram {col:?}");
             if let Some(accession) = col.accession {
                 match accession {
-                    crate::curie!(MS:1000465) => {
+                    curie!(MS:1000465) => {
                         self.visit_polarity(chrom_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1000626) => {
+                    curie!(MS:1000626) => {
                         // chromatogram type
                         self.visit_chromatogram_type(chrom_arr, col.index);
                         visited[col.index] = true;
                     }
-                    crate::curie!(MS:1003060) => {
+                    curie!(MS:1003060) => {
                         // number of data points
                         visited[col.index] = true;
                     }

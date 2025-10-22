@@ -8,8 +8,7 @@ use mzdata::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    curie,
-    param::{CURIE, MetadataColumn, Param},
+    param::{CURIE, MetadataColumn, Param, curie},
 };
 
 macro_rules! metacol {
@@ -23,7 +22,7 @@ macro_rules! metacol {
     };
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuxiliaryArray {
     pub data: Vec<u8>,
     pub name: Param,
@@ -209,7 +208,7 @@ impl SpectrumEntry {
                 "number of data points",
                 vec!["spectrum", "number_of_data_points"],
                 13,
-                crate::curie!(MS:1003060)
+                curie!(MS:1003060)
             ),
             MetadataColumn::new(
                 "base peak m/z".into(),
@@ -246,26 +245,26 @@ impl ScanEntry {
                 "scan start time",
                 ["scan", "scan_start_time"],
                 1,
-                crate::curie!(MS:1000016)
+                curie!(MS:1000016)
             )
             .with_unit(Unit::Minute),
             metacol!(
                 "preset scan configuration",
                 ["scan", "preset_scan_configuration"],
                 2,
-                crate::curie!(MS:1000616)
+                curie!(MS:1000616)
             ),
             metacol!(
                 "filter string",
                 ["scan", "filter_string"],
                 3,
-                crate::curie!(MS:1000512)
+                curie!(MS:1000512)
             ),
             metacol!(
                 "ion injection time",
                 ["scan", "ion_injection_time"],
                 4,
-                crate::curie!(MS:1000927)
+                curie!(MS:1000927)
             )
             .with_unit(Unit::Millisecond),
         ]
@@ -322,7 +321,7 @@ impl ChromatogramEntry {
                 "number of data points",
                 vec!["chromatogram", "number_of_data_points"],
                 4,
-                crate::curie!(MS:1003060)
+                curie!(MS:1003060)
             ),
         ]
     }

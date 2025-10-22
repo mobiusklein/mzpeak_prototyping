@@ -1,6 +1,4 @@
-use std::{fmt::Display, str::FromStr};
-
-use mzdata::params::{ControlledVocabulary, ParamDescribed, ParamLike, Unit};
+use mzdata::params::{ParamDescribed, ParamLike, Unit};
 use serde::{Deserialize, Serialize, ser::SerializeSeq};
 
 /// Numerical identifier for "Proteomics Standards Initiative Mass Spectrometry Ontology"
@@ -24,7 +22,7 @@ pub const ION_MOBILITY_SCAN_TERMS: [mzdata::params::CURIE; 4] = [
 ///
 /// This can be inter-converted with [`mzdata::params::Param`], though it is not a
 /// zero-copy operation.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, PartialOrd)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Param {
     /// The name, if given
     pub name: Option<String>,
@@ -36,51 +34,7 @@ pub struct Param {
     pub unit: Option<CURIE>,
 }
 
-/// A numerical encoding of a CURIE accession similar to [`mzdata::params::CURIE`]
-#[derive(
-    Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub struct CURIE {
-    pub cv_id: u8,
-    pub accession: u32,
-}
-
-impl CURIE {
-    pub fn format_with_namespace(&self, cvs: &[ControlledVocabulary]) -> Option<String> {
-        let cv = cvs.get(self.cv_id.saturating_sub(1) as usize)?;
-        Some(cv.curie(self.accession).to_string())
-    }
-
-    pub fn parse_with_namespace(
-        text: &str,
-        cvs: &[ControlledVocabulary],
-    ) -> Result<Self, mzdata::params::CURIEParsingError> {
-        let inst = mzdata::params::CURIE::from_str(text)?;
-        if let Some(i) = cvs.iter().position(|i| *i == inst.controlled_vocabulary) {
-            Ok(Self::new(i as u8, inst.accession))
-        } else {
-            Err(mzdata::params::CURIEParsingError::UnknownControlledVocabulary(
-                mzdata::params::ControlledVocabularyResolutionError::UnknownControlledVocabulary(
-                    format!("{:?}", inst.controlled_vocabulary)
-                )))
-        }
-    }
-}
-
-impl FromStr for CURIE {
-    type Err = mzdata::params::CURIEParsingError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(s.parse::<mzdata::params::CURIE>()?.into())
-    }
-}
-
-impl Display for CURIE {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let alt: mzdata::params::CURIE = (*self).into();
-        alt.fmt(f)
-    }
-}
+pub type CURIE = mzdata::params::CURIE;
 
 impl From<Param> for mzdata::Param {
     fn from(value: Param) -> Self {
@@ -114,65 +68,7 @@ impl From<&Param> for mzdata::Param {
     }
 }
 
-#[macro_export]
-macro_rules! curie {
-    (MS:$acc:literal) => {
-        $crate::CURIE {
-            cv_id: 1,
-            accession: $acc,
-        }
-    };
-    (UO:$acc:literal) => {
-        $crate::CURIE {
-            cv_id: 2,
-            accession: $acc,
-        }
-    };
-}
-
-impl From<mzdata::params::CURIE> for CURIE {
-    fn from(value: mzdata::params::CURIE) -> Self {
-        let cv_id = match value.controlled_vocabulary {
-            mzdata::params::ControlledVocabulary::MS => 1,
-            mzdata::params::ControlledVocabulary::UO => 2,
-            mzdata::params::ControlledVocabulary::EFO => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::OBI => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::HANCESTRO => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::BFO => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::NCIT => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::BTO => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::PRIDE => panic!("Unsupported CV in {value}"),
-            mzdata::params::ControlledVocabulary::Unknown => panic!("Unsupported CV in {value}"),
-        };
-
-        Self {
-            cv_id,
-            accession: value.accession,
-        }
-    }
-}
-
-impl From<CURIE> for mzdata::params::CURIE {
-    fn from(value: CURIE) -> Self {
-        Self {
-            controlled_vocabulary: match value.cv_id {
-                1 => mzdata::params::ControlledVocabulary::MS,
-                2 => mzdata::params::ControlledVocabulary::UO,
-                _ => todo!(
-                    "Could not infer controlled vocabulary from {} yet",
-                    value.cv_id
-                ),
-            },
-            accession: value.accession,
-        }
-    }
-}
-
-impl CURIE {
-    pub fn new(cv_id: u8, accession: u32) -> Self {
-        Self { cv_id, accession }
-    }
-}
+pub use mzdata::curie;
 
 // Provide a way to JSON-serialize CURIEs as nullable string
 pub(crate) fn opt_curie_serialize<S>(
@@ -412,12 +308,8 @@ impl From<MetaParam> for mzdata::Param {
             .map(|acc| Unit::from_curie(&(acc.into())))
             .unwrap_or_default();
         if let Some(curie) = value.accession {
+            this.controlled_vocabulary = Some(curie.controlled_vocabulary);
             this.accession = Some(curie.accession);
-            this.controlled_vocabulary = match curie.cv_id {
-                MS_CV_ID => Some(ControlledVocabulary::MS),
-                UO_CV_ID => Some(ControlledVocabulary::UO),
-                _ => None,
-            }
         }
         this.value = match value.value {
             serde_json::Value::Null => mzdata::params::Value::Empty,
@@ -837,7 +729,7 @@ impl From<&mzdata::meta::Sample> for Sample {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum PathOrCURIE {
     Path(Vec<String>),
     CURIE(CURIE),

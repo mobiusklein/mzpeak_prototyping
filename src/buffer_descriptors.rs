@@ -622,7 +622,7 @@ impl Display for BufferName {
 /// A JSON-serializable version of [`ArrayIndexEntry`].
 ///
 /// They can be inter-converted
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedArrayIndexEntry {
     pub context: String,
     pub prefix: String,
