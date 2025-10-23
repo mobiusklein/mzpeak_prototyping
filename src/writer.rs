@@ -213,6 +213,7 @@ pub fn sample_array_types_from_file_reader<
     return _eval_spectra_from_iter_for_fields(it, overrides, use_chunked_encoding);
 }
 
+/// Write an mzPeak archive to an uncompressed ZIP archive
 pub struct MzPeakWriterType<
     W: Write + Send + Seek,
     C: CentroidLike + ToMzPeakDataSeries = CentroidPeak,
@@ -639,3 +640,6 @@ impl<
         Ok(())
     }
 }
+
+
+pub type MzPeakWriter<W> = MzPeakWriterType<W, CentroidPeak, DeconvolutedPeak>;

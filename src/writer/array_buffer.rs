@@ -634,6 +634,7 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
     }
 }
 
+/// A builder for [`ArrayBufferWriter`] types.
 #[derive(Debug)]
 pub struct ArrayBuffersBuilder {
     prefix: String,
@@ -643,6 +644,7 @@ pub struct ArrayBuffersBuilder {
     include_time: bool,
 }
 
+/// The builder will default to the `point` layout
 impl Default for ArrayBuffersBuilder {
     fn default() -> Self {
         Self {
@@ -656,6 +658,9 @@ impl Default for ArrayBuffersBuilder {
 }
 
 impl ArrayBuffersBuilder {
+
+    /// Set the prefix for the data structure, all other arrays will be nested under a group/struct
+    /// with this name.
     pub fn prefix(mut self, value: impl ToString) -> Self {
         self.prefix = value.to_string();
         self

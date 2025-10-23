@@ -9,11 +9,15 @@ use std::{fmt::Debug, path::PathBuf};
 use std::{io::prelude::*, sync::Arc};
 
 use crate::{
-    BufferContext, BufferName, MzPeakWriterType, ToMzPeakDataSeries,
+    BufferContext, BufferName, ToMzPeakDataSeries,
     chunk_series::ChunkingStrategy,
-    writer::{ArrayBuffersBuilder, UnpackedMzPeakWriterType},
+    writer::{ArrayBuffersBuilder, MzPeakWriterType, UnpackedMzPeakWriterType},
 };
 
+/// A builder for mzPeak writers
+///
+/// This allows the caller to configure array content types, compression settings,
+/// and data layout.
 #[derive(Debug)]
 pub struct MzPeakWriterBuilder {
     spectrum_arrays: ArrayBuffersBuilder,
@@ -47,7 +51,10 @@ impl MzPeakWriterBuilder {
         self
     }
 
-    /// Add a column to the spectrum data file holding the spectrum's time in addition to the index
+    /// Add a column to the spectrum data file holding the spectrum's time in addition to the index.
+    ///
+    /// This is a convenience feature for building queries along the time spectrum peak/signal data,
+    /// as building a covering index from the metadata table is just as efficient.
     pub fn include_time_with_spectrum_data(mut self, include_time: bool) -> Self {
         self.spectrum_arrays = self.spectrum_arrays.include_time(include_time);
         self
@@ -77,7 +84,7 @@ impl MzPeakWriterBuilder {
         self
     }
 
-    /// Shuffle m/z arrays using [`Encoding::BYTE_STREAM_SPLIT`] encoding
+    /// Shuffle m/z arrays using [`Encoding::BYTE_STREAM_SPLIT`] encoding (or not)
     pub fn shuffle_mz(mut self, shuffle_mz: bool) -> Self {
         self.shuffle_mz = shuffle_mz;
         self
@@ -128,6 +135,7 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    /// Specify the schema prefix for chromatogram data
     pub fn chromatogram_data_prefix(mut self, value: impl ToString) -> Self {
         self.chromatogram_arrays = self.chromatogram_arrays.prefix(value);
         self
@@ -139,7 +147,8 @@ impl MzPeakWriterBuilder {
         self
     }
 
-    /// Build an unpacked writer
+    /// Build an unpacked writer, a directory on disk where all files can be written to at once,
+    /// but may be more work to move about.
     pub fn build_unpacked(
         self,
         path: PathBuf,
@@ -158,7 +167,8 @@ impl MzPeakWriterBuilder {
         )
     }
 
-    /// Build a zip archive-packed writer
+    /// Build a zip archive-packed writer, where the spectrum data facet is written to disk
+    /// and all other facets are buffered in memory until the spectrum data facet is complete.
     pub fn build<W: Write + Send + Seek>(
         self,
         writer: W,
@@ -177,6 +187,7 @@ impl MzPeakWriterBuilder {
         )
     }
 
+    /// Add the default time (f64) and intensity (f32) arrays for chromatograms
     pub fn add_default_chromatogram_fields(mut self) -> Self {
         let time = BufferName::new(
             BufferContext::Chromatogram,

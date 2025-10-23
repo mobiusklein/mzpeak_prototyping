@@ -13,4 +13,4 @@ pub mod filter;
 pub use param::{CURIE, ION_MOBILITY_SCAN_TERMS, MS_CV_ID};
 pub use peak_series::{BufferContext, BufferName, ToMzPeakDataSeries};
 pub use reader::MzPeakReader;
-pub use writer::MzPeakWriterType;
+pub use writer::MzPeakWriter;

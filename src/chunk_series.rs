@@ -12,6 +12,7 @@ use arrow::datatypes::{
     DataType, Field, Fields, Float32Type, Float64Type, Int32Type, Int64Type, Schema, UInt8Type,
 };
 use itertools::Itertools;
+use mzdata::params::CURIE;
 use mzdata::prelude::ByteArrayView;
 use mzdata::spectrum::{
     ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, bindata::ArrayRetrievalError,
@@ -96,10 +97,10 @@ pub fn delta_decode<T: Float + Pod + AddAssign>(
     }
 }
 
-pub const NO_COMPRESSION: mzdata::params::CURIE = mzdata::curie!(MS:1000576);
-pub const DELTA_ENCODE: mzdata::params::CURIE = mzdata::curie!(MS:1003089);
-pub const NUMPRESS_LINEAR: mzdata::params::CURIE = mzdata::curie!(MS:1002312);
-pub const NUMPRESS_SLOF: mzdata::params::CURIE = mzdata::curie!(MS:1002314);
+pub const NO_COMPRESSION: CURIE = mzdata::curie!(MS:1000576);
+pub const DELTA_ENCODE: CURIE = mzdata::curie!(MS:1003089);
+pub const NUMPRESS_LINEAR: CURIE = mzdata::curie!(MS:1002312);
+pub const NUMPRESS_SLOF: CURIE = mzdata::curie!(MS:1002314);
 
 /// Different methods for encoding chunks along a coordinate dimension
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,7 +121,7 @@ pub enum ChunkingStrategy {
 
 impl ChunkingStrategy {
     /// Convert the chunking stategy to a CURIE
-    pub const fn as_curie(&self) -> mzdata::params::CURIE {
+    pub const fn as_curie(&self) -> CURIE {
         match self {
             Self::Basic { chunk_size: _ } => NO_COMPRESSION,
             Self::Delta { chunk_size: _ } => DELTA_ENCODE,
