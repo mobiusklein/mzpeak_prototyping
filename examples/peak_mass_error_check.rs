@@ -20,15 +20,17 @@ struct PeakError {
     spec_mz: f64,
     diff: f64,
     numpress_diff: f64,
+    intensity: f32,
 }
 
 impl PeakError {
-    fn new(spectrum_index: usize, spec_mz: f64, diff: f64, numpress_diff: f64) -> Self {
+    fn new(spectrum_index: usize, spec_mz: f64, diff: f64, numpress_diff: f64, intensity: f32) -> Self {
         Self {
             spectrum_index,
             spec_mz,
             diff,
             numpress_diff,
+            intensity,
         }
     }
 }
@@ -155,7 +157,7 @@ fn main() -> io::Result<()> {
                 .zip(ref_peaks.iter())
                 .zip(numpress_peaks.iter())
             {
-                let e = PeakError::new(spec.index(), rp.mz, rp.mz - up.mz, rp.mz - np.mz);
+                let e = PeakError::new(spec.index(), rp.mz, rp.mz - up.mz, rp.mz - np.mz, rp.intensity);
                 errors.push(e);
                 if (rp.mz - up.mz).abs() > 0.001 {
                     println!(

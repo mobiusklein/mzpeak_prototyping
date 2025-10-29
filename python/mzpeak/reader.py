@@ -17,7 +17,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
-from .mz_reader import _ChunkIterator, MzPeakArrayDataReader, BufferFormat
+from .mz_reader import _BatchIterator, MzPeakArrayDataReader, BufferFormat
 from .file_index import FileIndex, DataKind, EntityType
 
 logger = logging.getLogger(__name__)
@@ -517,7 +517,7 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
     archive: "MzPeakFile"
     index: int
     buffer_format: BufferFormat
-    data_iter: _ChunkIterator
+    data_iter: _BatchIterator
     peeked: tuple[int, pa.StructArray] | None
 
     def __init__(self, archive: "MzPeakFile"):
@@ -531,20 +531,26 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
     def _make_data_iter(self):
         if self.buffer_format == BufferFormat.Point:
             it = self.archive.spectrum_data.handle.iter_batches(columns=["point"])
-            self.data_iter = _ChunkIterator(it, self.index)
+            self.data_iter = _BatchIterator(it, self.index)
         elif self.buffer_format == BufferFormat.Chunk:
             it = self.archive.spectrum_data.handle.iter_batches(128, columns=['chunk'])
-            self.data_iter = _ChunkIterator(it, self.index)
+            self.data_iter = _BatchIterator(it, self.index)
         else:
             raise ValueError(self.buffer_format)
 
     def _format_data_buffer(self, index: int, buffers: pa.StructArray):
         if self.buffer_format == BufferFormat.Point:
             return self.archive.spectrum_data._clean_point_batch(
-                buffers, self.archive.spectrum_data._delta_model_series[index] if self.archive.spectrum_data._delta_model_series is not None else None
+                buffers,
+                self.archive.spectrum_data._delta_model_series[index] if self.archive.spectrum_data._delta_model_series is not None else None
             )
         elif self.buffer_format == BufferFormat.Chunk:
-            return self.archive.spectrum_data._expand_chunks(buffers)
+            return self.archive.spectrum_data._expand_chunks(
+                buffers,
+                delta_model=self.archive.spectrum_data._delta_model_series[index]
+                if self.archive.spectrum_data._delta_model_series is not None
+                else None,
+            )
         else:
             raise ValueError(self.buffer_format)
 

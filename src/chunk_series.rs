@@ -270,9 +270,13 @@ impl ChunkingStrategy {
         &self,
         array: &ArrayRef,
         start_value: f64,
+        end_value: f64,
         accumulator: &mut DataArray,
         delta_model: Option<&RegressionDeltaModel<f64>>,
     ) {
+        if start_value == 0.0 && end_value == 0.0 {
+            return;
+        }
         macro_rules! decode_delta {
             ($array:ident, $dtype:ty, $native:ty, $debug:literal) => {
                 let it = $array.as_primitive::<$dtype>();
@@ -1055,7 +1059,10 @@ mod test {
         io::{self, prelude::*},
     };
 
+    use crate::filter::{drop_where_column_is_zero, nullify_at_zero, MZDeltaModel};
+
     use super::*;
+    use arrow::array::RecordBatch;
     use mzdata::{MZReader, prelude::*};
 
     fn load_chunking_data() -> io::Result<Vec<f64>> {
@@ -1143,11 +1150,24 @@ mod test {
 
     #[test]
     fn test_encode_arrow_drop_zeros_null() -> io::Result<()> {
-        let arrays = get_arrays_from_mzml()?;
+        let mut arrays = get_arrays_from_mzml()?;
+        let arr = arrays.get_mut(&ArrayType::MZArray).unwrap();
+        arr.store_as(BinaryDataArrayType::Float64)?;
+
+        let mzs = arrays.mzs()?;
+        let intens: Vec<f64> = arrays
+            .intensities()?
+            .iter()
+            .map(|w| (*w).sqrt() as f64)
+            .collect();
+
+        let betas = crate::filter::select_delta_model(&mzs, Some(&intens));
+        let delta_model = RegressionDeltaModel::<f64>::from_f64_iter(betas.into_iter());
+
         let target = BufferName::new(
             BufferContext::Spectrum,
             ArrayType::MZArray,
-            BinaryDataArrayType::Float32,
+            BinaryDataArrayType::Float64,
         );
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
@@ -1168,7 +1188,7 @@ mod test {
             }
         }
 
-        ArrowArrayChunk::to_struct_array(
+        let rendered = ArrowArrayChunk::to_struct_array(
             &chunks,
             BufferContext::Spectrum,
             Schema::empty().fields(),
@@ -1178,6 +1198,72 @@ mod test {
             ],
             false,
         );
+
+        let start_values = rendered.column(1).as_primitive::<Float64Type>();
+        let end_values = rendered.column(2).as_primitive::<Float64Type>();
+        let chunk_values = rendered.column(3).as_list::<i64>();
+        let intensity_values = rendered.column(5).as_list::<i64>();
+
+        let intensity_values: Vec<f32> = intensity_values
+            .iter()
+            .flatten()
+            .map(|a| {
+                a.as_primitive::<Float32Type>()
+                    .iter()
+                    .map(|v| v.unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect();
+
+        let mut accumulator =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        for ((start_value, end_value), chunk_vals) in start_values
+            .iter()
+            .flatten()
+            .zip(end_values.iter().flatten())
+            .zip(chunk_values.iter().flatten())
+        {
+            ChunkingStrategy::Delta { chunk_size: 50.0 }.decode_arrow(
+                &chunk_vals,
+                start_value as f64,
+                end_value as f64,
+                &mut accumulator,
+                Some(&delta_model),
+            );
+        }
+
+        assert_eq!(accumulator.data_len()?, intensity_values.len());
+
+        let mz_array = Float64Array::from_iter_values(mzs.iter().copied());
+        let intensity_array = Float32Array::from_iter_values(intens.iter().map(|v| *v as f32));
+        let mini_schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("mz_array", DataType::Float64, true)),
+            Arc::new(Field::new("intensity_array", DataType::Float32, true)),
+        ]));
+
+        let batch = RecordBatch::try_new(mini_schema.clone(), vec![
+            Arc::new(mz_array) as ArrayRef,
+            Arc::new(intensity_array)
+        ]).unwrap();
+
+        let trimmed_batch1 = drop_where_column_is_zero(&batch, 1).unwrap();
+        let trimmed_batch = nullify_at_zero(&trimmed_batch1, 1, &[0, 1]).unwrap();
+
+        assert_eq!(trimmed_batch.num_rows(), accumulator.data_len()?);
+
+        let mz_acc = accumulator.to_f64()?;
+        let mz_ref = trimmed_batch.column(0).as_primitive::<Float64Type>();
+        let mz_ref = crate::filter::fill_nulls_for(mz_ref, &delta_model);
+
+        for ((i, a), b) in mz_acc.iter().copied().enumerate().zip(mz_ref.iter().copied()) {
+            if intensity_values[i] == 0.0 {
+                assert!((a - b).abs() < 1e-6, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+            } else {
+                assert_eq!(a, b, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+            }
+        }
+
         Ok(())
     }
 
@@ -1261,6 +1347,255 @@ mod test {
         );
 
         eprintln!("{:?}", rendered.slice(0, 1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_arrow_drop_zeros_null2() -> io::Result<()> {
+        let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_large_gaps.txt")?);
+        let mut mzs = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        let mut intensities = DataArray::from_name_and_type(&ArrayType::IntensityArray, BinaryDataArrayType::Float32);
+        for line in reader.lines().flatten() {
+            if let Some((a, b)) = line.split_once("\t") {
+                mzs.push(a.parse::<f64>().unwrap())?;
+                intensities.push(b.parse::<f32>().unwrap())?;
+            }
+        }
+
+        let mut arrays = BinaryArrayMap::new();
+        arrays.add(mzs);
+        arrays.add(intensities);
+
+        let mzs = arrays.mzs()?;
+        let weights: Vec<f64> = arrays
+            .intensities()?
+            .iter()
+            .map(|w| (*w).sqrt() as f64)
+            .collect();
+
+        let betas = crate::filter::select_delta_model(&mzs, Some(&weights));
+        let delta_model = RegressionDeltaModel::<f64>::from_f64_iter(betas.into_iter());
+
+        let target = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::MZArray,
+            BinaryDataArrayType::Float64,
+        );
+
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
+            0,
+            None,
+            target,
+            &arrays,
+            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &HashMap::new(),
+            true,
+            true,
+            None,
+        )?;
+
+        let rendered = ArrowArrayChunk::to_struct_array(
+            &chunks,
+            BufferContext::Spectrum,
+            Schema::empty().fields(),
+            &[
+                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                ChunkingStrategy::Delta { chunk_size: 50.0 },
+            ],
+            false,
+        );
+
+        let start_values = rendered.column(1).as_primitive::<Float64Type>();
+        let end_values = rendered.column(2).as_primitive::<Float64Type>();
+        let chunk_values = rendered.column(3).as_list::<i64>();
+        let intensity_values = rendered.column(5).as_list::<i64>();
+
+        let intensity_values: Vec<f32> = intensity_values
+            .iter()
+            .flatten()
+            .map(|a| {
+                a.as_primitive::<Float32Type>()
+                    .iter()
+                    .map(|v| v.unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect();
+
+        let mut accumulator =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        for ((start_value, end_value), chunk_vals) in start_values
+            .iter()
+            .flatten()
+            .zip(end_values.iter().flatten())
+            .zip(chunk_values.iter().flatten())
+        {
+            ChunkingStrategy::Delta { chunk_size: 50.0 }.decode_arrow(
+                &chunk_vals,
+                start_value as f64,
+                end_value as f64,
+                &mut accumulator,
+                Some(&delta_model),
+            );
+        }
+
+        assert_eq!(accumulator.data_len()?, intensity_values.len());
+
+        let intens = arrays.intensities()?;
+
+        let mz_array = Float64Array::from_iter_values(mzs.iter().copied());
+        let intensity_array = Float32Array::from_iter_values(intens.iter().map(|v| *v as f32));
+        let mini_schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("mz_array", DataType::Float64, true)),
+            Arc::new(Field::new("intensity_array", DataType::Float32, true)),
+        ]));
+
+        let batch = RecordBatch::try_new(mini_schema.clone(), vec![
+            Arc::new(mz_array) as ArrayRef,
+            Arc::new(intensity_array)
+        ]).unwrap();
+
+        let trimmed_batch1 = drop_where_column_is_zero(&batch, 1).unwrap();
+        let trimmed_batch = nullify_at_zero(&trimmed_batch1, 1, &[0, 1]).unwrap();
+
+        assert_eq!(trimmed_batch.num_rows(), accumulator.data_len()?);
+
+        let mz_acc = accumulator.to_f64()?;
+        let mz_ref = trimmed_batch.column(0).as_primitive::<Float64Type>();
+        let mz_ref = crate::filter::fill_nulls_for(mz_ref, &delta_model);
+
+        for ((i, a), b) in mz_acc.iter().copied().enumerate().zip(mz_ref.iter().copied()) {
+            if intensity_values[i] == 0.0 {
+                assert!((a - b).abs() < 1e-6, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+            } else {
+                assert_eq!(a, b, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_arrow_drop_zeros_null3() -> io::Result<()> {
+        let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_sciex.txt")?);
+        let mut mzs = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        let mut intensities = DataArray::from_name_and_type(&ArrayType::IntensityArray, BinaryDataArrayType::Float32);
+        for line in reader.lines().flatten() {
+            if let Some((a, b)) = line.split_once("\t") {
+                mzs.push(a.parse::<f64>().unwrap())?;
+                intensities.push(b.parse::<f32>().unwrap())?;
+            }
+        }
+
+        let mut arrays = BinaryArrayMap::new();
+        arrays.add(mzs);
+        arrays.add(intensities);
+
+        let mzs = arrays.mzs()?;
+        let weights: Vec<f64> = arrays
+            .intensities()?
+            .iter()
+            .map(|w| (*w).sqrt() as f64)
+            .collect();
+
+        let betas = crate::filter::select_delta_model(&mzs, Some(&weights));
+        let delta_model = RegressionDeltaModel::<f64>::from_f64_iter(betas.into_iter());
+
+        let target = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::MZArray,
+            BinaryDataArrayType::Float64,
+        );
+
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
+            0,
+            None,
+            target,
+            &arrays,
+            ChunkingStrategy::Delta { chunk_size: 50.0 },
+            &HashMap::new(),
+            true,
+            true,
+            None,
+        )?;
+
+        let rendered = ArrowArrayChunk::to_struct_array(
+            &chunks,
+            BufferContext::Spectrum,
+            Schema::empty().fields(),
+            &[
+                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                ChunkingStrategy::Delta { chunk_size: 50.0 },
+            ],
+            false,
+        );
+
+        let start_values = rendered.column(1).as_primitive::<Float64Type>();
+        let end_values = rendered.column(2).as_primitive::<Float64Type>();
+        let chunk_values = rendered.column(3).as_list::<i64>();
+        let intensity_values = rendered.column(5).as_list::<i64>();
+
+        let intensity_values: Vec<f32> = intensity_values
+            .iter()
+            .flatten()
+            .map(|a| {
+                a.as_primitive::<Float32Type>()
+                    .iter()
+                    .map(|v| v.unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect();
+
+        let mut accumulator =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        for ((start_value, end_value), chunk_vals) in start_values
+            .iter()
+            .flatten()
+            .zip(end_values.iter().flatten())
+            .zip(chunk_values.iter().flatten())
+        {
+            ChunkingStrategy::Delta { chunk_size: 50.0 }.decode_arrow(
+                &chunk_vals,
+                start_value as f64,
+                end_value as f64,
+                &mut accumulator,
+                Some(&delta_model),
+            );
+        }
+
+        assert_eq!(accumulator.data_len()?, intensity_values.len());
+
+        let intens = arrays.intensities()?;
+
+        let mz_array = Float64Array::from_iter_values(mzs.iter().copied());
+        let intensity_array = Float32Array::from_iter_values(intens.iter().map(|v| *v as f32));
+        let mini_schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("mz_array", DataType::Float64, true)),
+            Arc::new(Field::new("intensity_array", DataType::Float32, true)),
+        ]));
+
+        let batch = RecordBatch::try_new(mini_schema.clone(), vec![
+            Arc::new(mz_array) as ArrayRef,
+            Arc::new(intensity_array)
+        ]).unwrap();
+
+        let trimmed_zero_dropped_batch = drop_where_column_is_zero(&batch, 1).unwrap();
+        let trimmed_null_filled_batch = nullify_at_zero(&trimmed_zero_dropped_batch, 1, &[0, 1]).unwrap();
+
+        assert_eq!(trimmed_null_filled_batch.num_rows(), accumulator.data_len()?);
+
+        let mz_acc = accumulator.to_f64()?;
+        let mz_ref = trimmed_null_filled_batch.column(0).as_primitive::<Float64Type>();
+        let mz_ref = crate::filter::fill_nulls_for(mz_ref, &delta_model);
+
+        for ((i, a), b) in mz_acc.iter().copied().enumerate().zip(mz_ref.iter().copied()) {
+            if intensity_values[i] == 0.0 {
+                assert!((a - b).abs() < 1e-6, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+            } else {
+                assert_eq!(a, b, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+            }
+        }
 
         Ok(())
     }

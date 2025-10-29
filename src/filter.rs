@@ -883,6 +883,8 @@ where
 mod test {
     use std::io::{self, BufRead};
 
+    use arrow::{array::ArrayRef, datatypes::Field};
+
     use super::*;
 
     #[test]
@@ -2711,16 +2713,22 @@ mod test {
         let mzs = Float64Array::from(mzs);
         let intensities = Float32Array::from(intensities);
 
-        let kept_indices = _skip_zero_runs_gen(&intensities);
-        let kept_indices: UInt64Array = kept_indices.into();
+        let schema = Arc::new(Schema::new(vec![
+            Arc::new(Field::new("m/z array", DataType::Float64, true)),
+            Arc::new(Field::new("intensity array", DataType::Float32, true))
+        ]));
 
-        let mzs = arrow::compute::take(&mzs, &kept_indices, None).unwrap();
-        let intensities = arrow::compute::take(&intensities, &kept_indices, None).unwrap();
-        let masked = is_zero_pair_mask(intensities.as_primitive::<Float32Type>());
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(mzs) as ArrayRef,
+            Arc::new(intensities),
+        ]).unwrap();
 
-        let mzs = arrow::compute::kernels::nullif::nullif(&mzs.clone(), &masked).unwrap();
+        let trimmed_batch = drop_where_column_is_zero(&batch, 1).unwrap();
+        let trimmed_batch = nullify_at_zero(&trimmed_batch, 1, &[0, 1]).unwrap();
 
-        let splits = super::null_chunk_every_k(mzs.as_primitive::<Float64Type>(), 50.0);
+        let mzs = trimmed_batch.column(0).as_primitive::<Float64Type>();
+
+        let splits = super::null_chunk_every_k(mzs, 50.0);
         for seg in splits.iter() {
             assert!(seg.end - seg.start > 1, "Segment {seg:?} is too short");
         }

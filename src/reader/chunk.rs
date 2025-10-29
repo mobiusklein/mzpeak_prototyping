@@ -378,6 +378,7 @@ struct ChunkDecoder<'a> {
     buffers: HashMap<BufferName, Vec<ArrayRef>>,
     main_axis_buffers: Vec<(BufferName, ArrayRef)>,
     main_axis_starts: Vec<ArrayRef>,
+    main_axis_ends: Vec<ArrayRef>,
     main_axis: Option<DataArray>,
     bin_map: BinaryArrayMap,
     spectrum_array_indices: &'a ArrayIndex,
@@ -393,6 +394,7 @@ impl<'a> ChunkDecoder<'a> {
             buffers: Default::default(),
             main_axis_buffers: Default::default(),
             main_axis_starts: Default::default(),
+            main_axis_ends: Default::default(),
             main_axis: None,
             bin_map: Default::default(),
             spectrum_array_indices,
@@ -517,7 +519,7 @@ impl<'a> ChunkDecoder<'a> {
                     self.main_axis_starts.push(arr.clone());
                 }
                 s if s.ends_with("chunk_end") => {
-                    continue;
+                    self.main_axis_ends.push(arr.clone());
                 }
                 _ => {
                     if let Some(name) =
@@ -550,10 +552,10 @@ impl<'a> ChunkDecoder<'a> {
             .sum();
 
         for (name, chunk_values) in self.main_axis_buffers.drain(..) {
-            for (encoding, chunk_starts) in chunk_encodings
+            for (encoding, (chunk_starts, chunk_ends)) in chunk_encodings
                 .iter()
                 .copied()
-                .zip(self.main_axis_starts.iter())
+                .zip(self.main_axis_starts.iter().zip(self.main_axis_ends.iter()))
             {
                 // This may over-allocate, but not by more than a few bytes per chunk
                 if self.main_axis.is_none() {
@@ -566,14 +568,16 @@ impl<'a> ChunkDecoder<'a> {
                 match encoding {
                     NO_COMPRESSION => {
                         macro_rules! decode_no_compression {
-                            ($chunk_values:ident, $starts:ident, $accumulator:expr) => {
-                                for (chunk_vals, start) in $chunk_values.iter().zip($starts.iter())
+                            ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
+                                for (chunk_vals, (start, end)) in $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
                                 {
                                     let chunk_vals = chunk_vals.unwrap();
                                     let start = start.unwrap();
+                                    let end = end.unwrap();
                                     (ChunkingStrategy::Basic { chunk_size: 50.0 }).decode_arrow(
                                         &chunk_vals,
                                         start as f64,
+                                        end as f64,
                                         $accumulator.as_mut().unwrap(),
                                         None,
                                     );
@@ -582,25 +586,29 @@ impl<'a> ChunkDecoder<'a> {
                         }
                         let chunk_values = chunk_values.as_list::<i64>();
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
-                            decode_no_compression!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float64Type>();
+                            decode_no_compression!(chunk_values, starts, ends, self.main_axis);
                         } else if let Some(starts) = chunk_starts.as_primitive_opt::<Float32Type>()
                         {
-                            decode_no_compression!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float32Type>();
+                            decode_no_compression!(chunk_values, starts, ends, self.main_axis);
                         } else {
                             unimplemented!("Starts were {:?}", chunk_starts.data_type());
                         };
                     }
                     DELTA_ENCODE => {
                         macro_rules! decode_deltas {
-                            ($chunk_values:ident, $starts:ident, $accumulator:expr) => {
-                                for (chunk_vals, start) in $chunk_values.iter().zip($starts.iter())
+                            ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
+                                for (chunk_vals, (start, end)) in $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
+                                        let end = end.unwrap();
                                         (ChunkingStrategy::Delta { chunk_size: 50.0 })
                                             .decode_arrow(
                                                 &chunk_vals,
                                                 start as f64,
+                                                end as f64,
                                                 $accumulator.as_mut().unwrap(),
                                                 self.delta_model,
                                             );
@@ -610,10 +618,12 @@ impl<'a> ChunkDecoder<'a> {
                         }
                         let chunk_values = chunk_values.as_list::<i64>();
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
-                            decode_deltas!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float64Type>();
+                            decode_deltas!(chunk_values, starts, ends, self.main_axis);
                         } else if let Some(starts) = chunk_starts.as_primitive_opt::<Float32Type>()
                         {
-                            decode_deltas!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float32Type>();
+                            decode_deltas!(chunk_values, starts, ends, self.main_axis);
                         } else {
                             unimplemented!("Starts were {:?}", chunk_starts.data_type());
                         };
@@ -621,15 +631,17 @@ impl<'a> ChunkDecoder<'a> {
                     NUMPRESS_LINEAR => {
                         let chunk_values = chunk_values.as_list::<i64>();
                         macro_rules! decode_numpress {
-                            ($chunk_values:ident, $starts:ident, $accumulator:expr) => {
-                                for (chunk_vals, start) in $chunk_values.iter().zip($starts.iter())
+                            ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
+                                for (chunk_vals, (start, end)) in $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
+                                        let end = end.unwrap();
                                         (ChunkingStrategy::NumpressLinear { chunk_size: 50.0 })
                                             .decode_arrow(
                                                 &chunk_vals,
                                                 start as f64,
+                                                end as f64,
                                                 $accumulator.as_mut().unwrap(),
                                                 self.delta_model,
                                             );
@@ -638,7 +650,8 @@ impl<'a> ChunkDecoder<'a> {
                             };
                         }
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
-                            decode_numpress!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float64Type>();
+                            decode_numpress!(chunk_values, starts, ends, self.main_axis);
                         } else {
                             unimplemented!("Starts were {:?}", chunk_starts.data_type());
                         }
@@ -656,6 +669,7 @@ struct ChunkScanDecoder<'a> {
     buffers: HashMap<BufferName, Vec<ArrayRef>>,
     main_axis_buffers: Vec<(BufferName, ArrayRef)>,
     main_axis_starts: Vec<ArrayRef>,
+    main_axis_ends: Vec<ArrayRef>,
     spectrum_index: Vec<ArrayRef>,
     main_axis: Option<DataArray>,
     metadata: &'a ReaderMetadata,
@@ -668,6 +682,7 @@ impl<'a> ChunkScanDecoder<'a> {
             buffers: Default::default(),
             main_axis_buffers: Default::default(),
             main_axis_starts: Default::default(),
+            main_axis_ends: Default::default(),
             main_axis: None,
             spectrum_index: Default::default(),
             metadata,
@@ -678,6 +693,8 @@ impl<'a> ChunkScanDecoder<'a> {
     fn clear(&mut self) {
         self.buffers.clear();
         self.main_axis_buffers.clear();
+        self.main_axis_starts.clear();
+        self.main_axis_ends.clear();
         self.main_axis = None;
         self.spectrum_index.clear();
     }
@@ -700,7 +717,7 @@ impl<'a> ChunkScanDecoder<'a> {
                     self.main_axis_starts.push(arr.clone());
                 }
                 s if s.ends_with("chunk_end") => {
-                    continue;
+                    self.main_axis_ends.push(arr.clone());
                 }
                 _ => {
                     if let Some(name) =
@@ -731,10 +748,10 @@ impl<'a> ChunkScanDecoder<'a> {
             Vec::with_capacity(self.spectrum_index.iter().map(|v| v.len()).sum());
 
         for (name, chunk_values) in self.main_axis_buffers.drain(..) {
-            for ((encoding, chunk_starts), spectrum_idxs) in chunk_encodings
+            for ((encoding, (chunk_starts, chunk_ends)), spectrum_idxs) in chunk_encodings
                 .iter()
                 .copied()
-                .zip(self.main_axis_starts.iter())
+                .zip(self.main_axis_starts.iter().zip(self.main_axis_ends.iter()))
                 .zip(
                     self.spectrum_index
                         .iter()
@@ -748,13 +765,14 @@ impl<'a> ChunkScanDecoder<'a> {
                 match encoding {
                     NO_COMPRESSION => {
                         macro_rules! decode_no_compression {
-                            ($chunk_values:ident, $starts:ident, $accumulator:expr) => {
-                                for (chunk_vals, (start, spectrum_idx)) in $chunk_values
+                            ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
+                                for (chunk_vals, ((start, end), spectrum_idx)) in $chunk_values
                                     .iter()
-                                    .zip($starts.iter().zip(spectrum_idxs.iter().flatten()))
+                                    .zip($starts.iter().zip($ends.iter()).zip(spectrum_idxs.iter().flatten()))
                                 {
                                     let chunk_vals = chunk_vals.unwrap();
                                     let start = start.unwrap();
+                                    let end = end.unwrap();
                                     let main_axis_size_before = self
                                         .main_axis
                                         .as_ref()
@@ -763,6 +781,7 @@ impl<'a> ChunkScanDecoder<'a> {
                                     (ChunkingStrategy::Basic { chunk_size: 50.0 }).decode_arrow(
                                         &chunk_vals,
                                         start as f64,
+                                        end as f64,
                                         $accumulator.as_mut().unwrap(),
                                         None,
                                     );
@@ -782,23 +801,26 @@ impl<'a> ChunkScanDecoder<'a> {
                         }
                         let chunk_values = chunk_values.as_list::<i64>();
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
-                            decode_no_compression!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float64Type>();
+                            decode_no_compression!(chunk_values, starts, ends, self.main_axis);
                         } else if let Some(starts) = chunk_starts.as_primitive_opt::<Float32Type>()
                         {
-                            decode_no_compression!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float32Type>();
+                            decode_no_compression!(chunk_values, starts, ends, self.main_axis);
                         } else {
                             unimplemented!("Starts were {:?}", chunk_starts.data_type());
                         };
                     }
                     DELTA_ENCODE => {
                         macro_rules! decode_deltas {
-                            ($chunk_values:ident, $starts:ident, $accumulator:expr) => {
-                                for (chunk_vals, (start, spectrum_idx)) in $chunk_values
+                            ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
+                                for (chunk_vals, ((start, end), spectrum_idx)) in $chunk_values
                                     .iter()
-                                    .zip($starts.iter().zip(spectrum_idxs.iter().flatten()))
+                                    .zip($starts.iter().zip($ends.iter()).zip(spectrum_idxs.iter().flatten()))
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
+                                        let end = end.unwrap();
                                         let delta_model =
                                             delta_model_cache.get(spectrum_idx, || {
                                                 self.metadata
@@ -813,6 +835,7 @@ impl<'a> ChunkScanDecoder<'a> {
                                             .decode_arrow(
                                                 &chunk_vals,
                                                 start as f64,
+                                                end as f64,
                                                 $accumulator.as_mut().unwrap(),
                                                 delta_model.as_ref(),
                                             );
@@ -833,10 +856,12 @@ impl<'a> ChunkScanDecoder<'a> {
                         }
                         let chunk_values = chunk_values.as_list::<i64>();
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
-                            decode_deltas!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float64Type>();
+                            decode_deltas!(chunk_values, starts, ends, self.main_axis);
                         } else if let Some(starts) = chunk_starts.as_primitive_opt::<Float32Type>()
                         {
-                            decode_deltas!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float32Type>();
+                            decode_deltas!(chunk_values, starts, ends, self.main_axis);
                         } else {
                             unimplemented!("Starts were {:?}", chunk_starts.data_type());
                         };
@@ -844,13 +869,14 @@ impl<'a> ChunkScanDecoder<'a> {
                     NUMPRESS_LINEAR => {
                         let chunk_values = chunk_values.as_list::<i64>();
                         macro_rules! decode_numpress {
-                            ($chunk_values:ident, $starts:ident, $accumulator:expr) => {
-                                for (chunk_vals, (start, spectrum_idx)) in $chunk_values
+                            ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
+                                for (chunk_vals, ((start, end), spectrum_idx)) in $chunk_values
                                     .iter()
-                                    .zip($starts.iter().zip(spectrum_idxs.iter().flatten()))
+                                    .zip($starts.iter().zip($ends.iter()).zip(spectrum_idxs.iter().flatten()))
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
+                                        let end = end.unwrap();
                                         let delta_model =
                                             delta_model_cache.get(spectrum_idx, || {
                                                 self.metadata
@@ -865,6 +891,7 @@ impl<'a> ChunkScanDecoder<'a> {
                                             .decode_arrow(
                                                 &chunk_vals,
                                                 start as f64,
+                                                end as f64,
                                                 $accumulator.as_mut().unwrap(),
                                                 delta_model.as_ref(),
                                             );
@@ -884,7 +911,8 @@ impl<'a> ChunkScanDecoder<'a> {
                             };
                         }
                         if let Some(starts) = chunk_starts.as_primitive_opt::<Float64Type>() {
-                            decode_numpress!(chunk_values, starts, self.main_axis);
+                            let ends = chunk_ends.as_primitive::<Float64Type>();
+                            decode_numpress!(chunk_values, starts, ends, self.main_axis);
                         } else {
                             unimplemented!("Starts were {:?}", chunk_starts.data_type());
                         }

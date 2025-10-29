@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import logging
 import json
 
+import math
 from typing import Any, Iterator
 from enum import Enum
 
@@ -160,7 +161,7 @@ class BufferFormat(Enum):
                 raise
 
 
-class _ChunkIterator:
+class _BatchIterator:
     it: Iterator[pa.RecordBatch]
     batch: pa.StructArray
     current_index: int
@@ -470,11 +471,16 @@ class MzPeakArrayDataReader:
         numpress_chunks_it = iter(numpress_chunks)
         for i, chunk in enumerate(chunks):
             start = chunk[f"{axis_prefix}_chunk_start"].as_py()
+            end = chunk[f"{axis_prefix}_chunk_end"].as_py()
+
             steps = chunk[f"{axis_prefix}_chunk_values"]
             encoding = chunk["chunk_encoding"].as_py()
 
             # Delta encoding
             if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):
+                if (start == end) and start == 0.0:
+                    continue
+
                 if steps.values.null_count > 0:
                     had_nulls = True
                     # The presence null values leads to sometimes restoring one fewer values because the chunk start is
@@ -606,16 +612,12 @@ class MzPeakArrayDataReader:
         self, index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512
     ) -> _SpectrumArrays:
         chunks = []
-        it = _ChunkIterator(
+        it = _BatchIterator(
             self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"])
         )
         it.seek(index)
         batch: pa.RecordBatch
         for idx, batch in it:
-            # batch = pc.filter(
-            #     batch,
-            #     pc.equal(pc.struct_field(batch, "spectrum_index"), spectrum_index),
-            # )
             if idx > index:
                 break
             if len(batch) == 0:

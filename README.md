@@ -65,14 +65,72 @@ $$
 $$
 
 or using the following Python code:
+<details>
+
+<summary>Python code for fitting the weighted least squares model</summary>
 
 ```python
-#TODO: Annotate DeltaCurveRegressionModel class here
+class DeltaCurveRegressionModel:
+    beta: np.ndarray
+
+    def __init__(self, beta: np.ndarray):
+        self.beta = beta
+
+    @classmethod
+    def fit(
+        cls,
+        mz_array,
+        delta_array,
+        weights: np.ndarray | None = None,
+        threshold: float | None = None,
+        rank: int = 2,
+    ):
+        if weights is None:
+            weights = np.ones(len(mz_array))
+        else:
+            weights = weights
+
+        if threshold is None:
+            threshold = 1.0
+
+        # Drop all entries where the gap between m/z values > threshold
+        raw = mz_array[1:][delta_array <= threshold]
+        w = weights[1:][delta_array <= threshold]
+        y = delta_array[delta_array <= threshold]
+
+        # Build the design matrix
+        data = [data.append(np.ones_like(raw))]
+        for i in range(1, rank + 1):
+            data.append(raw**i)
+        data = np.stack(data, axis=-1)
+
+        # Use the QR decomposition to solve the weighted least squares problem
+        # to estimate weights predicting δ m/z.
+        # https://stats.stackexchange.com/a/490782/59613
+        chol_w = np.sqrt(w)
+        qr = np.linalg.qr(chol_w[:, None] * data)
+        v = qr.Q.T.dot(chol_w * y)
+        beta = solve_triangular(qr.R, v)
+
+        # Numerically equivalent to and more stable than the direct inversion
+        # beta = np.linalg.inv((data.T * w).dot(data)).dot(data.T * w).dot(y)
+        return cls(beta)
+
+    def predict(self, mz: float) -> float:
+        acc = self.beta[0]
+        for i in range(1, len(self.beta)):
+            acc += self.beta[i] * mz ** i
+        return acc
 ```
+
+</details>
 
 Then when reading the the null-marked data, use either the local median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve an very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the minute angle change this would induce are still effectively lossless.
 
-#TODO: Insert plot of the point-level and peak δ m/zs on Thermo and Sciex profile data
+![Thermo dataset with null marking](static/thermo_null_marking_err.png)
+![Sciex dataset with delta encoding and null marking](static/sciex_null_marking_delta_encoding_error.png)
+
+Keep in mind that all Numpress compression methods are still available and still provide superior size reduction, but carry this slightly larger loss of accuracy. Using a Numpress compression is a transformation that requires the [Chunked Layout](#chunked-layout-for-data-arrays).
 
 ### Point Layout for Data Arrays
 
@@ -104,7 +162,7 @@ When storing data arrays, the chunked layout treats one array, which must be sor
 | 2              | 350.0    | 400.0 | [0.0014, ..., 0.0014] | [...]
 | 2              | 400.0    | 450.0 | [0.0013, ..., 0.0014] | [...]
 
-This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_array_chunk_values` list aren't accessible to the page index, but the start and end columns are. The chunk values are still accessible for the Parquet encodings.
+This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_array_chunk_values` list aren't accessible to the page index, but the start and end columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
 
 
 ## Conversion Program

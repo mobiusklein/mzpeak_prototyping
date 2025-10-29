@@ -29,6 +29,15 @@ fn main() -> io::Result<()> {
         match arrays.mzs() {
             Ok(arr) => {
                 points += arr.len();
+                let ints = arrays.intensities().unwrap();
+                assert_eq!(
+                    arr.len(),
+                    ints.len(),
+                    "{} had {} m/z values and {} intensities, {arr:?} {ints:?}",
+                    spec.index(),
+                    arr.len(),
+                    ints.len()
+                );
             }
             Err(e) => {
                 eprintln!(

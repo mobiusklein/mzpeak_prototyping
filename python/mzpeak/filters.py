@@ -107,7 +107,16 @@ class DeltaCurveRegressionModel(DeltaModelBase):
         data = np.stack(data, axis=-1)
         y = delta_array[delta_array <= threshold]
 
-        beta = np.linalg.inv((data.T * w).dot(data)).dot(data.T * w).dot(y)
+        # Use the QR decomposition to solve the weighted least squares problem
+        # to estimate weights predicting δ m/z.
+        # https://stats.stackexchange.com/a/490782/59613
+        chol_w = np.sqrt(w)
+        qr = np.linalg.qr(chol_w[:, None] * data)
+        v = qr.Q.T.dot(chol_w * y)
+        beta = solve_triangular(qr.R, v)
+
+        # Numerically equivalent to and more stable than the direct inversion
+        # beta = np.linalg.inv((data.T * w).dot(data)).dot(data.T * w).dot(y)
         return cls(beta)
 
     def predict(self, mz: float) -> float:
