@@ -14,6 +14,13 @@ use crate::{
     writer::{ArrayBuffersBuilder, MzPeakWriterType, UnpackedMzPeakWriterType},
 };
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteBatchConfig {
+    pub write_batch_size: Option<usize>,
+    pub page_size: Option<usize>,
+    pub row_group_size: Option<usize>,
+}
+
 /// A builder for mzPeak writers
 ///
 /// This allows the caller to configure array content types, compression settings,
@@ -28,6 +35,7 @@ pub struct MzPeakWriterBuilder {
     compression: Compression,
     // The schema to store peaks under, separate from the profile data (if any)
     store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
+    write_batch_config: WriteBatchConfig,
 }
 
 impl Default for MzPeakWriterBuilder {
@@ -40,6 +48,7 @@ impl Default for MzPeakWriterBuilder {
             chunked_encoding: None,
             compression: Compression::ZSTD(ZstdLevel::default()),
             store_peaks_and_profiles_apart: None,
+            write_batch_config: Default::default(),
         }
     }
 }
@@ -147,6 +156,22 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    pub fn write_batch_size(mut self, value: Option<usize>) -> Self {
+        self.write_batch_config.write_batch_size = value;
+        self
+    }
+
+    /// Set to control the approximate number of bytes for individual data pages.
+    pub fn page_size(mut self, value: Option<usize>) -> Self {
+        self.write_batch_config.page_size = value;
+        self
+    }
+
+    pub fn row_group_size(mut self, value: Option<usize>) -> Self {
+        self.write_batch_config.row_group_size = value;
+        self
+    }
+
     /// Build an unpacked writer, a directory on disk where all files can be written to at once,
     /// but may be more work to move about.
     pub fn build_unpacked(
@@ -164,6 +189,7 @@ impl MzPeakWriterBuilder {
             self.chunked_encoding,
             self.compression,
             self.store_peaks_and_profiles_apart,
+            self.write_batch_config,
         )
     }
 
@@ -184,6 +210,7 @@ impl MzPeakWriterBuilder {
             self.chunked_encoding,
             self.compression,
             self.store_peaks_and_profiles_apart,
+            self.write_batch_config,
         )
     }
 

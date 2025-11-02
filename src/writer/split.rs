@@ -14,15 +14,9 @@ use parquet::{
 use mzdata::{meta::FileMetadataConfig, prelude::*};
 
 use crate::{
-    BufferContext, ToMzPeakDataSeries,
-    archive::MzPeakArchiveType,
-    chunk_series::ChunkingStrategy,
-    peak_series::ArrayIndex,
-    writer::{
-        AbstractMzPeakWriter, ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder,
-        ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder, VisitorBase,
-        implement_mz_metadata,
-    },
+    archive::MzPeakArchiveType, chunk_series::ChunkingStrategy, peak_series::ArrayIndex, writer::{
+        implement_mz_metadata, AbstractMzPeakWriter, ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder, VisitorBase, WriteBatchConfig
+    }, BufferContext, ToMzPeakDataSeries
 };
 
 /// Writer for the MzPeak format that writes the different data types to separate files
@@ -48,8 +42,11 @@ pub struct UnpackedMzPeakWriterType<
     #[allow(unused)]
     chromatogram_data_point_counter: u64,
 
+
     buffer_size: usize,
     compression: Compression,
+    #[allow(unused)]
+    write_batch_config: WriteBatchConfig,
     mz_metadata: FileMetadataConfig,
     _t: PhantomData<(C, D)>,
 }
@@ -134,6 +131,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
         use_chunked_encoding: Option<ChunkingStrategy>,
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
+        write_batch_config: WriteBatchConfig,
     ) -> Self {
         let data_writer_path = path.join(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix());
         let metadata_writer_path = path.join(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix());
@@ -164,6 +162,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             shuffle_mz,
             &use_chunked_encoding,
             compression,
+            write_batch_config,
         );
 
         let separate_peak_writer = if let Some(peak_buffer_builder) = store_peaks_and_profiles_apart
@@ -182,6 +181,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
                 shuffle_mz,
                 &None,
                 compression,
+                write_batch_config,
             );
 
             let peak_writer = ArrowWriter::try_new_with_options(
@@ -225,6 +225,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
 
             chromatogram_data_point_counter: 0,
             compression,
+            write_batch_config,
             buffer_size: buffer_size,
             mz_metadata: Default::default(),
             _t: PhantomData,

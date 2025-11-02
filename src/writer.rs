@@ -27,8 +27,8 @@ use mzdata::{
 use crate::{
     archive::{MzPeakArchiveType, ZipArchiveWriter},
     peak_series::{
-        ArrayIndex, BufferContext, BufferName, ToMzPeakDataSeries, array_map_to_schema_arrays,
-    },
+        array_map_to_schema_arrays, ArrayIndex, BufferContext, BufferName, ToMzPeakDataSeries
+    }
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -46,7 +46,7 @@ pub use array_buffer::{
     ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChunkBuffers, PointBuffers,
 };
 pub use base::AbstractMzPeakWriter;
-pub use builder::MzPeakWriterBuilder;
+pub use builder::{MzPeakWriterBuilder, WriteBatchConfig};
 pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{
@@ -235,6 +235,8 @@ pub struct MzPeakWriterType<
 
     buffer_size: usize,
     compression: Compression,
+    #[allow(unused)]
+    write_batch_config: WriteBatchConfig,
     mz_metadata: FileMetadataConfig,
     _t: PhantomData<(C, D)>,
 }
@@ -270,6 +272,7 @@ impl<
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
         if self.spectrum_counter() % (self.buffer_size as u64) == 0 {
+            log::debug!("Flushing data buffer. {} spectra written so far. {} rows in the buffer", self.spectrum_counter(), self.buffered_spectrum_data());
             self.flush_data_arrays()?;
         }
         Ok(())
@@ -329,6 +332,7 @@ impl<
         use_chunked_encoding: Option<ChunkingStrategy>,
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
+        write_batch_config: WriteBatchConfig,
     ) -> Self {
         let spectrum_metadata_buffer = SpectrumBuilder::default();
 
@@ -365,6 +369,7 @@ impl<
             shuffle_mz,
             &use_chunked_encoding,
             compression,
+            write_batch_config,
         );
 
         let separate_peak_writer = if let Some(peak_buffer_builder) = store_peaks_and_profiles_apart
@@ -381,6 +386,7 @@ impl<
                 shuffle_mz,
                 &None,
                 compression,
+                write_batch_config,
             );
 
             let peak_writer = ArrowWriter::try_new_with_options(
@@ -419,6 +425,7 @@ impl<
             buffer_size: buffer_size,
             mz_metadata: Default::default(),
             compression,
+            write_batch_config,
             _t: PhantomData,
         };
         this.add_spectrum_array_metadata();
@@ -479,6 +486,10 @@ impl<
         let batch = RecordBatch::from(arrays.as_struct());
         self.archive_writer.as_mut().unwrap().write(&batch)?;
         Ok(())
+    }
+
+    pub fn buffered_spectrum_data(&self) -> usize {
+        self.spectrum_buffers.len()
     }
 
     fn flush_chromatogram_metadata_records(&mut self) -> io::Result<()> {

@@ -5,7 +5,7 @@ use std::{
 };
 
 use arrow::{
-    array::{ArrayRef, RecordBatch, StructArray, new_null_array},
+    array::{Array, ArrayRef, RecordBatch, StructArray, new_null_array},
     datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef},
 };
 use mzdata::spectrum::ArrayType;
@@ -148,7 +148,11 @@ impl PointBuffers {
     }
 
     pub fn len(&self) -> usize {
-        self.array_chunks.values().map(|v| v.len()).sum()
+        self.array_chunks
+            .values()
+            .map(|v| v.iter().map(|s| s.len()).sum::<usize>())
+            .max()
+            .unwrap_or_default()
     }
 
     pub fn num_chunks(&self) -> usize {
@@ -406,6 +410,10 @@ impl ChunkBuffers {
             include_time,
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
+    }
 }
 
 impl ArrayBufferWriter for ChunkBuffers {
@@ -503,6 +511,15 @@ impl ArrayBufferWriter for ChunkBuffers {
 pub enum ArrayBufferWriterVariants {
     ChunkBuffers(ChunkBuffers),
     PointBuffers(PointBuffers),
+}
+
+impl ArrayBufferWriterVariants {
+    pub fn len(&self) -> usize {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.len(),
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.len(),
+        }
+    }
 }
 
 impl From<ChunkBuffers> for ArrayBufferWriterVariants {
@@ -658,7 +675,6 @@ impl Default for ArrayBuffersBuilder {
 }
 
 impl ArrayBuffersBuilder {
-
     /// Set the prefix for the data structure, all other arrays will be nested under a group/struct
     /// with this name.
     pub fn prefix(mut self, value: impl ToString) -> Self {

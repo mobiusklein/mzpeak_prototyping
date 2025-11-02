@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::{fs, sync::Arc};
 
 use arrow::array::{
@@ -97,7 +98,7 @@ where
     }
 }
 
-impl<T: HasProximity> PageIndex<T>
+impl<T: HasProximity + Debug> PageIndex<T>
 where
     PageIndexEntry<T>: PageIndexType<T>,
 {
@@ -174,7 +175,7 @@ where
         self.iter().filter(move |p| p.contains(&query))
     }
 
-    pub fn row_selection_overlaps(&self, query: &impl Span1D<DimType = T>) -> RowSelection {
+    pub fn row_selection_overlaps<S: Span1D<DimType = T> + Debug>(&self, query: &S) -> RowSelection {
         let mut selectors = Vec::new();
         let mut last_row = 0;
         for page in self.iter() {
@@ -594,7 +595,7 @@ pub struct RangeIndex<'a, T: HasProximity> {
     end_index: &'a PageIndex<T>,
 }
 
-impl<'a, T: HasProximity> RangeIndex<'a, T> {
+impl<'a, T: HasProximity + Debug> RangeIndex<'a, T> {
     pub fn new(start_index: &'a PageIndex<T>, end_index: &'a PageIndex<T>) -> Self {
         Self {
             start_index,
@@ -638,7 +639,7 @@ pub(crate) trait SpectrumQueryIndex {
 
     fn index_overlaps(&self, index_range: &SimpleInterval<u64>) -> RowSelection;
     fn mz_overlaps(&self, mz_range: &SimpleInterval<f64>) -> RowSelection;
-    fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection;
+    fn ion_mobility_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection;
 }
 
 pub(crate) trait ChromatogramQueryIndex {
@@ -771,7 +772,7 @@ impl SpectrumQueryIndex for SpectrumPointIndex {
         self.mz_index.row_selection_overlaps(query)
     }
 
-    fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection {
+    fn ion_mobility_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection {
         self.im_index.row_selection_overlaps(im_range)
     }
 
@@ -902,7 +903,7 @@ impl SpectrumQueryIndex for SpectrumChunkIndex {
         chunk_range_idx.row_selection_overlaps(mz_range)
     }
 
-    fn im_overlaps(&self, _im_range: &SimpleInterval<f64>) -> RowSelection {
+    fn ion_mobility_overlaps(&self, _im_range: &SimpleInterval<f64>) -> RowSelection {
         RowSelection::from(vec![RowSelector::select(
             self.spectrum_index.iter().map(|p| p.row_len()).sum::<i64>() as usize,
         )])
@@ -1235,11 +1236,11 @@ impl SpectrumQueryIndex for QueryIndex {
         }
     }
 
-    fn im_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection {
+    fn ion_mobility_overlaps(&self, im_range: &SimpleInterval<f64>) -> RowSelection {
         if self.spectrum_point_index.is_populated() {
-            self.spectrum_point_index.im_overlaps(im_range)
+            self.spectrum_point_index.ion_mobility_overlaps(im_range)
         } else if self.spectrum_chunk_index.is_populated() {
-            self.spectrum_chunk_index.im_overlaps(im_range)
+            self.spectrum_chunk_index.ion_mobility_overlaps(im_range)
         } else {
             RowSelection::default()
         }
@@ -1314,7 +1315,7 @@ impl SpectrumQueryIndex for ChromatogramPointIndex {
         RowSelection::default()
     }
 
-    fn im_overlaps(&self, _im_range: &SimpleInterval<f64>) -> RowSelection {
+    fn ion_mobility_overlaps(&self, _im_range: &SimpleInterval<f64>) -> RowSelection {
         RowSelection::default()
     }
 }

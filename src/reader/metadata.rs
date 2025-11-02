@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    BufferContext,
     archive::{ArchiveReader, ArchiveSource},
     buffer_descriptors::{ArrayIndex, SerializedArrayIndex},
     filter::RegressionDeltaModel,
@@ -13,15 +14,17 @@ use crate::{
         index::{QueryIndex, SpectrumPointIndex},
         utils::MaskSet,
         visitor::{
-            metadata_columns_to_definition_map, schema_to_metadata_cols, MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor, MzSpectrumVisitor
+            MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
+            MzSpectrumVisitor, metadata_columns_to_definition_map, schema_to_metadata_cols,
         },
-    }, BufferContext,
+    },
 };
 use arrow::{
     array::{Array, AsArray, RecordBatch, StructArray, UInt64Array},
     datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type},
 };
 use identity_hash::BuildIdentityHasher;
+use itertools::Itertools;
 use mzdata::{
     io::OffsetIndex,
     meta,
@@ -1357,15 +1360,95 @@ impl TimeIndexDecoder {
     }
 }
 
+#[derive(Debug)]
+pub struct SelectedIonIndexDecoder {
+    mz_range: SimpleInterval<f64>,
+    indices: HashSet<u64, BuildIdentityHasher<u64>>,
+}
+
+#[allow(unused)]
+impl SelectedIonIndexDecoder {
+    pub fn new(mz_range: SimpleInterval<f64>) -> Self {
+        Self {
+            mz_range,
+            indices: Default::default(),
+        }
+    }
+
+    pub fn decode_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<(), parquet::errors::ParquetError> {
+        let root = batch.column(0).as_struct();
+        let arr: &UInt64Array = root.column(0).as_primitive();
+        let selected_mz_arr = root.column(1);
+
+        macro_rules! add {
+            ($val:ident, $mz:ident) => {
+                // Re-check the m/z interval constraint for consistency, but the predicate should have
+                // dealt with this
+                if self.mz_range.contains(&$mz) {
+                    self.indices.insert($val);
+                }
+            };
+        }
+
+        if let Some(selected_mz_arr) = selected_mz_arr.as_primitive_opt::<Float64Type>() {
+            for (val, mz) in arr.iter().flatten().zip(selected_mz_arr.iter().flatten()) {
+                add!(val, mz);
+            }
+        } else if let Some(selected_mz_arr) = selected_mz_arr.as_primitive_opt::<Float32Type>() {
+            for (val, mz) in arr
+                .iter()
+                .flatten()
+                .zip(selected_mz_arr.iter().flatten().map(|v| v as f64))
+            {
+                add!(val, mz);
+            }
+        } else {
+            return Err(parquet::errors::ParquetError::ArrowError(format!(
+                "Invalid selected ion m/z array data type: {:?}",
+                selected_mz_arr.data_type()
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    pub fn from_descriptions(&mut self, descriptions: &[SpectrumDescription]) {
+        for descr in descriptions {
+            if let Some(ion) = descr.precursor.first().and_then(|p| p.ion()) {
+                if self.mz_range.contains(&ion.mz) {
+                    self.indices.insert(descr.index as u64);
+                }
+            }
+        }
+    }
+
+    pub fn finish(self) -> MaskSet {
+        match self.indices.iter().minmax() {
+            itertools::MinMaxResult::NoElements => MaskSet::empty(),
+            itertools::MinMaxResult::OneElement(val) => {
+                MaskSet::new(SimpleInterval::new(*val, *val), Some(self.indices))
+            }
+            itertools::MinMaxResult::MinMax(min, max) => {
+                MaskSet::new(SimpleInterval::new(*min, *max), Some(self.indices))
+            }
+        }
+    }
+}
 
 pub struct AuxiliaryArrayCountDecoder {
     context: BufferContext,
-    counts: Vec<u32>
+    counts: Vec<u32>,
 }
 
 impl AuxiliaryArrayCountDecoder {
     pub fn new(context: BufferContext) -> Self {
-        Self { context, counts: Vec::new() }
+        Self {
+            context,
+            counts: Vec::new(),
+        }
     }
 
     pub fn build_projection<T>(&self, builder: &ArrowReaderBuilder<T>) -> Option<ProjectionMask> {
@@ -1388,10 +1471,15 @@ impl AuxiliaryArrayCountDecoder {
 
         let proj = match (index_i, auxiliary_count_i) {
             (Some(i), Some(j)) => ProjectionMask::leaves(schema, [i, j]),
-            _ => return {
-                log::warn!("No 'number_of_auxiliary_arrays' column found for {}", self.context.name());
-                None
-            },
+            _ => {
+                return {
+                    log::warn!(
+                        "No 'number_of_auxiliary_arrays' column found for {}",
+                        self.context.name()
+                    );
+                    None
+                };
+            }
         };
         Some(proj)
     }
@@ -1405,8 +1493,7 @@ impl AuxiliaryArrayCountDecoder {
             ($index_array:ident, $values_array:ident, $dtype:ty) => {
                 if let Some(values) = $values_array.as_primitive_opt::<$dtype>() {
                     for (i, c) in $index_array.iter().zip(values.iter()) {
-                        self.counts[i.unwrap() as usize] =
-                            c.unwrap_or_default() as u32;
+                        self.counts[i.unwrap() as usize] = c.unwrap_or_default() as u32;
                     }
                     true
                 } else {
@@ -1475,7 +1562,7 @@ impl DeltaModelDecoder {
     }
 
     pub fn decode_batch(&mut self, batch: &RecordBatch) {
-         let root = batch.column(0).as_struct();
+        let root = batch.column(0).as_struct();
         let index_array: &UInt64Array = root.column(0).as_primitive();
 
         if let Some(val_array) = root.column(1).as_list_opt::<i64>() {

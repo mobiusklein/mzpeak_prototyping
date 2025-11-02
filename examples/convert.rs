@@ -18,13 +18,7 @@ use mzpeak_prototyping::{
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
 use std::{
-    collections::HashMap,
-    fs, io,
-    panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
-    sync::mpsc::sync_channel,
-    thread,
-    time::Instant,
+    collections::HashMap, fmt::Debug, fs, io, panic::{self, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::sync_channel, thread, time::Instant
 };
 
 // ============================================================================
@@ -73,6 +67,47 @@ fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
             Ok(ChunkingStrategy::Delta { chunk_size: 50.0 })
         } else {
             Err(format!("Failed to parse {method_str}"))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SuffixedSize(usize);
+
+impl Debug for SuffixedSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<usize> for SuffixedSize {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+impl From<SuffixedSize> for usize {
+    fn from(value: SuffixedSize) -> Self {
+        value.0
+    }
+}
+
+impl std::str::FromStr for SuffixedSize {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(c) = s.chars().last() {
+            let val = match c {
+                'K' => 2usize.pow(10u32),
+                'M' => 2usize.pow(20u32),
+                'G' => 2usize.pow(30u32),
+                _ => {
+                    panic!("Unrecognized suffix {c}, accepts K (2**10), M(2**20), or G(2**30) or no suffix")
+                }
+            } * s[..s.len().saturating_sub(1)].parse::<usize>()?;
+            Ok(Self(val))
+        } else {
+            s.parse().map(Self)
         }
     }
 }
@@ -133,6 +168,15 @@ pub struct ConvertArgs {
         help = "The number of spectra to buffer between writes"
     )]
     buffer_size: usize,
+
+    #[arg(long, help="The number of rows to write in a batch")]
+    write_batch_size: Option<SuffixedSize>,
+
+    #[arg(long, help="The approximate number of *bytes* per data page")]
+    data_page_size: Option<SuffixedSize>,
+
+    #[arg(long, help="The approximate number of rows per row group")]
+    row_group_size: Option<SuffixedSize>,
 
     #[arg(
         short,
@@ -321,6 +365,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&input_path)
         .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
 
+    let n = reader.len();
     let overrides = args.create_type_overrides();
 
     if let Some(c) = args.chunked_encoding.as_ref() {
@@ -335,6 +380,9 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         .shuffle_mz(args.shuffle_mz)
         .chunked_encoding(args.chunked_encoding)
         .null_zeros(args.null_zeros)
+        .write_batch_size(args.write_batch_size.map(usize::from))
+        .page_size(args.data_page_size.inspect(|e| log::debug!("data page size: {e:?}")).map(usize::from))
+        .row_group_size(args.row_group_size.inspect(|e| log::debug!("row group size: {e:?}")).map(usize::from))
         .compression(Compression::ZSTD(
             ZstdLevel::try_new(args.compression_level).unwrap(),
         ));
@@ -372,11 +420,25 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     let write_peaks_and_profiles = args.write_peaks_and_profiles;
     let read_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            match &mut reader {
+                MZReaderType::BrukerTDF(tdfspectrum_reader_type) => {
+                    tdfspectrum_reader_type.set_consolidate_peaks(false);
+                },
+                _ => {},
+            }
             for mut entry in reader.iter() {
                 if entry.has_ion_mobility_dimension() {
-                    if let Some(mut arrays) = entry.arrays {
-                        arrays.sort_by_array(&ArrayType::MZArray).unwrap();
-                        entry.arrays = Some(arrays);
+                    let index_of_entry = entry.index();
+                    let id_of_entry = entry.id().to_string();
+                    if let Some(arrays) = entry.arrays.as_mut() {
+                        if arrays.has_array(&ArrayType::MZArray) {
+                            arrays.sort_by_array(&ArrayType::MZArray).unwrap_or_else(|e| {
+                                log::error!("Failed to canonicalize m/z array for {index_of_entry} {id_of_entry}: {e}.");
+                                for (arr, data) in arrays.iter() {
+                                    log::error!("\tHad {arr:?} with {} values", data.data_len().unwrap())
+                                }
+                            });
+                        }
                     }
                 } else if write_peaks_and_profiles && entry.peaks.is_none() {
                     entry.pick_peaks(3.0).unwrap();
@@ -401,10 +463,10 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             for (i, (spectrum, chromatogram)) in recv.into_iter().enumerate() {
                 if i % 5000 == 0 {
-                    log::info!("Writing batch {i}");
+                    log::info!("Writing batch {i} ({:0.2}%)", i as f64 / n as f64 * 100.0);
                 }
                 if i % 10 == 0 {
-                    log::debug!("Writing batch {i}");
+                    log::debug!("Writing batch {i} ({}%)", i as f64 / n as f64 * 100.0);
                 }
                 if let Some(mut spectrum) = spectrum {
                     if spectrum.signal_continuity() != SignalContinuity::Profile {

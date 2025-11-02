@@ -13,10 +13,9 @@ use arrow::{
 };
 use parquet::{
     arrow::{
-        ProjectionMask,
         arrow_reader::{
-            ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
-        },
+            ArrowPredicate, ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection
+        }, ProjectionMask
     },
     file::{metadata::ParquetMetaData, reader::ChunkReader},
     schema::types::SchemaDescriptor,
@@ -175,6 +174,46 @@ trait ChunkQuerySource {
         self.metadata().file_metadata().schema_descr_ptr()
     }
 
+    fn prepare_predicate_for_index(&self, index_range: MaskSet, metadata: &ReaderMetadata) -> Box<dyn ArrowPredicate> {
+        let sidx = format!("{}.spectrum_index", metadata.spectrum_array_indices.prefix);
+        let proj =
+            ProjectionMask::columns(&self.parquet_schema(), [sidx.as_str()]);
+
+        let predicate = ArrowPredicateFn::new(proj, move |batch| {
+            let root = batch.column(0).as_struct();
+            let spectrum_index = root.column(0);
+            Ok(index_range.contains_dy(spectrum_index))
+        });
+        Box::new(predicate)
+    }
+
+    fn prepare_predicate_for_mz(&self, query_range: SimpleInterval<f64>, metadata: &ReaderMetadata) -> Option<Box<dyn ArrowPredicate>> {
+        if let Some(e) = metadata.spectrum_array_indices.get(&ArrayType::MZArray) {
+            let prefix = e.path.as_str();
+            let prefix = if prefix.ends_with("_chunk_values") {
+                prefix.replace("_chunk_values", "")
+            } else {
+                prefix.to_string()
+            };
+            let fields = [
+                format!("{prefix}_chunk_start"),
+                format!("{prefix}_chunk_end")
+            ];
+
+            let proj = ProjectionMask::columns(&self.parquet_schema(), fields.iter().map(|s| s.as_str()));
+            let predicate = ArrowPredicateFn::new(proj, move |batch| {
+                let root = batch.column(0).as_struct();
+                let mz_start_array = root.column(0);
+                let mz_end_array = root.column(1);
+                let it2 = query_range.overlaps_dy(mz_start_array, mz_end_array);
+                Ok(it2)
+            });
+            Some(Box::new(predicate))
+        } else {
+            None
+        }
+    }
+
     fn prepare_scan(
         &self,
         index_range: MaskSet,
@@ -184,9 +223,7 @@ trait ChunkQuerySource {
     ) -> (
         RowSelection,
         Vec<usize>,
-        ArrowPredicateFn<
-            impl FnMut(RecordBatch) -> Result<arrow::array::BooleanArray, ArrowError> + 'static,
-        >,
+        RowFilter,
     ) {
         let mut rows = query_indices
             .spectrum_chunk_index
@@ -253,32 +290,15 @@ trait ChunkQuerySource {
 
         log::trace!("Executing query on {fields:?}");
 
-        let proj =
-            ProjectionMask::columns(&self.parquet_schema(), fields.iter().map(|s| s.as_str()));
-        let predicate_mask = proj.clone();
+        let mut predicates = vec![
+            self.prepare_predicate_for_index(index_range, metadata)
+        ];
 
-        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let root = batch.column(0).as_struct();
-            let spectrum_index: &UInt64Array = root.column(0).as_any().downcast_ref().unwrap();
+        if let Some(query_range) = query_range {
+            predicates.extend(self.prepare_predicate_for_mz(query_range, metadata));
+        }
 
-            let it = spectrum_index
-                .iter()
-                .map(|v| v.map(|v| index_range.contains(&v)));
-
-            match query_range {
-                None => Ok(it.collect()),
-                Some(mz_range) => {
-                    let mz_start_array = root.column(1);
-                    let mz_end_array = root.column(2);
-                    let it2 = mz_range.overlaps_dy(mz_start_array, mz_end_array);
-                    let it2 = it2.iter();
-                    let it = it
-                        .zip(it2)
-                        .map(|(a, b)| Some(a.is_some_and(|a| a && b.unwrap_or_default())));
-                    Ok(it.collect())
-                }
-            }
-        });
+        let predicate = RowFilter::new(predicates);
         (rows, row_group_indices, predicate)
     }
 
@@ -1089,7 +1109,7 @@ impl<T: ChunkReader + 'static> SpectrumChunkReader<T> {
             .builder
             .with_row_groups(row_group_indices)
             .with_row_selection(rows)
-            .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+            .with_row_filter(predicate)
             .with_batch_size(4096)
             .build()?;
 
@@ -1177,7 +1197,7 @@ mod async_impl {
                 .builder
                 .with_row_groups(row_group_indices)
                 .with_row_selection(rows)
-                .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                .with_row_filter(predicate)
                 .with_batch_size(4096)
                 .build()?;
 

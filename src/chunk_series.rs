@@ -886,6 +886,18 @@ impl ArrowArrayChunk {
 
         let mut auxiliary_arrays = Vec::new();
 
+        let empty_main_axis = match arrays.get(&main_axis.array_type) {
+            Some(v) => v.raw_len() == 0,
+            None => true
+        };
+
+        if empty_main_axis {
+            for arr in arrays.iter().filter_map(|(_, arr)| (arr.raw_len() > 0).then(|| arr)) {
+                auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
+            }
+            return Ok((Vec::new(), auxiliary_arrays))
+        }
+
         for (i, (_, arr)) in arrays.iter().enumerate() {
             let name = BufferName::from_data_array(main_axis.context, arr);
             let buffer_name = if name.array_type == main_axis.array_type {
@@ -989,10 +1001,15 @@ impl ArrowArrayChunk {
 
         let main_axis = overrides.get(&main_axis).unwrap_or(&main_axis);
 
-        let (_, main_axis_array) = arrow_arrays
+        let (_, main_axis_array) = match arrow_arrays
             .iter()
-            .find(|(k, _)| k == main_axis)
-            .ok_or_else(|| ArrayRetrievalError::NotFound(main_axis.array_type.clone()))?;
+            .find(|(k, _)| k == main_axis) {
+                Some(x) => x,
+                None => {
+                    log::warn!("Primary axis array is missing ({main_axis}) for {series_index} post-conversion");
+                    return Ok((Vec::new(), Vec::new()))
+                },
+            };
 
         let steps = match array_to_arrow_type(main_axis.dtype) {
             DataType::Float32 => null_chunk_every_k(

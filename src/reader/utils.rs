@@ -2,10 +2,9 @@ use std::collections::HashSet;
 
 use arrow::array::AsArray;
 use identity_hash::BuildIdentityHasher;
-use mzpeaks::coordinate::{Span1D, SimpleInterval};
+use mzpeaks::coordinate::{SimpleInterval, Span1D};
 
 use super::index::SpanDynNumeric;
-
 
 #[derive(Default, Debug)]
 pub(crate) struct OneCache<T: PartialEq + Eq, U> {
@@ -26,7 +25,6 @@ impl<T: PartialEq + Eq, U> OneCache<T, U> {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaskSet {
     pub range: SimpleInterval<u64>,
@@ -40,23 +38,63 @@ impl From<SimpleInterval<u64>> for MaskSet {
 }
 
 impl MaskSet {
-    pub fn new(range: SimpleInterval<u64>, includes: Option<HashSet<u64, BuildIdentityHasher<u64>>>) -> Self {
+    pub fn new(
+        range: SimpleInterval<u64>,
+        includes: Option<HashSet<u64, BuildIdentityHasher<u64>>>,
+    ) -> Self {
         Self { range, includes }
     }
 
     pub fn split(&mut self) -> Option<Self> {
         let halfway = (self.range.end - self.range.start) / 2;
         if halfway < 2 {
-            return None
+            return None;
         }
 
         self.range.end = self.range.start + halfway;
-        let mut other = self.clone();
+        let mut other = Self::new(self.range.clone(), None);
         other.range.start = self.end() + 1;
+        if let Some(includes) = self.includes.as_mut() {
+            let mut other_includes = HashSet::with_capacity_and_hasher(includes.len() / 2, Default::default());
+            includes.retain(|v| {
+                if other.range.contains(v) {
+                    other_includes.insert(*v);
+                    false
+                } else {
+                    true
+                }
+            });
 
-        // TODO: Maybe split the `includes` set evenly?
-
+            other.includes = Some(other_includes);
+        }
         Some(other)
+    }
+
+    pub fn empty() -> Self {
+        Self::new(SimpleInterval::new(u64::MAX, u64::MAX), None)
+    }
+
+    pub fn intersect(&self, other: &Self) -> Self {
+        if !self.overlaps(other) {
+            Self::empty()
+        } else {
+            let start = self.start().max(other.start());
+            let end = self.end().min(other.end());
+            let range = SimpleInterval::new(start, end);
+            let includes = match (self.includes.as_ref(), other.includes.as_ref()) {
+                (None, None) => None,
+                (None, Some(b)) => Some(b.iter().filter(|i| range.contains(*i)).copied().collect()),
+                (Some(a), None) => Some(a.iter().filter(|i| range.contains(*i)).copied().collect()),
+                (Some(a), Some(b)) => Some(
+                    a.intersection(b)
+                        .into_iter()
+                        .filter(|i| range.contains(i))
+                        .copied()
+                        .collect(),
+                ),
+            };
+            Self::new(range, includes)
+        }
     }
 }
 
@@ -87,11 +125,16 @@ impl SpanDynNumeric for MaskSet {
         let mask = self.range.contains_dy(array);
         if let Some(includes) = self.includes.as_ref() {
             if let Some(arr) = array.as_primitive_opt::<arrow::datatypes::UInt64Type>() {
-                let is_in: arrow::array::BooleanArray = arr.iter().map(|v| Some(v.is_some_and(|v| includes.contains(&v)))).collect();
+                let is_in: arrow::array::BooleanArray = arr
+                    .iter()
+                    .map(|v| Some(v.is_some_and(|v| includes.contains(&v))))
+                    .collect();
                 arrow::compute::and(&mask, &is_in).unwrap()
-            }
-            else if let Some(arr) = array.as_primitive_opt::<arrow::datatypes::UInt32Type>() {
-                let is_in = arr.iter().map(|v| Some(v.is_some_and(|v| includes.contains(&(v as u64))))).collect();
+            } else if let Some(arr) = array.as_primitive_opt::<arrow::datatypes::UInt32Type>() {
+                let is_in = arr
+                    .iter()
+                    .map(|v| Some(v.is_some_and(|v| includes.contains(&(v as u64)))))
+                    .collect();
                 arrow::compute::and(&mask, &is_in).unwrap()
             } else {
                 panic!("Unsupported data type {:?}", array.data_type())

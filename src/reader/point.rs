@@ -22,7 +22,7 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowPredicateFn, ArrowReaderBuilder, ParquetRecordBatchReader,
+            ArrowPredicate, ArrowPredicateFn, ArrowReaderBuilder, ParquetRecordBatchReader,
             ParquetRecordBatchReaderBuilder, RowFilter, RowSelection,
         },
     },
@@ -461,6 +461,66 @@ trait PointQuerySource {
 
     fn buffer_context(&self) -> BufferContext;
 
+    fn prepare_predicate_for_index<'a>(
+        &self,
+        index_range: MaskSet,
+        array_indices: &'a ArrayIndex,
+    ) -> Box<dyn ArrowPredicate> {
+        let sidx = format!(
+            "{}.{}",
+            array_indices.prefix,
+            self.buffer_context().index_name()
+        );
+        let predicate_mask = ProjectionMask::columns(&self.parquet_schema(), [sidx.as_str()]);
+
+        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
+            let root = batch.column(0).as_struct();
+            let it = index_range.contains_dy(root.column(0));
+            Ok(it)
+        });
+        Box::new(predicate)
+    }
+
+    fn prepare_predicate_for_mz<'a>(
+        &self,
+        mz_range: SimpleInterval<f64>,
+        array_indices: &'a ArrayIndex,
+    ) -> Option<Box<dyn ArrowPredicate>> {
+        if let Some(e) = array_indices.get(&ArrayType::MZArray) {
+            let predicate_mask = ProjectionMask::columns(&self.parquet_schema(), [e.path.as_str()]);
+            Some(Box::new(ArrowPredicateFn::new(
+                predicate_mask,
+                move |batch| {
+                    let root = batch.column(0).as_struct();
+                    let it = mz_range.contains_dy(root.column(0));
+                    Ok(it)
+                },
+            )))
+        } else {
+            None
+        }
+    }
+
+    fn prepare_predicate_for_ion_mobility<'a>(
+        &self,
+        ion_mobility_range: SimpleInterval<f64>,
+        array_indices: &'a ArrayIndex,
+    ) -> Option<Box<dyn ArrowPredicate>> {
+        if let Some(e) = array_indices.iter().find(|e| e.is_ion_mobility()) {
+            let predicate_mask = ProjectionMask::columns(&self.parquet_schema(), [e.path.as_str()]);
+            Some(Box::new(ArrowPredicateFn::new(
+                predicate_mask,
+                move |batch| {
+                    let root = batch.column(0).as_struct();
+                    let it = ion_mobility_range.contains_dy(root.column(0));
+                    Ok(it)
+                },
+            )))
+        } else {
+            None
+        }
+    }
+
     fn prepare_query<'a, I: SpectrumQueryIndex + 'a>(
         &self,
         index_range: MaskSet,
@@ -469,14 +529,7 @@ trait PointQuerySource {
         query_index: &'a I,
         array_indices: &'a ArrayIndex,
         query: Option<PageQuery>,
-    ) -> Option<(
-        RowSelection,
-        Vec<usize>,
-        ProjectionMask,
-        ArrowPredicateFn<
-            impl FnMut(RecordBatch) -> Result<arrow::array::BooleanArray, ArrowError> + 'static,
-        >,
-    )> {
+    ) -> Option<(RowSelection, Vec<usize>, ProjectionMask, RowFilter)> {
         let mut rows = query_index.index_overlaps(&index_range.range);
 
         let query = query.unwrap_or_else(|| query_index.query_pages_overlaps(&index_range));
@@ -496,9 +549,10 @@ trait PointQuerySource {
             rows = rows.intersection(&query_index.mz_overlaps(mz_range));
         }
 
-        if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
-            rows = rows.union(&query_index.im_overlaps(&ion_mobility_range));
-        }
+        // if let Some(ion_mobility_range) = ion_mobility_range.as_ref() {
+        //     let im_rows = query_index.ion_mobility_overlaps(&ion_mobility_range);
+        //     rows = rows.union(&im_rows);
+        // }
 
         rows.split_off(up_to_first_row as usize);
 
@@ -529,35 +583,20 @@ trait PointQuerySource {
 
         let proj =
             ProjectionMask::columns(&self.parquet_schema(), fields.iter().map(|s| s.as_str()));
-        let predicate_mask = proj.clone();
 
-        let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let root = batch.column(0).as_struct();
-            let it = index_range.contains_dy(root.column(0));
+        let mut predicates: Vec<Box<dyn ArrowPredicate>> =
+            vec![self.prepare_predicate_for_index(index_range, array_indices)];
+        if let Some(mz_range) = mz_range {
+            predicates.extend(self.prepare_predicate_for_mz(mz_range, array_indices));
+        }
+        if let Some(ion_mobility_range) = ion_mobility_range {
+            predicates
+                .extend(self.prepare_predicate_for_ion_mobility(ion_mobility_range, array_indices));
+        }
 
-            match (mz_range, ion_mobility_range) {
-                (None, None) => Ok(it),
-                (None, Some(ion_mobility_range)) => {
-                    let im_array = root.column(1);
-                    let it2 = ion_mobility_range.contains_dy(im_array);
-                    arrow::compute::and(&it, &it2)
-                }
-                (Some(mz_range), None) => {
-                    let mz_array = root.column(1);
-                    let it2 = mz_range.contains_dy(mz_array);
-                    arrow::compute::and(&it, &it2)
-                }
-                (Some(mz_range), Some(ion_mobility_range)) => {
-                    let mz_array = root.column(1);
-                    let im_array = root.column(2);
-                    let it2 = mz_range.contains_dy(mz_array);
-                    let it3 = ion_mobility_range.contains_dy(im_array);
-                    arrow::compute::and(&arrow::compute::and(&it2, &it3)?, &it)
-                }
-            }
-        });
+        let row_filter = RowFilter::new(predicates);
 
-        Some((rows, row_group_indices, proj, predicate))
+        Some((rows, row_group_indices, proj, row_filter))
     }
 }
 
@@ -712,7 +751,7 @@ mod async_impl {
                     .with_row_groups(row_group_indices)
                     .with_row_selection(rows)
                     .with_projection(proj)
-                    .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                    .with_row_filter(predicate)
                     .with_batch_size(10_000)
                     .build()?;
 
@@ -1068,7 +1107,8 @@ mod sync_impl {
             array_indices: &'a ArrayIndex,
             metadata: &'a ReaderMetadata,
             query: Option<PageQuery>,
-        ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a + Send>> {
+        ) -> io::Result<Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a + Send>>
+        {
             if let Some((rows, row_group_indices, proj, predicate)) = self.prepare_query(
                 index_range.into(),
                 mz_range,
@@ -1106,7 +1146,7 @@ mod sync_impl {
                     .with_row_groups(row_group_indices)
                     .with_row_selection(rows)
                     .with_projection(proj)
-                    .with_row_filter(RowFilter::new(vec![Box::new(predicate)]))
+                    .with_row_filter(predicate)
                     .with_batch_size(10_000)
                     .build()?;
 

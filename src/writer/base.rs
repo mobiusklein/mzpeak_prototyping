@@ -18,15 +18,10 @@ use parquet::{
 };
 
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries,
-    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
-    filter::select_delta_model,
-    peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
-    spectrum::AuxiliaryArray,
-    writer::{
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy}, filter::select_delta_model, peak_series::{array_map_to_schema_arrays_and_excess, MZ_ARRAY}, spectrum::AuxiliaryArray, writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType,
-        SpectrumBuilder,
-    },
+        SpectrumBuilder, WriteBatchConfig,
+    }, BufferContext, BufferName, ToMzPeakDataSeries
 };
 
 macro_rules! implement_mz_metadata {
@@ -551,6 +546,7 @@ pub trait AbstractMzPeakWriter {
         shuffle_mz: bool,
         use_chunked_encoding: &Option<ChunkingStrategy>,
         compression: Compression,
+        write_batch_config: WriteBatchConfig,
     ) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
@@ -568,16 +564,24 @@ pub trait AbstractMzPeakWriter {
             }
         }
 
+        let max_row_group_size = write_batch_config.row_group_size.unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE);
+        let data_page_size = write_batch_config.page_size.unwrap_or(parquet::file::properties::DEFAULT_PAGE_SIZE);
+        let write_batch_size = write_batch_config.write_batch_size.unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
+
         let mut data_props = WriterProperties::builder()
             .set_compression(compression)
             .set_dictionary_enabled(true)
             .set_sorting_columns(Some(sorted))
             .set_column_encoding(index_path.into(), Encoding::RLE)
             .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_statistics_enabled(EnabledStatistics::Page);
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_write_batch_size(write_batch_size);
+
 
         if use_chunked_encoding.is_some() {
-            data_props = data_props.set_max_row_group_size(1024 * 100)
+            data_props = data_props.set_max_row_group_size(max_row_group_size).set_data_page_size_limit(data_page_size / 4);
+        } else {
+            data_props = data_props.set_max_row_group_size(max_row_group_size).set_data_page_row_count_limit(data_page_size);
         }
 
         for c in parquet_schema.columns().iter() {

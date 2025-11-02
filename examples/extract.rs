@@ -15,8 +15,8 @@ struct App {
     #[arg(short, long, default_value = "623.0-625.0")]
     mz_range: CoordinateRange<f64>,
 
-    #[arg(short, long, default_value = "0.8-1.2")]
-    im_range: CoordinateRange<f64>,
+    #[arg(short, long)]
+    im_range: Option<CoordinateRange<f64>>,
 
     #[arg(short='l', long)]
     ms_level_range: Option<CoordinateRange<u8>>,
@@ -46,10 +46,10 @@ fn main() -> io::Result<()> {
         args.mz_range.end.unwrap_or(f64::INFINITY),
     );
 
-    let im_range = SimpleInterval::new(
-        args.im_range.start.unwrap_or(0.0),
-        args.im_range.end.unwrap_or(f64::INFINITY),
-    );
+    let mut im_range = args.im_range.map(|im_range| SimpleInterval::new(
+        im_range.start.unwrap_or(0.0),
+        im_range.end.unwrap_or(f64::INFINITY),
+    ));
 
     let ms_level_range = args.ms_level_range.map(|r| {
         SimpleInterval::new(
@@ -59,7 +59,7 @@ fn main() -> io::Result<()> {
     });
 
     let (it, time_index) =
-        reader.extract_peaks(time_range, Some(mz_range), None, ms_level_range)?;
+        reader.extract_peaks(time_range, Some(mz_range), im_range.take(), ms_level_range)?;
 
     let query_range_end = std::time::Instant::now();
     eprintln!(
@@ -86,13 +86,25 @@ fn main() -> io::Result<()> {
                 let mut last_time = 0.0;
 
                 if $ims.is_some() {
-                    for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
-                        if $im_range.contains(&im) {
+                    if let Some(im_range) = $im_range.as_ref() {
+                        for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
+                            if im_range.contains(&im) {
+                                if last_index != index {
+                                    last_time = time_index[&index];
+                                    last_index = index;
+                                }
+                                println!("{index}\t{last_time}\t{mz}\t{intensity}\t{im}");
+                            }
+                        }
+                    } else {
+                        for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
+
                             if last_index != index {
                                 last_time = time_index[&index];
                                 last_index = index;
                             }
                             println!("{index}\t{last_time}\t{mz}\t{intensity}\t{im}");
+
                         }
                     }
                 } else {
@@ -120,14 +132,14 @@ fn main() -> io::Result<()> {
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
-                        SimpleInterval::new(im_range.start as f64, im_range.end as f64)
+                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f64, im_range.end as f64))
                     );
                 } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
                     iter!(
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
-                        SimpleInterval::new(im_range.start as f32, im_range.end as f32)
+                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f32, im_range.end as f32))
                     );
                 } else {
                     iter!(mzs, Option::<Float64Array>::None, mz_range, im_range);
@@ -138,14 +150,14 @@ fn main() -> io::Result<()> {
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
-                        SimpleInterval::new(im_range.start as f64, im_range.end as f64)
+                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f64, im_range.end as f64))
                     );
                 } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
                     iter!(
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
-                        SimpleInterval::new(im_range.start as f32, im_range.end as f32)
+                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f32, im_range.end as f32))
                     );
                 } else {
                     iter!(
