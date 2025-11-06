@@ -18,7 +18,14 @@ use mzpeak_prototyping::{
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
 use std::{
-    collections::HashMap, fmt::Debug, fs, io, panic::{self, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::sync_channel, thread, time::Instant
+    collections::HashMap,
+    fmt::Debug,
+    fs, io,
+    panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
+    sync::mpsc::sync_channel,
+    thread,
+    time::Instant,
 };
 
 // ============================================================================
@@ -102,7 +109,9 @@ impl std::str::FromStr for SuffixedSize {
                 'M' => 2usize.pow(20u32),
                 'G' => 2usize.pow(30u32),
                 _ => {
-                    panic!("Unrecognized suffix {c}, accepts K (2**10), M(2**20), or G(2**30) or no suffix")
+                    panic!(
+                        "Unrecognized suffix {c}, accepts K (2**10), M(2**20), or G(2**30) or no suffix"
+                    )
                 }
             } * s[..s.len().saturating_sub(1)].parse::<usize>()?;
             Ok(Self(val))
@@ -151,11 +160,15 @@ pub struct ConvertArgs {
     #[arg(
         short = 'z',
         long = "shuffle-mz",
-        help = "Shuffle the m/z array, which may improve the compression of profile spectra"
+        help = "Shuffle the m/z array, which can improve the compression of profile spectra or densely packed centroids."
     )]
     pub shuffle_mz: bool,
 
-    #[arg(short = 'u', long, help = "Null mask out sparse zero intensity peaks")]
+    #[arg(
+        short = 'u',
+        long,
+        help = "Null mask out sparse zero intensity peaks. This is appropriate for *sparse* data with many gaps."
+    )]
     pub null_zeros: bool,
 
     #[arg(short = 'o', long, help = "Output file path")]
@@ -169,19 +182,34 @@ pub struct ConvertArgs {
     )]
     buffer_size: usize,
 
-    #[arg(long, help="The number of rows to write in a batch")]
+    #[arg(
+        long,
+        help = "The number of rows to write in a batch between deciding to open a new page or row group segment. Defaults to 1K. Supports SI suffixes K, M, G."
+    )]
     write_batch_size: Option<SuffixedSize>,
 
-    #[arg(long, help="The approximate number of *bytes* per data page")]
+    #[arg(
+        long,
+        help = "The approximate number of *bytes* per data page. Defaults to 1M. Supports SI suffixes K, M, G."
+    )]
     data_page_size: Option<SuffixedSize>,
 
-    #[arg(long, help="The approximate number of rows per row group")]
+    #[arg(
+        long,
+        help = "The approximate number of rows per row group. Defaults to 1M. Supports SI suffixes K, M, G."
+    )]
     row_group_size: Option<SuffixedSize>,
+
+    #[arg(
+        long,
+        help = "The approximate number of *bytes* per dictionary page. Defaults to 1M. Supports SI suffixes K, M, G."
+    )]
+    dictionary_page_size: Option<SuffixedSize>,
 
     #[arg(
         short,
         long,
-        help = "Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress', or 'plain'. You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'",
+        help = "Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress'. You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'",
         value_parser=chunk_encoding_parser,
         default_missing_value="delta:50",
         num_args=0..=1,
@@ -381,8 +409,21 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         .chunked_encoding(args.chunked_encoding)
         .null_zeros(args.null_zeros)
         .write_batch_size(args.write_batch_size.map(usize::from))
-        .page_size(args.data_page_size.inspect(|e| log::debug!("data page size: {e:?}")).map(usize::from))
-        .row_group_size(args.row_group_size.inspect(|e| log::debug!("row group size: {e:?}")).map(usize::from))
+        .page_size(
+            args.data_page_size
+                .inspect(|e| log::debug!("data page size: {e:?}"))
+                .map(usize::from),
+        )
+        .dictionary_page_size(
+            args.dictionary_page_size
+                .inspect(|e| log::debug!("dictionary page size: {e:?}"))
+                .map(usize::from),
+        )
+        .row_group_size(
+            args.row_group_size
+                .inspect(|e| log::debug!("row group size: {e:?}"))
+                .map(usize::from),
+        )
         .compression(Compression::ZSTD(
             ZstdLevel::try_new(args.compression_level).unwrap(),
         ));
@@ -414,6 +455,26 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     let mut writer = writer.build(handle, true);
     writer.copy_metadata_from(&reader);
+    writer.softwares_mut().push(mzdata::meta::Software::new(
+        "mzpeak_prototyping_convert1".into(),
+        "0.1.0".into(),
+        vec![mzdata::meta::custom_software_name(
+            "mzpeak_prototyping_convert",
+        )],
+    ));
+    writer
+        .data_processings_mut()
+        .push(mzdata::meta::DataProcessing {
+            id: "mzpeak_conversion1".to_string(),
+            methods: vec![mzdata::meta::ProcessingMethod {
+                order: 1,
+                software_reference: "mzpeak_prototyping_convert1".to_string(),
+                params: vec![mzdata::Param::new_key_value(
+                    "conversion options",
+                    std::env::args().skip(1).collect::<Vec<String>>().join(" "),
+                )],
+            }],
+        });
 
     let (send, recv) = sync_channel(1);
 
@@ -423,8 +484,8 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
             match &mut reader {
                 MZReaderType::BrukerTDF(tdfspectrum_reader_type) => {
                     tdfspectrum_reader_type.set_consolidate_peaks(false);
-                },
-                _ => {},
+                }
+                _ => {}
             }
             for mut entry in reader.iter() {
                 if entry.has_ion_mobility_dimension() {

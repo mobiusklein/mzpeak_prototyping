@@ -46,6 +46,18 @@ class DeltaModelBase:
 
 
 class ConstantDeltaModel(DeltaModelBase):
+    """
+    A :class:`DeltaModelBase` that uses a constant value like the median spacing
+    across the spectrum.
+
+    Effectively equivalent to :class:`DeltaCurveRegressionModel` with only the intercept
+    coefficient at inference time.
+
+    Attributes
+    ----------
+    delta : float
+        The spacing between m/z values
+    """
     delta: float
 
     def __init__(self, delta: float):
@@ -65,14 +77,23 @@ class ConstantDeltaModel(DeltaModelBase):
     def predict(self, mz: float) -> float:
         return self.delta
 
-    def __call__(self, mz: float) -> float:
-        return self.predict(mz)
-
     def __repr__(self):
         return f"{self.__class__.__name__}({self.delta})"
 
 
 class DeltaCurveRegressionModel(DeltaModelBase):
+    r"""
+    A :class:`DeltaModelBase` that uses a weighted least squares regression model
+    for m/z spacing as a function of m/z value.
+
+    .. math::
+        δ mz \sim β_0 + β_1 mz + β_2 mz^2 + ... + ϵ
+
+    Attributes
+    ----------
+    beta : :class:`np.ndarray`
+        The estimated linear model coefficients
+    """
     beta: np.ndarray
 
     def __init__(self, beta: np.ndarray):
@@ -81,12 +102,36 @@ class DeltaCurveRegressionModel(DeltaModelBase):
     @classmethod
     def fit(
         cls,
-        mz_array,
-        delta_array,
+        mz_array: np.ndarray,
+        delta_array: np.ndarray | None = None,
         weights: np.ndarray | None = None,
         threshold: float | None = None,
         rank: int = 2,
     ):
+        """
+        Fit a weighted least squares model on the provided m/z array.
+
+        Arguments
+        ---------
+        mz_array : np.ndarray
+            The m/z array to fit the model on.
+        delta_array : np.ndarray, optional
+            The difference between successive values in the m/z array. Should be
+            one shorter than ``mz_array``. If not provided, will be computed from
+            ``np.diff(mz_array)`` which has the expected alignment.
+        weights : np.ndarray, optional
+            The weight to put on each point in the m/z array. Is expected to be **sqrt**
+            transformed. The intensity at the m/z value is an appropriate quantity.
+        threshold : float, optional
+            The maximum m/z delta to consider, discarding any point whose delta value is larger
+            than this number. Defaults to ``1.0``.
+        rank : int, optional
+            The rank of the feature polynomial to construct, e.g. ``2 = β_0 + β_1 mz + β_2 mz^2``.
+            Defaults to ``2``.
+        """
+        if delta_array is None:
+            delta_array = np.diff(mz_array)
+
         if weights is None:
             weights = np.ones(len(mz_array))
         else:
@@ -97,6 +142,7 @@ class DeltaCurveRegressionModel(DeltaModelBase):
         data = []
         raw = mz_array[1:][delta_array <= threshold]
         w = weights[1:][delta_array <= threshold]
+        y = delta_array[delta_array <= threshold]
         for i in range(rank + 1):
             if i == 0:
                 data.append(np.ones_like(raw))
@@ -105,7 +151,6 @@ class DeltaCurveRegressionModel(DeltaModelBase):
             else:
                 data.append(raw**i)
         data = np.stack(data, axis=-1)
-        y = delta_array[delta_array <= threshold]
 
         # Use the QR decomposition to solve the weighted least squares problem
         # to estimate weights predicting δ m/z.
@@ -124,9 +169,6 @@ class DeltaCurveRegressionModel(DeltaModelBase):
         for i in range(1, len(self.beta)):
             acc += self.beta[i] * mz ** i
         return acc
-
-    def __call__(self, mz: float) -> float:
-        return self.predict(mz)
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.beta})"
@@ -151,14 +193,14 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
         if not data.null_count:
             return np.asarray(data)
 
-        tokenizer = NullTokenizer(data.is_null())
+        tokenizer = _NullTokenizer(data.is_null())
     else:
         data = pa.array(data)
-        tokenizer = NullTokenizer(data.is_nan())
+        tokenizer = _NullTokenizer(data.is_nan())
     buffer = []
     n = len(data)
     for token in tokenizer:
-        if token[-1] == NullFillState.NullStart:
+        if token[-1] == _NullFillState.NullStart:
             (start, _, _) = token
             length = (n - start) - 1
             real_values = np.asarray(data.slice(start + 1, length))
@@ -170,7 +212,7 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
                 val0 = real_values[0]
                 buffer.append((val0 - local_delta,))
                 buffer.append(real_values)
-        elif token[-1] == NullFillState.NullEnd:
+        elif token[-1] == _NullFillState.NullEnd:
             start = 0
             (_, end, _) = token
             length = end
@@ -182,7 +224,7 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
                 local_delta, _ = estimate_median_delta(real_values)
                 buffer.append(real_values)
                 buffer.append((real_values[-1] + local_delta,))
-        elif token[-1] == NullFillState.NullBounded:
+        elif token[-1] == _NullFillState.NullBounded:
             (start, end, _) = token
             length = (end - start) - 1
             real_values = np.asarray(data.slice(start + 1, length))
@@ -201,20 +243,20 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
     return np.concat(buffer)
 
 
-class NullFillState(Enum):
+class _NullFillState(Enum):
     Unset = auto()
     NullStart = auto()
     NullEnd = auto()
     NullBounded = auto()
 
 
-class NullTokenizer:
+class _NullTokenizer:
     array: Sequence[bool]
     _map: Sequence[int]
     _map_iter: Iterator[int]
     index: int
-    state: tuple[int, int | None, NullFillState] | None
-    next_state: tuple[int, int | None, NullFillState] | None
+    state: tuple[int, int | None, _NullFillState] | None
+    next_state: tuple[int, int | None, _NullFillState] | None
 
     def __init__(self, array):
         self.array = np.asarray(array)
@@ -268,9 +310,9 @@ class NullTokenizer:
             self.find_next_null()
             end = self.index
             if self.is_null():
-                self.next_state = (start, end, NullFillState.NullBounded)
+                self.next_state = (start, end, _NullFillState.NullBounded)
             else:
-                self.next_state = (start, None, NullFillState.NullStart)
+                self.next_state = (start, None, _NullFillState.NullStart)
         else:
             raise Exception(f"Trip run in null sequence at {prev}-{self.index}")
 
@@ -279,22 +321,22 @@ class NullTokenizer:
         start_null = self.is_null()
         self.find_next_null()
         if not start_null:
-            self.state = (None, self.index, NullFillState.NullEnd)
+            self.state = (None, self.index, _NullFillState.NullEnd)
             self.update_next_state()
         else:
             if self.is_null():
-                self.state = (0, self.index, NullFillState.NullBounded)
+                self.state = (0, self.index, _NullFillState.NullBounded)
                 self.update_next_state()
             else:
-                self.state = (0, None, NullFillState.NullStart)
+                self.state = (0, None, _NullFillState.NullStart)
 
         if len(self.array) < 3 and self.state is None:
             if start_null and not self.is_null():
-                self.state = (0, None, NullFillState.NullStart)
+                self.state = (0, None, _NullFillState.NullStart)
             elif not start_null and self.is_null():
-                self.state = (0, None, NullFillState.NullStart)
+                self.state = (0, None, _NullFillState.NullStart)
 
-    def emit(self) -> tuple[int | None, int | None, NullFillState] | None:
+    def emit(self) -> tuple[int | None, int | None, _NullFillState] | None:
         state = self.state
         self.state = self.next_state
         self.update_next_state()

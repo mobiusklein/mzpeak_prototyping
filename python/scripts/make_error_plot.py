@@ -90,6 +90,13 @@ def main(
         transform=ax1.transAxes,
         ha="left",
     )
+    ax1.text(
+        0.7,
+        0.65,
+        rf"max={x['diff'].abs().max():0.4g}",
+        transform=ax1.transAxes,
+        ha="left",
+    )
 
     ax2.hist(y["numpress_diff"].abs(), bins=bins, edgecolor="black", linewidth=0.5)
     ax2.set_yscale("log")
@@ -118,6 +125,13 @@ def main(
         0.7,
         0.7,
         rf"$\sigma$={y['numpress_diff'].abs().std():0.4g}",
+        transform=ax2.transAxes,
+        ha="left",
+    )
+    ax2.text(
+        0.7,
+        0.65,
+        rf"max={y['numpress_diff'].abs().max():0.4g}",
         transform=ax2.transAxes,
         ha="left",
     )

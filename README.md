@@ -187,7 +187,7 @@ Options:
   -y, --intensity-f32
           Encode the intensity values using float32
       --intensity-numpress-slof
-          Encode the intensity values using the Numpress Short Logged Float transform
+          Encode the intensity values using the Numpress Short Logged Float transform. This requires the chunked encoding.
   -i, --intensity-i32
           Encode the intensity values as int32 instead of floats which may improve compression at the cost of the decimal component
   -z, --shuffle-mz
@@ -198,8 +198,16 @@ Options:
           Output file path
   -b, --buffer-size <BUFFER_SIZE>
           The number of spectra to buffer between writes [default: 5000]
+      --write-batch-size <WRITE_BATCH_SIZE>
+          The number of rows to write in a batch between deciding to open a new page or row group segment. Defaults to 1K. Supports SI suffixes K, M, G.
+      --data-page-size <DATA_PAGE_SIZE>
+          The approximate number of *bytes* per data page. Defaults to 1M. Supports SI suffixes K, M, G.
+      --row-group-size <ROW_GROUP_SIZE>
+          The approximate number of rows per row group. Defaults to 1M. Supports SI suffixes K, M, G.
+      --dictionary-page-size <DICTIONARY_PAGE_SIZE>
+          The approximate number of *bytes* per dictionary page. Defaults to 1M. Supports SI suffixes K, M, G.
   -c, --chunked-encoding [<CHUNKED_ENCODING>]
-          Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress', or 'plain'. You can also specify a chunk size like 'delta:50'. [default: 'delta:50']
+          Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic' and 'numpress'. You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'
   -k, --compression-level <COMPRESSION_LEVEL>
           The Zstd compression level to use. Defaults to 3, but ranges from 1-22 [default: 3]
   -p, --write-peaks-and-profiles

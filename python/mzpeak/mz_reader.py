@@ -2,8 +2,7 @@ from dataclasses import dataclass
 import logging
 import json
 
-import math
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from enum import Enum
 
 import numpy as np
@@ -137,6 +136,14 @@ class _DataIndex:
                 break
         return rgs
 
+    def __len__(self):
+        try:
+            return self.meta.row_group(
+                self.meta.num_row_groups - 1
+            ).column(self.index_i).statistics.max
+        except IndexError:
+            return 0
+
 
 class BufferFormat(Enum):
     """
@@ -162,6 +169,21 @@ class BufferFormat(Enum):
 
 
 class _BatchIterator:
+    """
+    Incrementally partition a stream of :class:`pyarrow.RecordBatch` instances into
+    blocks of single spectrum or chromatogram data.
+
+    Attributes
+    ----------
+    it : :class:`Iterator` of :class:`pyarrow.RecordBatch`
+        The stream of Arrow batches to unpack from.
+    batch : :class:`pyarrow.StructArray`
+        The current batch being segmented.
+    current_index : int
+        The entry index that was last processed.
+    index_column : str
+        The name of entry index column.
+    """
     it: Iterator[pa.RecordBatch]
     batch: pa.StructArray
     current_index: int
@@ -181,7 +203,7 @@ class _BatchIterator:
         self.batch = None
         self.current_index = current_index
         self.index_column = index_column
-        self._read_next_chunk()
+        self._read_next_chunk(update_index=True)
 
     def _infer_starting_index(self):
         return pc.min(pc.struct_field(self.batch, self.index_column)).as_py()
@@ -195,16 +217,23 @@ class _BatchIterator:
     def __iter__(self):
         return self
 
-    def _read_next_chunk(self):
-        logger.debug(f"Reading next batch looking for {self.current_index}")
+    def _read_next_chunk(self, update_index: bool):
+        logger.debug("Reading next batch looking for %r", self.current_index)
         batch = next(self.it).column(0)
         lowest_index = pc.min(pc.struct_field(batch, self.index_column)).as_py()
-        if (
-            self.current_index is not None and lowest_index > self.current_index
-        ) or self.current_index is None:
+        if update_index and (
+            (self.current_index is not None and lowest_index > self.current_index)
+            or self.current_index is None
+        ):
             self.current_index = lowest_index
-        logger.debug(f"New batch starts with {lowest_index}")
+        logger.debug("New batch starts with %r", self.current_index)
         self.batch = batch
+
+    def _batch_has_index(self) -> bool:
+        mask = pc.equal(
+            pc.struct_field(self.batch, self.index_column), self.current_index
+        )
+        return np.any(mask)
 
     def _extract_for_index(self):
         mask = pc.equal(
@@ -223,14 +252,25 @@ class _BatchIterator:
         if n == len(self.batch):
             # This batch is only composed of the current index, so we should also read the next batch in and
             # take whatever rows correspond to this index too before advancing.
-            self._read_next_chunk()
-            rest = self._extract_for_index()
-            chunk = pa.concat_arrays([chunk, rest])
+            self._read_next_chunk(update_index=False)
+            if self._batch_has_index():
+                rest = self._extract_for_index()
+                chunk = pa.concat_arrays([chunk, rest])
         else:
             self.batch = self.batch.slice(n)
         return chunk
 
     def seek(self, index: int):
+        """
+        Advance the iterator until it reaches the requested index.
+
+        .. note:: The iterator cannot go backwards.
+
+        Arguments
+        ---------
+        index : int
+            The index to seek to
+        """
         if index < self.current_index:
             raise ValueError("Cannot rewind iterator")
         if index == self.current_index:
@@ -264,7 +304,7 @@ psims_dtypes = {
 _SpectrumArrays = dict[str, np.ndarray]
 
 
-class MzPeakArrayDataReader:
+class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     """
     A generic reader for mzPeak data array reading.
 
@@ -327,7 +367,7 @@ class MzPeakArrayDataReader:
         if isinstance(data, pa.StructArray):
             nulls = []
             for i, name in enumerate(data.type):
-                col = data.field(name)
+                col = data.field(i)
                 if col.null_count == len(col):
                     nulls.append(i)
             if len(nulls) > 1:
@@ -478,6 +518,8 @@ class MzPeakArrayDataReader:
 
             # Delta encoding
             if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):
+                # This indicates an empty chunk containing no information beyond possibly a null value.
+                # Skip it and keep going.
                 if (start == end) and start == 0.0:
                     continue
 
@@ -705,7 +747,19 @@ class MzPeakArrayDataReader:
             return self.read_data_for_range(index)
         return self._read_data_for(index)
 
+    def __len__(self):
+        if self._point_index.init:
+            return len(self._point_index)
+        elif self._chunk_index.init:
+            return len(self._chunk_index)
+        else:
+            return 0
+
     def buffer_format(self) -> BufferFormat:
+        """
+        The kind of data layout that the underlying file uses, either
+        :attr:`BufferFormat.Point` or :attr:`BufferFormat.Chunk`
+        """
         if self._point_index.init:
             return BufferFormat.Point
         elif self._chunk_index.init:

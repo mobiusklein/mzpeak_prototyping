@@ -19,6 +19,7 @@ pub struct WriteBatchConfig {
     pub write_batch_size: Option<usize>,
     pub page_size: Option<usize>,
     pub row_group_size: Option<usize>,
+    pub dictionary_page_size: Option<usize>
 }
 
 /// A builder for mzPeak writers
@@ -169,6 +170,11 @@ impl MzPeakWriterBuilder {
 
     pub fn row_group_size(mut self, value: Option<usize>) -> Self {
         self.write_batch_config.row_group_size = value;
+        self
+    }
+
+    pub fn dictionary_page_size(mut self, value: Option<usize>) -> Self {
+        self.write_batch_config.dictionary_page_size = value;
         self
     }
 

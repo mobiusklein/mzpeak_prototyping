@@ -1,12 +1,13 @@
 import logging
 import json
+import itertools
 import zipfile
 import zlib
 
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable, Sequence
-from typing import IO, Any, Iterator
+from typing import IO, Any, Iterator, Optional
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,85 @@ def _value_normalize(val: dict):
         if v is not None:
             return v
     return None
+
+
+class RTLocator:
+    def __init__(self, reader):
+        self._reader = reader
+
+    def resolve(self, time: float | slice):
+        if isinstance(time, slice):
+            start_time = time.start or 0.0
+            end_time = time.stop or self._reader.spectra["time"].iloc[-1]
+            start_hit = self._get_scan_by_time(start_time)
+            end_hit = self._get_scan_by_time(end_time)
+            if not start_hit:
+                return []
+            start_index, _ = start_hit
+            end_index, _ = end_hit
+            return slice(start_index, end_index + 1)
+        else:
+            hit = self._get_scan_by_time(time)
+            if not hit:
+                raise KeyError(time)
+            (index, _) = hit
+            return index
+
+    def _get_scan_by_time(self, time: float) -> Optional[tuple[int, float]]:
+        """
+        Retrieve the scan object for the specified scan time.
+
+        Parameters
+        ----------
+        time : float
+            The time to get the nearest scan from
+        Returns
+        -------
+        tuple: (scan_index, scan_time)
+        """
+        spectra_df = self._reader.spectra
+        times = spectra_df['time']
+        indices = spectra_df.index
+
+        lo = 0
+        hi = len(indices)
+
+        if hi == 0:
+            return None
+
+        best_error = float("inf")
+        best_time = None
+        best_id = None
+
+        if time == float("inf"):
+            return indices[-1], times[-1]
+
+        while hi != lo:
+            mid = (hi + lo) // 2
+            sid = indices[mid]
+            scan_time = times[sid]
+            err = abs(scan_time - time)
+            if err < best_error:
+                best_error = err
+                best_time = scan_time
+                best_id = sid
+            if scan_time == time:
+                return sid, scan_time
+            elif (hi - lo) == 1:
+                return best_id, best_time
+            elif scan_time > time:
+                hi = mid
+            else:
+                lo = mid
+
+        if time == float("inf"):
+            return indices[-1], times[-1]
+        else:
+            return None
+
+    def __getitem__(self, time: float | slice):
+        idx = self.resolve(time)
+        return self._reader[idx]
 
 
 def _format_curie(curie: dict):
@@ -237,24 +317,32 @@ class MzPeakSpectrumMetadataReader:
                 self.selected_ion_i = i
 
     def _read_spectra(self):
-        spectra = []
+        blocks = []
         for i in range(self.meta.num_row_groups):
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.spectrum_index_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["spectrum"])
-                spectra.append(bat.filter(bat[0].is_valid()))
+                table = self.handle.read_row_group(i, columns=["spectrum"])
+                bats = table['spectrum'].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
 
-        if not spectra:
+        if not blocks:
             self.spectra = pd.DataFrame([], columns=['index', 'id', ])
         else:
-            bat = pa.record_batch(pa.concat_tables(spectra)["spectrum"].combine_chunks())
+            bat = pa.record_batch(pa.concat_arrays(blocks))
             bat = _format_curies_batch(bat)
             self.spectra = _clean_frame(
                 bat
                 .to_pandas()
                 .set_index("index")
             )
+            if (np.diff(self.spectra.index) == 1).all():
+                self.spectra.index = pd.RangeIndex(
+                    self.spectra.index[0],
+                    self.spectra.index[-1] + 1,
+                    name="index",
+                )
         self.id_index = self.spectra[["id"]].reset_index().set_index("id")["index"]
 
     def _read_scans(self):
@@ -263,17 +351,24 @@ class MzPeakSpectrumMetadataReader:
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.scan_index_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["scan"])
-                blocks.append(bat.filter(bat[0].is_valid()))
+                table = self.handle.read_row_group(i, columns=["scan"])
+                bats = table['scan'].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if blocks:
-            bat = pa.record_batch(pa.concat_tables(blocks)["scan"].combine_chunks())
+            bat = pa.record_batch(pa.concat_arrays(blocks))
             bat = _format_curies_batch(bat)
             self.scans = _clean_frame(
                 bat
                 .to_pandas()
                 .set_index("spectrum_index")
             )
+            if (np.diff(self.scans.index) == 1).all():
+                self.scans.index = pd.RangeIndex(
+                    self.scans.index[0],
+                    self.scans.index[-1] + 1,
+                )
         else:
             self.scans = pd.DataFrame([], columns=['spectrum_index', ])
 
@@ -283,10 +378,12 @@ class MzPeakSpectrumMetadataReader:
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.precursor_index_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["precursor"])
-                blocks.append(bat.filter(bat[0].is_valid()))
+                table: pa.Table = self.handle.read_row_group(i, columns=["precursor"])
+                bats = table['precursor'].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
         if blocks:
-            bat = pa.record_batch(pa.concat_tables(blocks)["precursor"].combine_chunks())
+            bat = pa.record_batch(pa.concat_arrays(blocks))
             bat = _format_curies_batch(bat)
             self.precursors = _clean_frame(
                 bat
@@ -302,11 +399,13 @@ class MzPeakSpectrumMetadataReader:
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.selected_ion_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["selected_ion"])
-                blocks.append(bat.filter(bat[0].is_valid()))
+                table = self.handle.read_row_group(i, columns=["selected_ion"])
+                bats = table['selected_ion'].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if blocks:
-            bat = pa.record_batch(pa.concat_tables(blocks)["selected_ion"].combine_chunks())
+            bat = pa.record_batch(pa.concat_arrays(blocks))
             bat = _format_curies_batch(bat)
             self.selected_ions = _clean_frame(
                 bat
@@ -413,8 +512,10 @@ class MzPeakChromatogramMetadataReader:
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.chromatogram_index_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["chromatogram"])
-                chromatograms.append(bat.filter(bat[0].is_valid()))
+                table = self.handle.read_row_group(i, columns=["chromatogram"])
+                bats = table["chromatogram"].chunks
+                for bat in bats:
+                    chromatograms.append(bat.filter(bat.field(0).is_valid()))
 
         if not chromatograms:
             self.chromatograms = pd.DataFrame(
@@ -425,9 +526,7 @@ class MzPeakChromatogramMetadataReader:
                 ],
             )
         else:
-            bat = pa.record_batch(
-                pa.concat_tables(chromatograms)["chromatogram"].combine_chunks()
-            )
+            bat = pa.record_batch(pa.concat_arrays(chromatograms))
             bat = _format_curies_batch(bat)
             self.chromatograms = _clean_frame(bat.to_pandas().set_index("index"))
         self.id_index = self.chromatograms[["id"]].reset_index().set_index("id")["index"]
@@ -438,12 +537,12 @@ class MzPeakChromatogramMetadataReader:
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.precursor_index_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["precursor"])
-                blocks.append(bat.filter(bat[0].is_valid()))
+                table: pa.Table = self.handle.read_row_group(i, columns=["precursor"])
+                bats = table["precursor"].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
         if blocks:
-            bat = pa.record_batch(
-                pa.concat_tables(blocks)["precursor"].combine_chunks()
-            )
+            bat = pa.record_batch(pa.concat_arrays(blocks))
             bat = _format_curies_batch(bat)
             self.precursors = _clean_frame(bat.to_pandas().set_index("spectrum_index"))
         else:
@@ -461,13 +560,13 @@ class MzPeakChromatogramMetadataReader:
             rg = self.meta.row_group(i)
             col_idx = rg.column(self.selected_ion_i)
             if col_idx.statistics.has_min_max:
-                bat = self.handle.read_row_group(i, columns=["selected_ion"])
-                blocks.append(bat.filter(bat[0].is_valid()))
+                table = self.handle.read_row_group(i, columns=["selected_ion"])
+                bats = table["selected_ion"].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if blocks:
-            bat = pa.record_batch(
-                pa.concat_tables(blocks)["selected_ion"].combine_chunks()
-            )
+            bat = pa.record_batch(pa.concat_arrays(blocks))
             bat = _format_curies_batch(bat)
             self.selected_ions = _clean_frame(
                 bat.to_pandas().set_index("spectrum_index")
@@ -514,6 +613,9 @@ _SpectrumType = dict[str, Any]
 
 
 class MzPeakFileIter(Iterator[_SpectrumType]):
+    """
+    An :class:`Iterator` for :class:`MzPeakFile`.
+    """
     archive: "MzPeakFile"
     index: int
     buffer_format: BufferFormat
@@ -558,6 +660,21 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
         return self
 
     def seek(self, index: int):
+        """
+        Advance the underlying iterator to the requested index.
+
+        .. note:: The iterator cannot travel backwards.
+
+        Arguments
+        ---------
+        index : int
+            The index to advance to.
+
+        Raises
+        ------
+        :class:`ValueError`
+            If `index` is less than :attr:`index`
+        """
         self.index = index
         self.data_iter.seek(index)
 
@@ -663,33 +780,37 @@ class MzPeakFile(Sequence[_SpectrumType]):
     def _from_directory(self, path: Path):
         self._archive = path
         index_path = path / FileIndex.FILE_NAME
+        visited = set()
         if index_path.exists():
             self.file_index = FileIndex.from_json(json.load(index_path.open()))
             for e in self.file_index:
                 f = path / e.name
+                if f in visited:
+                    continue
+                visited.add(f)
                 match e.entry_type():
                     case (EntityType.Spectrum, DataKind.DataArrays):
                         self.spectrum_data = MzPeakArrayDataReader(
-                            pa.OSFile(f),
+                            pa.OSFile(str(f)),
                             namespace="spectrum",
                         )
                     case (EntityType.Spectrum, DataKind.Metadata):
                         self.spectrum_metadata = MzPeakSpectrumMetadataReader(
-                            pa.OSFile(f),
+                            pa.OSFile(str(f)),
                         )
                     case (EntityType.Spectrum, DataKind.Peaks):
                         self.spectrum_peak_data = MzPeakArrayDataReader(
-                            pa.OSFile(f),
+                            pa.OSFile(str(f)),
                             namespace="spectrum",
                         )
                     case (EntityType.Chromatogram, DataKind.DataArrays):
                         self.chromatogram_data = MzPeakArrayDataReader(
-                            pa.OSFile(f),
+                            pa.OSFile(str(f)),
                             namespace="chromatogram",
                         )
                     case (EntityType.Chromatogram, DataKind.Metadata):
                         self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
-                            pa.OSFile(f)
+                            pa.OSFile(str(f))
                         )
                     case _:
                         pass
@@ -697,18 +818,21 @@ class MzPeakFile(Sequence[_SpectrumType]):
         for f in path.glob("*mzpeak"):
             if not f.is_file():
                 continue
+            if f in visited:
+                continue
+            visited.add(f)
             if f.name.endswith("spectra_data.mzpeak") and not self.spectrum_data:
                 self.spectrum_data = MzPeakArrayDataReader(
-                    pa.OSFile(f),
+                    pa.OSFile(str(f)),
                     namespace="spectrum",
                 )
             elif f.name.endswith("spectra_metadata.mzpeak") and not self.spectrum_metadata:
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
-                    pa.OSFile(f),
+                    pa.OSFile(str(f)),
                 )
             elif f.name.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data:
                 self.spectrum_peak_data = MzPeakArrayDataReader(
-                    pa.OSFile(f),
+                    pa.OSFile(str(f)),
                     namespace="spectrum",
                 )
             elif (
@@ -716,22 +840,26 @@ class MzPeakFile(Sequence[_SpectrumType]):
                 and not self.chromatogram_metadata
             ):
                 self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
-                    pa.OSFile(f)
+                    pa.OSFile(str(f))
                 )
             elif (
                 f.name.endswith("chromatograms_data.mzpeak") and not self.chromatogram_data
             ):
                 self.chromatogram_data = MzPeakArrayDataReader(
-                    pa.OSFile(f),
+                    pa.OSFile(str(f)),
                     namespace="chromatogram",
                 )
 
     def _from_zip_archive(self, archive: zipfile.ZipFile):
         self._archive = archive
+        visited = set()
         try:
             f = archive.getinfo(FileIndex.FILE_NAME)
             self.file_index = FileIndex.from_json(json.load(archive.open(f)))
             for e in self.file_index:
+                if e.name in visited:
+                    continue
+                visited.add(e.name)
                 f = archive.open(e.name)
                 match e.entry_type():
                     case (EntityType.Spectrum, DataKind.DataArrays):
@@ -762,6 +890,9 @@ class MzPeakFile(Sequence[_SpectrumType]):
         except KeyError:
             pass
         for f in archive.filelist:
+            if f.filename in visited:
+                continue
+            visited.add(f.filename)
             if f.filename.endswith("spectra_data.mzpeak") and not self.spectrum_data:
                 self.spectrum_data = MzPeakArrayDataReader(
                     pa.PythonFile(archive.open(f)),
@@ -848,7 +979,16 @@ class MzPeakFile(Sequence[_SpectrumType]):
             start = index.start or 0
             end = index.stop or len(self)
             step = index.step or 1
-            spec = self.read_spectrum(range(start, end, step))
+            if step == 1:
+                it = iter(self)
+                it.seek(start)
+                spec = []
+                for s in it:
+                    spec.append(s)
+                    if s['index'] == (end - 1):
+                        break
+            else:
+                spec = self.read_spectrum(range(start, end, step))
         return spec
 
     def read_chromatogram(
@@ -908,6 +1048,10 @@ class MzPeakFile(Sequence[_SpectrumType]):
     @property
     def scans(self) -> pd.DataFrame:
         return self.spectrum_metadata.scans
+
+    @property
+    def time(self) -> RTLocator:
+        return RTLocator(self)
 
     @property
     def chromatograms(self) -> pd.DataFrame | None:
