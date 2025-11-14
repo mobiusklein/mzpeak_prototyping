@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -16,10 +15,11 @@ use mzdata::{
 use mzpeaks::peak::{IonMobilityAwareCentroidPeak, IonMobilityAwareDeconvolutedPeak};
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 
+use crate::buffer_descriptors::BufferOverrideTable;
 use crate::spectrum::AuxiliaryArray;
 
 pub use crate::buffer_descriptors::{
-    ArrayIndex, ArrayIndexEntry, BufferContext, BufferFormat, BufferName, BufferOverrideRule,
+    ArrayIndex, ArrayIndexEntry, BufferContext, BufferFormat, BufferName,
     SerializedArrayIndex, SerializedArrayIndexEntry, array_priority, array_type_from_accession,
     binary_datatype_from_accession,
 };
@@ -66,7 +66,7 @@ pub fn array_map_to_schema_arrays_and_excess(
     spectrum_index: u64,
     spectrum_time: Option<f32>,
     schema: Option<&Fields>,
-    overrides: &HashMap<BufferName, BufferName>,
+    overrides: &BufferOverrideTable,
 ) -> Result<(Fields, Vec<ArrayRef>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
@@ -85,11 +85,7 @@ pub fn array_map_to_schema_arrays_and_excess(
 
     for (_, v) in array_map.iter() {
         let buffer_name = BufferName::from_data_array(context, v);
-        let buffer_name = if let Some(buffer_name) = overrides.get(&buffer_name) {
-            buffer_name
-        } else {
-            &buffer_name
-        };
+        let buffer_name = overrides.map(&buffer_name);
 
         let fieldref = buffer_name.to_field();
         if let Some(schema) = schema {
@@ -120,7 +116,7 @@ pub fn array_map_to_schema_arrays_and_excess(
 
         fields.push(fieldref.clone());
 
-        let array: ArrayRef = data_array_to_arrow_array(buffer_name, v)?;
+        let array: ArrayRef = data_array_to_arrow_array(&buffer_name, v)?;
 
         arrays.push(array);
     }
@@ -134,7 +130,7 @@ pub fn array_map_to_schema_arrays(
     primary_array_len: usize,
     spectrum_index: u64,
     spectrum_time: Option<f32>,
-    overrides: &HashMap<BufferName, BufferName>,
+    overrides: &BufferOverrideTable,
 ) -> Result<(Fields, Vec<ArrayRef>), ArrayRetrievalError> {
     let (fields, arrays, _aux) = array_map_to_schema_arrays_and_excess(
         context,
@@ -161,7 +157,7 @@ pub trait ToMzPeakDataSeries: Sized + BuildArrayMapFrom {
         spectrum_index: u64,
         spectrum_time: Option<f32>,
         peaks: &[Self],
-        overrides: &HashMap<BufferName, BufferName>,
+        overrides: &BufferOverrideTable,
     ) -> (Fields, Vec<ArrayRef>);
 }
 
@@ -197,7 +193,7 @@ impl ToMzPeakDataSeries for CentroidPeak {
         spectrum_index: u64,
         spectrum_time: Option<f32>,
         peaks: &[Self],
-        overrides: &HashMap<BufferName, BufferName>,
+        overrides: &BufferOverrideTable,
     ) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
@@ -232,7 +228,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareCentroidPeak {
         spectrum_index: u64,
         spectrum_time: Option<f32>,
         peaks: &[Self],
-        overrides: &HashMap<BufferName, BufferName>,
+        overrides: &BufferOverrideTable,
     ) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
@@ -262,7 +258,7 @@ impl ToMzPeakDataSeries for DeconvolutedPeak {
         spectrum_index: u64,
         spectrum_time: Option<f32>,
         peaks: &[Self],
-        overrides: &HashMap<BufferName, BufferName>,
+        overrides: &BufferOverrideTable,
     ) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(
@@ -298,7 +294,7 @@ impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
         spectrum_index: u64,
         spectrum_time: Option<f32>,
         peaks: &[Self],
-        overrides: &HashMap<BufferName, BufferName>,
+        overrides: &BufferOverrideTable,
     ) -> (Fields, Vec<ArrayRef>) {
         let map = BuildArrayMapFrom::as_arrays(peaks);
         array_map_to_schema_arrays(

@@ -14,8 +14,9 @@ use crate::{
         index::{QueryIndex, SpectrumPointIndex},
         utils::MaskSet,
         visitor::{
-            MzChromatogramBuilder, MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor,
-            MzSpectrumVisitor, metadata_columns_to_definition_map, schema_to_metadata_cols,
+            CompoundIndexVisitor, DoubleIndexed, Indexed, MzChromatogramBuilder,
+            MzPrecursorVisitor, MzScanVisitor, MzSelectedIonVisitor, MzSpectrumVisitor,
+            metadata_columns_to_definition_map, schema_to_metadata_cols,
         },
     },
 };
@@ -488,6 +489,8 @@ pub(crate) trait BaseMetadataQuerySource {
     }
 }
 
+/// Defines shared logic for constructing traversals of the spectrum metadata
+/// table(s) independent of underlying reader component.
 pub(crate) trait SpectrumMetadataQuerySource: BaseMetadataQuerySource {
     fn prepare_predicate_for_all(
         &self,
@@ -686,12 +689,14 @@ pub(crate) trait SpectrumMetadataQuerySource: BaseMetadataQuerySource {
 
 const EMPTY_FIELDS: [MetadataColumn; 0] = [];
 
+/// An IO independent driver for parsing the spectrum metadata
+/// table(s) into [`SpectrumDescription`] instances
 #[derive(Debug)]
 pub struct SpectrumMetadataDecoder<'a> {
     pub descriptions: Vec<SpectrumDescription>,
-    pub precursors: Vec<(u64, u64, Precursor)>,
-    pub selected_ions: Vec<(u64, u64, SelectedIon)>,
-    pub scan_events: Vec<(u64, ScanEvent)>,
+    pub precursors: Vec<DoubleIndexed<Precursor>>,
+    pub selected_ions: Vec<DoubleIndexed<SelectedIon>>,
+    pub scan_events: Vec<Indexed<ScanEvent>>,
     metadata: &'a ReaderMetadata,
 }
 
@@ -722,7 +727,7 @@ impl<'a> SpectrumMetadataDecoder<'a> {
     fn load_precursors_from(
         &self,
         precursor_arr: &StructArray,
-        acc: &mut Vec<(u64, u64, Precursor)>,
+        acc: &mut Vec<(u64, Option<u64>, Precursor)>,
     ) {
         let n = precursor_arr
             .column_by_name("spectrum_index")
@@ -739,7 +744,7 @@ impl<'a> SpectrumMetadataDecoder<'a> {
     fn load_selected_ions_from(
         &self,
         si_arr: &StructArray,
-        acc: &mut Vec<(u64, u64, SelectedIon)>,
+        acc: &mut Vec<(u64, Option<u64>, SelectedIon)>,
     ) {
         let metacols = self
             .metadata
@@ -867,6 +872,8 @@ impl<'a> SpectrumMetadataDecoder<'a> {
         }
     }
 
+    /// Visit a [`RecordBatch`], splitting it into separate streams passed
+    /// through distinct visitors for *any* spectra.
     pub fn decode_batch(&mut self, batch: RecordBatch) {
         let spec_arr = batch.column_by_name("spectrum").unwrap().as_struct();
         let index_arr: &UInt64Array = spec_arr
@@ -928,27 +935,15 @@ impl<'a> SpectrumMetadataDecoder<'a> {
         }
     }
 
+    /// Consume the decoder to produce the final construction
     pub fn finish(mut self) -> Vec<SpectrumDescription> {
-        self.precursors.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-
         let spec_offset = match self.descriptions.first().map(|v| v.index) {
             Some(i) => i,
             None => return self.descriptions,
         };
 
-        let prec_offset = match self.precursors.first().map(|(_a, b, _v)| *b) {
-            Some(i) => i as usize,
-            None => {
-                self.selected_ions.clear();
-                0
-            }
-        };
-
-        for (_, prec_idx, si) in self.selected_ions {
-            if let Some(prec) = self.precursors.get_mut(prec_idx as usize - prec_offset) {
-                prec.2.add_ion(si);
-            }
-        }
+        self.precursors =
+            PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
         for (idx, scan) in self.scan_events {
             if let Some(spec) = self.descriptions.get_mut(idx as usize - spec_offset) {
@@ -956,12 +951,103 @@ impl<'a> SpectrumMetadataDecoder<'a> {
             }
         }
 
-        for (idx, _, precursor) in self.precursors {
+        // Reversed traversal to guarantee that the lowest order precursor is *last*
+        for (idx, _, precursor) in self.precursors.into_iter().rev().map(CompoundIndexVisitor::unpack) {
             if let Some(spec) = self.descriptions.get_mut(idx as usize - spec_offset) {
                 spec.precursor.push(precursor);
             }
         }
         self.descriptions
+    }
+}
+
+/// Encapsulate the procedure for reconstructing the precursor->selected ion hierarchy
+/// into a shared component. An implementation detail of [`SpectrumMetadataReader`] and
+/// [`ChromatogramMetadataReader`].
+struct PrecursorSelectedIonAssembler {
+    pub precursors: Vec<DoubleIndexed<Precursor>>,
+    pub selected_ions: Vec<DoubleIndexed<SelectedIon>>,
+    last_precursor_i: usize,
+    spec_idx_match: Option<usize>,
+}
+
+impl PrecursorSelectedIonAssembler {
+    pub fn new(
+        precursors: Vec<DoubleIndexed<Precursor>>,
+        selected_ions: Vec<DoubleIndexed<SelectedIon>>,
+    ) -> Self {
+        Self {
+            precursors,
+            selected_ions,
+            last_precursor_i: 0,
+            spec_idx_match: None,
+        }
+    }
+
+    fn sort_precursors(&mut self) {
+        self.precursors.sort_unstable_by(|a, b| {
+            a.source_index()
+                .cmp(&b.source_index())
+                .then(a.secondary_index().cmp(&b.secondary_index()))
+        });
+    }
+
+    pub fn build(mut self) -> Vec<DoubleIndexed<Precursor>> {
+        self.sort_precursors();
+
+        self.last_precursor_i = 0;
+        let n = self.precursors.len();
+        for (spec_idx, prec_idx, si) in self.selected_ions {
+            let mut si = Some(si);
+            let mut hit = false;
+            self.spec_idx_match = None;
+            for precursor_i in self.last_precursor_i..n {
+                if let Some((precursor_rec_spec_i, precursor_rec_prec_i, prec)) =
+                    self.precursors.get_mut(precursor_i)
+                {
+                    if *precursor_rec_spec_i == spec_idx {
+                        self.spec_idx_match = Some(precursor_i);
+                    }
+                    if (*precursor_rec_spec_i) == spec_idx && (*precursor_rec_prec_i) == prec_idx {
+                        self.last_precursor_i = precursor_i;
+                        prec.add_ion(si.take().unwrap());
+                        hit = true;
+                        break;
+                    } else if *precursor_rec_spec_i > spec_idx {
+                        if !hit {
+                            log::debug!(
+                                "Fallback assignment of selected ion {spec_idx}:{prec_idx:?}:{si:?}"
+                            );
+                            if let Some(spec_idx_match) = self.spec_idx_match {
+                                if let Some((_, _, prec)) = self.precursors.get_mut(spec_idx_match)
+                                {
+                                    prec.add_ion(si.take().unwrap());
+                                    self.last_precursor_i = spec_idx_match;
+                                }
+                            }
+                            hit = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if !hit && si.is_some() {
+                if let Some(spec_idx_match) = self.spec_idx_match {
+                    log::debug!(
+                        "Fallback assignment of selected ion {spec_idx}:{prec_idx:?}:{si:?}"
+                    );
+                    if let Some((_, _, prec)) = self.precursors.get_mut(spec_idx_match) {
+                        prec.add_ion(si.take().unwrap());
+                        self.last_precursor_i = spec_idx_match;
+                    }
+                } else {
+                    log::debug!(
+                        "Did not find an owner for selected ion {spec_idx}:{prec_idx:?}:{si:?}"
+                    )
+                }
+            }
+        }
+        self.precursors
     }
 }
 
@@ -977,6 +1063,9 @@ impl<T: ChunkReader + 'static> BaseMetadataQuerySource for SpectrumMetadataReade
 
 impl<T: ChunkReader + 'static> SpectrumMetadataQuerySource for SpectrumMetadataReader<T> {}
 
+
+/// Defines shared logic for constructing traversals of the chromatogram metadata
+/// table(s) independent of underlying reader component.
 pub(crate) trait ChromatogramMetadataQuerySource: BaseMetadataQuerySource {
     fn prepare_predicate_for_all(
         &self,
@@ -1038,8 +1127,8 @@ pub(crate) trait ChromatogramMetadataQuerySource: BaseMetadataQuerySource {
 
 pub struct ChromatogramMetadataDecoder<'a> {
     pub descriptions: Vec<ChromatogramDescription>,
-    pub precursors: Vec<(u64, u64, Precursor)>,
-    pub selected_ions: Vec<(u64, u64, SelectedIon)>,
+    pub precursors: Vec<DoubleIndexed<Precursor>>,
+    pub selected_ions: Vec<DoubleIndexed<SelectedIon>>,
     metadata: &'a ReaderMetadata,
 }
 
@@ -1056,7 +1145,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
     fn load_precursors_from(
         &self,
         precursor_arr: &StructArray,
-        acc: &mut Vec<(u64, u64, Precursor)>,
+        acc: &mut Vec<(u64, Option<u64>, Precursor)>,
     ) {
         let n = precursor_arr
             .column_by_name("spectrum_index")
@@ -1073,7 +1162,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
     fn load_selected_ions_from(
         &self,
         si_arr: &StructArray,
-        acc: &mut Vec<(u64, u64, SelectedIon)>,
+        acc: &mut Vec<(u64, Option<u64>, SelectedIon)>,
     ) {
         let metacols = self
             .metadata
@@ -1172,14 +1261,12 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
     }
 
     pub fn finish(mut self) -> Vec<ChromatogramDescription> {
-        self.precursors.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        // This sorts the precursor list in addition to merging in the selected ions
+        self.precursors =
+            PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
-        for (_spec_idx, prec_idx, si) in self.selected_ions {
-            let prec = &mut self.precursors[prec_idx as usize].2;
-            prec.add_ion(si);
-        }
-
-        for (idx, _prec_idx, precursor) in self.precursors {
+        // Reversed traversal to guarantee that the lowest order precursor is *last*
+        for (idx, _prec_idx, precursor) in self.precursors.into_iter().rev() {
             self.descriptions[idx as usize].precursor.push(precursor);
         }
         self.descriptions

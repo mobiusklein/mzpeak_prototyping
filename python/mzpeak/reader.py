@@ -1,6 +1,5 @@
 import logging
 import json
-import itertools
 import zipfile
 import zlib
 
@@ -211,7 +210,8 @@ class _AuxiliaryArrayDecoder:
         if cls.ascii_code != dtype_acc:
             data = data.view(cls.dtypes[dtype_acc])
         else:
-            raise NotImplementedError(cls.ascii_code)
+            data = bytearray(data).strip().split(b'\0')
+            data = np.array(data, dtype=np.object_)
         return AuxiliaryArray(name, data, parameters)
 
 
@@ -447,9 +447,11 @@ class MzPeakSpectrumMetadataReader:
             pass
         spec["index"] = i
         if 'auxiliary_arrays' in spec:
-            for v in spec.pop("auxiliary_arrays"):
-                v = _AuxiliaryArrayDecoder.decode(v)
-                spec[v.name] = v.values
+            auxiliary_arrays = spec.pop("auxiliary_arrays")
+            if auxiliary_arrays is not None:
+                for v in  auxiliary_arrays:
+                    v = _AuxiliaryArrayDecoder.decode(v)
+                    spec[v.name] = v.values
         return spec
 
     def __len__(self):
@@ -603,9 +605,11 @@ class MzPeakChromatogramMetadataReader:
             pass
         spec["index"] = i
         if "auxiliary_arrays" in spec:
-            for v in spec.pop("auxiliary_arrays"):
-                v = _AuxiliaryArrayDecoder.decode(v)
-                spec[v.name] = v.values
+            auxiliary_arrays = spec.pop("auxiliary_arrays")
+            if auxiliary_arrays is not None:
+                for v in auxiliary_arrays:
+                    v = _AuxiliaryArrayDecoder.decode(v)
+                    spec[v.name] = v.values
         return spec
 
 
@@ -634,7 +638,7 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
         if self.buffer_format == BufferFormat.Point:
             it = self.archive.spectrum_data.handle.iter_batches(columns=["point"])
             self.data_iter = _BatchIterator(it, self.index)
-        elif self.buffer_format == BufferFormat.Chunk:
+        elif self.buffer_format == BufferFormat.ChunkValues:
             it = self.archive.spectrum_data.handle.iter_batches(128, columns=['chunk'])
             self.data_iter = _BatchIterator(it, self.index)
         else:
@@ -646,7 +650,7 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
                 buffers,
                 self.archive.spectrum_data._delta_model_series[index] if self.archive.spectrum_data._delta_model_series is not None else None
             )
-        elif self.buffer_format == BufferFormat.Chunk:
+        elif self.buffer_format == BufferFormat.ChunkValues:
             return self.archive.spectrum_data._expand_chunks(
                 buffers,
                 delta_model=self.archive.spectrum_data._delta_model_series[index]
@@ -935,6 +939,10 @@ class MzPeakFile(Sequence[_SpectrumType]):
 
     def spectra_signal_for_indices(self, index_range: slice | list[int]) -> dict[str, np.ndarray]:
         return self.spectrum_data.read_data_for_range(index_range)
+
+    def read_peaks_for(self, index: int):
+        if self.spectrum_peak_data is not None:
+            return self.spectrum_peak_data[index]
 
     def _init_metadata(self):
         metadata = {}

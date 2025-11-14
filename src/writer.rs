@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs,
     io::{self, prelude::*},
     marker::PhantomData,
@@ -25,9 +24,8 @@ use mzdata::{
 };
 
 use crate::{
-    archive::{MzPeakArchiveType, ZipArchiveWriter},
-    peak_series::{
-        array_map_to_schema_arrays, ArrayIndex, BufferContext, BufferName, ToMzPeakDataSeries
+    archive::{MzPeakArchiveType, ZipArchiveWriter}, buffer_descriptors::{BufferOverrideTable, BufferPriority}, peak_series::{
+        ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays
     }
 };
 use crate::{
@@ -60,12 +58,17 @@ pub use visitor::{
 pub(crate) use base::implement_mz_metadata;
 pub(crate) use mini_peak::MiniPeakWriterType;
 
+/*
+Internal helper function that, given an iterator over spectra, will
+perform the requested overrides and encodings to the data buffers and
+construct a
+*/
 fn _eval_spectra_from_iter_for_fields<
     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
 >(
     iter: impl Iterator<Item = MultiLayerSpectrum<C, D>>,
-    overrides: &HashMap<BufferName, BufferName>,
+    overrides: &BufferOverrideTable,
     use_chunked_encoding: Option<ChunkingStrategy>,
 ) -> Vec<Arc<Field>> {
     let mut arrays: Vec<Arc<Field>> = Vec::new();
@@ -77,12 +80,15 @@ fn _eval_spectra_from_iter_for_fields<
             if s.signal_continuity() == SignalContinuity::Profile {
                 is_profile += 1;
             }
+            // Using the raw data arrays (not peak lists), to generate a
+            // dataset schema.
             s.raw_arrays().and_then(|map| {
+                // generate a schema for this chunked
                 if let Some(use_chunked_encoding) = use_chunked_encoding {
                     ArrowArrayChunk::from_arrays(
                         0,
                         None,
-                        MZ_ARRAY,
+                        MZ_ARRAY.clone().with_priority(BufferPriority::Primary),
                         map,
                         use_chunked_encoding,
                         overrides,
@@ -138,7 +144,7 @@ fn _eval_spectra_from_iter_for_fields<
 
 pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
     iter: I,
-    overrides: &HashMap<BufferName, BufferName>,
+    overrides: &BufferOverrideTable,
 ) -> Vec<Arc<Field>> {
     let field_it = iter
         .flat_map(|s| {
@@ -179,7 +185,7 @@ pub fn sample_array_types_from_stream<
     I: Iterator<Item = MultiLayerSpectrum<C, D>>,
 >(
     reader: &mut StreamingSpectrumIterator<C, D, MultiLayerSpectrum<C, D>, I>,
-    overrides: &HashMap<BufferName, BufferName>,
+    overrides: &BufferOverrideTable,
     use_chunked_encoding: Option<ChunkingStrategy>,
 ) -> Vec<std::sync::Arc<arrow::datatypes::Field>>
 where
@@ -199,7 +205,7 @@ pub fn sample_array_types_from_file_reader<
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
 >(
     reader: &mut MZReaderType<std::fs::File, C, D>,
-    overrides: &HashMap<BufferName, BufferName>,
+    overrides: &BufferOverrideTable,
     use_chunked_encoding: Option<ChunkingStrategy>,
 ) -> Vec<Arc<arrow::datatypes::Field>> {
     let n = reader.len();
@@ -539,6 +545,7 @@ impl<
                 writer.add_file_from_read(
                     &mut peak_file,
                     Some(&MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()),
+                    Some(MzPeakArchiveType::SpectrumPeakDataArrays.into())
                 )?;
             }
 

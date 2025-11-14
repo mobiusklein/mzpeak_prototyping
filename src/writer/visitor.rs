@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use arrow::{
     array::{
@@ -10,7 +10,7 @@ use arrow::{
 };
 use mzdata::{
     curie,
-    params::{Unit, CURIE},
+    params::{CURIE, Unit},
     prelude::*,
     spectrum::{Chromatogram, ScanPolarity, SpectrumDescription},
 };
@@ -614,7 +614,10 @@ impl ParamListBuilder {
         &mut self.0
     }
 
-    pub fn append_iter<'a, T: 'a>(&mut self, iter: impl IntoIterator<Item=&'a T>) -> bool where ParamBuilder: StructVisitor<T> + Sized {
+    pub fn append_iter<'a, T: 'a>(&mut self, iter: impl IntoIterator<Item = &'a T>) -> bool
+    where
+        ParamBuilder: StructVisitor<T> + Sized,
+    {
         let inner = self.0.values();
         for v in iter {
             inner.append_value(v);
@@ -805,6 +808,11 @@ impl VisitorBase for ScanBuilder {
     }
 }
 
+const BUILTIN_SCAN_PARAMS: &[CURIE] = &[
+    curie!(MS:1000512),
+    curie!(MS:1000616),
+];
+
 impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
     fn append_value(&mut self, item: &(u64, &mzdata::spectrum::ScanEvent)) -> bool {
         let (si, item) = item;
@@ -829,18 +837,20 @@ impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
         }
         self.scan_windows.append(true);
 
+        self.curies_to_mask.extend_from_slice(BUILTIN_SCAN_PARAMS);
         for e in self.extra.iter_mut() {
             if e.append_value(item) {
                 self.curies_to_mask.extend(e.associated_curie_to_skip());
             }
         }
-        self.parameters.append_iter(item.params().iter().filter(|p| {
-            if let Some(c) = p.curie() {
-                !self.curies_to_mask.contains(&c)
-            } else {
-                true
-            }
-        }));
+        self.parameters
+            .append_iter(item.params().iter().filter(|p| {
+                if let Some(c) = p.curie() {
+                    !self.curies_to_mask.contains(&c)
+                } else {
+                    true
+                }
+            }));
         self.curies_to_mask.clear();
         true
     }
@@ -1014,13 +1024,14 @@ impl StructVisitor<mzdata::spectrum::Activation> for ActivationBuilder {
             }
         }
 
-        self.parameters.append_iter(item.params().iter().chain([&energy]).filter(|p| {
-            if let Some(c) = p.curie() {
-                !self.curies_to_mask.contains(&c)
-            } else {
-                true
-            }
-        }));
+        self.parameters
+            .append_iter(item.params().iter().chain([&energy]).filter(|p| {
+                if let Some(c) = p.curie() {
+                    !self.curies_to_mask.contains(&c)
+                } else {
+                    true
+                }
+            }));
         self.curies_to_mask.clear();
         true
     }
@@ -1045,6 +1056,7 @@ impl VisitorBase for ActivationBuilder {
 pub struct PrecursorBuilder {
     spectrum_index: UInt64Builder,
     precursor_index: UInt64Builder,
+    precursor_id: LargeStringBuilder,
     isolation_window: IsolationWindowBuilder,
     activation: ActivationBuilder,
 }
@@ -1060,6 +1072,7 @@ impl ArrayBuilder for PrecursorBuilder {
         let arrays = vec![
             finish_it!(self.spectrum_index),
             finish_it!(self.precursor_index),
+            finish_it!(self.precursor_id),
             self.isolation_window.finish(),
             self.activation.finish(),
         ];
@@ -1073,6 +1086,7 @@ impl ArrayBuilder for PrecursorBuilder {
         let arrays = vec![
             finish_cloned!(self.spectrum_index),
             finish_cloned!(self.precursor_index),
+            finish_cloned!(self.precursor_id),
             self.isolation_window.finish_cloned(),
             self.activation.finish_cloned(),
         ];
@@ -1083,12 +1097,12 @@ impl ArrayBuilder for PrecursorBuilder {
     anyways!();
 }
 
-impl StructVisitor<(u64, u64, &mzdata::spectrum::Precursor)> for PrecursorBuilder {
-    fn append_value(&mut self, item: &(u64, u64, &mzdata::spectrum::Precursor)) -> bool {
+impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::Precursor)> for PrecursorBuilder {
+    fn append_value(&mut self, item: &(u64, Option<u64>, &mzdata::spectrum::Precursor)) -> bool {
         let (i, j, item) = item;
         self.spectrum_index.append_value(*i);
-        self.precursor_index.append_value(*j);
-
+        self.precursor_index.append_option(*j);
+        self.precursor_id.append_option(item.precursor_id.as_ref());
         self.isolation_window.append_value(&item.isolation_window);
         self.activation.append_value(&item.activation);
         true
@@ -1100,6 +1114,7 @@ impl VisitorBase for PrecursorBuilder {
         vec![
             field!("spectrum_index", DataType::UInt64),
             field!("precursor_index", DataType::UInt64),
+            field!("precursor_id", DataType::LargeUtf8),
             field!("isolation_window", self.isolation_window.as_struct_type()),
             field!("activation", self.activation.as_struct_type()),
         ]
@@ -1108,6 +1123,7 @@ impl VisitorBase for PrecursorBuilder {
     fn append_null(&mut self) {
         self.spectrum_index.append_null();
         self.precursor_index.append_null();
+        self.precursor_id.append_null();
         self.isolation_window.append_null();
         self.activation.append_null();
     }
@@ -1173,11 +1189,11 @@ impl ArrayBuilder for SelectedIonBuilder {
     anyways!();
 }
 
-impl StructVisitor<(u64, u64, &mzdata::spectrum::SelectedIon)> for SelectedIonBuilder {
-    fn append_value(&mut self, item: &(u64, u64, &mzdata::spectrum::SelectedIon)) -> bool {
+impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::SelectedIon)> for SelectedIonBuilder {
+    fn append_value(&mut self, item: &(u64, Option<u64>, &mzdata::spectrum::SelectedIon)) -> bool {
         let (i, j, item) = item;
         self.spectrum_index.append_value(*i);
-        self.precursor_index.append_value(*j);
+        self.precursor_index.append_option(*j);
         self.selected_ion_mz.append_value(item.mz);
         self.charge_state.append_option(item.charge());
         self.intensity.append_value(item.intensity);
@@ -1197,13 +1213,14 @@ impl StructVisitor<(u64, u64, &mzdata::spectrum::SelectedIon)> for SelectedIonBu
                 self.curies_to_mask.extend(e.associated_curie_to_skip());
             }
         }
-        self.parameters.append_iter(item.params().iter().filter(|p| {
-            if let Some(c) = p.curie() {
-                !self.curies_to_mask.contains(&c)
-            } else {
-                true
-            }
-        }));
+        self.parameters
+            .append_iter(item.params().iter().filter(|p| {
+                if let Some(c) = p.curie() {
+                    !self.curies_to_mask.contains(&c)
+                } else {
+                    true
+                }
+            }));
         self.curies_to_mask.clear();
         true
     }
@@ -1527,6 +1544,18 @@ impl VisitorBase for SpectrumDetailsBuilder {
     }
 }
 
+
+const BUILTIN_SPECTRUM_PARAMS: &[CURIE] = &[
+    curie!(MS:1000504),
+    curie!(MS:1000505),
+    curie!(MS:1000285),
+    curie!(MS:1000527),
+    curie!(MS:1000528),
+    curie!(MS:1000579),
+    curie!(MS:1000580),
+];
+
+
 impl SpectrumDetailsBuilder {
     pub fn append_value<
         C: CentroidLike,
@@ -1631,19 +1660,23 @@ impl SpectrumDetailsBuilder {
             match e {
                 SpectrumVisitor::Description(builder) => {
                     if builder.append_value(item.description()) {
-                        self.curies_to_mask.extend(builder.associated_curie_to_skip());
+                        self.curies_to_mask
+                            .extend(builder.associated_curie_to_skip());
                     }
                 }
             }
         }
 
-        self.parameters.append_iter(item.params().iter().filter(|p| {
-            if let Some(c) = p.curie() {
-                !self.curies_to_mask.contains(&c)
-            } else {
-                true
-            }
-        }));
+        self.curies_to_mask.extend_from_slice(BUILTIN_SPECTRUM_PARAMS);
+
+        self.parameters
+            .append_iter(item.params().iter().filter(|p| {
+                if let Some(c) = p.curie() {
+                    !self.curies_to_mask.contains(&c)
+                } else {
+                    true
+                }
+            }));
         self.curies_to_mask.clear();
         true
     }
@@ -1731,6 +1764,7 @@ pub struct SpectrumBuilder {
     scan: ScanBuilder,
     precursor: PrecursorBuilder,
     selected_ion: SelectedIonBuilder,
+    id_to_index: HashMap<String, u64>,
 }
 
 impl SpectrumBuilder {
@@ -1744,6 +1778,8 @@ impl SpectrumBuilder {
         mz_delta_model_params: Option<Vec<f64>>,
         auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
     ) -> bool {
+        self.id_to_index
+            .insert(item.id().to_string(), self.spectrum_index_counter);
         let out = self.spectrum.append_value(
             self.spectrum_index_counter,
             item,
@@ -1754,15 +1790,17 @@ impl SpectrumBuilder {
             self.scan.append_value(&(self.spectrum_index_counter, s));
         }
         for precursor in item.precursor_iter() {
-            self.precursor.append_value(&(
-                self.spectrum_index_counter,
-                self.precursor_index_counter,
-                precursor,
-            ));
+            let precursor_index = precursor
+                .precursor_id
+                .as_ref()
+                .and_then(|s| self.id_to_index.get(s))
+                .copied();
+            self.precursor
+                .append_value(&(self.spectrum_index_counter, precursor_index, precursor));
             for ion in precursor.iter() {
                 self.selected_ion.append_value(&(
                     self.spectrum_index_counter,
-                    self.precursor_index_counter,
+                    precursor_index,
                     ion,
                 ));
             }
@@ -1928,13 +1966,14 @@ impl ChromatogramDetailsBuilder {
                 self.curies_to_mask.extend(e.associated_curie_to_skip());
             }
         }
-        self.parameters.append_iter(item.params().iter().filter(|p| {
-            if let Some(c) = p.curie() {
-                !self.curies_to_mask.contains(&c)
-            } else {
-                true
-            }
-        }));
+        self.parameters
+            .append_iter(item.params().iter().filter(|p| {
+                if let Some(c) = p.curie() {
+                    !self.curies_to_mask.contains(&c)
+                } else {
+                    true
+                }
+            }));
         self.curies_to_mask.clear();
         true
     }
@@ -2033,6 +2072,7 @@ pub struct ChromatogramBuilder {
     chromatogram: ChromatogramDetailsBuilder,
     precursor: PrecursorBuilder,
     selected_ion: SelectedIonBuilder,
+    id_to_index: HashMap<String, u64>,
 }
 
 impl VisitorBase for ChromatogramBuilder {
@@ -2057,19 +2097,25 @@ impl ChromatogramBuilder {
         item: &Chromatogram,
         auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
     ) -> bool {
+        self.id_to_index
+            .insert(item.id().to_string(), self.chromatogram_index_counter);
         let out =
             self.chromatogram
                 .append_value(self.chromatogram_index_counter, item, auxiliary_arrays);
         for precursor in item.precursor_iter() {
+            let precursor_index = precursor
+                .precursor_id
+                .as_ref()
+                .and_then(|s| self.id_to_index.get(s).copied());
             self.precursor.append_value(&(
                 self.chromatogram_index_counter,
-                self.precursor_index_counter,
+                precursor_index,
                 precursor,
             ));
             for ion in precursor.iter() {
                 self.selected_ion.append_value(&(
                     self.chromatogram_index_counter,
-                    self.precursor_index_counter,
+                    precursor_index,
                     ion,
                 ));
             }

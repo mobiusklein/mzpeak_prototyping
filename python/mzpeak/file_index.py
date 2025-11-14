@@ -28,6 +28,7 @@ class EntityType(StrEnum):
 
 class DataKind(StrEnum):
     DataArrays = DATA_ARRAYS
+    Peaks = PEAKS
     Metadata = METADATA
     Other = OTHER
 

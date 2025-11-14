@@ -620,7 +620,6 @@ impl<'a> From<&'a StringArray> for CURIEStrArray<'a> {
     }
 }
 
-#[allow(unused)]
 impl<'a> CURIEStrArray<'a> {
     pub fn len(&self) -> usize {
         self.0.len()
@@ -645,19 +644,21 @@ impl<'a> CURIEStrArray<'a> {
     }
 }
 
-pub struct CURIEArray<'a> {
+/// A deprecated struct-based encoding. To be removed before
+/// first stable release.
+pub struct CURIEStructArray<'a> {
     cv_id: &'a UInt8Array,
     accession: &'a UInt32Array,
     null: Option<&'a NullBuffer>,
 }
 
-impl<'a> From<&'a StructArray> for CURIEArray<'a> {
+impl<'a> From<&'a StructArray> for CURIEStructArray<'a> {
     fn from(value: &'a StructArray) -> Self {
         Self::from_struct_array(value)
     }
 }
 
-impl<'a> CURIEArray<'a> {
+impl<'a> CURIEStructArray<'a> {
     fn new(
         cv_id: &'a UInt8Array,
         accession: &'a UInt32Array,
@@ -707,7 +708,7 @@ impl<'a> CURIEArray<'a> {
 }
 
 pub enum AnyCURIEArray<'a> {
-    Struct(CURIEArray<'a>),
+    Struct(CURIEStructArray<'a>),
     String(CURIEStrArray<'a>),
 }
 
@@ -725,7 +726,7 @@ impl<'a> TryFrom<&'a ArrayRef> for AnyCURIEArray<'a> {
 
 impl<'a> AnyCURIEArray<'a> {
     pub fn from_struct_array(array: &'a StructArray) -> Self {
-        Self::Struct(CURIEArray::from_struct_array(array))
+        Self::Struct(CURIEStructArray::from_struct_array(array))
     }
 
     pub fn len(&self) -> usize {
@@ -773,8 +774,8 @@ impl<'a> AnyCURIEArray<'a> {
     }
 }
 
-impl<'a> From<CURIEArray<'a>> for AnyCURIEArray<'a> {
-    fn from(value: CURIEArray<'a>) -> Self {
+impl<'a> From<CURIEStructArray<'a>> for AnyCURIEArray<'a> {
+    fn from(value: CURIEStructArray<'a>) -> Self {
         Self::Struct(value)
     }
 }
@@ -793,8 +794,8 @@ impl<'a> From<&'a ArrayRef> for UnitArray<'a> {
     }
 }
 
-impl<'a> From<CURIEArray<'a>> for UnitArray<'a> {
-    fn from(value: CURIEArray<'a>) -> Self {
+impl<'a> From<CURIEStructArray<'a>> for UnitArray<'a> {
+    fn from(value: CURIEStructArray<'a>) -> Self {
         Self(value.into())
     }
 }
@@ -827,6 +828,7 @@ impl<'a> UnitArray<'a> {
     }
 }
 
+/// A single unit that is used for all values in a column
 struct UnitScalar(Unit);
 
 impl UnitScalar {
@@ -836,6 +838,7 @@ impl UnitScalar {
     }
 }
 
+/// A generic strategy for mapping units across rows of another column
 enum UnitCollection<'a> {
     Array(UnitArray<'a>),
     Scalar(UnitScalar),
@@ -869,6 +872,96 @@ impl<'a> UnitCollection<'a> {
     }
 }
 
+/// A type alias over a tuple of (primary source id, <entity>)
+pub(crate) type Indexed<T> = (u64, T);
+/// A type alias over a tuple of (primary source id, optional secondary id, <entity>)
+pub(crate) type DoubleIndexed<T> = (u64, Option<u64>, T);
+
+/// A helper trait for handling (multi-)-relationship keyed visitors over type `T`
+pub(crate) trait CompoundIndexVisitor<T> {
+    /// The primary source entity's id key
+    fn source_index_mut(&mut self) -> &mut u64;
+
+    /// The (potentially absent) secondary id key
+    fn secondary_index_mut(&mut self) -> Option<&mut u64>;
+
+    /// Get a mutable access to the actual thing we are visiting to build
+    fn description_mut(&mut self) -> &mut T;
+
+    /// Take the entity out of the container
+    fn into_description(self) -> T;
+
+    /// The primary source entity's id key
+    fn source_index(&self) -> u64;
+
+    /// The (potentially absent) secondary id key
+    fn secondary_index(&self) -> Option<u64>;
+
+    /// Unpack the container into a tuple of id keys and the entity description
+    fn unpack(self) -> (u64, Option<u64>, T)
+    where
+        Self: Sized,
+    {
+        (
+            self.source_index(),
+            self.secondary_index(),
+            self.into_description(),
+        )
+    }
+}
+
+impl<T> CompoundIndexVisitor<T> for Indexed<T> {
+    fn description_mut(&mut self) -> &mut T {
+        &mut self.1
+    }
+
+    fn source_index_mut(&mut self) -> &mut u64 {
+        &mut self.0
+    }
+
+    fn secondary_index_mut(&mut self) -> Option<&mut u64> {
+        None
+    }
+
+    fn into_description(self) -> T {
+        self.1
+    }
+
+    fn source_index(&self) -> u64 {
+        self.0
+    }
+
+    fn secondary_index(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl<T> CompoundIndexVisitor<T> for DoubleIndexed<T> {
+    fn description_mut(&mut self) -> &mut T {
+        &mut self.2
+    }
+
+    fn source_index_mut(&mut self) -> &mut u64 {
+        &mut self.0
+    }
+
+    fn secondary_index_mut(&mut self) -> Option<&mut u64> {
+        self.1.as_mut()
+    }
+
+    fn into_description(self) -> T {
+        self.2
+    }
+
+    fn source_index(&self) -> u64 {
+        self.0
+    }
+
+    fn secondary_index(&self) -> Option<u64> {
+        self.1
+    }
+}
+
 /// Enclose the parallel arrays of "descriptions" and their offsets so that the borrow
 /// checker knows that method calls on this instance aren't tied to the owning objects
 struct OffsetCollection<'a, T> {
@@ -890,8 +983,6 @@ impl<'a, T> IntoIterator for OffsetCollection<'a, T> {
             .zip(self.descriptions.into_iter())
     }
 }
-
-impl<'a, T> OffsetCollection<'a, T> {}
 
 impl<'a, T> OffsetCollection<'a, T> {
     fn new(descriptions: &'a mut [T], offsets: &'a [usize]) -> Self {
@@ -997,7 +1088,10 @@ trait VisitorBuilder1<'a, T: ParamDescribed>: VisitorBuilderBase<'a, T> {
     }
 }
 
-trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
+trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, Indexed<T>>
+where
+    Indexed<T>: CompoundIndexVisitor<T>,
+{
     fn visit_as_param(
         &mut self,
         spec_arr: &StructArray,
@@ -1022,7 +1116,7 @@ trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
 
         macro_rules! convert {
             ($arr:ident) => {
-                for (i, (_, descr)) in self.iter_instances() {
+                for (i, descr) in self.iter_instances() {
                     if $arr.is_null(i) {
                         continue;
                     };
@@ -1031,7 +1125,7 @@ trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
                     if let Some(acc) = accession {
                         p = p.curie(acc)
                     }
-                    descr.add_param(p.build());
+                    descr.description_mut().add_param(p.build());
                 }
             };
         }
@@ -1092,7 +1186,10 @@ trait VisitorBuilder2<'a, T: ParamDescribed>: VisitorBuilderBase<'a, (u64, T)> {
     }
 }
 
-trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
+trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, DoubleIndexed<T>>
+where
+    DoubleIndexed<T>: CompoundIndexVisitor<T>,
+{
     fn visit_as_param(
         &mut self,
         spec_arr: &StructArray,
@@ -1119,7 +1216,7 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
 
         macro_rules! convert {
             ($arr:ident) => {
-                for (i, (_, _, descr)) in self.iter_instances() {
+                for (i, descr) in self.iter_instances() {
                     if $arr.is_null(i) {
                         continue;
                     };
@@ -1128,7 +1225,7 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
                     if let Some(acc) = accession {
                         p = p.curie(acc)
                     }
-                    descr.add_param(p.build());
+                    descr.description_mut().add_param(p.build());
                 }
             };
         }
@@ -1179,7 +1276,8 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
         let params_array: &LargeListArray =
             spec_arr.column_by_name("parameters").unwrap().as_list();
 
-        for (i, (_, _, descr)) in self.iter_instances() {
+        for (i, descr) in self.iter_instances() {
+            let descr = descr.description_mut();
             let params = params_array.value(i);
             let params = params.as_struct();
 
@@ -1193,24 +1291,25 @@ trait VisitorBuilder3<'a, T>: VisitorBuilderBase<'a, (u64, u64, T)> {
 
     fn visit_precursor_index(&mut self, spec_arr: &StructArray, index: usize) {
         let arr = spec_arr.column(index).as_primitive::<UInt64Type>();
-        for (i, (_spec_index, prec_index, _descr)) in self.iter_instances() {
+        for (i, descr) in self.iter_instances() {
             if arr.is_null(i) {
                 continue;
             };
-            *prec_index = arr.value(i);
+            let mut v = arr.value(i);
+            let _ = descr.secondary_index_mut().insert(&mut v);
         }
     }
 }
 
 pub(crate) struct MzScanVisitor<'a> {
-    pub(crate) descriptions: &'a mut [(u64, ScanEvent)],
+    pub(crate) descriptions: &'a mut [Indexed<ScanEvent>],
     pub(crate) metadata_map: &'a [MetadataColumn],
     pub(crate) base_offset: usize,
     pub(crate) offsets: Vec<usize>,
 }
 
-impl<'a> VisitorBuilderBase<'a, (u64, ScanEvent)> for MzScanVisitor<'a> {
-    fn iter_instances(&mut self) -> OffsetCollection<'_, (u64, ScanEvent)> {
+impl<'a> VisitorBuilderBase<'a, Indexed<ScanEvent>> for MzScanVisitor<'a> {
+    fn iter_instances(&mut self) -> OffsetCollection<'_, Indexed<ScanEvent>> {
         OffsetCollection::new(self.descriptions, &self.offsets)
     }
 
@@ -1680,14 +1779,14 @@ impl<'a> MzScanVisitor<'a> {
 }
 
 pub(crate) struct MzPrecursorVisitor<'a> {
-    pub(crate) descriptions: &'a mut [(u64, u64, Precursor)],
+    pub(crate) descriptions: &'a mut [DoubleIndexed<Precursor>],
     pub(crate) metadata_map: &'a [MetadataColumn],
     pub(crate) base_offset: usize,
     pub(crate) offsets: Vec<usize>,
 }
 
-impl<'a> VisitorBuilderBase<'a, (u64, u64, Precursor)> for MzPrecursorVisitor<'a> {
-    fn iter_instances(&mut self) -> OffsetCollection<'_, (u64, u64, Precursor)> {
+impl<'a> VisitorBuilderBase<'a, DoubleIndexed<Precursor>> for MzPrecursorVisitor<'a> {
+    fn iter_instances(&mut self) -> OffsetCollection<'_, DoubleIndexed<Precursor>> {
         OffsetCollection::new(self.descriptions, &self.offsets)
     }
 
@@ -1700,7 +1799,7 @@ impl<'a> VisitorBuilder3<'a, Precursor> for MzPrecursorVisitor<'a> {}
 
 impl<'a> MzPrecursorVisitor<'a> {
     pub(crate) fn new(
-        descriptions: &'a mut [(u64, u64, Precursor)],
+        descriptions: &'a mut [DoubleIndexed<Precursor>],
         metadata_map: &'a [MetadataColumn],
         base_offset: usize,
         offsets: Vec<usize>,
@@ -1717,13 +1816,13 @@ impl<'a> MzPrecursorVisitor<'a> {
         let arr = spec_arr.column(index).as_primitive::<UInt64Type>();
         let mut offsets = Vec::with_capacity(self.descriptions.len());
         let mut j = 0;
-        for (i, (spec_index, _, _descr)) in self.descriptions.iter_mut().enumerate() {
+        for (i, descr) in self.descriptions.iter_mut().enumerate() {
             while arr.is_null(self.base_offset + i + j) {
                 j += 1;
             }
             let val = arr.value(self.base_offset + i + j);
             offsets.push(self.base_offset + i + j);
-            *spec_index = val;
+            *descr.source_index_mut() = val;
         }
         self.offsets = offsets
     }
@@ -1732,32 +1831,35 @@ impl<'a> MzPrecursorVisitor<'a> {
         let root = spec_arr.column(index).as_struct();
         if let Some(arr) = root.column_by_name("target") {
             let arr: &Float32Array = arr.as_primitive();
-            for (offset, (_, _, descr)) in self.iter_instances() {
+            for (offset, descr) in self.iter_instances() {
                 if arr.is_null(offset) {
                     continue;
                 }
+                let descr = descr.description_mut();
                 descr.isolation_window.target = arr.value(offset) as f32;
                 descr.isolation_window.flags = mzdata::spectrum::IsolationWindowState::Explicit;
             }
         }
         if let Some(arr) = root.column_by_name("lower_bound") {
             let arr: &Float32Array = arr.as_primitive();
-            for (offset, (_, _, descr)) in self.iter_instances() {
+            for (offset, descr) in self.iter_instances() {
                 if arr.is_null(offset) {
                     continue;
                 }
-                descr.isolation_window.lower_bound = arr.value(offset) as f32;
-                descr.isolation_window.flags = mzdata::spectrum::IsolationWindowState::Explicit;
+                descr.description_mut().isolation_window.lower_bound = arr.value(offset) as f32;
+                descr.description_mut().isolation_window.flags =
+                    mzdata::spectrum::IsolationWindowState::Explicit;
             }
         }
         if let Some(arr) = root.column_by_name("upper_bound") {
             let arr: &Float32Array = arr.as_primitive();
-            for (offset, (_, _, descr)) in self.iter_instances() {
+            for (offset, descr) in self.iter_instances() {
                 if arr.is_null(offset) {
                     continue;
                 }
-                descr.isolation_window.upper_bound = arr.value(offset) as f32;
-                descr.isolation_window.flags = mzdata::spectrum::IsolationWindowState::Explicit;
+                descr.description_mut().isolation_window.upper_bound = arr.value(offset) as f32;
+                descr.description_mut().isolation_window.flags =
+                    mzdata::spectrum::IsolationWindowState::Explicit;
             }
         }
     }
@@ -1767,12 +1869,12 @@ impl<'a> MzPrecursorVisitor<'a> {
         let params_array: &LargeListArray =
             spec_arr.column_by_name("parameters").unwrap().as_list();
 
-        for (i, (_, _, descr)) in self.iter_instances() {
+        for (i, descr) in self.iter_instances() {
             let params = params_array.value(i);
             let params = params.as_struct();
 
             let params = ParameterVisitor::new(params).build();
-
+            let descr = descr.description_mut();
             for p in params {
                 if let Some(acc) = p.curie() {
                     match acc {
@@ -1802,11 +1904,11 @@ impl<'a> MzPrecursorVisitor<'a> {
     fn visit_precursor_id(&mut self, spec_arr: &StructArray, index: usize) {
         let arr = spec_arr.column(index);
         let arr = arr.as_string::<i64>();
-        for (index, (_, _, descr)) in self.iter_instances() {
+        for (index, descr) in self.iter_instances() {
             if arr.is_null(index) {
                 continue;
             }
-            descr.precursor_id = Some(arr.value(index).to_string());
+            descr.description_mut().precursor_id = Some(arr.value(index).to_string());
         }
     }
 
@@ -1859,14 +1961,14 @@ impl<'a> MzPrecursorVisitor<'a> {
 }
 
 pub(crate) struct MzSelectedIonVisitor<'a> {
-    pub(crate) descriptions: &'a mut [(u64, u64, SelectedIon)],
+    pub(crate) descriptions: &'a mut [(u64, Option<u64>, SelectedIon)],
     pub(crate) metadata_map: &'a [MetadataColumn],
     pub(crate) base_offset: usize,
     pub(crate) offsets: Vec<usize>,
 }
 
-impl<'a> VisitorBuilderBase<'a, (u64, u64, SelectedIon)> for MzSelectedIonVisitor<'a> {
-    fn iter_instances(&mut self) -> OffsetCollection<'_, (u64, u64, SelectedIon)> {
+impl<'a> VisitorBuilderBase<'a, (u64, Option<u64>, SelectedIon)> for MzSelectedIonVisitor<'a> {
+    fn iter_instances(&mut self) -> OffsetCollection<'_, (u64, Option<u64>, SelectedIon)> {
         OffsetCollection::new(self.descriptions, &self.offsets)
     }
 
@@ -1879,7 +1981,7 @@ impl<'a> VisitorBuilder3<'a, SelectedIon> for MzSelectedIonVisitor<'a> {}
 
 impl<'a> MzSelectedIonVisitor<'a> {
     pub(crate) fn new(
-        descriptions: &'a mut [(u64, u64, SelectedIon)],
+        descriptions: &'a mut [DoubleIndexed<SelectedIon>],
         metadata_map: &'a [MetadataColumn],
         base_offset: usize,
         offsets: Vec<usize>,
@@ -1896,13 +1998,13 @@ impl<'a> MzSelectedIonVisitor<'a> {
         let arr = spec_arr.column(index).as_primitive::<UInt64Type>();
         let mut offsets = Vec::with_capacity(self.descriptions.len());
         let mut j = 0;
-        for (i, (spec_index, _prec_index, _descr)) in self.descriptions.iter_mut().enumerate() {
+        for (i, descr) in self.descriptions.iter_mut().enumerate() {
             while arr.is_null(self.base_offset + i + j) {
                 j += 1;
             }
             let val = arr.value(self.base_offset + i + j);
             offsets.push(self.base_offset + i + j);
-            *spec_index = val;
+            *descr.source_index_mut() = val;
         }
         self.offsets = offsets
     }
@@ -1911,10 +2013,11 @@ impl<'a> MzSelectedIonVisitor<'a> {
         let arr = spec_arr.column(index);
         macro_rules! pack {
             ($arr:ident) => {
-                for (i, (_, _, descr)) in self.iter_instances() {
+                for (i, descr) in self.iter_instances() {
                     if $arr.is_null(i) {
                         continue;
                     };
+                    let descr = descr.description_mut();
                     descr.mz = $arr.value(i) as f64;
                 }
             };
@@ -1935,7 +2038,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
         }
         macro_rules! pack {
             ($arr:ident) => {
-                for (i, (_, _, descr)) in self
+                for (i, descr) in self
                     .offsets
                     .iter()
                     .copied()
@@ -1944,6 +2047,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
                     if $arr.is_null(i) {
                         continue;
                     };
+                    let descr = descr.description_mut();
                     descr.intensity = $arr.value(i) as f32;
                 }
             };
@@ -1964,12 +2068,13 @@ impl<'a> MzSelectedIonVisitor<'a> {
         }
         macro_rules! pack {
             ($arr:ident) => {
-                for (i, (_, _, descr)) in self
+                for (i, descr) in self
                     .offsets
                     .iter()
                     .copied()
                     .zip(self.descriptions.iter_mut())
                 {
+                    let descr = descr.description_mut();
                     if $arr.is_null(i) {
                         descr.charge = None;
                     } else {
@@ -2013,7 +2118,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
 
         macro_rules! pack {
             ($arr:ident) => {
-                        for (i, (_, _, descr)) in self
+                        for (i, descr) in self
             .offsets
             .iter()
             .copied()
@@ -2022,6 +2127,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
             if $arr.is_null(i) {
                 continue;
             };
+            let descr = descr.description_mut();
             let im_val = $arr.value(i);
             let im_tp = ion_mobility_types.value(i).unwrap();
             match im_tp {

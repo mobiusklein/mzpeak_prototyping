@@ -3,3 +3,5 @@
 *.txt
 *.mzpeak
 .Rproj.user
+*delta*.pq
+*error*.pq

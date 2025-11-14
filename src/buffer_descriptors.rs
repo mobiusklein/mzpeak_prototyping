@@ -7,6 +7,7 @@ use mzdata::{
     spectrum::{ArrayType, BinaryDataArrayType, DataArray, bindata::BinaryCompressionType},
 };
 use serde::{Deserialize, Serialize};
+use serde_with::{DeserializeFromStr, SerializeDisplay};
 
 use crate::param::{
     CURIE, curie_deserialize, curie_serialize, opt_curie_deserialize, opt_curie_serialize,
@@ -60,14 +61,27 @@ impl Display for BufferContext {
 /// The layout of a buffer denoting the shape of the data in each position in the buffer.
 ///
 /// This is part of a [`BufferName`] and helps guide a reader in decoding signal data.
+///
+/// ## Note
+/// This enum derives a [`Ord`], which means that the order of the names matters. This
+/// is tied to how values are explicitly ordered elsewhere in the source code.
 #[derive(Default, Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferFormat {
     /// A series of contiguous points
     #[default]
     Point,
+    /// The start value of the encoded values of a chunk, to be visible to the indexer.
+    /// Goes with [`BufferFormat::Chunked`]
+    ChunkBoundsStart,
+    /// The end value of the encoded values of a chunk, to be visible to the indexer.
+    /// Goes with [`BufferFormat::Chunked`]
+    ChunkBoundsEnd,
     /// A contiguous list of values in a chunk that may be transformed. It will have a start
-    /// and end value encoded in parallel with it.
+    /// and end value encoded in parallel with it, along with an encoding to tell the reader
+    /// how to reconstruct the original values.
     Chunked,
+    /// The CURIE defining how the chunk was encoded. Goes with [`BufferFormat::Chunked`]
+    ChunkEncoding,
     /// A contiguous list of values in a chunk contiguous with a [`BufferFormat::Chunked`] array
     ChunkedSecondary,
 }
@@ -79,6 +93,9 @@ impl BufferFormat {
             Self::Chunked => "chunk",
             Self::Point => "point",
             Self::ChunkedSecondary => "chunk",
+            Self::ChunkBoundsStart => "chunk_start",
+            Self::ChunkBoundsEnd => "chunk_end",
+            Self::ChunkEncoding => "chunk_encoding",
         }
     }
 }
@@ -91,6 +108,9 @@ impl FromStr for BufferFormat {
             "point" => Ok(Self::Point),
             "chunk_values" => Ok(Self::Chunked),
             "secondary_chunk" => Ok(Self::ChunkedSecondary),
+            "chunk_start" => Ok(Self::ChunkBoundsStart),
+            "chunk_end" => Ok(Self::ChunkBoundsEnd),
+            "chunk_encoding" => Ok(Self::ChunkEncoding),
             _ => Err(format!("{s} not recognized as a buffer format")),
         }
     }
@@ -102,6 +122,9 @@ impl Display for BufferFormat {
             BufferFormat::Point => f.write_str("point"),
             BufferFormat::Chunked => f.write_str("chunk_values"),
             BufferFormat::ChunkedSecondary => f.write_str("secondary_chunk"),
+            BufferFormat::ChunkBoundsStart => f.write_str("chunk_start"),
+            BufferFormat::ChunkBoundsEnd => f.write_str("chunk_end"),
+            BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
         }
     }
 }
@@ -112,8 +135,63 @@ impl PartialEq<str> for BufferFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Hash)]
+pub enum BufferPriority {
+    Primary,
+    Secondary,
+}
+
+impl Display for BufferPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BufferPriority::Primary => f.write_str("primary"),
+            BufferPriority::Secondary => f.write_str("secondary"),
+        }
+    }
+}
+
+impl Ord for BufferPriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if matches!(self, Self::Primary) {
+            if self != other {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        } else if matches!(self, Self::Secondary) {
+            if matches!(other, Self::Primary) {
+                std::cmp::Ordering::Less
+            } else if self != other {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
+impl PartialOrd for BufferPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl FromStr for BufferPriority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "primary" => Ok(Self::Primary),
+            "secondary" => Ok(Self::Secondary),
+            _ => Err(format!("Unknown buffer priority {s}")),
+        }
+    }
+}
+
 /// Composite structure for directly naming a data array series
-#[derive(Clone, Debug, Hash, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct BufferName {
     /// Is this a spectrum or chromatogram array?
     pub context: BufferContext,
@@ -127,6 +205,18 @@ pub struct BufferName {
     pub buffer_format: BufferFormat,
     pub transform: Option<BufferTransform>,
     pub data_processing_id: Option<Box<str>>,
+    pub buffer_priority: Option<BufferPriority>,
+}
+
+impl std::hash::Hash for BufferName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.context.hash(state);
+        self.array_type.hash(state);
+        self.dtype.hash(state);
+        self.unit.hash(state);
+        self.buffer_format.hash(state);
+        self.transform.hash(state);
+    }
 }
 
 impl PartialEq for BufferName {
@@ -146,6 +236,16 @@ impl Ord for BufferName {
             ord => return ord,
         }
         match array_priority(&self.array_type).cmp(&array_priority(&other.array_type)) {
+            core::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+
+        match self.buffer_priority.cmp(&other.buffer_priority) {
+            core::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+
+        match self.buffer_format.cmp(&other.buffer_format) {
             core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
@@ -293,6 +393,7 @@ pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<Array
             name: "".to_string().into(),
         }
     } else {
+        log::trace!("Failed to translate {accession} to an array type");
         return None;
     };
     Some(tp)
@@ -367,6 +468,7 @@ impl BufferName {
             buffer_format: BufferFormat::Point,
             transform: None,
             data_processing_id: None,
+            buffer_priority: None,
         }
     }
 
@@ -384,7 +486,13 @@ impl BufferName {
             buffer_format,
             transform: None,
             data_processing_id: None,
+            buffer_priority: None,
         }
+    }
+
+    pub const fn with_priority(mut self, buffer_priority: BufferPriority) -> Self {
+        self.buffer_priority = Some(buffer_priority);
+        self
     }
 
     pub const fn with_format(mut self, buffer_format: BufferFormat) -> Self {
@@ -422,6 +530,7 @@ impl BufferName {
 
     pub fn as_field_metadata(&self) -> HashMap<String, String> {
         let mut meta: HashMap<String, String> = [
+            ("context".to_string(), self.context.to_string()),
             (
                 "unit".to_string(),
                 self.unit
@@ -455,6 +564,9 @@ impl BufferName {
         if let Some(dp_id) = self.data_processing_id.as_ref() {
             meta.insert("data_processing_id".to_string(), dp_id.to_string());
         }
+        if let Some(priority) = self.buffer_priority {
+            meta.insert("buffer_priority".to_string(), priority.to_string());
+        }
         meta
     }
 
@@ -466,8 +578,10 @@ impl BufferName {
         let mut buffer_format = BufferFormat::Point;
         let mut transform = None;
         let mut data_processing_id = None;
+        let mut buffer_priority: Option<BufferPriority> = None;
         for (k, v) in field.metadata().iter() {
             match k.as_str() {
+                "context" => {}
                 "unit" => {
                     unit = Unit::from_accession(v);
                 }
@@ -504,6 +618,12 @@ impl BufferName {
                         .and_then(|v| BufferTransform::from_curie(v));
                 }
                 "data_processing_id" => data_processing_id = Some(v.clone().into_boxed_str()),
+                "buffer_priority" => {
+                    buffer_priority = v
+                        .parse()
+                        .inspect_err(|e| log::error!("Failed to parse buffer priority: {e}"))
+                        .ok()
+                }
                 _ => {}
             }
         }
@@ -518,6 +638,7 @@ impl BufferName {
                     buffer_format,
                     transform,
                     data_processing_id,
+                    buffer_priority,
                 };
                 if let ArrayType::NonStandardDataArray { name } = &mut this.array_type {
                     *name = array_name.into();
@@ -531,6 +652,21 @@ impl BufferName {
     pub fn from_data_array(context: BufferContext, data_array: &DataArray) -> Self {
         let name = Self::new(context, data_array.name.clone(), data_array.dtype());
         name.with_unit(data_array.unit)
+    }
+
+    pub fn make_bounds_fields(&self) -> Option<(FieldRef, FieldRef)> {
+        if !matches!(self.buffer_format, BufferFormat::Chunked) {
+            return None;
+        }
+        let start = self
+            .clone()
+            .with_format(BufferFormat::ChunkBoundsStart)
+            .to_field();
+        let end = self
+            .clone()
+            .with_format(BufferFormat::ChunkBoundsEnd)
+            .to_field();
+        Some((start, end))
     }
 
     pub fn to_field(&self) -> FieldRef {
@@ -578,6 +714,18 @@ impl Display for BufferName {
                     .replace("array", "_array"),
             ),
         };
+        if self.buffer_priority == Some(BufferPriority::Primary) {
+            return match self.buffer_format {
+                BufferFormat::Point | BufferFormat::ChunkedSecondary => {
+                    write!(f, "{}_{}", context, tp_name)
+                }
+                BufferFormat::Chunked => write!(f, "{}_{}_chunk_values", context, tp_name),
+                BufferFormat::ChunkBoundsStart => write!(f, "{context}_{tp_name}_chunk_start"),
+                BufferFormat::ChunkBoundsEnd => write!(f, "{context}_{tp_name}_chunk_end"),
+                BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
+            };
+            // return write!(f, "{}_{}", context, tp_name)
+        }
         let dtype = match self.dtype {
             BinaryDataArrayType::Unknown => "unknown",
             BinaryDataArrayType::Float64 => "f64",
@@ -844,7 +992,10 @@ impl ArrayIndex {
     }
 
     pub fn get(&self, key: &ArrayType) -> Option<&ArrayIndexEntry> {
-        self.entries.iter().find(|v| v.array_type == *key)
+        self.entries
+            .iter()
+            .filter(|v| matches!(v.buffer_format, BufferFormat::Chunked | BufferFormat::Point))
+            .find(|v| v.array_type == *key)
     }
 
     pub fn get_all(&self, key: &ArrayType) -> impl Iterator<Item = &ArrayIndexEntry> {
@@ -928,8 +1079,60 @@ pub struct SerializedArrayIndex {
     pub entries: Vec<SerializedArrayIndexEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BufferOverrideRule {
-    from_buffer: BufferName,
-    to_buffer: BufferName,
+#[derive(Debug, Default, Clone)]
+pub struct BufferOverrideTable(HashMap<BufferName, BufferName>);
+
+impl BufferOverrideTable {
+    pub fn contains_key(&self, k: &BufferName) -> bool {
+        self.0.contains_key(k)
+    }
+
+    fn get(&self, k: &BufferName) -> Option<&BufferName> {
+        self.0.get(k)
+    }
+
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, BufferName, BufferName> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, BufferName, BufferName> {
+        self.0.iter_mut()
+    }
+
+    pub fn propagate_priorities(&mut self, buffer_names: &[BufferName]) {
+        for (_, val) in self.iter_mut() {
+            for alt in buffer_names {
+                val.buffer_priority = val.buffer_priority.max(alt.buffer_priority);
+            }
+        }
+        for v in buffer_names {
+            self.insert(v.clone(), v.clone());
+        }
+    }
+
+    pub fn map(&self, k: &BufferName) -> BufferName {
+        let mut name = self.get(k).or(Some(k)).cloned().unwrap();
+        name.buffer_priority = k.buffer_priority.max(name.buffer_priority);
+        name
+    }
+
+    pub fn insert(&mut self, k: BufferName, v: BufferName) -> Option<BufferName> {
+        self.0.insert(k, v)
+    }
+
+    pub fn remove(&mut self, k: &BufferName) -> Option<BufferName> {
+        self.0.remove(k)
+    }
+}
+
+impl From<HashMap<BufferName, BufferName>> for BufferOverrideTable {
+    fn from(value: HashMap<BufferName, BufferName>) -> Self {
+        Self(value)
+    }
+}
+
+impl FromIterator<(BufferName, BufferName)> for BufferOverrideTable {
+    fn from_iter<T: IntoIterator<Item = (BufferName, BufferName)>>(iter: T) -> Self {
+        HashMap::from_iter(iter).into()
+    }
 }

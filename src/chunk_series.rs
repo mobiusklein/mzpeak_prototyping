@@ -23,6 +23,7 @@ use mzpeaks::coordinate::SimpleInterval;
 use bytemuck::Pod;
 use num_traits::{Float, NumCast, ToPrimitive};
 
+use crate::buffer_descriptors::{BufferOverrideTable, BufferPriority};
 use crate::writer::StructVisitor;
 use crate::{
     buffer_descriptors::BufferTransform,
@@ -808,19 +809,20 @@ impl ArrowArrayChunk {
         include_time: bool,
     ) -> Schema {
         let base_name = self.chunk_axis.clone();
-
+        let mut bounds_name = base_name.clone();
+        bounds_name.dtype = BinaryDataArrayType::Float64;
+        let (start, end) = bounds_name.make_bounds_fields().unwrap();
         let field_meta = base_name.as_field_metadata();
+        let chunk_encoding_meta = base_name
+            .clone()
+            .with_format(BufferFormat::ChunkEncoding)
+            .as_field_metadata();
         let mut fields_of = vec![
             buffer_context.index_field(),
+            start,
+            end,
             Field::new(
-                format!("{}_chunk_start", base_name),
-                DataType::Float64,
-                true,
-            )
-            .into(),
-            Field::new(format!("{}_chunk_end", base_name), DataType::Float64, true).into(),
-            Field::new(
-                format!("{}_chunk_values", base_name),
+                base_name.to_string(),
                 DataType::LargeList(Arc::new(Field::new(
                     "item",
                     array_to_arrow_type(base_name.dtype),
@@ -835,6 +837,7 @@ impl ArrowArrayChunk {
                 CURIEBuilder::default().as_struct_type(),
                 true,
             )
+            .with_metadata(chunk_encoding_meta)
             .into(),
         ];
 
@@ -873,7 +876,7 @@ impl ArrowArrayChunk {
         main_axis: BufferName,
         arrays: &BinaryArrayMap,
         chunk_encoding: ChunkingStrategy,
-        overrides: &HashMap<BufferName, BufferName>,
+        overrides: &BufferOverrideTable,
         drop_zero_intensity: bool,
         nullify_zero_intensity: bool,
         fields: Option<&Fields>,
@@ -886,34 +889,56 @@ impl ArrowArrayChunk {
 
         let mut auxiliary_arrays = Vec::new();
 
+        let main_axis = overrides
+            .map(&main_axis)
+            .with_format(BufferFormat::Chunked)
+            .with_priority(BufferPriority::Primary);
+
+        let fields_of: BufferOverrideTable = fields
+            .as_ref()
+            .map(|v| {
+                v.iter()
+                    .flat_map(|f| BufferName::from_field(main_axis.context, f.clone()))
+                    .map(|f| (f.clone(), f))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let empty_main_axis = match arrays.get(&main_axis.array_type) {
             Some(v) => v.raw_len() == 0,
-            None => true
+            None => true,
         };
 
         if empty_main_axis {
-            for arr in arrays.iter().filter_map(|(_, arr)| (arr.raw_len() > 0).then(|| arr)) {
+            for arr in arrays
+                .iter()
+                .filter_map(|(_, arr)| (arr.raw_len() > 0).then(|| arr))
+            {
                 auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
             }
-            return Ok((Vec::new(), auxiliary_arrays))
+            return Ok((Vec::new(), auxiliary_arrays));
         }
 
         for (i, (_, arr)) in arrays.iter().enumerate() {
             let name = BufferName::from_data_array(main_axis.context, arr);
-            let buffer_name = if name.array_type == main_axis.array_type {
-                &main_axis
+            let buffer_name0 = if name.array_type == main_axis.array_type {
+                main_axis.clone().with_format(BufferFormat::Chunked)
             } else {
-                overrides.get(&name).unwrap_or(&name)
+                overrides
+                    .map(&name)
+                    .with_format(BufferFormat::ChunkedSecondary)
             };
+            let buffer_name = fields_of.map(&buffer_name0);
+
             if let Some(fields) = fields {
                 let field_name =
                     if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
-                        transform.to_field(buffer_name).name().clone()
+                        transform.to_field(&buffer_name).name().clone()
                     } else {
                         buffer_name.to_field().name().clone()
                     };
                 // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
-                if !fields.find(&field_name).is_some() && *buffer_name != main_axis {
+                if !fields.find(&field_name).is_some() && buffer_name != main_axis {
                     log::debug!(
                         "Skipping {:?}, not in schema: {fields:?}",
                         buffer_name.to_field().name()
@@ -927,8 +952,8 @@ impl ArrowArrayChunk {
             } else if matches!(buffer_name.array_type, ArrayType::MZArray) {
                 mz_idx = Some(i);
             }
-            let array = data_array_to_arrow_array(buffer_name, arr)?;
-            arrow_arrays.push((buffer_name.clone(), array));
+            let array = data_array_to_arrow_array(&buffer_name, arr)?;
+            arrow_arrays.push((buffer_name, array));
         }
 
         if let Some(intensity_idx) = intensity_idx {
@@ -999,17 +1024,15 @@ impl ArrowArrayChunk {
             }
         }
 
-        let main_axis = overrides.get(&main_axis).unwrap_or(&main_axis);
-
-        let (_, main_axis_array) = match arrow_arrays
-            .iter()
-            .find(|(k, _)| k == main_axis) {
-                Some(x) => x,
-                None => {
-                    log::warn!("Primary axis array is missing ({main_axis}) for {series_index} post-conversion");
-                    return Ok((Vec::new(), Vec::new()))
-                },
-            };
+        let (_, main_axis_array) = match arrow_arrays.iter().find(|(k, _)| *k == main_axis) {
+            Some(x) => x,
+            None => {
+                log::warn!(
+                    "Primary axis array is missing ({main_axis}) for {series_index} post-conversion"
+                );
+                return Ok((Vec::new(), Vec::new()));
+            }
+        };
 
         let steps = match array_to_arrow_type(main_axis.dtype) {
             DataType::Float32 => null_chunk_every_k(
@@ -1076,11 +1099,11 @@ mod test {
         io::{self, prelude::*},
     };
 
-    use crate::filter::{drop_where_column_is_zero, nullify_at_zero, MZDeltaModel};
+    use crate::filter::{MZDeltaModel, drop_where_column_is_zero, nullify_at_zero};
 
     use super::*;
     use arrow::array::RecordBatch;
-    use mzdata::{MZReader, prelude::*};
+    use mzdata::{MZReader, params::Unit, prelude::*};
 
     fn load_chunking_data() -> io::Result<Vec<f64>> {
         let reader = io::BufReader::new(fs::File::open("test/data/chunking_mzs.txt")?);
@@ -1136,7 +1159,7 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            &HashMap::new(),
+            &BufferOverrideTable::default(),
             true,
             false,
             None,
@@ -1193,7 +1216,7 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            &HashMap::new(),
+            &BufferOverrideTable::default(),
             true,
             true,
             None,
@@ -1259,10 +1282,11 @@ mod test {
             Arc::new(Field::new("intensity_array", DataType::Float32, true)),
         ]));
 
-        let batch = RecordBatch::try_new(mini_schema.clone(), vec![
-            Arc::new(mz_array) as ArrayRef,
-            Arc::new(intensity_array)
-        ]).unwrap();
+        let batch = RecordBatch::try_new(
+            mini_schema.clone(),
+            vec![Arc::new(mz_array) as ArrayRef, Arc::new(intensity_array)],
+        )
+        .unwrap();
 
         let trimmed_batch1 = drop_where_column_is_zero(&batch, 1).unwrap();
         let trimmed_batch = nullify_at_zero(&trimmed_batch1, 1, &[0, 1]).unwrap();
@@ -1273,11 +1297,27 @@ mod test {
         let mz_ref = trimmed_batch.column(0).as_primitive::<Float64Type>();
         let mz_ref = crate::filter::fill_nulls_for(mz_ref, &delta_model);
 
-        for ((i, a), b) in mz_acc.iter().copied().enumerate().zip(mz_ref.iter().copied()) {
+        for ((i, a), b) in mz_acc
+            .iter()
+            .copied()
+            .enumerate()
+            .zip(mz_ref.iter().copied())
+        {
             if intensity_values[i] == 0.0 {
-                assert!((a - b).abs() < 1e-6, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "{i}: {} {a} - {b} = {}",
+                    intensity_values.get(i).unwrap(),
+                    a - b
+                );
             } else {
-                assert_eq!(a, b, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+                assert_eq!(
+                    a,
+                    b,
+                    "{i}: {} {a} - {b} = {}",
+                    intensity_values.get(i).unwrap(),
+                    a - b
+                );
             }
         }
 
@@ -1297,11 +1337,11 @@ mod test {
             BufferContext::Spectrum,
             ArrayType::IntensityArray,
             BinaryDataArrayType::Float32,
-        );
+        ).with_unit(Unit::DetectorCounts);
         let intensity_name_tfm = intensity_name
             .clone()
             .with_transform(Some(BufferTransform::NumpressSLOF));
-        let overrides = HashMap::from_iter(vec![(intensity_name, intensity_name_tfm)]);
+        let overrides = BufferOverrideTable::from_iter(vec![(intensity_name, intensity_name_tfm)]);
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
@@ -1326,7 +1366,11 @@ mod test {
             false,
         );
 
-        eprintln!("{:?}", rendered.slice(0, 1));
+        for col in rendered.column_names() {
+            eprintln!("{col}, {}", rendered.column_by_name(col).unwrap().len());
+        }
+
+        assert!(rendered.column_by_name("spectrum_intensity_f32_dc_numpress_slof_bytes").is_some());
 
         Ok(())
     }
@@ -1338,7 +1382,7 @@ mod test {
             BufferContext::Spectrum,
             ArrayType::MZArray,
             BinaryDataArrayType::Float32,
-        );
+        ).with_unit(Unit::MZ);
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,
@@ -1346,7 +1390,7 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            &HashMap::new(),
+            &Default::default(),
             false,
             false,
             None,
@@ -1371,8 +1415,10 @@ mod test {
     #[test]
     fn test_encode_arrow_drop_zeros_null2() -> io::Result<()> {
         let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_large_gaps.txt")?);
-        let mut mzs = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
-        let mut intensities = DataArray::from_name_and_type(&ArrayType::IntensityArray, BinaryDataArrayType::Float32);
+        let mut mzs =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        let mut intensities =
+            DataArray::from_name_and_type(&ArrayType::IntensityArray, BinaryDataArrayType::Float32);
         for line in reader.lines().flatten() {
             if let Some((a, b)) = line.split_once("\t") {
                 mzs.push(a.parse::<f64>().unwrap())?;
@@ -1406,7 +1452,7 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            &HashMap::new(),
+            &Default::default(),
             true,
             true,
             None,
@@ -1468,10 +1514,11 @@ mod test {
             Arc::new(Field::new("intensity_array", DataType::Float32, true)),
         ]));
 
-        let batch = RecordBatch::try_new(mini_schema.clone(), vec![
-            Arc::new(mz_array) as ArrayRef,
-            Arc::new(intensity_array)
-        ]).unwrap();
+        let batch = RecordBatch::try_new(
+            mini_schema.clone(),
+            vec![Arc::new(mz_array) as ArrayRef, Arc::new(intensity_array)],
+        )
+        .unwrap();
 
         let trimmed_batch1 = drop_where_column_is_zero(&batch, 1).unwrap();
         let trimmed_batch = nullify_at_zero(&trimmed_batch1, 1, &[0, 1]).unwrap();
@@ -1482,11 +1529,27 @@ mod test {
         let mz_ref = trimmed_batch.column(0).as_primitive::<Float64Type>();
         let mz_ref = crate::filter::fill_nulls_for(mz_ref, &delta_model);
 
-        for ((i, a), b) in mz_acc.iter().copied().enumerate().zip(mz_ref.iter().copied()) {
+        for ((i, a), b) in mz_acc
+            .iter()
+            .copied()
+            .enumerate()
+            .zip(mz_ref.iter().copied())
+        {
             if intensity_values[i] == 0.0 {
-                assert!((a - b).abs() < 1e-6, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "{i}: {} {a} - {b} = {}",
+                    intensity_values.get(i).unwrap(),
+                    a - b
+                );
             } else {
-                assert_eq!(a, b, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+                assert_eq!(
+                    a,
+                    b,
+                    "{i}: {} {a} - {b} = {}",
+                    intensity_values.get(i).unwrap(),
+                    a - b
+                );
             }
         }
         Ok(())
@@ -1495,8 +1558,10 @@ mod test {
     #[test]
     fn test_encode_arrow_drop_zeros_null3() -> io::Result<()> {
         let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_sciex.txt")?);
-        let mut mzs = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
-        let mut intensities = DataArray::from_name_and_type(&ArrayType::IntensityArray, BinaryDataArrayType::Float32);
+        let mut mzs =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        let mut intensities =
+            DataArray::from_name_and_type(&ArrayType::IntensityArray, BinaryDataArrayType::Float32);
         for line in reader.lines().flatten() {
             if let Some((a, b)) = line.split_once("\t") {
                 mzs.push(a.parse::<f64>().unwrap())?;
@@ -1530,7 +1595,7 @@ mod test {
             target,
             &arrays,
             ChunkingStrategy::Delta { chunk_size: 50.0 },
-            &HashMap::new(),
+            &Default::default(),
             true,
             true,
             None,
@@ -1592,25 +1657,48 @@ mod test {
             Arc::new(Field::new("intensity_array", DataType::Float32, true)),
         ]));
 
-        let batch = RecordBatch::try_new(mini_schema.clone(), vec![
-            Arc::new(mz_array) as ArrayRef,
-            Arc::new(intensity_array)
-        ]).unwrap();
+        let batch = RecordBatch::try_new(
+            mini_schema.clone(),
+            vec![Arc::new(mz_array) as ArrayRef, Arc::new(intensity_array)],
+        )
+        .unwrap();
 
         let trimmed_zero_dropped_batch = drop_where_column_is_zero(&batch, 1).unwrap();
-        let trimmed_null_filled_batch = nullify_at_zero(&trimmed_zero_dropped_batch, 1, &[0, 1]).unwrap();
+        let trimmed_null_filled_batch =
+            nullify_at_zero(&trimmed_zero_dropped_batch, 1, &[0, 1]).unwrap();
 
-        assert_eq!(trimmed_null_filled_batch.num_rows(), accumulator.data_len()?);
+        assert_eq!(
+            trimmed_null_filled_batch.num_rows(),
+            accumulator.data_len()?
+        );
 
         let mz_acc = accumulator.to_f64()?;
-        let mz_ref = trimmed_null_filled_batch.column(0).as_primitive::<Float64Type>();
+        let mz_ref = trimmed_null_filled_batch
+            .column(0)
+            .as_primitive::<Float64Type>();
         let mz_ref = crate::filter::fill_nulls_for(mz_ref, &delta_model);
 
-        for ((i, a), b) in mz_acc.iter().copied().enumerate().zip(mz_ref.iter().copied()) {
+        for ((i, a), b) in mz_acc
+            .iter()
+            .copied()
+            .enumerate()
+            .zip(mz_ref.iter().copied())
+        {
             if intensity_values[i] == 0.0 {
-                assert!((a - b).abs() < 1e-6, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "{i}: {} {a} - {b} = {}",
+                    intensity_values.get(i).unwrap(),
+                    a - b
+                );
             } else {
-                assert_eq!(a, b, "{i}: {} {a} - {b} = {}", intensity_values.get(i).unwrap(), a - b);
+                assert_eq!(
+                    a,
+                    b,
+                    "{i}: {} {a} - {b} = {}",
+                    intensity_values.get(i).unwrap(),
+                    a - b
+                );
             }
         }
 

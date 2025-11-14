@@ -18,10 +18,10 @@ use parquet::{
 };
 
 use crate::{
-    chunk_series::{ArrowArrayChunk, ChunkingStrategy}, filter::select_delta_model, peak_series::{array_map_to_schema_arrays_and_excess, MZ_ARRAY}, spectrum::AuxiliaryArray, writer::{
+    BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::BufferPriority, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, filter::select_delta_model, peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess}, spectrum::AuxiliaryArray, writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType,
         SpectrumBuilder, WriteBatchConfig,
-    }, BufferContext, BufferName, ToMzPeakDataSeries
+    }
 };
 
 macro_rules! implement_mz_metadata {
@@ -148,7 +148,7 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 chromatogram_index,
                 None,
-                time_axis,
+                time_axis.with_priority(BufferPriority::Primary),
                 binary_array_map,
                 chunking,
                 buffer_ref.overrides(),
@@ -284,7 +284,7 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 spectrum_time,
-                MZ_ARRAY,
+                MZ_ARRAY.with_priority(BufferPriority::Primary),
                 binary_array_map,
                 chunking,
                 buffer_ref.overrides(),
@@ -352,7 +352,7 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 spectrum_time,
-                MZ_ARRAY,
+                MZ_ARRAY.clone().with_priority(BufferPriority::Primary),
                 &arrays,
                 ChunkingStrategy::Basic {
                     chunk_size: encoding.chunk_size(),

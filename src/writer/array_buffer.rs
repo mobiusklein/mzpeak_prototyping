@@ -12,6 +12,7 @@ use mzdata::spectrum::ArrayType;
 
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
+    buffer_descriptors::{BufferOverrideTable, BufferPriority},
     filter::{drop_where_column_is_zero, nullify_at_zero},
     peak_series::{ArrayIndex, ArrayIndexEntry},
 };
@@ -68,6 +69,7 @@ pub trait ArrayBufferWriter {
         schema: SchemaRef,
     ) -> RecordBatch {
         let num_rows = batch.num_rows();
+        let src_schema = batch.schema();
         let mut batch = Some(batch);
         let mut arrays = Vec::with_capacity(schema.fields().len());
         for f in schema.fields().iter() {
@@ -80,12 +82,14 @@ pub trait ArrayBufferWriter {
                 arrays.push(new_null_array(f.data_type(), num_rows));
             }
         }
-        RecordBatch::try_new(schema, arrays).unwrap_or_else(|e| {
+        RecordBatch::try_new(schema.clone(), arrays).unwrap_or_else(|e| {
+            log::error!("Expected: {schema:#?}");
+            log::error!("Source: {src_schema:#?}");
             panic!("Failed to convert arrays to record batch: {e:#?}");
         })
     }
 
-    fn overrides(&self) -> &HashMap<BufferName, BufferName>;
+    fn overrides(&self) -> &BufferOverrideTable;
 
     fn as_array_index(&self) -> ArrayIndex {
         let mut array_index: ArrayIndex =
@@ -135,7 +139,7 @@ pub struct PointBuffers {
     pub schema: SchemaRef,
     pub prefix: String,
     pub array_chunks: HashMap<String, Vec<ArrayRef>>,
-    pub overrides: HashMap<BufferName, BufferName>,
+    pub overrides: BufferOverrideTable,
     pub drop_zero_column: Option<Vec<String>>,
     pub null_zeros: bool,
     pub is_profile_buffer: Vec<bool>,
@@ -190,15 +194,18 @@ impl PointBuffers {
         let (fields, chunks) = T::to_arrays(spectrum_index, spectrum_time, peaks, &self.overrides);
         let mut visited = HashSet::new();
         for (f, arr) in fields.iter().zip(chunks.into_iter()) {
+            let name = BufferName::from_field(self.buffer_context, f.clone())
+                .map(|b| b.to_string())
+                .unwrap_or(f.name().to_string());
             self.array_chunks
-                .get_mut(f.name())
+                .get_mut(&name)
                 .unwrap_or_else(|| panic!("Unexpected field {f:?}"))
                 .push(arr);
-            visited.insert(f.name());
+            visited.insert(name);
         }
         self.is_profile_buffer.push(false);
         for (f, chunk) in self.array_chunks.iter_mut() {
-            if !visited.contains(&f) {
+            if !visited.contains(f) {
                 if let Some(t) = chunk.first().map(|a| a.data_type()).or_else(|| {
                     self.peak_array_fields
                         .iter()
@@ -357,7 +364,7 @@ impl ArrayBufferWriter for PointBuffers {
         &self.prefix
     }
 
-    fn overrides(&self) -> &HashMap<BufferName, BufferName> {
+    fn overrides(&self) -> &BufferOverrideTable {
         &self.overrides
     }
 
@@ -377,7 +384,7 @@ pub struct ChunkBuffers {
     pub schema: SchemaRef,
     pub prefix: String,
     pub chunks: Vec<StructArray>,
-    pub overrides: HashMap<BufferName, BufferName>,
+    pub overrides: BufferOverrideTable,
     pub drop_zero_column: Option<Vec<String>>,
     pub null_zeros: bool,
     pub is_profile_buffer: Vec<bool>,
@@ -391,7 +398,7 @@ impl ChunkBuffers {
         schema: SchemaRef,
         prefix: String,
         chunks: Vec<StructArray>,
-        overrides: HashMap<BufferName, BufferName>,
+        overrides: BufferOverrideTable,
         drop_zero_column: Option<Vec<String>>,
         null_zeros: bool,
         is_profile_buffer: Vec<bool>,
@@ -490,7 +497,7 @@ impl ArrayBufferWriter for ChunkBuffers {
         &self.prefix
     }
 
-    fn overrides(&self) -> &HashMap<BufferName, BufferName> {
+    fn overrides(&self) -> &BufferOverrideTable {
         &self.overrides
     }
 
@@ -614,7 +621,7 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
         chunks.into_iter()
     }
 
-    fn overrides(&self) -> &HashMap<BufferName, BufferName> {
+    fn overrides(&self) -> &BufferOverrideTable {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.overrides(),
             ArrayBufferWriterVariants::PointBuffers(array_buffers) => array_buffers.overrides(),
@@ -656,9 +663,10 @@ impl ArrayBufferWriter for ArrayBufferWriterVariants {
 pub struct ArrayBuffersBuilder {
     prefix: String,
     array_fields: Vec<FieldRef>,
-    overrides: HashMap<BufferName, BufferName>,
+    overrides: BufferOverrideTable,
     null_zeros: bool,
     include_time: bool,
+    buffer_context: BufferContext,
 }
 
 /// The builder will default to the `point` layout
@@ -667,9 +675,10 @@ impl Default for ArrayBuffersBuilder {
         Self {
             prefix: "point".to_string(),
             array_fields: Default::default(),
-            overrides: HashMap::new(),
+            overrides: BufferOverrideTable::default(),
             null_zeros: false,
             include_time: false,
+            buffer_context: BufferContext::Spectrum,
         }
     }
 }
@@ -679,6 +688,11 @@ impl ArrayBuffersBuilder {
     /// with this name.
     pub fn prefix(mut self, value: impl ToString) -> Self {
         self.prefix = value.to_string();
+        self
+    }
+
+    pub fn with_context(mut self, value: BufferContext) -> Self {
+        self.buffer_context = value;
         self
     }
 
@@ -753,6 +767,27 @@ impl ArrayBuffersBuilder {
         });
     }
 
+    fn mark_primary_arrays(&mut self) -> Vec<BufferName> {
+        let mut seen = HashSet::new();
+        let mut has_priority = Vec::new();
+        for f in self.array_fields.iter_mut() {
+            if let Some(mut buff) = BufferName::from_field(self.buffer_context, f.clone()) {
+                if !seen.contains(&buff.array_type) {
+                    seen.insert(buff.array_type.clone());
+                    buff = buff.with_priority(BufferPriority::Primary);
+                    has_priority.push(buff.clone());
+                    *f = Arc::new(
+                        f.as_ref()
+                            .clone()
+                            .with_metadata(buff.as_field_metadata())
+                            .with_name(buff.to_string()),
+                    );
+                }
+            }
+        }
+        has_priority
+    }
+
     /// Store zero intensity points as nulls in the intensity and coordinate domain
     pub fn null_zeros(mut self, null_zeros: bool) -> Self {
         self.null_zeros = null_zeros;
@@ -774,6 +809,9 @@ impl ArrayBuffersBuilder {
         if self.include_time {
             self = self.add_time_field(buffer_context);
         }
+        self.canonicalize_field_order();
+        let primaries = self.mark_primary_arrays();
+        self.overrides.propagate_priorities(&primaries);
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         self.prefix = "chunk".to_string();
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
@@ -821,24 +859,25 @@ impl ArrayBuffersBuilder {
             self = self.add_time_field(buffer_context);
         }
         self.canonicalize_field_order();
+        let primaries = self.mark_primary_arrays();
+        self.overrides.propagate_priorities(&primaries);
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
-        let buffers: HashMap<String, _> = self
-            .array_fields
-            .iter()
-            .map(|f| (f.name().clone(), Vec::new()))
-            .collect();
-        let drop_zero_column = if mask_zero_intensity_runs {
-            Some(
-                buffers
-                    .keys()
-                    .filter(|c| c.starts_with("spectrum_intensity_"))
-                    .map(|s| s.to_string())
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let mut buffers: HashMap<String, Vec<ArrayRef>> =
+            HashMap::with_capacity(self.array_fields.len());
+        let mut drop_zero_column = Vec::new();
+        for f in self.array_fields.iter() {
+            let name = f.name();
+            if mask_zero_intensity_runs {
+                if let Some(bufname) = BufferName::from_field(self.buffer_context, f.clone()) {
+                    if matches!(bufname.array_type, ArrayType::IntensityArray) {
+                        drop_zero_column.push(name.to_string());
+                    }
+                }
+            }
+            buffers.insert(name.to_string(), Vec::new());
+        }
+        let drop_zero_column = mask_zero_intensity_runs.then(|| drop_zero_column);
         PointBuffers {
             buffer_context,
             peak_array_fields: self.array_fields.clone().into(),

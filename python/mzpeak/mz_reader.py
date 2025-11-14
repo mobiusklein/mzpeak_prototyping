@@ -154,16 +154,21 @@ class BufferFormat(Enum):
     - ``Secondary_Chunk`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
     """
     Point = 1
-    Chunk = 2
-    Secondary_Chunk = 3
+    ChunkStart = 2
+    ChunkEnd = 3
+    ChunkValues = 4
+    ChunkEncoding = 5
+    SecondaryChunk = 6
+
+    Chunk = ChunkValues
 
     @classmethod
     def from_str(cls, name: str):
         try:
-            return cls[name]
+            return cls[name.title().replace("_", "")]
         except KeyError:
             if name.lower() == 'chunk_values':
-                return cls.Chunk
+                return cls.ChunkValues
             else:
                 raise
 
@@ -429,7 +434,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         if not rgs:
             rgs = self._chunk_index.row_groups_for_spectrum_range(index_range)
             if rgs:
-                prefix = BufferFormat.Chunk
+                prefix = BufferFormat.ChunkValues
 
         is_slice = False
         if isinstance(index_range, slice):
@@ -444,7 +449,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
             return self._read_point_range(
                 start, end, index_range, is_slice, rgs
             )
-        elif prefix == BufferFormat.Chunk:
+        elif prefix == BufferFormat.ChunkValues:
             return self._read_chunk_range(
                 start, end, index_range, is_slice, rgs
             )
@@ -470,8 +475,10 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
 
         has_transforms = {k: v.get('transform') for k, v in self.array_index.items() if v.get('transform')}
         for k, v in self.array_index.items():
+            name = BufferName.from_index(k, v)
             if k.startswith(axis_prefix):
-                axis_prefix = k.removesuffix("_chunk_values")
+                if name.buffer_format == BufferFormat.ChunkValues or name.buffer_format == BufferFormat.Chunk:
+                    axis_prefix = k.removesuffix("_chunk_values")
 
         n = 0
         numpress_chunks = []
@@ -731,10 +738,10 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         if not rgs:
             rgs = self._chunk_index.row_groups_for_index(index)
             if rgs:
-                prefix = BufferFormat.Chunk
+                prefix = BufferFormat.ChunkValues
         if prefix == BufferFormat.Point:
             return self._read_point(index, rgs, median_delta)
-        elif prefix == BufferFormat.Chunk:
+        elif prefix == BufferFormat.ChunkValues:
             return self._read_chunk(
                 index,
                 rgs,
@@ -763,7 +770,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         if self._point_index.init:
             return BufferFormat.Point
         elif self._chunk_index.init:
-            return BufferFormat.Chunk
+            return BufferFormat.ChunkValues
         else:
             raise ValueError("Could not infer buffer format")
 

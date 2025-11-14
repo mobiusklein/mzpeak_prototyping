@@ -107,6 +107,13 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         Ok(())
     }
 
+    pub fn start_for_entry(&mut self, entry: FileEntry) -> ZipResult<()> {
+        self.state = ArchiveState::Other;
+        self.archive_writer.start_file(entry.name.clone(), file_options())?;
+        self.index.push(entry);
+        Ok(())
+    }
+
     pub fn start_other<S: AsRef<str>>(&mut self, name: Option<&S>) -> ZipResult<()> {
         let name = name
             .map(|s| s.as_ref())
@@ -124,13 +131,13 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
     pub fn add_other_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
         let p = path.file_name().map(|p| p.to_string_lossy().to_string());
-        self.index.push(FileEntry::new(
+        let index_entry = FileEntry::new(
             p.as_ref().unwrap().to_string(),
             super::EntityType::Other("other".into()),
             super::DataKind::Other("other".into()),
-        ));
+        );
         let mut handle = fs::File::open(&path)?;
-        self.add_file_from_read(&mut handle, p.as_ref())
+        self.add_file_from_read(&mut handle, p.as_ref(), Some(index_entry))
     }
 
     pub fn add_file<P: AsRef<Path>>(
@@ -146,17 +153,20 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
 
         let mut index_entry: FileEntry = archive_type.into();
         index_entry.name = p.as_ref().unwrap().to_string();
-        self.index.push(index_entry);
-
-        self.add_file_from_read(&mut handle, p.as_ref())
+        self.add_file_from_read(&mut handle, p.as_ref(), Some(index_entry))
     }
 
     pub fn add_file_from_read<S: AsRef<str>>(
         &mut self,
         read: &mut impl io::Read,
         name: Option<&S>,
+        entry: Option<FileEntry>
     ) -> io::Result<()> {
-        self.start_other(name)?;
+        if let Some(entry) = entry {
+            self.start_for_entry(entry)?
+        } else {
+            self.start_other(name)?;
+        }
 
         let mut buffer = [0u8; 65536];
         loop {

@@ -7,7 +7,7 @@ use mzdata::{
     spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity},
 };
 use mzpeak_prototyping::{
-    buffer_descriptors::BufferTransform,
+    buffer_descriptors::{BufferOverrideTable, BufferTransform},
     chunk_series::ChunkingStrategy,
     peak_series::{BufferContext, BufferName},
     writer::{
@@ -79,7 +79,7 @@ fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
 }
 
 #[derive(Clone, Copy)]
-struct SuffixedSize(usize);
+pub struct SuffixedSize(usize);
 
 impl Debug for SuffixedSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -180,31 +180,31 @@ pub struct ConvertArgs {
         default_value_t = 5000,
         help = "The number of spectra to buffer between writes"
     )]
-    buffer_size: usize,
+    pub buffer_size: usize,
 
     #[arg(
         long,
         help = "The number of rows to write in a batch between deciding to open a new page or row group segment. Defaults to 1K. Supports SI suffixes K, M, G."
     )]
-    write_batch_size: Option<SuffixedSize>,
+    pub write_batch_size: Option<SuffixedSize>,
 
     #[arg(
         long,
         help = "The approximate number of *bytes* per data page. Defaults to 1M. Supports SI suffixes K, M, G."
     )]
-    data_page_size: Option<SuffixedSize>,
+    pub data_page_size: Option<SuffixedSize>,
 
     #[arg(
         long,
         help = "The approximate number of rows per row group. Defaults to 1M. Supports SI suffixes K, M, G."
     )]
-    row_group_size: Option<SuffixedSize>,
+    pub row_group_size: Option<SuffixedSize>,
 
     #[arg(
         long,
         help = "The approximate number of *bytes* per dictionary page. Defaults to 1M. Supports SI suffixes K, M, G."
     )]
-    dictionary_page_size: Option<SuffixedSize>,
+    pub dictionary_page_size: Option<SuffixedSize>,
 
     #[arg(
         short,
@@ -214,7 +214,7 @@ pub struct ConvertArgs {
         default_missing_value="delta:50",
         num_args=0..=1,
     )]
-    chunked_encoding: Option<ChunkingStrategy>,
+    pub chunked_encoding: Option<ChunkingStrategy>,
 
     #[arg(
         short = 'k',
@@ -222,25 +222,25 @@ pub struct ConvertArgs {
         default_value_t = 3,
         help = "The Zstd compression level to use. Defaults to 3, but ranges from 1-22"
     )]
-    compression_level: i32,
+    pub compression_level: i32,
 
     #[arg(
         short = 'p',
         long,
         help = "Whether or not to write both profile and peak picked data in the same file."
     )]
-    write_peaks_and_profiles: bool,
+    pub write_peaks_and_profiles: bool,
 
     #[arg(
         short = 't',
         long,
         help = "Include an extra 'spectrum_time' array alongside the 'spectrum_index' array."
     )]
-    include_time_with_spectrum_data: bool,
+    pub include_time_with_spectrum_data: bool,
 }
 
 impl ConvertArgs {
-    pub fn create_type_overrides(&self) -> HashMap<BufferName, BufferName> {
+    pub fn create_type_overrides(&self) -> BufferOverrideTable {
         let mut overrides = HashMap::new();
 
         if self.mz_f32 {
@@ -305,12 +305,14 @@ impl ConvertArgs {
                             ctx,
                             ArrayType::IntensityArray,
                             BinaryDataArrayType::Float32,
-                        ),
+                        )
+                        .with_unit(unit),
                         BufferName::new(
                             ctx,
                             ArrayType::IntensityArray,
                             BinaryDataArrayType::Float32,
                         )
+                        .with_unit(unit)
                         .with_transform(intensity_transform),
                     );
                 }
@@ -320,8 +322,10 @@ impl ConvertArgs {
                             ctx,
                             ArrayType::IntensityArray,
                             BinaryDataArrayType::Float32,
-                        ),
+                        )
+                        .with_unit(unit),
                         BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
+                            .with_unit(unit)
                             .with_transform(intensity_transform),
                     );
                     overrides.insert(
@@ -329,8 +333,10 @@ impl ConvertArgs {
                             ctx,
                             ArrayType::IntensityArray,
                             BinaryDataArrayType::Float64,
-                        ),
+                        )
+                        .with_unit(unit),
                         BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
+                            .with_unit(unit)
                             .with_transform(intensity_transform),
                     );
                 }
@@ -365,7 +371,7 @@ impl ConvertArgs {
                 }
             }
         }
-        overrides
+        overrides.into()
     }
 }
 
@@ -389,19 +395,10 @@ pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
     Ok(())
 }
 
-pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -> io::Result<()> {
-    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&input_path)
-        .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
-
-    let n = reader.len();
-    let overrides = args.create_type_overrides();
-
-    if let Some(c) = args.chunked_encoding.as_ref() {
-        log::debug!("Using chunking method {c:?}");
-    }
-
-    let handle = fs::File::create(output_path)?;
-    let mut writer = MzPeakWriterType::<fs::File>::builder()
+pub fn configure_writer_builder(
+    args: &ConvertArgs,
+) -> mzpeak_prototyping::writer::MzPeakWriterBuilder {
+    MzPeakWriterType::<fs::File>::builder()
         .add_default_chromatogram_fields()
         .buffer_size(args.buffer_size)
         .include_time_with_spectrum_data(args.include_time_with_spectrum_data)
@@ -426,10 +423,50 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         )
         .compression(Compression::ZSTD(
             ZstdLevel::try_new(args.compression_level).unwrap(),
-        ));
+        ))
+}
+
+pub fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
+    writer.softwares_mut().push(mzdata::meta::Software::new(
+        "mzpeak_prototyping_convert1".into(),
+        "0.1.0".into(),
+        vec![mzdata::meta::custom_software_name(
+            "mzpeak_prototyping_convert",
+        )],
+    ));
+    writer
+        .data_processings_mut()
+        .push(mzdata::meta::DataProcessing {
+            id: "mzpeak_conversion1".to_string(),
+            methods: vec![mzdata::meta::ProcessingMethod {
+                order: 1,
+                software_reference: "mzpeak_prototyping_convert1".to_string(),
+                params: vec![mzdata::Param::new_key_value(
+                    "conversion options",
+                    std::env::args().skip(1).collect::<Vec<String>>().join(" "),
+                )],
+            }],
+        });
+}
+
+pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -> io::Result<()> {
+    let mut reader = MZReaderType::<_, CentroidPeak, DeconvolutedPeak>::open_path(&input_path)
+        .inspect_err(|e| eprintln!("Failed to open data file: {e}"))?;
+
+    let n = reader.len();
+    let overrides = args.create_type_overrides();
+
+    if let Some(c) = args.chunked_encoding.as_ref() {
+        log::debug!("Using chunking method {c:?}");
+    }
+
+    let handle = fs::File::create(output_path)?;
+    let mut writer = configure_writer_builder(&args);
 
     if args.write_peaks_and_profiles {
-        let mut point_builder = ArrayBuffersBuilder::default().prefix("point");
+        let mut point_builder = ArrayBuffersBuilder::default()
+            .prefix("point")
+            .with_context(BufferContext::Spectrum);
         for f in sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
             &mut reader,
             &overrides,
@@ -455,26 +492,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     let mut writer = writer.build(handle, true);
     writer.copy_metadata_from(&reader);
-    writer.softwares_mut().push(mzdata::meta::Software::new(
-        "mzpeak_prototyping_convert1".into(),
-        "0.1.0".into(),
-        vec![mzdata::meta::custom_software_name(
-            "mzpeak_prototyping_convert",
-        )],
-    ));
-    writer
-        .data_processings_mut()
-        .push(mzdata::meta::DataProcessing {
-            id: "mzpeak_conversion1".to_string(),
-            methods: vec![mzdata::meta::ProcessingMethod {
-                order: 1,
-                software_reference: "mzpeak_prototyping_convert1".to_string(),
-                params: vec![mzdata::Param::new_key_value(
-                    "conversion options",
-                    std::env::args().skip(1).collect::<Vec<String>>().join(" "),
-                )],
-            }],
-        });
+    add_processing_metadata(&mut writer);
 
     let (send, recv) = sync_channel(1);
 
@@ -488,20 +506,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
                 _ => {}
             }
             for mut entry in reader.iter() {
-                if entry.has_ion_mobility_dimension() {
-                    let index_of_entry = entry.index();
-                    let id_of_entry = entry.id().to_string();
-                    if let Some(arrays) = entry.arrays.as_mut() {
-                        if arrays.has_array(&ArrayType::MZArray) {
-                            arrays.sort_by_array(&ArrayType::MZArray).unwrap_or_else(|e| {
-                                log::error!("Failed to canonicalize m/z array for {index_of_entry} {id_of_entry}: {e}.");
-                                for (arr, data) in arrays.iter() {
-                                    log::error!("\tHad {arr:?} with {} values", data.data_len().unwrap())
-                                }
-                            });
-                        }
-                    }
-                } else if write_peaks_and_profiles && entry.peaks.is_none() {
+                if write_peaks_and_profiles && entry.peaks.is_none() {
                     entry.pick_peaks(3.0).unwrap();
                 }
                 if send.send((Some(entry), None)).is_err() {

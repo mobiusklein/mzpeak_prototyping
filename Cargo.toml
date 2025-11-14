@@ -12,6 +12,11 @@ name = "convert"
 path = "examples/convert.rs"
 
 [[example]]
+name = "convert_thermo"
+path = "examples/convert_thermo.rs"
+required-features = ["thermo"]
+
+[[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"
 
@@ -46,7 +51,7 @@ path = "examples/extract_ref_object_store.rs"
 required-features = ["async"]
 
 [features]
-default = ["async"]
+default = ["async", "thermo"]
 
 async = ["dep:tokio", "dep:async_zip", "dep:object_store", "parquet/async", "dep:futures", "mzdata/async_partial", "dep:url"]
 s3 = ["object_store/aws", "async"]
@@ -58,7 +63,7 @@ arrow = "55.2.0"
 env_logger = "0.11.8"
 itertools = "0.14.0"
 log = "0.4.27"
-mzdata = { version = "0.62.0", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress"] }
+mzdata = { version = "0.62.1", features = ["serde", "bruker_tdf", "nalgebra", "zstd", "numpress"] }
 parquet = { version = "55.2.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 mzpeaks = "1.0.9"

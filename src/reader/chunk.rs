@@ -189,6 +189,8 @@ trait ChunkQuerySource {
 
     fn prepare_predicate_for_mz(&self, query_range: SimpleInterval<f64>, metadata: &ReaderMetadata) -> Option<Box<dyn ArrowPredicate>> {
         if let Some(e) = metadata.spectrum_array_indices.get(&ArrayType::MZArray) {
+            // Maybe rewrite this in terms of `BufferFormat` values instead of raw names, but these
+            // are unlikely to change.
             let prefix = e.path.as_str();
             let prefix = if prefix.ends_with("_chunk_values") {
                 prefix.replace("_chunk_values", "")
@@ -557,6 +559,9 @@ impl<'a> ChunkDecoder<'a> {
                             BufferFormat::ChunkedSecondary | BufferFormat::Point => {
                                 self.buffers.entry(name).or_default().push(arr.clone());
                             }
+                            BufferFormat::ChunkBoundsStart => self.main_axis_starts.push(arr.clone()),
+                            BufferFormat::ChunkBoundsEnd => self.main_axis_ends.push(arr.clone()),
+                            BufferFormat::ChunkEncoding => chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec(),
                         }
                     } else {
                         log::warn!("{f:?} failed to map to a chunk buffer");
@@ -755,6 +760,9 @@ impl<'a> ChunkScanDecoder<'a> {
                             BufferFormat::ChunkedSecondary | BufferFormat::Point => {
                                 self.buffers.entry(name).or_default().push(arr.clone());
                             }
+                            BufferFormat::ChunkBoundsStart => self.main_axis_starts.push(arr.clone()),
+                            BufferFormat::ChunkBoundsEnd => self.main_axis_ends.push(arr.clone()),
+                            BufferFormat::ChunkEncoding => chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec(),
                         }
                     } else {
                         log::warn!("{f:?} failed to map to a chunk buffer");

@@ -19,7 +19,7 @@ pub struct WriteBatchConfig {
     pub write_batch_size: Option<usize>,
     pub page_size: Option<usize>,
     pub row_group_size: Option<usize>,
-    pub dictionary_page_size: Option<usize>
+    pub dictionary_page_size: Option<usize>,
 }
 
 /// A builder for mzPeak writers
@@ -42,8 +42,12 @@ pub struct MzPeakWriterBuilder {
 impl Default for MzPeakWriterBuilder {
     fn default() -> Self {
         Self {
-            spectrum_arrays: ArrayBuffersBuilder::default().prefix("point"),
-            chromatogram_arrays: ArrayBuffersBuilder::default().prefix("point"),
+            spectrum_arrays: ArrayBuffersBuilder::default()
+                .prefix("point")
+                .with_context(BufferContext::Spectrum),
+            chromatogram_arrays: ArrayBuffersBuilder::default()
+                .prefix("point")
+                .with_context(BufferContext::Chromatogram),
             buffer_size: 5_000,
             shuffle_mz: false,
             chunked_encoding: None,
