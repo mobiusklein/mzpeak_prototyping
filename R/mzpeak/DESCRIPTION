@@ -1,0 +1,16 @@
+Package: mzpeak
+Type: Package
+Title: Reader for mzPeak Files and Archives
+Version: 0.1.0
+Authors@R: c(
+    person(
+      "Joshua", "Klein",
+      email = "mobiusklein@gmail.com",
+      role = c("aut", "cre")
+    )
+  )
+Description: Reads mzPeak Files and Archives, really.
+License: Apache II
+Encoding: UTF-8
+LazyData: true
+Imports: zip, R6, arrow, nanoparquet, jsonlite, dplyr, methods

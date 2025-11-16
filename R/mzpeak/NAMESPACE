@@ -1,0 +1,6 @@
+useDynLib(mzpeak, .registration=TRUE)
+export(connection_segment)
+exportPattern(MZPeakFile)
+exportClass(MZPeakFile)
+exportClass(ArchiveHandle)
+export(`[[`)
