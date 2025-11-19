@@ -1,6 +1,22 @@
+importFrom("dplyr", filter, collect)
+
+# The low-level ZIP slicer
 useDynLib(mzpeak, .registration=TRUE)
 export(connection_segment)
-exportPattern(MZPeakFile)
-exportClass(MZPeakFile)
-exportClass(ArchiveHandle)
-export(`[[`)
+
+# The classes exported
+export(MZPeakFile)
+export(MZPeakSpectrumDataFile)
+export(MZPeakSpectrumMetadataFile)
+export(ArchiveHandle)
+
+S3method(length, MZPeakFile)
+S3method(length, MZPeakSpectrumDataFile)
+S3method(length, MZPeakSpectrumMetadataFile)
+
+S3method(`[`, MZPeakFile)
+S3method(`[`, MZPeakSpectrumDataFile)
+#S3method(`[`, MZPeaSpectrumMetadataFile)
+
+S3method(filter, MZPeakFile)
+

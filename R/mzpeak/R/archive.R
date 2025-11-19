@@ -48,6 +48,7 @@ ArchiveHandle <- R6::R6Class(
       }
     },
     connect_file = function(name) {
+      logger::log_debug(paste("Opening", name))
       if (self$archive_type == UNPACKED_ARCHIVE) {
         return(file.path(self$root, name))
       } else {
