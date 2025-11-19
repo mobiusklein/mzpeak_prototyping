@@ -14,8 +14,10 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
     selected_ions = NULL,
 
     initialize = function(path) {
+      logger::log_debug("Loading metadata")
       # Read the entire table into RAM, we will decompose it next
       raw_df <- arrow::read_parquet(path, as_data_frame = FALSE)
+
       # Store the original connection or location, we may later
       # want it for something else.
       self$path <- path
@@ -36,12 +38,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       spectra <- raw_df$GetColumnByName("spectrum")
       if (!is.null(spectra)) {
-        self$spectra <- dplyr::bind_rows(lapply(spectra$chunks, function(par0) {
-          par0$Filter(!is.na(par0$field(0)))$as_vector()
-        }))
-        self$spectra[, !apply(X = is.na(self$spectra),
-                              FUN = all,
-                              MARGIN = 2)]
+        self$spectra <- chunks_to_table(spectra)
       }
 
       # Extract the scan partition.
@@ -49,16 +46,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       scans <- raw_df$GetColumnByName("scan")
       if (!is.null(scans)) {
-        self$scans <- dplyr::bind_rows(lapply(scans$chunks, function(par0) {
-          par0$Filter(!is.na(par0$field(0)))$as_vector()
-        }))
-        mask <- apply(X = is.na(self$scans),
-                      FUN = all,
-                      MARGIN = 2)
-        if (any(mask)) {
-          self$scans <- self$scans[, !mask]
-        }
-
+        self$scans <- chunks_to_table(scans)
       }
 
       # Extract the precursor partition.
@@ -66,15 +54,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       precursors <- raw_df$GetColumnByName("precursor")
       if (!is.null(precursors)) {
-        self$precursors <- dplyr::bind_rows(lapply(precursors$chunks, function(par0) {
-          par0$Filter(!is.na(par0$field(0)))$as_vector()
-        }))
-        mask <- apply(X = is.na(self$precursors),
-                      FUN = all,
-                      MARGIN = 2)
-        if (any(mask)) {
-          self$precursors <- self$precursors[, !mask]
-        }
+        self$precursors <- chunks_to_table(precursors)
       }
 
       # Extract the selected ion partition.
@@ -82,17 +62,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       selected_ions <- raw_df$GetColumnByName("selected_ion")
       if (!is.null(selected_ions)) {
-        self$selected_ions <- dplyr::bind_rows(lapply(selected_ions$chunks, function(par0) {
-          par0$Filter(!is.na(par0$field(0)))$as_vector()
-        }))
-        mask <- apply(
-          X = is.na(self$selected_ions),
-          FUN = all,
-          MARGIN = 2
-        )
-        if (any(mask)) {
-          self$selected_ions <- self$selected_ions[, !mask]
-        }
+        self$selected_ions <- chunks_to_table(selected_ions)
       }
     }
   ),
@@ -140,6 +110,11 @@ MZPeakSpectrumDataFile <- R6::R6Class(
     },
     # Read the actual signal data associated with a spectrum
     read_spectrum = function(index) {
+      if (length(index) > 1) {
+        values <- lapply(index, self$read_spectrum)
+        names(values) <- index
+        return(values)
+      }
       index = index - 1
       row_groups = self$row_groups_for_index(index)
 
@@ -169,12 +144,12 @@ MZPeakSpectrumDataFile <- R6::R6Class(
 )
 
 
-`[[.MZPeakFile` <- function(self, index) {
+`[.MZPeakFile` <- function(self, index) {
   self$read_spectrum(index + 1)
 }
 
 
-`[[.MZPeakSpectrumDataFile` <- function(self, index) {
+`[.MZPeakSpectrumDataFile` <- function(self, index) {
   self$read_spectrum(index + 1)
 }
 
@@ -187,6 +162,7 @@ derive_id_min_max <- function(array) {
 
 build_index_bins_direct <- function(pq_reader, column_index) {
   n <- pq_reader$num_row_groups
+  logger::log_debug("Loading bounds for", n, "row groups")
   bounds = lapply(seq(n), function(i) {
     derive_id_min_max(pq_reader$ReadRowGroup(i - 1, 0)$column(0))
   })
@@ -214,6 +190,9 @@ MZPeakFile <- R6::R6Class(
     },
     read_spectrum = function(index) {
       self$spectrum_data$read_spectrum(index)
+    },
+    query = function() {
+      MZPeakQuery$new(self)
     }
   ),
   active = list(
@@ -232,7 +211,30 @@ MZPeakFile <- R6::R6Class(
   )
 )
 
+length.MZPeakSpectrumDataFile <- function(self) {
+  as.numeric(self$meta$spectrum_count)
+}
+
+length.MZPeakFile <- function(self) {
+  length(self$spectrum_metadata$spectra)
+}
 
 dim.MZPeakFile <- function(self) {
   dim(self$spectra)
+}
+
+
+chunks_to_table <- function(chunked_array, mask_column=0) {
+  columns_of <- names(chunked_array$type)
+  chunks <- lapply(chunked_array$chunks, function(chunk) {
+    chunk <- if(chunk$field(mask_column)$null_count > 0) {
+      chunk$Filter(!is.na(chunk$field(mask_column)))
+    } else {
+      chunk
+    }
+    parts <- chunk$Flatten()
+    names(parts) <- columns_of
+    do.call(arrow::arrow_table, parts)
+  })
+  do.call(rbind, chunks)
 }
