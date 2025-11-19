@@ -13,9 +13,11 @@ use arrow::{
 };
 use parquet::{
     arrow::{
+        ProjectionMask,
         arrow_reader::{
-            ArrowPredicate, ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter, RowSelection
-        }, ProjectionMask
+            ArrowPredicate, ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter,
+            RowSelection,
+        },
     },
     file::{metadata::ParquetMetaData, reader::ChunkReader},
     schema::types::SchemaDescriptor,
@@ -28,7 +30,7 @@ use mzdata::{
 use mzpeaks::coordinate::SimpleInterval;
 
 use crate::{
-    BufferName,
+    BufferContext, BufferName,
     chunk_series::{
         BufferTransformDecoder, ChunkingStrategy, DELTA_ENCODE, NO_COMPRESSION, NUMPRESS_LINEAR,
     },
@@ -168,16 +170,28 @@ impl DataChunkCache {
 }
 
 trait ChunkQuerySource {
+    fn buffer_context(&self) -> BufferContext;
+
     fn metadata(&self) -> &ParquetMetaData;
 
     fn parquet_schema(&self) -> Arc<SchemaDescriptor> {
         self.metadata().file_metadata().schema_descr_ptr()
     }
 
-    fn prepare_predicate_for_index(&self, index_range: MaskSet, metadata: &ReaderMetadata) -> Box<dyn ArrowPredicate> {
-        let sidx = format!("{}.spectrum_index", metadata.spectrum_array_indices.prefix);
-        let proj =
-            ProjectionMask::columns(&self.parquet_schema(), [sidx.as_str()]);
+    fn array_prefix<'a>() -> &'a str {
+        "chunk"
+    }
+
+    fn prepare_predicate_for_index(
+        &self,
+        index_range: MaskSet,
+    ) -> Box<dyn ArrowPredicate> {
+        let sidx = format!(
+            "{}.{}",
+            Self::array_prefix(),
+            self.buffer_context().index_name()
+        );
+        let proj = ProjectionMask::columns(&self.parquet_schema(), [sidx.as_str()]);
 
         let predicate = ArrowPredicateFn::new(proj, move |batch| {
             let root = batch.column(0).as_struct();
@@ -187,7 +201,11 @@ trait ChunkQuerySource {
         Box::new(predicate)
     }
 
-    fn prepare_predicate_for_mz(&self, query_range: SimpleInterval<f64>, metadata: &ReaderMetadata) -> Option<Box<dyn ArrowPredicate>> {
+    fn prepare_predicate_for_mz(
+        &self,
+        query_range: SimpleInterval<f64>,
+        metadata: &ReaderMetadata,
+    ) -> Option<Box<dyn ArrowPredicate>> {
         if let Some(e) = metadata.spectrum_array_indices.get(&ArrayType::MZArray) {
             // Maybe rewrite this in terms of `BufferFormat` values instead of raw names, but these
             // are unlikely to change.
@@ -199,10 +217,11 @@ trait ChunkQuerySource {
             };
             let fields = [
                 format!("{prefix}_chunk_start"),
-                format!("{prefix}_chunk_end")
+                format!("{prefix}_chunk_end"),
             ];
 
-            let proj = ProjectionMask::columns(&self.parquet_schema(), fields.iter().map(|s| s.as_str()));
+            let proj =
+                ProjectionMask::columns(&self.parquet_schema(), fields.iter().map(|s| s.as_str()));
             let predicate = ArrowPredicateFn::new(proj, move |batch| {
                 let root = batch.column(0).as_struct();
                 let mz_start_array = root.column(0);
@@ -222,11 +241,7 @@ trait ChunkQuerySource {
         query_range: Option<SimpleInterval<f64>>,
         metadata: &ReaderMetadata,
         query_indices: &QueryIndex,
-    ) -> (
-        RowSelection,
-        Vec<usize>,
-        RowFilter,
-    ) {
+    ) -> (RowSelection, Vec<usize>, RowFilter) {
         let mut rows = query_indices
             .spectrum_chunk_index
             .spectrum_index
@@ -258,7 +273,11 @@ trait ChunkQuerySource {
 
         rows.split_off(up_to_first_row as usize);
 
-        let sidx = format!("{}.spectrum_index", metadata.spectrum_array_indices.prefix);
+        let sidx = format!(
+            "{}.{}",
+            Self::array_prefix(),
+            self.buffer_context().index_name()
+        );
 
         let mut fields: Vec<String> = Vec::new();
 
@@ -292,9 +311,7 @@ trait ChunkQuerySource {
 
         log::trace!("Executing query on {fields:?}");
 
-        let mut predicates = vec![
-            self.prepare_predicate_for_index(index_range, metadata)
-        ];
+        let mut predicates = vec![self.prepare_predicate_for_index(index_range)];
 
         if let Some(query_range) = query_range {
             predicates.extend(self.prepare_predicate_for_mz(query_range, metadata));
@@ -340,8 +357,14 @@ trait ChunkQuerySource {
             .spectrum_index
             .pages_to_row_selection(&pages, first_row);
 
+        let sidx = format!(
+            "{}.{}",
+            Self::array_prefix(),
+            self.buffer_context().index_name()
+        );
+
         let predicate_mask =
-            ProjectionMask::columns(&self.parquet_schema(), ["chunk.spectrum_index"]);
+            ProjectionMask::columns(&self.parquet_schema(), [sidx.as_str()]);
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
             let spectrum_index: &UInt64Array = batch
@@ -359,7 +382,7 @@ trait ChunkQuerySource {
             Ok(it.map(Some).collect())
         });
 
-        let proj = ProjectionMask::columns(&self.parquet_schema(), ["chunk"]);
+        let proj = ProjectionMask::columns(&self.parquet_schema(), [Self::array_prefix()]);
 
         Some((rows, rg_idx_acc, proj, predicate))
     }
@@ -379,7 +402,13 @@ trait ChunkQuerySource {
             .spectrum_index
             .row_selection_overlaps(&index_range);
 
-        let proj = ProjectionMask::columns(&self.parquet_schema(), vec!["chunk.spectrum_index"]);
+        let sidx = format!(
+            "{}.{}",
+            Self::array_prefix(),
+            self.buffer_context().index_name()
+        );
+
+        let proj = ProjectionMask::columns(&self.parquet_schema(), vec![sidx.as_str()]);
         let predicate_mask = proj;
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
@@ -403,7 +432,7 @@ struct ChunkDecoder<'a> {
     main_axis_ends: Vec<ArrayRef>,
     main_axis: Option<DataArray>,
     bin_map: BinaryArrayMap,
-    spectrum_array_indices: &'a ArrayIndex,
+    array_indices: &'a ArrayIndex,
     delta_model: Option<&'a RegressionDeltaModel<f64>>,
 }
 
@@ -419,7 +448,7 @@ impl<'a> ChunkDecoder<'a> {
             main_axis_ends: Default::default(),
             main_axis: None,
             bin_map: Default::default(),
-            spectrum_array_indices,
+            array_indices: spectrum_array_indices,
             delta_model,
         }
     }
@@ -427,7 +456,7 @@ impl<'a> ChunkDecoder<'a> {
     fn compile_buffers(mut self) -> Result<BinaryArrayMap, ArrayRetrievalError> {
         // If we never populated the main axis, exit early and return empty arrays.
         if self.main_axis.is_none() {
-            for k in self.spectrum_array_indices.iter() {
+            for k in self.array_indices.iter() {
                 self.bin_map.add(k.as_buffer_name().as_data_array(0));
             }
             return Ok(self.bin_map);
@@ -559,9 +588,13 @@ impl<'a> ChunkDecoder<'a> {
                             BufferFormat::ChunkedSecondary | BufferFormat::Point => {
                                 self.buffers.entry(name).or_default().push(arr.clone());
                             }
-                            BufferFormat::ChunkBoundsStart => self.main_axis_starts.push(arr.clone()),
+                            BufferFormat::ChunkBoundsStart => {
+                                self.main_axis_starts.push(arr.clone())
+                            }
                             BufferFormat::ChunkBoundsEnd => self.main_axis_ends.push(arr.clone()),
-                            BufferFormat::ChunkEncoding => chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec(),
+                            BufferFormat::ChunkEncoding => {
+                                chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec()
+                            }
                         }
                     } else {
                         log::warn!("{f:?} failed to map to a chunk buffer");
@@ -594,7 +627,8 @@ impl<'a> ChunkDecoder<'a> {
                     NO_COMPRESSION => {
                         macro_rules! decode_no_compression {
                             ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
-                                for (chunk_vals, (start, end)) in $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
+                                for (chunk_vals, (start, end)) in
+                                    $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
                                 {
                                     let chunk_vals = chunk_vals.unwrap();
                                     let start = start.unwrap();
@@ -624,7 +658,8 @@ impl<'a> ChunkDecoder<'a> {
                     DELTA_ENCODE => {
                         macro_rules! decode_deltas {
                             ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
-                                for (chunk_vals, (start, end)) in $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
+                                for (chunk_vals, (start, end)) in
+                                    $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
@@ -657,7 +692,8 @@ impl<'a> ChunkDecoder<'a> {
                         let chunk_values = chunk_values.as_list::<i64>();
                         macro_rules! decode_numpress {
                             ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
-                                for (chunk_vals, (start, end)) in $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
+                                for (chunk_vals, (start, end)) in
+                                    $chunk_values.iter().zip($starts.iter().zip($ends.iter()))
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
@@ -760,9 +796,13 @@ impl<'a> ChunkScanDecoder<'a> {
                             BufferFormat::ChunkedSecondary | BufferFormat::Point => {
                                 self.buffers.entry(name).or_default().push(arr.clone());
                             }
-                            BufferFormat::ChunkBoundsStart => self.main_axis_starts.push(arr.clone()),
+                            BufferFormat::ChunkBoundsStart => {
+                                self.main_axis_starts.push(arr.clone())
+                            }
                             BufferFormat::ChunkBoundsEnd => self.main_axis_ends.push(arr.clone()),
-                            BufferFormat::ChunkEncoding => chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec(),
+                            BufferFormat::ChunkEncoding => {
+                                chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec()
+                            }
                         }
                     } else {
                         log::warn!("{f:?} failed to map to a chunk buffer");
@@ -794,9 +834,13 @@ impl<'a> ChunkScanDecoder<'a> {
                     NO_COMPRESSION => {
                         macro_rules! decode_no_compression {
                             ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
-                                for (chunk_vals, ((start, end), spectrum_idx)) in $chunk_values
-                                    .iter()
-                                    .zip($starts.iter().zip($ends.iter()).zip(spectrum_idxs.iter().flatten()))
+                                for (chunk_vals, ((start, end), spectrum_idx)) in
+                                    $chunk_values.iter().zip(
+                                        $starts
+                                            .iter()
+                                            .zip($ends.iter())
+                                            .zip(spectrum_idxs.iter().flatten()),
+                                    )
                                 {
                                     let chunk_vals = chunk_vals.unwrap();
                                     let start = start.unwrap();
@@ -842,9 +886,13 @@ impl<'a> ChunkScanDecoder<'a> {
                     DELTA_ENCODE => {
                         macro_rules! decode_deltas {
                             ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
-                                for (chunk_vals, ((start, end), spectrum_idx)) in $chunk_values
-                                    .iter()
-                                    .zip($starts.iter().zip($ends.iter()).zip(spectrum_idxs.iter().flatten()))
+                                for (chunk_vals, ((start, end), spectrum_idx)) in
+                                    $chunk_values.iter().zip(
+                                        $starts
+                                            .iter()
+                                            .zip($ends.iter())
+                                            .zip(spectrum_idxs.iter().flatten()),
+                                    )
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
@@ -898,9 +946,13 @@ impl<'a> ChunkScanDecoder<'a> {
                         let chunk_values = chunk_values.as_list::<i64>();
                         macro_rules! decode_numpress {
                             ($chunk_values:ident, $starts:ident, $ends:ident, $accumulator:expr) => {
-                                for (chunk_vals, ((start, end), spectrum_idx)) in $chunk_values
-                                    .iter()
-                                    .zip($starts.iter().zip($ends.iter()).zip(spectrum_idxs.iter().flatten()))
+                                for (chunk_vals, ((start, end), spectrum_idx)) in
+                                    $chunk_values.iter().zip(
+                                        $starts
+                                            .iter()
+                                            .zip($ends.iter())
+                                            .zip(spectrum_idxs.iter().flatten()),
+                                    )
                                 {
                                     if let Some(chunk_vals) = chunk_vals {
                                         let start = start.unwrap();
@@ -1063,6 +1115,10 @@ pub struct SpectrumChunkReader<T: ChunkReader + 'static> {
 impl<T: ChunkReader + 'static> ChunkQuerySource for SpectrumChunkReader<T> {
     fn metadata(&self) -> &ParquetMetaData {
         self.builder.metadata()
+    }
+
+    fn buffer_context(&self) -> BufferContext {
+        BufferContext::Spectrum
     }
 }
 
@@ -1292,6 +1348,10 @@ mod async_impl {
     impl<T: AsyncFileReader + 'static + Unpin + Send> ChunkQuerySource for AsyncSpectrumChunkReader<T> {
         fn metadata(&self) -> &parquet::file::metadata::ParquetMetaData {
             self.builder.metadata()
+        }
+
+        fn buffer_context(&self) -> BufferContext {
+            BufferContext::Spectrum
         }
     }
 }

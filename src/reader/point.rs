@@ -104,9 +104,9 @@ pub(crate) trait PointDataArrayReader {
         incremental: bool,
     ) {
         for (f, arr) in points.fields().iter().zip(points.columns()) {
-            if f.name() == "spectrum_index"
-                || f.name() == "spectrum_time"
-                || f.name() == "chromatogram_index"
+            if f.name() == BufferContext::Spectrum.index_name()
+                || f.name() == BufferContext::Spectrum.time_name()
+                || f.name() == BufferContext::Chromatogram.index_name()
             {
                 continue;
             }
@@ -1150,6 +1150,7 @@ mod sync_impl {
                     .with_batch_size(10_000)
                     .build()?;
 
+                // We don't have spectra in this reader, or we do but they don't have an m/z axis
                 if !matches!(context, BufferContext::Spectrum)
                     || index_column_idx.is_none()
                     || mz_column_idx.is_none()

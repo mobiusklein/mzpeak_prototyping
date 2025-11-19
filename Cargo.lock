@@ -2037,6 +2037,7 @@ dependencies = [
  "arrow",
  "async_zip",
  "base64-simd",
+ "bitflags",
  "bytemuck",
  "bytes",
  "clap",

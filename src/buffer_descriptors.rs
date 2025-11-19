@@ -33,12 +33,16 @@ impl BufferContext {
         Arc::new(Field::new(self.index_name(), DataType::UInt64, true))
     }
 
+    pub const fn time_name(&self) -> &'static str {
+        match self {
+            BufferContext::Spectrum => "spectrum_time",
+            BufferContext::Chromatogram => "chromatogram_time",
+        }
+    }
+
     pub fn time_field(&self) -> FieldRef {
         Arc::new(Field::new(
-            match self {
-                BufferContext::Spectrum => "spectrum_time",
-                BufferContext::Chromatogram => "chromatogram_time",
-            },
+            self.time_name(),
             DataType::Float32,
             true,
         ))
@@ -137,7 +141,11 @@ impl PartialEq<str> for BufferFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Hash)]
 pub enum BufferPriority {
+    /// This is the primary array of this type, it receives the short naming scheme, along with the
+    /// regular metadata in the [`ArrayIndex`].
     Primary,
+    /// This is a secondary array of this type, it will receive an implementation-defined name, but
+    /// will still be annotated in the [`ArrayIndex`].
     Secondary,
 }
 
@@ -203,8 +211,14 @@ pub struct BufferName {
     pub unit: Unit,
     /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
+    /// Any transformations applied to this array
     pub transform: Option<BufferTransform>,
+    /// The default data processing method's ID applied to this array. Alternatives may
+    /// be specified in the metadata table.
     pub data_processing_id: Option<Box<str>>,
+    /// Whether this is the primary array for this quantity, or a secondary array.
+    /// Primary arrays get a much more succinct standardized naming scheme while
+    /// all other arrays' names are implementation details.
     pub buffer_priority: Option<BufferPriority>,
 }
 
@@ -678,7 +692,6 @@ impl BufferName {
 
 impl Display for BufferName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let context = self.context.name();
         let tp_name = match &self.array_type {
             ArrayType::Unknown => Cow::Borrowed("unknown"),
             ArrayType::MZArray => Cow::Borrowed("mz"),
@@ -717,11 +730,11 @@ impl Display for BufferName {
         if self.buffer_priority == Some(BufferPriority::Primary) {
             return match self.buffer_format {
                 BufferFormat::Point | BufferFormat::ChunkedSecondary => {
-                    write!(f, "{}_{}", context, tp_name)
+                    write!(f, "{tp_name}")
                 }
-                BufferFormat::Chunked => write!(f, "{}_{}_chunk_values", context, tp_name),
-                BufferFormat::ChunkBoundsStart => write!(f, "{context}_{tp_name}_chunk_start"),
-                BufferFormat::ChunkBoundsEnd => write!(f, "{context}_{tp_name}_chunk_end"),
+                BufferFormat::Chunked => write!(f, "{tp_name}_chunk_values"),
+                BufferFormat::ChunkBoundsStart => write!(f, "{tp_name}_chunk_start"),
+                BufferFormat::ChunkBoundsEnd => write!(f, "{tp_name}_chunk_end"),
                 BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
             };
             // return write!(f, "{}_{}", context, tp_name)
@@ -735,7 +748,7 @@ impl Display for BufferName {
             BinaryDataArrayType::ASCII => "ascii",
         };
         if matches!(self.unit, Unit::Unknown) {
-            write!(f, "{}_{}_{}", context, tp_name, dtype)
+            write!(f, "{}_{}", tp_name, dtype)
         } else {
             let unit = match self.unit {
                 Unit::Unknown => "",
@@ -762,7 +775,7 @@ impl Display for BufferName {
                 Unit::Percent => "pct",
                 Unit::Dimensionless => "",
             };
-            write!(f, "{}_{}_{}_{}", context, tp_name, dtype, unit)
+            write!(f, "{}_{}_{}", tp_name, dtype, unit)
         }
     }
 }

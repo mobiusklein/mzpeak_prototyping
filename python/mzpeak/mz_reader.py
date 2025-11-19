@@ -462,23 +462,18 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         axis_prefix: str | None = None,
         delta_model: float | np.ndarray | None = None,
     ) -> _SpectrumArrays:
-        if axis_prefix is None:
-            if self._namespace == "spectrum":
-                axis_prefix = f"{self._namespace}_mz"
-            elif self._namespace == "chromatogram":
-                axis_prefix = f"{self._namespace}_time"
-            else:
-                raise ValueError(self._namespace)
-
         time_label = f"{self._namespace}_time"
-
 
         has_transforms = {k: v.get('transform') for k, v in self.array_index.items() if v.get('transform')}
         for k, v in self.array_index.items():
             name = BufferName.from_index(k, v)
-            if k.startswith(axis_prefix):
-                if name.buffer_format == BufferFormat.ChunkValues or name.buffer_format == BufferFormat.Chunk:
+            if name.buffer_format == BufferFormat.ChunkValues or name.buffer_format == BufferFormat.Chunk:
+                axis_prefix = k.removesuffix("_chunk_values")
+        if axis_prefix is None:
+            for k, v in self.array_index.items():
+                if k.endswith("_chunk_values"):
                     axis_prefix = k.removesuffix("_chunk_values")
+                    break
 
         n = 0
         numpress_chunks = []
