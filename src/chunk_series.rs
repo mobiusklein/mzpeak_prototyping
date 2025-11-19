@@ -1370,7 +1370,7 @@ mod test {
             eprintln!("{col}, {}", rendered.column_by_name(col).unwrap().len());
         }
 
-        assert!(rendered.column_by_name("spectrum_intensity_f32_dc_numpress_slof_bytes").is_some());
+        assert!(rendered.column_by_name("intensity_f32_dc_numpress_slof_bytes").is_some());
 
         Ok(())
     }

@@ -198,7 +198,12 @@ impl FromStr for BufferPriority {
     }
 }
 
-/// Composite structure for directly naming a data array series
+/// Composite structure for directly naming a data array series and describing
+/// its metadata, e.g. data type, array type + unit, format (layout in points or chunks)
+/// and any other "stuff" we might need.
+///
+/// This type also serializes to a JSON-friendly key-value pair map that is also used as
+/// [`Field`] metadata to make runtime inspection possible
 #[derive(Clone, Debug, Eq)]
 pub struct BufferName {
     /// Is this a spectrum or chromatogram array?
@@ -289,6 +294,7 @@ impl PartialOrd for BufferName {
     }
 }
 
+/// Potentially opaque transforms that need additional buffers to store the transformed data
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BufferTransform {
     NumpressLinear,
