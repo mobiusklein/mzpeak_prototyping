@@ -963,7 +963,7 @@ class MzPeakFile(Sequence[_SpectrumType]):
     def __init__(self, path: str | Path | zipfile.ZipFile | IO[bytes]):
         self.file_index = FileIndex()
         if isinstance(path, zipfile.ZipFile):
-            self._from_zip_archive(self._archive)
+            self._from_zip_archive(path)
         elif isinstance(path, (str, Path)):
             self._from_path(Path(path))
         else:
