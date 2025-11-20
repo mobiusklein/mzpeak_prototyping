@@ -24,3 +24,9 @@ class Span(Generic[Q]):
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.start}, {self.end})"
+
+
+def _slice_to_range(slice_val: slice, n: int) -> range:
+    start = slice_val.start or 0
+    end = slice_val.stop or n
+    return range(start, end)

@@ -13,7 +13,7 @@ import pyarrow as pa
 from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
-from .util import Span
+from .util import Span, _slice_to_range
 from .filters import null_delta_decode, fill_nulls
 
 logger = logging.getLogger(__name__)
@@ -309,6 +309,368 @@ psims_dtypes = {
 _SpectrumArrays = dict[str, np.ndarray]
 
 
+
+class _PointBatchCleaner:
+    """
+    Help clean :term:`Point Layout` data, formatting
+    for more ease of use outside of Arrow.
+    """
+    namespace: str
+    array_index: dict[str, dict]
+    drop_index: bool
+    delta_model: float | np.ndarray | dict[int, np.ndarray] | None = None
+    has_mulitple_indices: bool
+    has_mulitple_delta_models: bool
+    index_name: str
+
+    def __init__(self, namespace: str, array_index: dict[str, dict], drop_index: bool=True, delta_model=None, has_multiple_indices: bool=False):
+        self.namespace = namespace
+        self.array_index = array_index
+        self.drop_index = drop_index
+        self.delta_model = delta_model
+        self.has_mulitple_indices = has_multiple_indices
+        self.has_multiple_delta_models = isinstance(self.delta_model, dict)
+        self.index_name = f"{self.namespace}_index"
+        if self.has_multiple_delta_models and not self.has_mulitple_indices:
+            logger.warning("Cleaning a point data batch with multiple delta models %r but not multiple indices", self.delta_model)
+
+    def get_index_runs(self, data: pa.StructArray):
+        index_values = data.field(self.index_name)
+        index_runs_pa = pc.run_end_encode(index_values, run_end_type=pa.int64())
+        index_runs = np.asarray(index_runs_pa.run_ends).view(np.uint64)
+        index_values_unique = np.asarray(index_runs_pa.values)
+        return index_runs, index_values_unique
+
+    def null_column_indices(self, data: pa.StructArray) -> list[int]:
+        nulls = []
+        for i, _name in enumerate(data.type):
+            col = data.field(i)
+            if col.null_count == len(col):
+                nulls.append(i)
+
+        if len(nulls) > 1:
+            nulls.sort()
+
+        return nulls
+
+    def convert_struct_array_to_dict(self, data: pa.StructArray) -> dict[str, pa.Array]:
+        nulls = self.null_column_indices(data)
+
+        fields = [f.name for f in data.type]
+        data = {f: v for f, v in zip(fields, data.flatten())}
+
+        for i in nulls:
+            data.pop(fields[i])
+
+        for k, v in {
+            k: v["array_name"] for k, v in self.array_index.items() if k in data.keys()
+        }.items():
+            data[v] = data.pop(k)
+
+        return data
+
+    def fill_nulls(
+        self, v: pa.Array,
+        index_runs: np.ndarray,
+        index_values_unique: np.ndarray
+    ) -> np.ndarray:
+        """
+        Fill null values into a data array using the delta model.
+
+        If :attr:`has_multiple_delta_models` is set this will require
+        ``index_runs`` and ``index_values_unique`` is not :const:`None`.
+        """
+        if self.has_multiple_delta_models and self.has_mulitple_indices:
+            if index_runs is None or index_values_unique is None:
+                raise ValueError(
+                    "Cannot decode nulls across multiple indices and models if index runs are None"
+                )
+            v_np = np.asarray(v)
+            start = 0
+            for run_i, run_end in enumerate(index_runs):
+                index = index_values_unique[run_i]
+                delta_model_for = self.delta_model[index]
+                v_for = v.slice(start, run_end - start)
+                v_np[start:run_end] = fill_nulls(v_for, delta_model_for)
+                start = run_end
+            v = v_np
+
+        elif not np.any(np.isnan(self.delta_model)):
+            v = fill_nulls(v, self.delta_model)
+        return v
+
+    def expand(self, data: pa.RecordBatch | pa.StructArray) -> _SpectrumArrays:
+        """
+        This internal helper takes a :class:`pyarrow.RecordBatch` or
+        :class:`pyarrow.StructArray` in the :term:`Point Layout`,
+        cleans it up and converts it into a :class:`dict` mapping
+        :class:`str` keys to :class:`numpy.ndarray` instances.
+
+        Parameters
+        ----------
+        data : :class:`pyarrow.RecordBatch` or :class:`pyarrow.StructArray`
+            The raw Arrow data read from the Parquet file to be transformed.
+
+        Returns
+        -------
+        dict[str, np.ndarray]:
+            The arrays of the entity in ``data``
+        """
+        if isinstance(data, pa.RecordBatch):
+            data = data.to_struct_array()
+
+        index_runs = index_values_unique = None
+
+        if self.has_mulitple_indices and self.has_multiple_delta_models:
+            (index_runs, index_values_unique) = self.get_index_runs(data)
+
+        data = self.convert_struct_array_to_dict(data)
+        it = data.items()
+
+        result = {}
+        for k, v in it:
+            if v.null_count and self.delta_model is not None:
+                if k == "m/z array":
+                    v = self.fill_nulls(
+                        v,
+                        index_runs=index_runs,
+                        index_values_unique=index_values_unique
+                    )
+
+                elif k == "intensity array":
+                    v = np.asarray(v)
+                    v[np.isnan(v)] = 0.0
+
+            result[k] = np.asarray(v)
+
+        if self.drop_index and self.index_name in result:
+            result.pop(self.index_name)
+        return result
+
+
+class _ChunkBatchCleaner:
+    namespace: str
+    array_index: dict[str, dict]
+    drop_index: bool
+    delta_model: float | np.ndarray | dict[int, np.ndarray] | None = None
+    has_mulitple_indices: bool
+    has_mulitple_delta_models: bool
+    index_name: str
+    time_label: str
+    axis_prefix: str
+
+    def __init__(
+        self,
+        namespace: str,
+        array_index: dict[str, dict],
+        drop_index: bool = True,
+        delta_model=None,
+    ):
+        self.namespace = namespace
+        self.array_index = array_index
+        self.drop_index = drop_index
+        self.delta_model = delta_model
+        self.has_multiple_delta_models = isinstance(self.delta_model, dict)
+        self.index_name = f"{self.namespace}_index"
+        self.time_label = f"{self.namespace}_time"
+        self.axis_prefix = self.find_axis_prefix()
+        self.has_transforms = self.arrays_has_transforms()
+        if self.has_multiple_delta_models:
+            logger.warning(
+                "Cleaning a point data batch with multiple delta models %r but not multiple indices",
+                self.delta_model,
+            )
+
+    def arrays_has_transforms(self):
+        has_transforms = {
+            k: v.get("transform")
+            for k, v in self.array_index.items()
+            if v.get("transform")
+        }
+        return has_transforms
+
+    def find_axis_prefix(self):
+        axis_prefix = None
+        for k, v in self.array_index.items():
+            name = BufferName.from_index(k, v)
+            if (
+                name.buffer_format == BufferFormat.ChunkValues
+                or name.buffer_format == BufferFormat.Chunk
+            ):
+                axis_prefix = k.removesuffix("_chunk_values")
+        if axis_prefix is None:
+            for k, v in self.array_index.items():
+                if k.endswith("_chunk_values"):
+                    axis_prefix = k.removesuffix("_chunk_values")
+                    break
+        if axis_prefix is None:
+            raise ValueError(f"Could not infer axis prefix from {self.array_index}")
+        return axis_prefix
+
+    def prescan_chunks(self, chunks: list[dict[str, Any]]):
+        n = 0
+        numpress_chunks = []
+        for chunk in chunks:
+            # The +1 is to account for the starting point
+            encoding = chunk["chunk_encoding"].as_py()
+            if encoding in (
+                DELTA_ENCODING,
+                NO_COMPRESSION,
+                NO_COMPRESSION_CURIE,
+                DELTA_ENCODING_CURIE,
+            ):
+                n += len(chunk[f"{self.axis_prefix}_chunk_values"]) + 1
+            elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
+                raw = chunk[f"{self.axis_prefix}_numpress_bytes"].as_py()
+                part = pynumpress.decode_linear(raw)
+                n += len(part)
+                numpress_chunks.append(part)
+            else:
+                raise ValueError(f"Unsupported chunk encoding {encoding}")
+        return n, numpress_chunks
+
+    def initialize_arrays(self, n: int, chunks: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+        arrays_of = {}
+        for k, v in chunks[0].items():
+            if k == self.index_name:
+                if not self.drop_index:
+                    arrays_of[k] = np.zeros(n, dtype=np.uint64)
+            elif k == "chunk_encoding" or k == self.time_label or k.startswith(self.axis_prefix):
+                continue
+            else:
+                arrays_of[k] = np.zeros(
+                    n, dtype=psims_dtypes[self.array_index[k]["data_type"]]
+                )
+        return arrays_of
+
+    def process_chunks(self, n: int,
+                       numpress_chunks: list,
+                       chunks: list[dict[str, pa.Array]],
+                       arrays_of: dict[str, np.ndarray]) -> tuple[int, bool]:
+        main_axis_array = np.zeros(n)
+        offset = 0
+        had_nulls = False
+        numpress_chunks_it = iter(numpress_chunks)
+        for _i, chunk in enumerate(chunks):
+            start = chunk[f"{self.axis_prefix}_chunk_start"].as_py()
+            end = chunk[f"{self.axis_prefix}_chunk_end"].as_py()
+
+            steps = chunk[f"{self.axis_prefix}_chunk_values"]
+            encoding = chunk["chunk_encoding"].as_py()
+            index_val = chunk[self.index_name].as_py()
+
+            delta_model_ = self.delta_model
+            if self.has_multiple_delta_models:
+                delta_model_ = self.delta_model[index_val]
+
+            # Delta encoding
+            if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):
+                # This indicates an empty chunk containing no information beyond possibly a null value.
+                # Skip it and keep going.
+                if (start == end) and start == 0.0:
+                    continue
+
+                if steps.values.null_count > 0:
+                    had_nulls = True
+                    # The presence null values leads to sometimes restoring one fewer values because the chunk start is
+                    # included in the data itself.
+                    steps = null_delta_decode(
+                        steps.values, pa.scalar(start, type=steps.values.type)
+                    )
+                    chunk_size = len(steps)
+                    if delta_model_ is not None:
+                        steps = fill_nulls(steps, delta_model_)
+                    else:
+                        steps = np.asarray(steps)
+                    main_axis_array[offset : offset + len(steps)] = steps
+                else:
+                    chunk_size = len(steps) + 1
+                    main_axis_array[offset : offset + chunk_size] = start
+                    main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(
+                        steps.values
+                    )
+            # Direct encoding
+            elif encoding in (NO_COMPRESSION, NO_COMPRESSION_CURIE):
+                chunk_size = len(steps)
+                main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
+            elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
+                part: np.ndarray = next(numpress_chunks_it)
+                chunk_size = len(part)
+                zeros = part == 0
+                if zeros.sum() > 0:
+                    had_nulls = True
+                    if delta_model_ is not None:
+                        part = pa.array(part, mask=zeros)
+                        part = fill_nulls(part, delta_model_)
+                        part = np.asarray(part)
+                        chunk_size = len(part)
+                main_axis_array[offset : offset + chunk_size] = part
+            else:
+                raise ValueError(f"Unsupported chunk encoding {encoding}")
+
+            for k, v in chunk.items():
+                if k == self.index_name:
+                    if not self.drop_index:
+                        arrays_of[k][offset : offset + chunk_size] = index_val
+                elif k in ("chunk_encoding", self.time_label) or k.startswith(
+                    self.axis_prefix
+                ):
+                    continue
+                else:
+                    values = np.asarray(v.values)
+                    if k in self.has_transforms:
+                        if self.has_transforms[k] == NUMPRESS_SLOF_CURIE:
+                            values = pynumpress.decode_slof(values)
+                        elif self.has_transforms[k] == NUMPRESS_PIC_CURIE:
+                            values = pynumpress.decode_pic(values)
+                        else:
+                            raise NotImplementedError(self.has_transforms[k])
+                    arrays_of[k][offset : offset + chunk_size] = values
+
+            offset += chunk_size
+        arrays_of[self.axis_prefix] = main_axis_array
+        return offset, had_nulls
+
+    def expand(self, chunks: list[dict[str, Any]]):
+        axis_prefix = self.axis_prefix
+
+        n, numpress_chunks = self.prescan_chunks(chunks)
+        if n == 0:
+            return {axis_prefix: np.array([])}
+
+        arrays_of = self.initialize_arrays(n, chunks)
+        (offset, had_nulls) = self.process_chunks(
+            n,
+            numpress_chunks=numpress_chunks,
+            chunks=chunks,
+            arrays_of=arrays_of
+        )
+
+        rename_map = {
+            k: v["array_name"] for k, v in self.array_index.items() if k in arrays_of
+        }
+
+        if f"{axis_prefix}_chunk_values" in self.array_index:
+            rename_map[rename_map.pop(axis_prefix, axis_prefix)] = self.array_index[
+                f"{axis_prefix}_chunk_values"
+            ]["array_name"]
+
+        elif axis_prefix in self.array_index:
+            rename_map[axis_prefix] = self.array_index[axis_prefix]["array_name"]
+
+        for k, v in rename_map.items():
+            arrays_of[v] = arrays_of.pop(k)
+            if v == "intensity array" and had_nulls:
+                arrays_of[v][np.isnan(arrays_of[v])] = 0
+
+        # truncate the arrays to just the size used in case we over-allocated
+        truncated = {}
+        for k, v in arrays_of.items():
+            truncated[k] = v[:offset]
+
+        return truncated
+
+
 class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     """
     A generic reader for mzPeak data array reading.
@@ -367,68 +729,62 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     def _clean_point_batch(
         self,
         data: pa.RecordBatch | pa.StructArray,
-        delta_model: float | np.ndarray | None = None,
+        delta_model: float | np.ndarray | dict[int, np.ndarray] | None = None,
+        drop_index: bool = True,
+        has_mulitple_indices: bool = False,
     ) -> _SpectrumArrays:
-        if isinstance(data, pa.StructArray):
-            nulls = []
-            for i, name in enumerate(data.type):
-                col = data.field(i)
-                if col.null_count == len(col):
-                    nulls.append(i)
-            if len(nulls) > 1:
-                nulls.sort()
+        """
+        This internal helper takes a :class:`pyarrow.RecordBatch` or
+        :class:`pyarrow.StructArray` in the :term:`Point Layout`,
+        cleans it up and converts it into a :class:`dict` mapping
+        :class:`str` keys to :class:`numpy.ndarray` instances.
 
-            fields = [f.name for f in data.type]
-            data = {f: v for f, v in zip(fields, data.flatten())}
+        Parameters
+        ----------
+        data : :class:`pyarrow.RecordBatch` or :class:`pyarrow.StructArray`
+            The raw Arrow data read from the Parquet file to be transformed.
+        delta_model : :class:`float` or :class:`numpy.ndarray`, optional
+            The parameters of a null-filling model if available to be used
+            to fill in any null value gaps in the m/z axis.
+        drop_index : :class:`bool`
+            Whether or not to remove the index column from the output. Defaults to :const:`True`.
+        has_multiple_indices : :class:`bool`
+            Whether or not to run the more complex algorithm to process the data in
+            batches in order to fill null values correctly across multiple entities
+            in the same batch. Defaults to :const:`False`
 
-            for i in nulls:
-                data.pop(fields[i])
+        Returns
+        -------
+        dict[str, np.ndarray]:
+            The arrays of the entity in ``data``
+        """
 
-            for k, v in {
-                k: v["array_name"]
-                for k, v in self.array_index.items()
-                if k in data.keys()
-            }.items():
-                data[v] = data.pop(k)
-            it = data.items()
-        else:
-            nulls = []
-            for i, col in enumerate(data.columns):
-                if col.null_count == len(col):
-                    nulls.append(i)
-            if len(nulls) > 1:
-                nulls.sort()
-            for i, j in enumerate(nulls):
-                data = data.drop_columns(data.schema[j - i].name)
-            data = data.rename_columns(
-                {
-                    k: v["array_name"]
-                    for k, v in self.array_index.items()
-                    if k in data.column_names
-                }
-            )
-            it = zip(data.column_names, data.columns)
-
-        result = {}
-        for k, v in it:
-            if v.null_count and self._do_null_filling:
-                if (
-                    k == "m/z array"
-                    and delta_model is not None
-                    and not np.any(np.isnan(delta_model))
-                ):
-                    v = fill_nulls(v, delta_model)
-                elif (
-                    k == "intensity array"
-                    and delta_model is not None
-                    and not np.any(np.isnan(delta_model))
-                ):
-                    v = np.asarray(v)
-                    v[np.isnan(v)] = 0.0
-            result[k] = np.asarray(v)
-        return result
+        cleaner = _PointBatchCleaner(
+            self._namespace,
+            self.array_index,
+            drop_index,
+            delta_model=delta_model if self._do_null_filling else None,
+            has_multiple_indices=has_mulitple_indices
+        )
+        return cleaner.expand(data)
 
     def read_data_for_range(self, index_range: slice | list[int]) -> _SpectrumArrays:
+        """
+        Perform a read that slices along the primary index of the series,
+        loading data for multiple entities.
+
+        Parameters
+        ----------
+        index_range : slice[int] or list[int]
+            The indices or index range to load data for. If this is a slice,
+            the ``step`` value is ignored.
+
+        Returns
+        -------
+        dict[str, np.ndarray]:
+            The arrays of the entities selected, with an index array denoting which entity
+            all points at that index came from.
+        """
         prefix = BufferFormat.Point
         rgs = self._point_index.row_groups_for_spectrum_range(index_range)
         if not rgs:
@@ -460,152 +816,16 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         self,
         chunks: list[dict[str, Any]],
         axis_prefix: str | None = None,
-        delta_model: float | np.ndarray | None = None,
+        delta_model: float | np.ndarray | dict[int, np.ndarray] | None = None,
+        preserve_index: bool = False,
     ) -> _SpectrumArrays:
-        time_label = f"{self._namespace}_time"
-
-        has_transforms = {k: v.get('transform') for k, v in self.array_index.items() if v.get('transform')}
-        for k, v in self.array_index.items():
-            name = BufferName.from_index(k, v)
-            if name.buffer_format == BufferFormat.ChunkValues or name.buffer_format == BufferFormat.Chunk:
-                axis_prefix = k.removesuffix("_chunk_values")
-        if axis_prefix is None:
-            for k, v in self.array_index.items():
-                if k.endswith("_chunk_values"):
-                    axis_prefix = k.removesuffix("_chunk_values")
-                    break
-
-        n = 0
-        numpress_chunks = []
-        for chunk in chunks:
-            # The +1 is to account for the starting point
-            encoding = chunk["chunk_encoding"].as_py()
-            if encoding in (DELTA_ENCODING, NO_COMPRESSION, NO_COMPRESSION_CURIE, DELTA_ENCODING_CURIE):
-                n += len(chunk[f"{axis_prefix}_chunk_values"]) + 1
-            elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
-                raw = chunk[f"{axis_prefix}_numpress_bytes"].as_py()
-                part = pynumpress.decode_linear(raw)
-                n += len(part)
-                numpress_chunks.append(part)
-            else:
-                raise ValueError(f"Unsupported chunk encoding {encoding}")
-
-        if n == 0:
-            return {axis_prefix: np.array([])}
-
-        arrays_of = {}
-        for k, v in chunks[0].items():
-            if (
-                k == f"{self._namespace}_index"
-                or k == "chunk_encoding"
-                or k == time_label
-                or k.startswith(axis_prefix)
-            ):
-                continue
-            else:
-                arrays_of[k] = np.zeros(
-                    n, dtype=psims_dtypes[self.array_index[k]["data_type"]]
-                )
-
-        main_axis_array = np.zeros(n)
-        offset = 0
-        had_nulls = False
-        numpress_chunks_it = iter(numpress_chunks)
-        for i, chunk in enumerate(chunks):
-            start = chunk[f"{axis_prefix}_chunk_start"].as_py()
-            end = chunk[f"{axis_prefix}_chunk_end"].as_py()
-
-            steps = chunk[f"{axis_prefix}_chunk_values"]
-            encoding = chunk["chunk_encoding"].as_py()
-
-            # Delta encoding
-            if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):
-                # This indicates an empty chunk containing no information beyond possibly a null value.
-                # Skip it and keep going.
-                if (start == end) and start == 0.0:
-                    continue
-
-                if steps.values.null_count > 0:
-                    had_nulls = True
-                    # The presence null values leads to sometimes restoring one fewer values because the chunk start is
-                    # included in the data itself.
-                    steps = null_delta_decode(
-                        steps.values, pa.scalar(start, type=steps.values.type)
-                    )
-                    chunk_size = len(steps)
-                    if delta_model is not None:
-                        steps = fill_nulls(steps, delta_model)
-                    else:
-                        steps = np.asarray(steps)
-                    main_axis_array[offset : offset + len(steps)] = steps
-                else:
-                    chunk_size = len(steps) + 1
-                    main_axis_array[offset : offset + chunk_size] = start
-                    main_axis_array[offset + 1 : offset + chunk_size] += np.cumsum(
-                        steps.values
-                    )
-            # Direct encoding
-            elif encoding in (NO_COMPRESSION, NO_COMPRESSION_CURIE):
-                chunk_size = len(steps)
-                main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
-            elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
-                part: np.ndarray = next(numpress_chunks_it)
-                chunk_size = len(part)
-                zeros = part == 0
-                if zeros.sum() > 0:
-                    had_nulls = True
-                    if delta_model is not None:
-                        part = pa.array(part, mask=zeros)
-                        part = fill_nulls(part, delta_model)
-                        part = np.asarray(part)
-                        chunk_size = len(part)
-                main_axis_array[offset : offset + chunk_size] = part
-            else:
-                raise ValueError(f"Unsupported chunk encoding {encoding}")
-
-            for k, v in chunk.items():
-                if k in (f"{self._namespace}_index", "chunk_encoding", time_label) or k.startswith(
-                    axis_prefix
-                ):
-                    continue
-                else:
-                    values = np.asarray(v.values)
-                    if k in has_transforms:
-                        if has_transforms[k] == NUMPRESS_SLOF_CURIE:
-                            values = pynumpress.decode_slof(values)
-                        elif has_transforms[k] == NUMPRESS_PIC_CURIE:
-                            values = pynumpress.decode_pic(values)
-                        else:
-                            raise NotImplementedError(has_transforms[k])
-                    arrays_of[k][offset : offset + chunk_size] = values
-
-            offset += chunk_size
-        arrays_of[axis_prefix] = main_axis_array
-
-        rename_map = {
-            k: v["array_name"] for k, v in self.array_index.items() if k in arrays_of
-        }
-
-        if f"{axis_prefix}_chunk_values" in self.array_index:
-            rename_map[axis_prefix] = self.array_index[
-                f"{axis_prefix}_chunk_values"
-            ]['array_name']
-        elif axis_prefix in self.array_index:
-            rename_map[axis_prefix] = self.array_index[axis_prefix][
-                "array_name"
-            ]
-
-        for k, v in rename_map.items():
-            arrays_of[v] = arrays_of.pop(k)
-            if v == "intensity array" and had_nulls:
-                arrays_of[v][np.isnan(arrays_of[v])] = 0
-
-        # truncate the arrays to just the size used in case we over-allocated
-        truncated = {}
-        for k, v in arrays_of.items():
-            truncated[k] = v[:offset]
-
-        return truncated
+        cleaner = _ChunkBatchCleaner(
+            self._namespace,
+            array_index=self.array_index,
+            drop_index=not preserve_index,
+            delta_model=delta_model,
+        )
+        return cleaner.expand(chunks)
 
     def _read_point(
         self,
@@ -614,43 +834,62 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         delta_model: float | list[float] | None,
     ) -> _SpectrumArrays:
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
+        index_col = f"{self._namespace}_index"
         block = pc.filter(
             block,
             pc.equal(
-                pc.struct_field(block, f"{self._namespace}_index"), spectrum_index
+                pc.struct_field(block, index_col), spectrum_index
             ),
         )
 
-        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
-            f"{self._namespace}_index"
-        )
+        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(index_col)
         time_label = f"{self._namespace}_time"
         if time_label in data.column_names:
             data = data.drop_columns(time_label)
-        return self._clean_point_batch(data, delta_model)
+        return self._clean_point_batch(
+            data,
+            delta_model,
+            drop_index=True,
+            has_mulitple_indices=False
+        )
 
     def _read_point_range(
         self,
         start: int,
         end: int,
-        spectrum_index_range: list[int] | slice,
+        index_range: list[int] | slice,
         is_slice: bool,
         rgs: list[int],
     ) -> _SpectrumArrays:
+        index_name = f"{self._namespace}_index"
         block = self.handle.read_row_groups(rgs, columns=["point"])["point"]
-        idx_col = pc.struct_field(block, f"{self._namespace}_index")
-
+        idx_col = pc.struct_field(block, index_name)
+        delta_models = None
+        if not is_slice:
+            if self._delta_model_series is not None and self._do_null_filling:
+                delta_models = {i: self._delta_model_series[i] for i in index_range}
+            index_range = pa.array(index_range)
+        else:
+            if self._delta_model_series is not None and self._do_null_filling:
+                delta_models = {
+                    i: self._delta_model_series[i]
+                    for i in _slice_to_range(index_range, len(self))
+                }
         if is_slice:
             mask = pc.and_(
                 pc.less_equal(idx_col, end), pc.greater_equal(idx_col, start)
             )
         else:
-            mask = pc.is_in(idx_col, pa.array(spectrum_index_range))
+            mask = pc.is_in(idx_col, pa.array(index_range))
         block = pc.filter(block, mask)
-        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
-            f"{self._namespace}_index"
+        data: pa.RecordBatch = pa.record_batch(block.combine_chunks())
+        data = self._clean_point_batch(
+            data,
+            delta_model=delta_models,
+            has_mulitple_indices=True,
+            drop_index=False
         )
-        return self._clean_point_batch(data)
+        return data
 
     def _read_chunk(
         self, index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512
@@ -690,11 +929,19 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         index_range: list[int] | slice,
         is_slice: bool,
         rgs: list[int],
+        batch_size: int = 128
     ) -> _SpectrumArrays:
         chunks = []
+        delta_models = None
         if not is_slice:
+            if self._delta_model_series is not None:
+                delta_models = {i: self._delta_model_series[i] for i in index_range}
             index_range = pa.array(index_range)
-        for batch in self.handle.iter_batches(128, row_groups=rgs, columns=["chunk"]):
+        else:
+            if self._delta_model_series is not None:
+                delta_models = {i: self._delta_model_series[i] for i in _slice_to_range(index_range, len(self))}
+
+        for batch in self.handle.iter_batches(batch_size, row_groups=rgs, columns=["chunk"]):
             batch = batch["chunk"]
             idx_col = pc.struct_field(batch, f"{self._namespace}_index")
             batch_end = pc.max(idx_col).as_py()
@@ -720,7 +967,11 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
             else:
                 chunks.append(batch)
         chunks = pa.chunked_array(chunks)
-        return self._expand_chunks(chunks)
+        return self._expand_chunks(
+            chunks,
+            preserve_index=True,
+            delta_model=delta_models
+        )
 
     def _read_data_for(self, index: int) -> _SpectrumArrays:
         if self._delta_model_series is not None:
