@@ -648,7 +648,9 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
         if self.buffer_format == BufferFormat.Point:
             return self.archive.spectrum_data._clean_point_batch(
                 buffers,
-                self.archive.spectrum_data._delta_model_series[index] if self.archive.spectrum_data._delta_model_series is not None else None
+                delta_model=self.archive.spectrum_data._delta_model_series[index]
+                if self.archive.spectrum_data._delta_model_series is not None
+                else None
             )
         elif self.buffer_format == BufferFormat.ChunkValues:
             return self.archive.spectrum_data._expand_chunks(
@@ -762,8 +764,8 @@ class MzPeakFile(Sequence[_SpectrumType]):
     """
     _archive: zipfile.ZipFile | Path
 
-    spectrum_data: MzPeakArrayDataReader | None = None
     spectrum_metadata: MzPeakSpectrumMetadataReader | None = None
+    spectrum_data: MzPeakArrayDataReader | None = None
     spectrum_peak_data: MzPeakArrayDataReader | None = None
 
     chromatogram_metadata: MzPeakChromatogramMetadataReader | None = None
@@ -936,6 +938,14 @@ class MzPeakFile(Sequence[_SpectrumType]):
         else:
             archive = zipfile.ZipFile(path)
             self._from_zip_archive(archive)
+
+    def open_stream(self, name: str) -> IO[bytes]:
+        if isinstance(self._archive, zipfile.ZipFile):
+            return self._archive.open(name)
+        elif isinstance(self._archive, Path):
+            return (self._archive / name).open(mode='rb')
+        else:
+            raise TypeError(f"Do not understand how to open a stream from {self._archive}")
 
     def spectra_signal_for_indices(self, index_range: slice | list[int]) -> dict[str, np.ndarray]:
         return self.spectrum_data.read_data_for_range(index_range)

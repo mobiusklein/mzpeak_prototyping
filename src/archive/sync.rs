@@ -387,6 +387,16 @@ impl ZipArchiveSource {
         })
     }
 
+    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
+        if let Some(index) = self.file_names.iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
+    }
+
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = self.archive_file.try_clone()?;
         zip_archive_open_entry(handle, index, self.archive_offset.clone())
@@ -438,6 +448,16 @@ impl SplittingZipArchiveSource {
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = fs::File::open(self.archive_file.as_path())?;
         zip_archive_open_entry(handle, index, self.archive_offset.clone())
+    }
+
+    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
+        if let Some(index) = self.file_names.iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -500,6 +520,16 @@ pub trait ArchiveSource: Sized + 'static {
 
     /// Open a file stream by it's index
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File>;
+
+    fn open_stream(&self, name: &str) -> io::Result<Self::File> {
+        if let Some(index) = self.file_names().iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
+    }
 
     /// Load the Parquet metadata for the specified index.
     ///
@@ -600,6 +630,16 @@ impl DirectorySource {
             file_names,
             file_index: file_index.unwrap_or_default(),
         })
+    }
+
+    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
+        if let Some(index) = self.file_names.iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
     }
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {

@@ -28,7 +28,17 @@ pub trait AsyncArchiveSource: Clone + 'static {
     ) -> impl Future<Output = io::Result<Self>>;
     fn file_names(&self) -> &[String];
     fn open_entry_by_index(&self, index: usize) -> impl Future<Output = io::Result<Self::File>>;
-
+    fn open_stream(&self, name: &str) -> impl Future<Output = io::Result<Self::File>> {
+        async move {
+            if let Some(index) = self.file_names().iter().position(|v| v == name) {
+                self.open_entry_by_index(index).await
+            } else {
+                Err(
+                    io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+                )
+            }
+        }
+    }
     fn metadata_for_index(
         &self,
         index: usize,

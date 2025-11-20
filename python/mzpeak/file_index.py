@@ -11,6 +11,7 @@ CHROMATOGRAM = "chromatogram"
 DATA_ARRAYS = "data arrays"
 METADATA = "metadata"
 PEAKS = "peaks"
+PROPRIETARY = "proprietary"
 
 
 class EntityType(StrEnum):
@@ -31,6 +32,7 @@ class DataKind(StrEnum):
     Peaks = PEAKS
     Metadata = METADATA
     Other = OTHER
+    Proprietary = PROPRIETARY
 
     @classmethod
     def get(cls, value: str):

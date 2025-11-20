@@ -12,6 +12,8 @@ pub enum DataKind {
     Peaks,
     #[serde(rename="metadata")]
     Metadata,
+    #[serde(rename="proprietary")]
+    Proprietary,
     #[serde(rename="other")]
     Other(String),
 }
@@ -24,6 +26,7 @@ impl FromStr for DataKind {
             "data arrays" => Self::DataArray,
             "peaks" => Self::Peaks,
             "metadata" => Self::Metadata,
+            "proprietary" => Self::Proprietary,
             "other" => Self::Other("other".into()),
             _ => Self::Other(s.to_string())
         })
