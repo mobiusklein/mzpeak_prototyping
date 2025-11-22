@@ -354,6 +354,10 @@ pub struct AsyncArchiveReader<T: AsyncArchiveSource + 'static> {
 }
 
 impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
+    pub fn file_index(&self) -> &FileIndex {
+        self.archive.file_index()
+    }
+
     async fn init_from_archive(archive: T) -> io::Result<Self> {
         let mut members = SchemaMetadataManager::default();
         for (i, name) in archive.file_names().iter().enumerate() {
@@ -496,6 +500,14 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
                 "Spectrum metadata entry not found",
             ))
         }
+    }
+
+    pub fn list_files(&self) -> &[String] {
+        self.archive.file_names()
+    }
+
+    pub fn open_stream(&self, name: &str) -> impl Future<Output = Result<<T as AsyncArchiveSource>::File, io::Error>> {
+        self.archive.open_stream(name)
     }
 }
 

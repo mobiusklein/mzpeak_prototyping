@@ -1103,6 +1103,18 @@ impl<
             Ok(None)
         }
     }
+
+    pub fn file_index(&self) -> &crate::archive::FileIndex {
+        self.handle.file_index()
+    }
+
+    pub fn list_files(&self) -> &[String] {
+        self.handle.list_files()
+    }
+
+    pub fn open_stream(&self, name: &str) -> impl Future<Output = Result<<T as AsyncArchiveSource>::File, io::Error>> {
+        self.handle.open_stream(name)
+    }
 }
 
 pub type AsyncMzPeakReader =

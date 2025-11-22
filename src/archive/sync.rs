@@ -521,6 +521,7 @@ pub trait ArchiveSource: Sized + 'static {
     /// Open a file stream by it's index
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File>;
 
+    /// Open a file stream by it's name
     fn open_stream(&self, name: &str) -> io::Result<Self::File> {
         if let Some(index) = self.file_names().iter().position(|v| v == name) {
             self.open_entry_by_index(index)
@@ -776,6 +777,10 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
         Ok(Self { archive, members })
     }
 
+    pub fn file_index(&self) -> &FileIndex {
+        self.archive.file_index()
+    }
+
     pub fn from_path(archive_path: PathBuf) -> io::Result<Self> {
         let archive = T::from_path(archive_path)?;
         Self::init_from_archive(archive)
@@ -843,6 +848,16 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
                 "Spectrum metadata entry not found",
             ))
         }
+    }
+
+    /// List of the names of the files within the archive
+    pub fn list_files(&self) -> &[String] {
+        self.archive.file_names()
+    }
+
+    /// Open a raw readable stream for the requested file name
+    pub fn open_stream(&self, name: &str) -> Result<<T as ArchiveSource>::File, io::Error> {
+        self.archive.open_stream(name)
     }
 }
 

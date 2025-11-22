@@ -105,6 +105,10 @@ impl<
             _ => None,
         }
     }
+
+    fn count_chromatograms(&self) -> usize {
+        self.load_all_chromatgram_metadata_impl().map(|v| v.len()).unwrap_or(2)
+    }
 }
 
 impl<
@@ -357,6 +361,22 @@ impl<
             this.load_chromatogram_auxiliary_array_count()?;
 
         Ok(this)
+    }
+
+
+    /// Access the saved file index which classifies the files in the archive
+    pub fn file_index(&self) -> &crate::archive::FileIndex {
+        self.handle.file_index()
+    }
+
+    /// Get the list of file names in the archive. This may exceed what is in the file index
+    pub fn list_all_files_in_archive(&self) -> &[String] {
+        self.handle.list_files()
+    }
+
+    /// Open a file stream by it's name
+    pub fn open_stream(&self, name: &str) -> Result<<T as ArchiveSource>::File, io::Error> {
+        self.handle.open_stream(name)
     }
 
     /// Load the descriptive metadata for all spectra

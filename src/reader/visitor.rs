@@ -1812,7 +1812,7 @@ impl<'a> MzPrecursorVisitor<'a> {
         }
     }
 
-    fn visit_spectrum_index(&mut self, spec_arr: &StructArray, index: usize) {
+    fn visit_source_index(&mut self, spec_arr: &StructArray, index: usize) {
         let arr = spec_arr.column(index).as_primitive::<UInt64Type>();
         let mut offsets = Vec::with_capacity(self.descriptions.len());
         let mut j = 0;
@@ -1920,7 +1920,7 @@ impl<'a> MzPrecursorVisitor<'a> {
             .iter()
             .position(|v| *v == "spectrum_index" || *v == "source_index")
         {
-            self.visit_spectrum_index(spec_arr, i);
+            self.visit_source_index(spec_arr, i);
             visited[i] = true;
         } else {
             log::error!("Precursor arrays did not contain \"spectrum_index\" column");
@@ -1994,7 +1994,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
         }
     }
 
-    fn visit_spectrum_index(&mut self, spec_arr: &StructArray, index: usize) {
+    fn visit_source_index(&mut self, spec_arr: &StructArray, index: usize) {
         let arr = spec_arr.column(index).as_primitive::<UInt64Type>();
         let mut offsets = Vec::with_capacity(self.descriptions.len());
         let mut j = 0;
@@ -2197,7 +2197,7 @@ impl<'a> MzSelectedIonVisitor<'a> {
             .iter()
             .position(|v| *v == "spectrum_index" || *v == "source_index")
         {
-            self.visit_spectrum_index(spec_arr, i);
+            self.visit_source_index(spec_arr, i);
             visited[i] = true;
         } else {
             log::error!("Precursor arrays did not contain \"spectrum_index\" column");

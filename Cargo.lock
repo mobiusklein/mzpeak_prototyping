@@ -1908,9 +1908,9 @@ dependencies = [
 
 [[package]]
 name = "marrow"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64369333feea08a4c974cc5d7bad82197999624d0c9508bec4b97ea9fc0e3f63"
+checksum = "ea734fcb7619dfcc47a396f7bf0c72571ccc8c18ae7236ae028d485b27424b74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1994,9 +1994,9 @@ dependencies = [
 
 [[package]]
 name = "mzdata"
-version = "0.62.1"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff2f39fffa9d3a3ffbe5e2adba2a1c61680824f49f69670291f4b9966e1681cf"
+checksum = "107abc734f10ea7c4e5d8625f4e04dba44d8b981898f9a361ea130a97d049a5a"
 dependencies = [
  "base16ct",
  "base64-simd",
@@ -3003,9 +3003,9 @@ dependencies = [
 
 [[package]]
 name = "serde_arrow"
-version = "0.13.6"
+version = "0.13.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "197c925e607eaed897d7912f53895097c6994fdc04fe5f7a2e61eb3898de1d26"
+checksum = "038967a6dda16f5c6ca5b6e1afec9cd2361d39f0db681ca338ac5f0ccece6469"
 dependencies = [
  "arrow-array",
  "arrow-schema",
