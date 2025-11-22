@@ -774,7 +774,7 @@ impl ArrayBuffersBuilder {
             if let Some(mut buff) = BufferName::from_field(self.buffer_context, f.clone()) {
                 if !seen.contains(&buff.array_type) {
                     seen.insert(buff.array_type.clone());
-                    buff = buff.with_priority(BufferPriority::Primary);
+                    buff = buff.with_priority(Some(BufferPriority::Primary));
                     has_priority.push(buff.clone());
                     *f = Arc::new(
                         f.as_ref()

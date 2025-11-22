@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable, Sequence
 from typing import IO, Any, Iterator, Optional
+from enum import Enum, auto
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,13 @@ from .file_index import FileIndex, DataKind, EntityType
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+
+class ArchiveStorage(Enum):
+    Zip = auto()
+    Directory = auto()
+    FileSpecZip = auto()
+    FileSpecDirectory = auto()
 
 
 def _value_normalize(val: dict):
@@ -66,7 +74,7 @@ class RTLocator:
         tuple: (scan_index, scan_time)
         """
         spectra_df = self._reader.spectra
-        times = spectra_df['time']
+        times = spectra_df["time"]
         indices = spectra_df.index
 
         lo = 0
@@ -115,8 +123,8 @@ def _format_curie(curie: dict):
         return None
     elif isinstance(curie, str):
         return curie
-    idx = curie['cv_id']
-    acc = curie['accession']
+    idx = curie["cv_id"]
+    acc = curie["accession"]
     if idx == 1:
         return f"MS:{acc}"
     elif idx == 2:
@@ -128,8 +136,8 @@ def _format_curie(curie: dict):
 def _format_param(param: dict):
     param = param.copy()
     param["value"] = _value_normalize(param["value"])
-    param['accession'] = _format_curie(param['accession'])
-    if param.get('unit'):
+    param["accession"] = _format_curie(param["accession"])
+    if param.get("unit"):
         param["unit"] = _format_curie(param["unit"])
     return param
 
@@ -143,22 +151,12 @@ def _clean_frame(df: pd.DataFrame):
 def _format_curie_arrow(arr):
     cvs = arr.field(0)
     cvs = pc.case_when(
-        pc.make_struct(
-            pc.equal(cvs, 1),
-            pc.equal(cvs, 2)
-        ),
+        pc.make_struct(pc.equal(cvs, 1), pc.equal(cvs, 2)),
         "MS",
         "UO",
     )
     accs = arr.field(1)
-    accs = pc.utf8_lpad(
-        pc.cast(
-            accs,
-            pa.string()
-        ),
-        7,
-        "0"
-    )
+    accs = pc.utf8_lpad(pc.cast(accs, pa.string()), 7, "0")
     return pc.binary_join_element_wise(cvs, accs, ":")
 
 
@@ -179,17 +177,18 @@ class _AuxiliaryArrayDecoder:
     """
     A helper class for decoding extra arrays packed in with the metadata table.
     """
+
     compression = {
         "MS:1000576": lambda x: x,
         "MS:1000574": zlib.decompress,
-        'MS:1002314': pynumpress.decode_slof,
-        'MS:1002313': pynumpress.decode_pic,
-        'MS:1002312': pynumpress.decode_linear,
+        "MS:1002314": pynumpress.decode_slof,
+        "MS:1002313": pynumpress.decode_pic,
+        "MS:1002312": pynumpress.decode_linear,
     }
 
     dtypes = {
         "MS:1000519": np.int32,
-        'MS:1000521': np.float32,
+        "MS:1000521": np.float32,
         "MS:1000522": np.int64,
         "MS:1000523": np.float64,
     }
@@ -197,20 +196,20 @@ class _AuxiliaryArrayDecoder:
 
     @classmethod
     def decode(cls, arr: dict):
-        data: np.ndarray = arr['data']
-        compression_acc: str = _format_curie(arr['compression'])
-        dtype_acc: str = _format_curie(arr['data_type'])
-        name_param = _format_param(arr['name'])
-        if name_param['name'] == "non-standard data array":
-            name = name_param['value']
+        data: np.ndarray = arr["data"]
+        compression_acc: str = _format_curie(arr["compression"])
+        dtype_acc: str = _format_curie(arr["data_type"])
+        name_param = _format_param(arr["name"])
+        if name_param["name"] == "non-standard data array":
+            name = name_param["value"]
         else:
             name = name_param["name"]
-        parameters = [_format_param(v) for v in arr.get('parameters', [])]
+        parameters = [_format_param(v) for v in arr.get("parameters", [])]
         data: np.ndarray = cls.compression[compression_acc](data)
         if cls.ascii_code != dtype_acc:
             data = data.view(cls.dtypes[dtype_acc])
         else:
-            data = bytearray(data).strip().split(b'\0')
+            data = bytearray(data).strip().split(b"\0")
             data = np.array(data, dtype=np.object_)
         return AuxiliaryArray(name, data, parameters)
 
@@ -230,6 +229,7 @@ class AuxiliaryArray:
     parameters : list[dict]
         The parameters, controlled or otherwise, not already covered by the decoded array attributes
     """
+
     name: str
     values: np.ndarray
     parameters: list[dict]
@@ -254,7 +254,7 @@ class MzPeakSpectrumMetadataReader:
         A series mapping spectrum ID to index
     precursors : :class:`pandas.DataFrame`
         A data frame holding precursor-level metadata like precursor scan ID, isolation window,
-        and activation parameters. See :attr:`MzPeakFile.selected_ions` for ion-level information.
+        and activation parameters. See :attr:`MzPeakSpectrumMetadataReader.selected_ions` for ion-level information.
     selected_ions : :class:`pandas.Dataframe`
         A data frame holding selected ions connected to precursors and spectra including selected
         ion m/z, charge, intensity, and possibly ion mobility.
@@ -309,11 +309,17 @@ class MzPeakSpectrumMetadataReader:
             col = rg.column(i)
             if col.path_in_schema == "spectrum.index":
                 self.spectrum_index_i = i
-            elif col.path_in_schema == "scan.spectrum_index":
+            elif col.path_in_schema in ("scan.spectrum_index", "scan.source_index"):
                 self.scan_index_i = i
-            elif col.path_in_schema == "precursor.spectrum_index":
+            elif col.path_in_schema in (
+                "precursor.spectrum_index",
+                "precursor.source_index",
+            ):
                 self.precursor_index_i = i
-            elif col.path_in_schema == "selected_ion.spectrum_index":
+            elif col.path_in_schema in (
+                "selected_ion.spectrum_index",
+                "selected_ion.source_index",
+            ):
                 self.selected_ion_i = i
 
     def _read_spectra(self):
@@ -323,19 +329,24 @@ class MzPeakSpectrumMetadataReader:
             col_idx = rg.column(self.spectrum_index_i)
             if col_idx.statistics.has_min_max:
                 table = self.handle.read_row_group(i, columns=["spectrum"])
-                bats = table['spectrum'].chunks
+                bats = table["spectrum"].chunks
                 for bat in bats:
+                    # TODO: filter or slice this if there *are* nulls, otherwise avoid copying
                     blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if not blocks:
-            self.spectra = pd.DataFrame([], columns=['index', 'id', ])
+            self.spectra = pd.DataFrame(
+                [],
+                columns=[
+                    "index",
+                    "id",
+                ],
+            )
         else:
-            bat = pa.record_batch(pa.concat_arrays(blocks))
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
             self.spectra = _clean_frame(
-                bat
-                .to_pandas()
-                .set_index("index")
+                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index("index")
             )
             if (np.diff(self.spectra.index) == 1).all():
                 self.spectra.index = pd.RangeIndex(
@@ -352,25 +363,30 @@ class MzPeakSpectrumMetadataReader:
             col_idx = rg.column(self.scan_index_i)
             if col_idx.statistics.has_min_max:
                 table = self.handle.read_row_group(i, columns=["scan"])
-                bats = table['scan'].chunks
+                bats = table["scan"].chunks
                 for bat in bats:
                     blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if blocks:
-            bat = pa.record_batch(pa.concat_arrays(blocks))
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
-            self.scans = _clean_frame(
-                bat
-                .to_pandas()
-                .set_index("spectrum_index")
-            )
+            if "spectrum_index" in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
+            self.scans = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
             if (np.diff(self.scans.index) == 1).all():
                 self.scans.index = pd.RangeIndex(
                     self.scans.index[0],
                     self.scans.index[-1] + 1,
                 )
         else:
-            self.scans = pd.DataFrame([], columns=['spectrum_index', ])
+            self.scans = pd.DataFrame(
+                [],
+                columns=[
+                    "source_index",
+                ],
+            )
 
     def _read_precursors(self):
         blocks = []
@@ -379,19 +395,25 @@ class MzPeakSpectrumMetadataReader:
             col_idx = rg.column(self.precursor_index_i)
             if col_idx.statistics.has_min_max:
                 table: pa.Table = self.handle.read_row_group(i, columns=["precursor"])
-                bats = table['precursor'].chunks
+                bats = table["precursor"].chunks
                 for bat in bats:
                     blocks.append(bat.filter(bat.field(0).is_valid()))
         if blocks:
-            bat = pa.record_batch(pa.concat_arrays(blocks))
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
-            self.precursors = _clean_frame(
-                bat
-                .to_pandas()
-                .set_index("spectrum_index")
-            )
+            if "spectrum_index" in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
+            self.precursors = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
         else:
-            self.precursors = pd.DataFrame([], columns=['spectrum_index', 'precursor_index', ])
+            self.precursors = pd.DataFrame(
+                [],
+                columns=[
+                    "source_index",
+                    "precursor_index",
+                ],
+            )
 
     def _read_selected_ions(self):
         blocks = []
@@ -400,20 +422,28 @@ class MzPeakSpectrumMetadataReader:
             col_idx = rg.column(self.selected_ion_i)
             if col_idx.statistics.has_min_max:
                 table = self.handle.read_row_group(i, columns=["selected_ion"])
-                bats = table['selected_ion'].chunks
+                bats = table["selected_ion"].chunks
                 for bat in bats:
                     blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if blocks:
-            bat = pa.record_batch(pa.concat_arrays(blocks))
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
+            if "spectrum_index" in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
             self.selected_ions = _clean_frame(
-                bat
-                .to_pandas()
-                .set_index("spectrum_index")
+                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
             )
         else:
-            self.selected_ions = pd.DataFrame([], columns=['spectrum_index', 'precursor_index', ])
+            self.selected_ions = pd.DataFrame(
+                [],
+                columns=[
+                    index_col,
+                    "precursor_index",
+                ],
+            )
 
     def __getitem__(self, i: int | str):
         if isinstance(i, str):
@@ -421,13 +451,13 @@ class MzPeakSpectrumMetadataReader:
         spec = self.spectra.loc[i].to_dict()
         spec["parameters"] = [_format_param(v) for v in spec["parameters"]]
         spec["scans"] = self.scans.loc[i].to_dict()
-        if isinstance(spec['scans'], dict):
+        if isinstance(spec["scans"], dict):
             spec["scans"]["parameters"] = [
                 _format_param(v) for v in spec["scans"]["parameters"]
             ]
-            spec['scans'] = [spec['scans']]
+            spec["scans"] = [spec["scans"]]
         else:
-            for scan in spec['scans']:
+            for scan in spec["scans"]:
                 scan["parameters"] = [_format_param(v) for v in scan["parameters"]]
         try:
             precursors_of = self.precursors.loc[[i]]
@@ -446,10 +476,10 @@ class MzPeakSpectrumMetadataReader:
         except KeyError:
             pass
         spec["index"] = i
-        if 'auxiliary_arrays' in spec:
+        if "auxiliary_arrays" in spec:
             auxiliary_arrays = spec.pop("auxiliary_arrays")
             if auxiliary_arrays is not None:
-                for v in  auxiliary_arrays:
+                for v in auxiliary_arrays:
                     v = _AuxiliaryArrayDecoder.decode(v)
                     spec[v.name] = v.values
         return spec
@@ -469,6 +499,29 @@ class MzPeakSpectrumMetadataReader:
 
 
 class MzPeakChromatogramMetadataReader:
+    """
+    A reader for chromatogram metadata in an mzPeak file.
+
+    Attributes
+    ----------
+    handle : :class:`pyarrow.parquet.ParquetFile`
+        The underlying Parquet file reader
+    meta : :class:`pyarrow.parquet.FileMetaData`
+        The metadata segment of the underlying Parquet file
+    num_chromatograms : int
+        The number of distinct chromatograms in the metadata table
+    chromatograms : :class:`pandas.DataFrame`
+        A data frame holding chromatogram-level metadata like MS level, scan time, centroid status,
+        and polarity.
+    id_index : :class:`pandas.Series`
+        A series mapping chromatogram ID to index
+    precursors : :class:`pandas.DataFrame`
+        A data frame holding precursor-level metadata like precursor scan ID, isolation window,
+        and activation parameters. See :attr:`MzPeakChromatogramMetadataReader.selected_ions` for ion-level information.
+    selected_ions : :class:`pandas.Dataframe`
+        A data frame holding selected ions connected to precursors and chromatograms including selected
+        ion m/z, charge, intensity, and possibly ion mobility.
+    """
     handle: pq.ParquetFile
     meta: pq.FileMetaData
     num_chromatograms: int
@@ -503,9 +556,15 @@ class MzPeakChromatogramMetadataReader:
             col = rg.column(i)
             if col.path_in_schema == "chromatogram.index":
                 self.chromatogram_index_i = i
-            elif col.path_in_schema == "precursor.spectrum_index":
+            elif col.path_in_schema in (
+                "precursor.spectrum_index",
+                "precursor.source_index",
+            ):
                 self.precursor_index_i = i
-            elif col.path_in_schema == "selected_ion.spectrum_index":
+            elif col.path_in_schema in (
+                "selected_ion.spectrum_index",
+                "selected_ion.source_index",
+            ):
                 self.selected_ion_i = i
 
     def _read_chromatograms(self):
@@ -528,10 +587,12 @@ class MzPeakChromatogramMetadataReader:
                 ],
             )
         else:
-            bat = pa.record_batch(pa.concat_arrays(chromatograms))
+            bat = pa.Table.from_struct_array(pa.chunked_array(chromatograms))
             bat = _format_curies_batch(bat)
-            self.chromatograms = _clean_frame(bat.to_pandas().set_index("index"))
-        self.id_index = self.chromatograms[["id"]].reset_index().set_index("id")["index"]
+            self.chromatograms = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index("index"))
+        self.id_index = (
+            self.chromatograms[["id"]].reset_index().set_index("id")["index"]
+        )
 
     def _read_precursors(self):
         blocks = []
@@ -544,14 +605,18 @@ class MzPeakChromatogramMetadataReader:
                 for bat in bats:
                     blocks.append(bat.filter(bat.field(0).is_valid()))
         if blocks:
-            bat = pa.record_batch(pa.concat_arrays(blocks))
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
-            self.precursors = _clean_frame(bat.to_pandas().set_index("spectrum_index"))
+            if "spectrum_index" in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
+            self.precursors = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
         else:
             self.precursors = pd.DataFrame(
                 [],
                 columns=[
-                    "spectrum_index",
+                    "source_index",
                     "precursor_index",
                 ],
             )
@@ -568,16 +633,20 @@ class MzPeakChromatogramMetadataReader:
                     blocks.append(bat.filter(bat.field(0).is_valid()))
 
         if blocks:
-            bat = pa.record_batch(pa.concat_arrays(blocks))
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
+            if 'spectrum_index' in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
             self.selected_ions = _clean_frame(
-                bat.to_pandas().set_index("spectrum_index")
+                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
             )
         else:
             self.selected_ions = pd.DataFrame(
                 [],
                 columns=[
-                    "spectrum_index",
+                    "source_index",
                     "precursor_index",
                 ],
             )
@@ -620,6 +689,7 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
     """
     An :class:`Iterator` for :class:`MzPeakFile`.
     """
+
     archive: "MzPeakFile"
     index: int
     buffer_format: BufferFormat
@@ -639,7 +709,7 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
             it = self.archive.spectrum_data.handle.iter_batches(columns=["point"])
             self.data_iter = _BatchIterator(it, self.index)
         elif self.buffer_format == BufferFormat.ChunkValues:
-            it = self.archive.spectrum_data.handle.iter_batches(128, columns=['chunk'])
+            it = self.archive.spectrum_data.handle.iter_batches(128, columns=["chunk"])
             self.data_iter = _BatchIterator(it, self.index)
         else:
             raise ValueError(self.buffer_format)
@@ -650,7 +720,7 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
                 buffers,
                 delta_model=self.archive.spectrum_data._delta_model_series[index]
                 if self.archive.spectrum_data._delta_model_series is not None
-                else None
+                else None,
             )
         elif self.buffer_format == BufferFormat.ChunkValues:
             return self.archive.spectrum_data._expand_chunks(
@@ -762,7 +832,9 @@ class MzPeakFile(Sequence[_SpectrumType]):
         A data frame holding chromatogram-level metadata. This will only be present if
         :attr:`chromatogram_metadata` is present.
     """
+
     _archive: zipfile.ZipFile | Path
+    _archive_storage: ArchiveStorage
 
     spectrum_metadata: MzPeakSpectrumMetadataReader | None = None
     spectrum_data: MzPeakArrayDataReader | None = None
@@ -777,13 +849,14 @@ class MzPeakFile(Sequence[_SpectrumType]):
 
     @property
     def filename(self) -> str | None:
-        '''The name of the data file'''
+        """The name of the data file"""
         if isinstance(self._archive, Path):
             return self._archive.name
         elif isinstance(self._archive, zipfile.ZipFile):
             return self._archive.filename
 
     def _from_directory(self, path: Path):
+        self._archive_storage = ArchiveStorage.Directory
         self._archive = path
         index_path = path / FileIndex.FILE_NAME
         visited = set()
@@ -832,11 +905,16 @@ class MzPeakFile(Sequence[_SpectrumType]):
                     pa.OSFile(str(f)),
                     namespace="spectrum",
                 )
-            elif f.name.endswith("spectra_metadata.mzpeak") and not self.spectrum_metadata:
+            elif (
+                f.name.endswith("spectra_metadata.mzpeak")
+                and not self.spectrum_metadata
+            ):
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
                     pa.OSFile(str(f)),
                 )
-            elif f.name.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data:
+            elif (
+                f.name.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data
+            ):
                 self.spectrum_peak_data = MzPeakArrayDataReader(
                     pa.OSFile(str(f)),
                     namespace="spectrum",
@@ -849,7 +927,8 @@ class MzPeakFile(Sequence[_SpectrumType]):
                     pa.OSFile(str(f))
                 )
             elif (
-                f.name.endswith("chromatograms_data.mzpeak") and not self.chromatogram_data
+                f.name.endswith("chromatograms_data.mzpeak")
+                and not self.chromatogram_data
             ):
                 self.chromatogram_data = MzPeakArrayDataReader(
                     pa.OSFile(str(f)),
@@ -857,6 +936,7 @@ class MzPeakFile(Sequence[_SpectrumType]):
                 )
 
     def _from_zip_archive(self, archive: zipfile.ZipFile):
+        self._archive_storage = ArchiveStorage.Zip
         self._archive = archive
         visited = set()
         try:
@@ -911,7 +991,10 @@ class MzPeakFile(Sequence[_SpectrumType]):
                 self.spectrum_metadata = MzPeakSpectrumMetadataReader(
                     pa.PythonFile(archive.open(f)),
                 )
-            elif f.filename.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data:
+            elif (
+                f.filename.endswith("spectra_peaks.mzpeak")
+                and not self.spectrum_peak_data
+            ):
                 self.spectrum_peak_data = MzPeakArrayDataReader(
                     pa.PythonFile(archive.open(f)),
                     namespace="spectrum",
@@ -940,14 +1023,30 @@ class MzPeakFile(Sequence[_SpectrumType]):
             self._from_zip_archive(archive)
 
     def open_stream(self, name: str) -> IO[bytes]:
-        if isinstance(self._archive, zipfile.ZipFile):
-            return self._archive.open(name)
-        elif isinstance(self._archive, Path):
-            return (self._archive / name).open(mode='rb')
-        else:
-            raise TypeError(f"Do not understand how to open a stream from {self._archive}")
+        match self._archive_storage:
+            case ArchiveStorage.Zip:
+                return self._archive.open(name)
+            case ArchiveStorage.Directory:
+                return (self._archive / name).open(mode="rb")
+            case _:
+                raise TypeError(
+                    f"Do not understand how to open a stream from {self._archive} of type {self._archive_storage}"
+                )
 
-    def spectra_signal_for_indices(self, index_range: slice | list[int]) -> dict[str, np.ndarray]:
+    def list_files(self) -> list[str]:
+        match self._archive_storage:
+            case ArchiveStorage.Zip:
+                return [f.filename for f in self._archive.filelist]
+            case ArchiveStorage.Directory:
+                return [f.name for f in self._archive.glob("*")]
+            case _:
+                raise TypeError(
+                    f"Do not understand how to list files from {self._archive} of type {self._archive_storage}"
+                )
+
+    def spectra_signal_for_indices(
+        self, index_range: slice | list[int]
+    ) -> dict[str, np.ndarray]:
         return self.spectrum_data.read_data_for_range(index_range)
 
     def read_peaks_for(self, index: int):
@@ -1003,7 +1102,7 @@ class MzPeakFile(Sequence[_SpectrumType]):
                 spec = []
                 for s in it:
                     spec.append(s)
-                    if s['index'] == (end - 1):
+                    if s["index"] == (end - 1):
                         break
             else:
                 spec = self.read_spectrum(range(start, end, step))
@@ -1031,8 +1130,10 @@ class MzPeakFile(Sequence[_SpectrumType]):
     def __repr__(self):
         return f"{self.__class__.__name__}({self._archive.filename!r})"
 
-    def __getitem__(self, index: int | str | Iterable[int | str] | slice) -> _SpectrumType | list[_SpectrumType]:
-        '''An alias for :meth:`read_spectrum`.'''
+    def __getitem__(
+        self, index: int | str | Iterable[int | str] | slice
+    ) -> _SpectrumType | list[_SpectrumType]:
+        """An alias for :meth:`read_spectrum`."""
         return self.read_spectrum(index)
 
     def __iter__(self) -> MzPeakFileIter:

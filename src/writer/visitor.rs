@@ -751,7 +751,7 @@ impl ArrayBuilder for ScanWindowBuilder {
 
 #[derive(Default, Debug)]
 pub struct ScanBuilder {
-    spectrum_index: UInt64Builder,
+    source_index: UInt64Builder,
     scan_start_time: Float32Builder,
     preset_scan_configuration: UInt32Builder,
     filter_string: LargeStringBuilder,
@@ -768,7 +768,7 @@ pub struct ScanBuilder {
 impl VisitorBase for ScanBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
-            field!("spectrum_index", DataType::UInt64),
+            field!("source_index", DataType::UInt64),
             field!("scan_start_time", DataType::Float32),
             field!("preset_scan_configuration", DataType::UInt32),
             field!("filter_string", DataType::LargeUtf8),
@@ -792,7 +792,7 @@ impl VisitorBase for ScanBuilder {
     }
 
     fn append_null(&mut self) {
-        self.spectrum_index.append_null();
+        self.source_index.append_null();
         self.scan_start_time.append_null();
         self.preset_scan_configuration.append_null();
         self.filter_string.append_null();
@@ -816,7 +816,7 @@ const BUILTIN_SCAN_PARAMS: &[CURIE] = &[
 impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
     fn append_value(&mut self, item: &(u64, &mzdata::spectrum::ScanEvent)) -> bool {
         let (si, item) = item;
-        self.spectrum_index.append_value(*si);
+        self.source_index.append_value(*si);
         self.scan_start_time.append_value(item.start_time as f32);
         self.preset_scan_configuration.append_option(
             item.scan_configuration()
@@ -858,13 +858,13 @@ impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
 
 impl ArrayBuilder for ScanBuilder {
     fn len(&self) -> usize {
-        self.spectrum_index.len()
+        self.source_index.len()
     }
 
     fn finish(&mut self) -> ArrayRef {
         let schema = self.fields();
         let mut arrays: Vec<ArrayRef> = vec![
-            finish_it!(self.spectrum_index),
+            finish_it!(self.source_index),
             finish_it!(self.scan_start_time),
             finish_it!(self.preset_scan_configuration),
             finish_it!(self.filter_string),
@@ -882,7 +882,7 @@ impl ArrayBuilder for ScanBuilder {
     fn finish_cloned(&self) -> ArrayRef {
         let schema = self.fields();
         let mut arrays: Vec<ArrayRef> = vec![
-            finish_cloned!(self.spectrum_index),
+            finish_cloned!(self.source_index),
             finish_cloned!(self.scan_start_time),
             finish_cloned!(self.preset_scan_configuration),
             finish_cloned!(self.filter_string),
@@ -1054,7 +1054,7 @@ impl VisitorBase for ActivationBuilder {
 
 #[derive(Default, Debug)]
 pub struct PrecursorBuilder {
-    spectrum_index: UInt64Builder,
+    source_index: UInt64Builder,
     precursor_index: UInt64Builder,
     precursor_id: LargeStringBuilder,
     isolation_window: IsolationWindowBuilder,
@@ -1063,14 +1063,14 @@ pub struct PrecursorBuilder {
 
 impl ArrayBuilder for PrecursorBuilder {
     fn len(&self) -> usize {
-        self.spectrum_index.len()
+        self.source_index.len()
     }
 
     fn finish(&mut self) -> ArrayRef {
         let fields = self.fields();
 
         let arrays = vec![
-            finish_it!(self.spectrum_index),
+            finish_it!(self.source_index),
             finish_it!(self.precursor_index),
             finish_it!(self.precursor_id),
             self.isolation_window.finish(),
@@ -1084,7 +1084,7 @@ impl ArrayBuilder for PrecursorBuilder {
         let fields = self.fields();
 
         let arrays = vec![
-            finish_cloned!(self.spectrum_index),
+            finish_cloned!(self.source_index),
             finish_cloned!(self.precursor_index),
             finish_cloned!(self.precursor_id),
             self.isolation_window.finish_cloned(),
@@ -1100,7 +1100,7 @@ impl ArrayBuilder for PrecursorBuilder {
 impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::Precursor)> for PrecursorBuilder {
     fn append_value(&mut self, item: &(u64, Option<u64>, &mzdata::spectrum::Precursor)) -> bool {
         let (i, j, item) = item;
-        self.spectrum_index.append_value(*i);
+        self.source_index.append_value(*i);
         self.precursor_index.append_option(*j);
         self.precursor_id.append_option(item.precursor_id.as_ref());
         self.isolation_window.append_value(&item.isolation_window);
@@ -1112,7 +1112,7 @@ impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::Precursor)> for Precurs
 impl VisitorBase for PrecursorBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         vec![
-            field!("spectrum_index", DataType::UInt64),
+            field!("source_index", DataType::UInt64),
             field!("precursor_index", DataType::UInt64),
             field!("precursor_id", DataType::LargeUtf8),
             field!("isolation_window", self.isolation_window.as_struct_type()),
@@ -1121,7 +1121,7 @@ impl VisitorBase for PrecursorBuilder {
     }
 
     fn append_null(&mut self) {
-        self.spectrum_index.append_null();
+        self.source_index.append_null();
         self.precursor_index.append_null();
         self.precursor_id.append_null();
         self.isolation_window.append_null();
@@ -1131,7 +1131,7 @@ impl VisitorBase for PrecursorBuilder {
 
 #[derive(Default, Debug)]
 pub struct SelectedIonBuilder {
-    spectrum_index: UInt64Builder,
+    source_index: UInt64Builder,
     precursor_index: UInt64Builder,
     selected_ion_mz: Float64Builder,
     charge_state: Int32Builder,
@@ -1145,14 +1145,14 @@ pub struct SelectedIonBuilder {
 
 impl ArrayBuilder for SelectedIonBuilder {
     fn len(&self) -> usize {
-        self.spectrum_index.len()
+        self.source_index.len()
     }
 
     fn finish(&mut self) -> ArrayRef {
         let fields = self.fields();
 
         let mut arrays = vec![
-            finish_it!(self.spectrum_index),
+            finish_it!(self.source_index),
             finish_it!(self.precursor_index),
             finish_it!(self.selected_ion_mz),
             finish_it!(self.charge_state),
@@ -1171,7 +1171,7 @@ impl ArrayBuilder for SelectedIonBuilder {
         let fields = self.fields();
 
         let mut arrays = vec![
-            finish_cloned!(self.spectrum_index),
+            finish_cloned!(self.source_index),
             finish_cloned!(self.precursor_index),
             finish_cloned!(self.selected_ion_mz),
             finish_cloned!(self.charge_state),
@@ -1192,7 +1192,7 @@ impl ArrayBuilder for SelectedIonBuilder {
 impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::SelectedIon)> for SelectedIonBuilder {
     fn append_value(&mut self, item: &(u64, Option<u64>, &mzdata::spectrum::SelectedIon)) -> bool {
         let (i, j, item) = item;
-        self.spectrum_index.append_value(*i);
+        self.source_index.append_value(*i);
         self.precursor_index.append_option(*j);
         self.selected_ion_mz.append_value(item.mz);
         self.charge_state.append_option(item.charge());
@@ -1229,7 +1229,7 @@ impl StructVisitor<(u64, Option<u64>, &mzdata::spectrum::SelectedIon)> for Selec
 impl VisitorBase for SelectedIonBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
-            field!("spectrum_index", DataType::UInt64),
+            field!("source_index", DataType::UInt64),
             field!("precursor_index", DataType::UInt64),
             field!("selected_ion_mz", DataType::Float64),
             field!("charge_state", DataType::Int32),
@@ -1245,7 +1245,7 @@ impl VisitorBase for SelectedIonBuilder {
     }
 
     fn append_null(&mut self) {
-        self.spectrum_index.append_null();
+        self.source_index.append_null();
         self.precursor_index.append_null();
         self.selected_ion_mz.append_null();
         self.charge_state.append_null();

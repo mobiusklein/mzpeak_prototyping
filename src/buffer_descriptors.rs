@@ -41,17 +41,20 @@ impl BufferContext {
     }
 
     pub fn time_field(&self) -> FieldRef {
-        Arc::new(Field::new(
-            self.time_name(),
-            DataType::Float32,
-            true,
-        ))
+        Arc::new(Field::new(self.time_name(), DataType::Float32, true))
     }
 
     pub const fn name(&self) -> &'static str {
         match self {
             BufferContext::Spectrum => "spectrum",
             BufferContext::Chromatogram => "chromatogram",
+        }
+    }
+
+    pub const fn default_sorted_array(&self) -> ArrayType {
+        match self {
+            BufferContext::Spectrum => ArrayType::MZArray,
+            BufferContext::Chromatogram => ArrayType::TimeArray
         }
     }
 }
@@ -225,6 +228,11 @@ pub struct BufferName {
     /// Primary arrays get a much more succinct standardized naming scheme while
     /// all other arrays' names are implementation details.
     pub buffer_priority: Option<BufferPriority>,
+    /// In what rank order this array's values are sorted, if at all, within a parent
+    /// entity. This may be useful when deciding how to prioritize applying filters.
+    ///
+    /// Lower values are sorted first.
+    pub sorting_rank: Option<u32>,
 }
 
 impl std::hash::Hash for BufferName {
@@ -489,6 +497,7 @@ impl BufferName {
             transform: None,
             data_processing_id: None,
             buffer_priority: None,
+            sorting_rank: None,
         }
     }
 
@@ -507,11 +516,17 @@ impl BufferName {
             transform: None,
             data_processing_id: None,
             buffer_priority: None,
+            sorting_rank: None,
         }
     }
 
-    pub const fn with_priority(mut self, buffer_priority: BufferPriority) -> Self {
-        self.buffer_priority = Some(buffer_priority);
+    pub const fn with_priority(mut self, buffer_priority: Option<BufferPriority>) -> Self {
+        self.buffer_priority = buffer_priority;
+        self
+    }
+
+    pub const fn with_sorting_rank(mut self, sorting_rank: Option<u32>) -> Self {
+        self.sorting_rank = sorting_rank;
         self
     }
 
@@ -587,6 +602,9 @@ impl BufferName {
         if let Some(priority) = self.buffer_priority {
             meta.insert("buffer_priority".to_string(), priority.to_string());
         }
+        if let Some(sorting_rank) = self.sorting_rank {
+            meta.insert("sorting_rank".to_string(), sorting_rank.to_string());
+        }
         meta
     }
 
@@ -599,6 +617,7 @@ impl BufferName {
         let mut transform = None;
         let mut data_processing_id = None;
         let mut buffer_priority: Option<BufferPriority> = None;
+        let mut sorting_rank: Option<u32> = None;
         for (k, v) in field.metadata().iter() {
             match k.as_str() {
                 "context" => {}
@@ -644,6 +663,12 @@ impl BufferName {
                         .inspect_err(|e| log::error!("Failed to parse buffer priority: {e}"))
                         .ok()
                 }
+                "sorting_rank" => {
+                    sorting_rank = v
+                        .parse()
+                        .inspect_err(|e| log::error!("Failed to parse sorting rank: {e}"))
+                        .ok()
+                }
                 _ => {}
             }
         }
@@ -659,6 +684,7 @@ impl BufferName {
                     transform,
                     data_processing_id,
                     buffer_priority,
+                    sorting_rank,
                 };
                 if let ArrayType::NonStandardDataArray { name } = &mut this.array_type {
                     *name = array_name.into();
@@ -788,7 +814,8 @@ impl Display for BufferName {
 
 /// A JSON-serializable version of [`ArrayIndexEntry`].
 ///
-/// They can be inter-converted
+/// They can be inter-converted. See [`ArrayIndexEntry`] for
+/// an explanation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedArrayIndexEntry {
     pub context: String,
@@ -819,6 +846,9 @@ pub struct SerializedArrayIndexEntry {
         default
     )]
     pub transform: Option<CURIE>,
+    pub data_processing_id: Option<Box<str>>,
+    pub buffer_priority: Option<BufferPriority>,
+    pub sorting_rank: Option<u32>,
 }
 
 /// Convert an Arrow [`DataType`] to a [`BinaryDataArrayType`]
@@ -860,6 +890,9 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
             unit: value.unit.to_curie().map(|c| c.into()),
             buffer_format: value.buffer_format.to_string(),
             transform: value.transform.map(|t| t.curie()),
+            data_processing_id: value.data_processing_id,
+            buffer_priority: value.buffer_priority,
+            sorting_rank: value.sorting_rank,
         }
     }
 }
@@ -899,11 +932,17 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
                     None
                 })
             }),
+            data_processing_id: value.data_processing_id,
+            buffer_priority: value.buffer_priority,
+            sorting_rank: value.sorting_rank,
         }
     }
 }
 
 /// Describes an array that is encoded long-form in the data file
+///
+/// This type is a logical extension [`BufferName`] but it is tied to a specific
+/// path in the schema and with certain properties rendered for human readability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayIndexEntry {
     /// Is this a spectrum or chromatogram array?
@@ -922,7 +961,20 @@ pub struct ArrayIndexEntry {
     pub unit: Unit,
     /// The layout of buffer, either point or chunks
     pub buffer_format: BufferFormat,
+    /// Any transformations applied to this array
     pub transform: Option<BufferTransform>,
+    /// The default data processing method's ID applied to this array. Alternatives may
+    /// be specified in the metadata table.
+    pub data_processing_id: Option<Box<str>>,
+    /// Whether this is the primary array for this quantity, or a secondary array.
+    /// Primary arrays get a much more succinct standardized naming scheme while
+    /// all other arrays' names are implementation details.
+    pub buffer_priority: Option<BufferPriority>,
+    /// In what rank order this array's values are sorted, if at all, within a parent
+    /// entity. This may be useful when deciding how to prioritize applying filters.
+    ///
+    /// Lower values are sorted first.
+    pub sorting_rank: Option<u32>,
 }
 
 impl ArrayIndexEntry {
@@ -946,6 +998,9 @@ impl ArrayIndexEntry {
             unit,
             buffer_format,
             transform: None,
+            data_processing_id: None,
+            buffer_priority: None,
+            sorting_rank: None,
         }
     }
 
@@ -972,11 +1027,14 @@ impl ArrayIndexEntry {
             unit: buffer_name.unit,
             buffer_format: buffer_name.buffer_format,
             transform: buffer_name.transform,
+            data_processing_id: buffer_name.data_processing_id,
+            buffer_priority: buffer_name.buffer_priority,
+            sorting_rank: buffer_name.sorting_rank,
         }
     }
 
     pub fn as_buffer_name(&self) -> BufferName {
-        BufferName::new_with_buffer_format(
+        let mut this = BufferName::new_with_buffer_format(
             self.context,
             self.array_type.clone(),
             arrow_to_array_type(&self.data_type).unwrap(),
@@ -984,6 +1042,10 @@ impl ArrayIndexEntry {
         )
         .with_transform(self.transform)
         .with_unit(self.unit)
+        .with_priority(self.buffer_priority)
+        .with_sorting_rank(self.sorting_rank);
+        this.data_processing_id = self.data_processing_id.clone();
+        this
     }
 
     pub const fn is_ion_mobility(&self) -> bool {
@@ -1132,6 +1194,7 @@ impl BufferOverrideTable {
     pub fn map(&self, k: &BufferName) -> BufferName {
         let mut name = self.get(k).or(Some(k)).cloned().unwrap();
         name.buffer_priority = k.buffer_priority.max(name.buffer_priority);
+        name.sorting_rank = k.sorting_rank.or(name.sorting_rank);
         name
     }
 

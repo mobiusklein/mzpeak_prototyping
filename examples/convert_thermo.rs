@@ -11,14 +11,17 @@ use mzdata::{
     },
 };
 use mzpeak_prototyping::{
-    ToMzPeakDataSeries, buffer_descriptors::BufferOverrideTable, peak_series::{BufferContext, BufferName}, writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_file_reader}
+    ToMzPeakDataSeries,
+    buffer_descriptors::BufferOverrideTable,
+    peak_series::{BufferContext, BufferName},
+    writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_file_reader},
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use std::{
     fmt::Debug,
     fs, io,
     panic::{self, AssertUnwindSafe},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc::sync_channel},
     thread,
     time::Instant,
@@ -26,9 +29,19 @@ use std::{
 
 mod convert;
 
+/// Convert a single Thermo RAW file to mzPeak format
+#[derive(Parser, Debug, Clone)]
+pub struct ConvertCli {
+    /// Input file path
+    pub filename: PathBuf,
+
+    #[command(flatten)]
+    pub convert_args: convert::ConvertArgs,
+}
+
 fn main() -> io::Result<()> {
     env_logger::init();
-    let cli = convert::ConvertCli::parse();
+    let cli = ConvertCli::parse();
     let start = Instant::now();
 
     let outpath = cli

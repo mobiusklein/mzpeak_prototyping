@@ -19,25 +19,70 @@ from .filters import null_delta_decode, fill_nulls
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
+
+class BufferFormat(Enum):
+    """
+    The different orientations data arrays may be written in.
+
+    - ``Point`` - Each data point is stored as a row in the table as-is. Easy to do filtering random access queries over.
+    - ``Chunk`` - Segments of data in a specific start-stop range are stored in an encoded block. More compact but harder to do queries over.
+    - ``Secondary_Chunk`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
+    """
+
+    Point = 1
+    ChunkStart = 2
+    ChunkEnd = 3
+    ChunkValues = 4
+    ChunkEncoding = 5
+    SecondaryChunk = 6
+
+    Chunk = ChunkValues
+
+    @classmethod
+    def from_str(cls, name: str):
+        try:
+            return cls[name.title().replace("_", "")]
+        except KeyError:
+            if name.lower() == "chunk_values":
+                return cls.ChunkValues
+            else:
+                raise
+
+
+class BufferPriority(Enum):
+    Primary = 1
+    Secondary = 2
+
+    @classmethod
+    def from_str(cls, name: str):
+        return cls[name.title()]
+
+
 @dataclass(frozen=True)
-class BufferName:
+class ArrayIndexEntry:
     key: str
     array_name: str
-    buffer_format: "BufferFormat"
+    buffer_format: BufferFormat
     context: str
     prefix: str
     path: str
     data_type: str
     array_type: str
+    data_processing_id: str | None = None
     unit: str | None = None
     transform: str | None = None
+    buffer_priority: BufferPriority | None = None
+    sorting_rank: int | None = None
 
     @classmethod
     def from_index(cls, key, fields):
         fields = fields.copy()
-        fmt = fields.pop('buffer_format', None)
+        fmt = fields.pop("buffer_format", None)
         if fmt:
-            fields['buffer_format'] = BufferFormat.from_str(fmt.title())
+            fields["buffer_format"] = BufferFormat.from_str(fmt)
+        priority = fields.pop("buffer_priority", None)
+        if priority:
+            fields["buffer_priority"] = BufferPriority.from_str(priority)
         return cls(key=key, **fields)
 
 
@@ -49,7 +94,7 @@ class _DataIndex:
     namespace: str
     row_group_index_ranges: list[Span[int] | None]
 
-    def __init__(self, meta: pq.FileMetaData, prefix: str, namespace: str="spectrum"):
+    def __init__(self, meta: pq.FileMetaData, prefix: str, namespace: str = "spectrum"):
         self.meta = meta
         self.prefix = prefix
         self.index_i = 0
@@ -81,12 +126,16 @@ class _DataIndex:
                 else:
                     self.row_group_index_ranges.append(None)
 
-        index = json.loads(self.meta.metadata[f"{self.namespace}_array_index".encode('utf8')])
+        index = json.loads(
+            self.meta.metadata[f"{self.namespace}_array_index".encode("utf8")]
+        )
         self.array_index = {
             entry["path"].rsplit(".")[-1]: entry for entry in index["entries"]
         }
         try:
-            self.n_entries = int(self.meta.metadata[f"{self.namespace}_count".encode('utf8')])
+            self.n_entries = int(
+                self.meta.metadata[f"{self.namespace}_count".encode("utf8")]
+            )
         except KeyError:
             self.n_entries = max_index
 
@@ -138,39 +187,13 @@ class _DataIndex:
 
     def __len__(self):
         try:
-            return self.meta.row_group(
-                self.meta.num_row_groups - 1
-            ).column(self.index_i).statistics.max
+            return (
+                self.meta.row_group(self.meta.num_row_groups - 1)
+                .column(self.index_i)
+                .statistics.max
+            )
         except IndexError:
             return 0
-
-
-class BufferFormat(Enum):
-    """
-    The different orientations data arrays may be written in.
-
-    - ``Point`` - Each data point is stored as a row in the table as-is. Easy to do filtering random access queries over.
-    - ``Chunk`` - Segments of data in a specific start-stop range are stored in an encoded block. More compact but harder to do queries over.
-    - ``Secondary_Chunk`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
-    """
-    Point = 1
-    ChunkStart = 2
-    ChunkEnd = 3
-    ChunkValues = 4
-    ChunkEncoding = 5
-    SecondaryChunk = 6
-
-    Chunk = ChunkValues
-
-    @classmethod
-    def from_str(cls, name: str):
-        try:
-            return cls[name.title().replace("_", "")]
-        except KeyError:
-            if name.lower() == 'chunk_values':
-                return cls.ChunkValues
-            else:
-                raise
 
 
 class _BatchIterator:
@@ -189,14 +212,17 @@ class _BatchIterator:
     index_column : str
         The name of entry index column.
     """
+
     it: Iterator[pa.RecordBatch]
     batch: pa.StructArray
     current_index: int
     index_column: str
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.it}, {self.current_index}, {self.index_column}" \
-               f", buffered={len(self.batch) if self.batch is not None else None})"
+        return (
+            f"{self.__class__.__name__}({self.it}, {self.current_index}, {self.index_column}"
+            f", buffered={len(self.batch) if self.batch is not None else None})"
+        )
 
     def __init__(
         self,
@@ -309,12 +335,12 @@ psims_dtypes = {
 _SpectrumArrays = dict[str, np.ndarray]
 
 
-
 class _PointBatchCleaner:
     """
     Help clean :term:`Point Layout` data, formatting
     for more ease of use outside of Arrow.
     """
+
     namespace: str
     array_index: dict[str, dict]
     drop_index: bool
@@ -323,7 +349,14 @@ class _PointBatchCleaner:
     has_mulitple_delta_models: bool
     index_name: str
 
-    def __init__(self, namespace: str, array_index: dict[str, dict], drop_index: bool=True, delta_model=None, has_multiple_indices: bool=False):
+    def __init__(
+        self,
+        namespace: str,
+        array_index: dict[str, dict],
+        drop_index: bool = True,
+        delta_model=None,
+        has_multiple_indices: bool = False,
+    ):
         self.namespace = namespace
         self.array_index = array_index
         self.drop_index = drop_index
@@ -332,7 +365,10 @@ class _PointBatchCleaner:
         self.has_multiple_delta_models = isinstance(self.delta_model, dict)
         self.index_name = f"{self.namespace}_index"
         if self.has_multiple_delta_models and not self.has_mulitple_indices:
-            logger.warning("Cleaning a point data batch with multiple delta models %r but not multiple indices", self.delta_model)
+            logger.warning(
+                "Cleaning a point data batch with multiple delta models %r but not multiple indices",
+                self.delta_model,
+            )
 
     def get_index_runs(self, data: pa.StructArray):
         index_values = data.field(self.index_name)
@@ -370,9 +406,7 @@ class _PointBatchCleaner:
         return data
 
     def fill_nulls(
-        self, v: pa.Array,
-        index_runs: np.ndarray,
-        index_values_unique: np.ndarray
+        self, v: pa.Array, index_runs: np.ndarray, index_values_unique: np.ndarray
     ) -> np.ndarray:
         """
         Fill null values into a data array using the delta model.
@@ -434,7 +468,7 @@ class _PointBatchCleaner:
                     v = self.fill_nulls(
                         v,
                         index_runs=index_runs,
-                        index_values_unique=index_values_unique
+                        index_values_unique=index_values_unique,
                     )
 
                 elif k == "intensity array":
@@ -492,7 +526,7 @@ class _ChunkBatchCleaner:
     def find_axis_prefix(self):
         axis_prefix = None
         for k, v in self.array_index.items():
-            name = BufferName.from_index(k, v)
+            name = ArrayIndexEntry.from_index(k, v)
             if (
                 name.buffer_format == BufferFormat.ChunkValues
                 or name.buffer_format == BufferFormat.Chunk
@@ -529,13 +563,19 @@ class _ChunkBatchCleaner:
                 raise ValueError(f"Unsupported chunk encoding {encoding}")
         return n, numpress_chunks
 
-    def initialize_arrays(self, n: int, chunks: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    def initialize_arrays(
+        self, n: int, chunks: list[dict[str, Any]]
+    ) -> dict[str, np.ndarray]:
         arrays_of = {}
         for k, v in chunks[0].items():
             if k == self.index_name:
                 if not self.drop_index:
                     arrays_of[k] = np.zeros(n, dtype=np.uint64)
-            elif k == "chunk_encoding" or k == self.time_label or k.startswith(self.axis_prefix):
+            elif (
+                k == "chunk_encoding"
+                or k == self.time_label
+                or k.startswith(self.axis_prefix)
+            ):
                 continue
             else:
                 arrays_of[k] = np.zeros(
@@ -543,10 +583,13 @@ class _ChunkBatchCleaner:
                 )
         return arrays_of
 
-    def process_chunks(self, n: int,
-                       numpress_chunks: list,
-                       chunks: list[dict[str, pa.Array]],
-                       arrays_of: dict[str, np.ndarray]) -> tuple[int, bool]:
+    def process_chunks(
+        self,
+        n: int,
+        numpress_chunks: list,
+        chunks: list[dict[str, pa.Array]],
+        arrays_of: dict[str, np.ndarray],
+    ) -> tuple[int, bool]:
         main_axis_array = np.zeros(n)
         offset = 0
         had_nulls = False
@@ -640,10 +683,7 @@ class _ChunkBatchCleaner:
 
         arrays_of = self.initialize_arrays(n, chunks)
         (offset, had_nulls) = self.process_chunks(
-            n,
-            numpress_chunks=numpress_chunks,
-            chunks=chunks,
-            arrays_of=arrays_of
+            n, numpress_chunks=numpress_chunks, chunks=chunks, arrays_of=arrays_of
         )
 
         rename_map = {
@@ -687,6 +727,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     array_index : dict[str, dict]
         Descriptions of the different arrays stored in the data file
     """
+
     handle: pq.ParquetFile
     meta: pq.FileMetaData
     _point_index: _DataIndex
@@ -697,7 +738,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     _do_null_filling: bool = True
     _namespace: str
 
-    def __init__(self, handle: pq.ParquetFile, namespace: str | None=None):
+    def __init__(self, handle: pq.ParquetFile, namespace: str | None = None):
         if not isinstance(handle, pq.ParquetFile):
             handle = pq.ParquetFile(handle)
         self.handle = handle
@@ -720,7 +761,9 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
             self._namespace = "spectrum"
 
     def _infer_schema_idx(self):
-        index = json.loads(self.meta.metadata[f"{self._namespace}_array_index".encode('utf8')])
+        index = json.loads(
+            self.meta.metadata[f"{self._namespace}_array_index".encode("utf8")]
+        )
         self.array_index = {
             entry["path"].rsplit(".")[-1]: entry for entry in index["entries"]
         }
@@ -764,7 +807,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
             self.array_index,
             drop_index,
             delta_model=delta_model if self._do_null_filling else None,
-            has_multiple_indices=has_mulitple_indices
+            has_multiple_indices=has_mulitple_indices,
         )
         return cleaner.expand(data)
 
@@ -802,13 +845,9 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
             end = max(index_range)
 
         if prefix == BufferFormat.Point:
-            return self._read_point_range(
-                start, end, index_range, is_slice, rgs
-            )
+            return self._read_point_range(start, end, index_range, is_slice, rgs)
         elif prefix == BufferFormat.ChunkValues:
-            return self._read_chunk_range(
-                start, end, index_range, is_slice, rgs
-            )
+            return self._read_chunk_range(start, end, index_range, is_slice, rgs)
         else:
             raise NotImplementedError(prefix)
 
@@ -837,20 +876,17 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         index_col = f"{self._namespace}_index"
         block = pc.filter(
             block,
-            pc.equal(
-                pc.struct_field(block, index_col), spectrum_index
-            ),
+            pc.equal(pc.struct_field(block, index_col), spectrum_index),
         )
 
-        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(index_col)
+        data: pa.RecordBatch = pa.record_batch(block.combine_chunks()).drop_columns(
+            index_col
+        )
         time_label = f"{self._namespace}_time"
         if time_label in data.column_names:
             data = data.drop_columns(time_label)
         return self._clean_point_batch(
-            data,
-            delta_model,
-            drop_index=True,
-            has_mulitple_indices=False
+            data, delta_model, drop_index=True, has_mulitple_indices=False
         )
 
     def _read_point_range(
@@ -884,10 +920,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         block = pc.filter(block, mask)
         data: pa.RecordBatch = pa.record_batch(block.combine_chunks())
         data = self._clean_point_batch(
-            data,
-            delta_model=delta_models,
-            has_mulitple_indices=True,
-            drop_index=False
+            data, delta_model=delta_models, has_mulitple_indices=True, drop_index=False
         )
         return data
 
@@ -929,7 +962,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         index_range: list[int] | slice,
         is_slice: bool,
         rgs: list[int],
-        batch_size: int = 128
+        batch_size: int = 128,
     ) -> _SpectrumArrays:
         chunks = []
         delta_models = None
@@ -939,9 +972,14 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
             index_range = pa.array(index_range)
         else:
             if self._delta_model_series is not None:
-                delta_models = {i: self._delta_model_series[i] for i in _slice_to_range(index_range, len(self))}
+                delta_models = {
+                    i: self._delta_model_series[i]
+                    for i in _slice_to_range(index_range, len(self))
+                }
 
-        for batch in self.handle.iter_batches(batch_size, row_groups=rgs, columns=["chunk"]):
+        for batch in self.handle.iter_batches(
+            batch_size, row_groups=rgs, columns=["chunk"]
+        ):
             batch = batch["chunk"]
             idx_col = pc.struct_field(batch, f"{self._namespace}_index")
             batch_end = pc.max(idx_col).as_py()
@@ -968,9 +1006,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
                 chunks.append(batch)
         chunks = pa.chunked_array(chunks)
         return self._expand_chunks(
-            chunks,
-            preserve_index=True,
-            delta_model=delta_models
+            chunks, preserve_index=True, delta_model=delta_models
         )
 
     def _read_data_for(self, index: int) -> _SpectrumArrays:

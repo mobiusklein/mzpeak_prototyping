@@ -8,7 +8,7 @@ use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
     arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
     basic::Compression,
-    format::KeyValue,
+    file::metadata::KeyValue,
 };
 
 use mzdata::{meta::FileMetadataConfig, prelude::*};

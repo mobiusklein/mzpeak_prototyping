@@ -892,7 +892,8 @@ impl ArrowArrayChunk {
         let main_axis = overrides
             .map(&main_axis)
             .with_format(BufferFormat::Chunked)
-            .with_priority(BufferPriority::Primary);
+            .with_priority(Some(BufferPriority::Primary))
+            .with_sorting_rank(Some(0));
 
         let fields_of: BufferOverrideTable = fields
             .as_ref()

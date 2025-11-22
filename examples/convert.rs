@@ -32,7 +32,7 @@ use std::{
 // CLI Interface for standalone usage
 // ============================================================================
 
-/// Convert a single mass spectrometry file to mzpeak format
+/// Convert a single mass spectrometry file to mzPeak format
 #[derive(Parser, Debug, Clone)]
 pub struct ConvertCli {
     /// Input file path
