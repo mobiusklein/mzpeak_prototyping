@@ -59,8 +59,8 @@ s3 = ["object_store/aws", "async"]
 thermo = ["mzdata/thermo"]
 
 [dependencies]
-arrow = "55.2.0"
-parquet = "55.2.0"
+arrow = "57.0.0"
+parquet = "57.0.0"
 env_logger = "0.11.8"
 itertools = "0.14.0"
 log = "0.4.27"
@@ -97,7 +97,7 @@ bitflags = "2.10.0"
 clap = { version = "4.5.38", features = ["derive"] }
 test-log = "0.2.12 "
 tokio = { version = "1.47.1", features = ["rt-multi-thread"]}
-serde_arrow = { version = "0.13.3", features = ["arrow-55"] }
+serde_arrow = { version = "0.13.7", features = ["arrow-57"] }
 
 [profile.release]
 debug = true

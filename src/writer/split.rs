@@ -329,7 +329,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
 
     pub fn finish(
         &mut self,
-    ) -> Result<parquet::format::FileMetaData, parquet::errors::ParquetError> {
+    ) -> Result<parquet::file::metadata::ParquetMetaData, parquet::errors::ParquetError> {
         self.flush_spectrum_data_arrays()?;
         self.flush_spectrum_metadata_records()?;
         self.append_metadata();

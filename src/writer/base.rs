@@ -14,7 +14,7 @@ use parquet::{
     file::properties::{
         DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT, EnabledStatistics, WriterProperties, WriterVersion,
     },
-    format::SortingColumn,
+    file::metadata::SortingColumn,
 };
 
 use crate::{
