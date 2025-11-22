@@ -207,7 +207,7 @@ class _AuxiliaryArrayDecoder:
         parameters = [_format_param(v) for v in arr.get("parameters", [])]
         data: np.ndarray = cls.compression[compression_acc](data)
         if cls.ascii_code != dtype_acc:
-            data = data.view(cls.dtypes[dtype_acc])
+            data = np.asarray(bytearray(data)).view(cls.dtypes[dtype_acc])
         else:
             data = bytearray(data).strip().split(b"\0")
             data = np.array(data, dtype=np.object_)

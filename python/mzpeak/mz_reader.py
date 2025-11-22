@@ -27,6 +27,9 @@ class BufferFormat(Enum):
     - ``Point`` - Each data point is stored as a row in the table as-is. Easy to do filtering random access queries over.
     - ``Chunk`` - Segments of data in a specific start-stop range are stored in an encoded block. More compact but harder to do queries over.
     - ``Secondary_Chunk`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
+    - ``ChunkStart`` - The start of an encoded chunk's value range.
+    - ``ChunkEnd`` - The end of an encoded chunk's value range.
+    - ``ChunkEncoding`` - The method used to encode the chunk's values.
     """
 
     Point = 1
@@ -77,9 +80,11 @@ class ArrayIndexEntry:
     @classmethod
     def from_index(cls, key, fields):
         fields = fields.copy()
+
         fmt = fields.pop("buffer_format", None)
         if fmt:
             fields["buffer_format"] = BufferFormat.from_str(fmt)
+
         priority = fields.pop("buffer_priority", None)
         if priority:
             fields["buffer_priority"] = BufferPriority.from_str(priority)
@@ -139,7 +144,20 @@ class _DataIndex:
         except KeyError:
             self.n_entries = max_index
 
-    def row_groups_for_index(self, spectrum_index: int) -> list[int]:
+    def row_groups_for_index(self, query_index: int) -> list[int]:
+        """
+        Find the row group indices that span ``query_index``
+
+        Parameters
+        ----------
+        query_index : int
+            The index to select
+
+        Returns
+        -------
+        list[int]:
+            The row group indices that span the query index
+        """
         rgs = []
         if not self.init:
             return rgs
@@ -148,27 +166,40 @@ class _DataIndex:
             col_idx = rg.column(self.index_i)
             if col_idx.statistics.has_min_max:
                 if (
-                    col_idx.statistics.min <= spectrum_index
-                    and spectrum_index <= col_idx.statistics.max
+                    col_idx.statistics.min <= query_index
+                    and query_index <= col_idx.statistics.max
                 ):
                     rgs.append(i)
-                if col_idx.statistics.min > spectrum_index:
+                if col_idx.statistics.min > query_index:
                     break
             else:
                 break
         return rgs
 
     def row_groups_for_spectrum_range(
-        self, spectrum_index_range: slice | list
+        self, query_index_range: slice | list
     ) -> list[int]:
+        """
+        Find the row group indices that span ``query_index_range``
+
+        Parameters
+        ----------
+        query_index_range : list[int] or slice
+            The indices to select
+
+        Returns
+        -------
+        list[int]:
+            The row group indices that span the query index range
+        """
         if not self.init:
             return []
-        if isinstance(spectrum_index_range, slice):
-            start = spectrum_index_range.start or 0
-            end = spectrum_index_range.stop or self.n_entries
+        if isinstance(query_index_range, slice):
+            start = query_index_range.start or 0
+            end = query_index_range.stop or self.n_entries
         else:
-            start = min(spectrum_index_range)
-            end = max(spectrum_index_range)
+            start = min(query_index_range)
+            end = max(query_index_range)
 
         span = Span(start, end)
         rgs = []
@@ -312,6 +343,7 @@ class _BatchIterator:
             return self
 
 
+# These parsed CURIEs will be removed closer to formalization
 DELTA_ENCODING = {"cv_id": 1, "accession": 1003089}
 NO_COMPRESSION = {"cv_id": 1, "accession": 1000576}
 NUMPRESS_LINEAR = {"cv_id": 1, "accession": 1002312}
@@ -1047,7 +1079,7 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     def buffer_format(self) -> BufferFormat:
         """
         The kind of data layout that the underlying file uses, either
-        :attr:`BufferFormat.Point` or :attr:`BufferFormat.Chunk`
+        :attr:`BufferFormat.Point` or :attr:`BufferFormat.ChunkValues`
         """
         if self._point_index.init:
             return BufferFormat.Point
