@@ -45,13 +45,6 @@ static size_t seg_read(void *ptr, size_t size, size_t nitems,
                        Rconnection con) {
   ConnectionSegment* myconn = con->private;
   size_t to_read = size * nitems;
-  // printf(
-  //   "Asked to read %zu bytes at position %zu, for %zu items of size %zu\n",
-  //   to_read,
-  //   myconn->position,
-  //   nitems,
-  //   size
-  // );
   fseeko64(myconn->stream, myconn->offset + myconn->position, SEEK_SET);
   if ((to_read + myconn->position) > myconn->size) {
     size_t remaining_bytes = (myconn->size - myconn->position);
@@ -61,26 +54,8 @@ static size_t seg_read(void *ptr, size_t size, size_t nitems,
     myconn->position += remaining_items * size;
     return remaining_items;
   } else {
-    size_t n_bytes_read = fread(ptr, size, nitems, myconn->stream) * size;
-    // printf(
-    //   "Expected to read %zu bytes, consumed %zu bytes\n",
-    //   to_read,
-    //   n_bytes_read
-    // );
+    fread(ptr, size, nitems, myconn->stream);
     myconn->position += to_read;
-    // char* data = (char*)ptr;
-    // size_t was_zero = 0;
-    // for(size_t i = 0; i < to_read; i++) {
-    //   was_zero += (data[i] == 0);
-    // }
-    // printf("%zu of %zu bytes read were null\n", was_zero, to_read);
-    // printf(
-    //   "Read ended at %zu, stream position %zu + %zu\n",
-    //   myconn->position,
-    //   ftello64(myconn->stream) - myconn->offset,
-    //   myconn->offset
-    // );
-
     return nitems;
   }
 }
