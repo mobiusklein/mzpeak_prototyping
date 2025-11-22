@@ -318,6 +318,15 @@ MZPeakFile <- R6::R6Class(
     chromatogram_metadata = NULL,
     chromatogram_data = NULL,
     file_index = NULL,
+    #' @description
+    #' A reader for mzPeak files.\cr
+    #'
+    #' This type will load metadata eagerly into memory, but will load signal data
+    #' only when requested.
+    #'
+    #' @param path(character(1))\cr
+    #'   The path to where on the file system the mzPeak archive is. It may be a
+    #'   ZIP archive or an unpacked directory.
     initialize = function(path) {
       self$handle <- ArchiveHandle$new(path)
 
@@ -366,9 +375,20 @@ MZPeakFile <- R6::R6Class(
       }
 
     },
+    #' @description
+    #' Read a spectrum's signal data
+    #'
+    #' @param index (`integer(1)`).
+    #' @return [tibble]
     read_spectrum = function(index) {
       self$spectrum_data$read_spectrum(index)
     },
+
+    #' @description
+    #' Read a spectrum's peaks, if the peak data volume is present, and are stored separately
+    #'
+    #' @param index (`integer(1)`).
+    #' @return [tibble]
     read_spectrum_peaks = function(index) {
       ifelse(
         is.null(self$spectrum_peak_data),
@@ -376,20 +396,32 @@ MZPeakFile <- R6::R6Class(
         self$spectrum_peak_data$read_spectrum(index)
       )
     }
-    query = function() {
-      MZPeakQuery$new(self)
-    }
   ),
   active = list(
+    #' @field spectra (tibble)\cr
+    #'
+    #' The spectrum-level metadata. Information about scan acquisition, precursors
+    #' selected ions, are in other tables
     spectra = function() {
       self$spectrum_metadata$spectra
     },
+    #' @field scans (tibble)\cr
+    #'
+    #' The scan acquisition metadata.
     scans = function() {
       self$spectrum_metadata$scans
     },
+
+    #' @field precursors (tibble)\cr
+    #'
+    #' The precursors selection and activation metadata.
     precursors = function() {
       self$spectrum_metadata$precursors
     },
+
+    #' @field selected_ions (tibble)\cr
+    #'
+    #' The selected ion metadata.
     selected_ions = function() {
       self$spectrum_metadata$selected_ions
     }
