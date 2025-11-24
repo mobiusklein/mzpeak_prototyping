@@ -14,7 +14,7 @@ use parquet::{
     file::properties::{
         DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT, EnabledStatistics, WriterProperties, WriterVersion,
     },
-    format::SortingColumn,
+    file::metadata::SortingColumn,
 };
 
 use crate::{
@@ -148,7 +148,7 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 chromatogram_index,
                 None,
-                time_axis.with_priority(BufferPriority::Primary),
+                time_axis.with_priority(Some(BufferPriority::Primary)),
                 binary_array_map,
                 chunking,
                 buffer_ref.overrides(),
@@ -284,7 +284,7 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 spectrum_time,
-                MZ_ARRAY.with_priority(BufferPriority::Primary),
+                MZ_ARRAY.with_priority(Some(BufferPriority::Primary)),
                 binary_array_map,
                 chunking,
                 buffer_ref.overrides(),
@@ -352,7 +352,7 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 spectrum_time,
-                MZ_ARRAY.clone().with_priority(BufferPriority::Primary),
+                MZ_ARRAY.clone().with_priority(Some(BufferPriority::Primary)),
                 &arrays,
                 ChunkingStrategy::Basic {
                     chunk_size: encoding.chunk_size(),
@@ -456,7 +456,7 @@ pub trait AbstractMzPeakWriter {
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
                 "spectrum.index" => {
-                    sorted.push(SortingColumn::new(i as i32, false, false));
+                    sorted.push(SortingColumn { column_idx: i as i32, descending: false, nulls_first: false});
                 }
                 _ => {}
             }
@@ -491,7 +491,7 @@ pub trait AbstractMzPeakWriter {
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
                 x if x == index_path => {
-                    sorted.push(SortingColumn::new(i as i32, false, false));
+                    sorted.push(SortingColumn { column_idx: i as i32, descending: false, nulls_first: false});
                 }
                 _ => {}
             }
@@ -558,7 +558,7 @@ pub trait AbstractMzPeakWriter {
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
                 x if x == index_path => {
-                    sorted.push(SortingColumn::new(i as i32, false, false));
+                    sorted.push(SortingColumn { column_idx: i as i32, descending: false, nulls_first: false});
                 }
                 _ => {}
             }

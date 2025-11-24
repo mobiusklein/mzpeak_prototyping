@@ -11,6 +11,7 @@ CHROMATOGRAM = "chromatogram"
 DATA_ARRAYS = "data arrays"
 METADATA = "metadata"
 PEAKS = "peaks"
+PROPRIETARY = "proprietary"
 
 
 class EntityType(StrEnum):
@@ -31,6 +32,7 @@ class DataKind(StrEnum):
     Peaks = PEAKS
     Metadata = METADATA
     Other = OTHER
+    Proprietary = PROPRIETARY
 
     @classmethod
     def get(cls, value: str):
@@ -112,3 +114,6 @@ class FileIndex(MutableSequence[FileEntry]):
     def from_json(cls, data: dict) -> 'FileIndex':
         files = [FileEntry.from_json(f) for f in data['files']]
         return cls(files, data['metadata'])
+
+
+__all__ = ["FileIndex", "FileEntry", "EntityType", "DataKind"]

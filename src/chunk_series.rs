@@ -369,7 +369,30 @@ impl ChunkingStrategy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferTransformEncoder(pub(crate) BufferTransform);
+pub struct BufferTransformEncoder(BufferTransform);
+
+impl TryFrom<Option<BufferTransform>> for BufferTransformEncoder {
+    type Error = <Self as TryFrom<BufferTransform>>::Error;
+
+    fn try_from(value: Option<BufferTransform>) -> Result<Self, Self::Error> {
+        match value {
+            Some(value) => value.try_into(),
+            None => Err(format!("Cannot convert from empty")),
+        }
+    }
+}
+
+impl TryFrom<BufferTransform> for BufferTransformEncoder {
+    type Error = String;
+
+    fn try_from(value: BufferTransform) -> Result<Self, Self::Error> {
+        match value {
+            BufferTransform::NumpressLinear => Ok(Self(value)),
+            BufferTransform::NumpressSLOF => Ok(Self(value)),
+            BufferTransform::NumpressPIC => Ok(Self(value)),
+        }
+    }
+}
 
 impl BufferTransformEncoder {
     pub fn to_buffer_name(&self, buffer_name: &BufferName) -> BufferName {
@@ -396,7 +419,6 @@ impl BufferTransformEncoder {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressSLOF => {
-                // let meta = self.to_buffer_name(buffer_name).as_field_metadata();
                 let meta = buffer_name.as_field_metadata();
                 let bytes = Field::new(
                     format!("{}_numpress_slof_bytes", buffer_name),
@@ -407,7 +429,6 @@ impl BufferTransformEncoder {
                 bytes
             }
             BufferTransform::NumpressPIC => {
-                // let meta = self.to_buffer_name(buffer_name).as_field_metadata();
                 let meta = buffer_name.as_field_metadata();
                 let bytes = Field::new(
                     format!("{}_numpress_pic_bytes", buffer_name),
@@ -495,14 +516,8 @@ impl BufferTransformEncoder {
     }
 }
 
-impl From<BufferTransform> for BufferTransformEncoder {
-    fn from(value: BufferTransform) -> Self {
-        Self(value)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferTransformDecoder(pub(crate) BufferTransform);
+pub struct BufferTransformDecoder(BufferTransform);
 
 impl BufferTransformDecoder {
     pub fn decode(&self, buffer_name: &BufferName, array: &impl AsArray) -> ArrayRef {
@@ -548,9 +563,26 @@ impl BufferTransformDecoder {
     }
 }
 
-impl From<BufferTransform> for BufferTransformDecoder {
-    fn from(value: BufferTransform) -> Self {
-        Self(value)
+impl TryFrom<Option<BufferTransform>> for BufferTransformDecoder {
+    type Error = <Self as TryFrom<BufferTransform>>::Error;
+
+    fn try_from(value: Option<BufferTransform>) -> Result<Self, Self::Error> {
+        match value {
+            Some(value) => value.try_into(),
+            None => Err(format!("Cannot convert from empty")),
+        }
+    }
+}
+
+impl TryFrom<BufferTransform> for BufferTransformDecoder {
+    type Error = String;
+
+    fn try_from(value: BufferTransform) -> Result<Self, Self::Error> {
+        match value {
+            BufferTransform::NumpressLinear => Ok(Self(value)),
+            BufferTransform::NumpressSLOF => Ok(Self(value)),
+            BufferTransform::NumpressPIC => Ok(Self(value)),
+        }
     }
 }
 
@@ -732,7 +764,10 @@ impl ArrowArrayChunk {
                 {
                     let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                         this_builder.field_builder(i).unwrap();
-                    if let Some(transform) = buf_name.transform.map(BufferTransformEncoder) {
+                    if let Some(transform) = buf_name
+                        .transform
+                        .and_then(|x| BufferTransformEncoder::try_from(x).ok())
+                    {
                         transform.visit_builder(
                             &buf_name,
                             chunk,
@@ -842,7 +877,8 @@ impl ArrowArrayChunk {
         ];
 
         for buffer_name in self.arrays.keys().sorted() {
-            if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
+            if let Ok(transform) = BufferTransformEncoder::try_from(buffer_name.transform)
+            {
                 let f_of = transform.to_field(buffer_name);
                 fields_of.push(Arc::new(f_of));
             } else {
@@ -892,7 +928,8 @@ impl ArrowArrayChunk {
         let main_axis = overrides
             .map(&main_axis)
             .with_format(BufferFormat::Chunked)
-            .with_priority(BufferPriority::Primary);
+            .with_priority(Some(BufferPriority::Primary))
+            .with_sorting_rank(Some(0));
 
         let fields_of: BufferOverrideTable = fields
             .as_ref()
@@ -931,12 +968,12 @@ impl ArrowArrayChunk {
             let buffer_name = fields_of.map(&buffer_name0);
 
             if let Some(fields) = fields {
-                let field_name =
-                    if let Some(transform) = buffer_name.transform.map(BufferTransformEncoder) {
-                        transform.to_field(&buffer_name).name().clone()
-                    } else {
-                        buffer_name.to_field().name().clone()
-                    };
+                let field_name = if let Ok(transform) = BufferTransformEncoder::try_from(buffer_name.transform)
+                {
+                    transform.to_field(&buffer_name).name().clone()
+                } else {
+                    buffer_name.to_field().name().clone()
+                };
                 // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
                 if !fields.find(&field_name).is_some() && buffer_name != main_axis {
                     log::debug!(
@@ -1068,7 +1105,8 @@ impl ArrowArrayChunk {
             {
                 let k = k.clone().with_format(BufferFormat::ChunkedSecondary);
                 let v = v.slice(step.start, step.end - step.start);
-                if let Some(transform) = k.transform.map(BufferTransformEncoder) {
+                if let Ok(transform) = BufferTransformEncoder::try_from(k.transform)
+                {
                     let vi = transform.encode_arrow(&k, &v);
                     chunk_arrays.insert(k, vi);
                 } else {
@@ -1337,7 +1375,8 @@ mod test {
             BufferContext::Spectrum,
             ArrayType::IntensityArray,
             BinaryDataArrayType::Float32,
-        ).with_unit(Unit::DetectorCounts);
+        )
+        .with_unit(Unit::DetectorCounts);
         let intensity_name_tfm = intensity_name
             .clone()
             .with_transform(Some(BufferTransform::NumpressSLOF));
@@ -1370,7 +1409,11 @@ mod test {
             eprintln!("{col}, {}", rendered.column_by_name(col).unwrap().len());
         }
 
-        assert!(rendered.column_by_name("intensity_f32_dc_numpress_slof_bytes").is_some());
+        assert!(
+            rendered
+                .column_by_name("intensity_f32_dc_numpress_slof_bytes")
+                .is_some()
+        );
 
         Ok(())
     }
@@ -1382,7 +1425,8 @@ mod test {
             BufferContext::Spectrum,
             ArrayType::MZArray,
             BinaryDataArrayType::Float32,
-        ).with_unit(Unit::MZ);
+        )
+        .with_unit(Unit::MZ);
 
         let (chunks, _) = ArrowArrayChunk::from_arrays(
             0,

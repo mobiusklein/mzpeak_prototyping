@@ -13,4 +13,4 @@ Description: Reads mzPeak Files and Archives, really.
 License: Apache II
 Encoding: UTF-8
 LazyData: true
-Imports: zip, R6, arrow, nanoparquet, jsonlite, dplyr, methods, logger
+Imports: zip, R6, arrow, nanoparquet, jsonlite, dplyr, methods, logger, purrr

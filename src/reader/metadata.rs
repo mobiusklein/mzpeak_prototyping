@@ -504,9 +504,9 @@ pub(crate) trait SpectrumMetadataQuerySource: BaseMetadataQuerySource {
             &self.parquet_schema(),
             [
                 "spectrum.index",
-                "scan.spectrum_index",
-                "precursor.spectrum_index",
-                "selected_ion.spectrum_index",
+                "scan.spectrum_index", "scan.source_index",
+                "precursor.spectrum_index", "precursor.source_index",
+                "selected_ion.spectrum_index", "selected_ion.source_index",
             ],
         );
 
@@ -624,9 +624,9 @@ pub(crate) trait SpectrumMetadataQuerySource: BaseMetadataQuerySource {
             &self.parquet_schema(),
             [
                 "spectrum.index",
-                "scan.spectrum_index",
-                "precursor.spectrum_index",
-                "selected_ion.spectrum_index",
+                "scan.spectrum_index", "scan.source_index",
+                "precursor.spectrum_index", "precursor.source_index",
+                "selected_ion.spectrum_index", "selected_ion.source_index",
             ],
         );
 
@@ -1077,8 +1077,8 @@ pub(crate) trait ChromatogramMetadataQuerySource: BaseMetadataQuerySource {
             &self.parquet_schema(),
             [
                 "chromatogram.index",
-                "precursor.spectrum_index",
-                "selected_ion.spectrum_index",
+                "precursor.spectrum_index", "precursor.source_index",
+                "selected_ion.spectrum_index", "selected_ion.source_index",
             ],
         );
 

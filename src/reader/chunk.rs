@@ -472,7 +472,7 @@ impl<'a> ChunkDecoder<'a> {
                 name.dtype,
                 name.dtype.size_of() * n,
             );
-            let decoder = name.transform.map(BufferTransformDecoder);
+            let decoder: Option<BufferTransformDecoder> = name.transform.try_into().ok();
 
             macro_rules! extend_array {
                 ($buf:ident, $tp:ty) => {
@@ -1017,7 +1017,7 @@ impl<'a> ChunkScanDecoder<'a> {
         arrays.push(axis);
 
         for (name, chunks) in self.buffers.drain() {
-            let decoder = name.transform.map(BufferTransformDecoder);
+            let decoder: Option<BufferTransformDecoder> = name.transform.try_into().ok();
             let chunks = match decoder {
                 Some(decoder) => {
                     let chunks: Vec<ArrayRef> = chunks

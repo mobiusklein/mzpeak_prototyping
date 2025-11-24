@@ -15,7 +15,8 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::{
     self,
     arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
-    file::page_index::index::Index as ParquetTypedIndex,
+    // file::page_index::index::Index as ParquetTypedIndex,
+    file::page_index::column_index::{PrimitiveColumnIndex, ColumnIndexMetaData as ParquetTypedIndex },
     schema::types::SchemaDescriptor,
 };
 
@@ -245,19 +246,42 @@ pub type PointMZIndexPage = PageIndexEntry<f64>;
 pub type PointIonMobilityIndexPage = PageIndexEntry<f64>;
 pub type PointSpectrumIndexPage = PageIndexEntry<u64>;
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PageMinMaxBounds<T: Copy> {
+    min: Option<T>,
+    max: Option<T>,
+}
+
+impl<T: Copy> PageMinMaxBounds<T> {
+    fn new(min: Option<T>, max: Option<T>) -> Self {
+        Self { min, max }
+    }
+
+    fn from_index(column_index: &PrimitiveColumnIndex<T>) -> impl Iterator<Item = Self> {
+        column_index.min_values_iter().zip(column_index.max_values_iter()).map(|(min, max)| { Self::new(min.copied(), max.copied()) })
+    }
+
+    fn min(&self) -> Option<T> {
+        self.min
+    }
+
+    fn max(&self) -> Option<T> {
+        self.max
+    }
+}
+
+
 macro_rules! read_pages {
     ($rg:ident, $i:ident, $native_index:expr, $vtype:ty, $pages:ident, $total_rows:ident, $offset_list:ident) => {
-        for (page_i, (q, offset)) in $native_index
-            .indexes
-            .iter()
+        for (page_i, (q, offset)) in PageMinMaxBounds::from_index($native_index)
             .zip($offset_list.page_locations().iter())
             .enumerate()
         {
             if q.min().is_none() {
                 continue;
             }
-            let min = *q.min().unwrap() as $vtype;
-            let max = *q.max().unwrap() as $vtype;
+            let min = q.min().unwrap() as $vtype;
+            let max = q.max().unwrap() as $vtype;
             let start_row = offset.first_row_index + $total_rows;
             let end_row =
                 if let Some(next_loc) = $offset_list.page_locations().get(page_i + 1) {

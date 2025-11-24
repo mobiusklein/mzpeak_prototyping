@@ -198,6 +198,7 @@ pub enum MzPeakArchiveType {
     ChromatogramMetadata,
     ChromatogramDataArrays,
     Other,
+    Proprietary,
 }
 
 impl MzPeakArchiveType {
@@ -209,6 +210,7 @@ impl MzPeakArchiveType {
             MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.mzpeak",
             MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.mzpeak",
             MzPeakArchiveType::Other => "",
+            MzPeakArchiveType::Proprietary => "",
         }
     }
 
@@ -387,6 +389,16 @@ impl ZipArchiveSource {
         })
     }
 
+    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
+        if let Some(index) = self.file_names.iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
+    }
+
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = self.archive_file.try_clone()?;
         zip_archive_open_entry(handle, index, self.archive_offset.clone())
@@ -438,6 +450,16 @@ impl SplittingZipArchiveSource {
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = fs::File::open(self.archive_file.as_path())?;
         zip_archive_open_entry(handle, index, self.archive_offset.clone())
+    }
+
+    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
+        if let Some(index) = self.file_names.iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -500,6 +522,17 @@ pub trait ArchiveSource: Sized + 'static {
 
     /// Open a file stream by it's index
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File>;
+
+    /// Open a file stream by it's name
+    fn open_stream(&self, name: &str) -> io::Result<Self::File> {
+        if let Some(index) = self.file_names().iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
+    }
 
     /// Load the Parquet metadata for the specified index.
     ///
@@ -600,6 +633,16 @@ impl DirectorySource {
             file_names,
             file_index: file_index.unwrap_or_default(),
         })
+    }
+
+    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
+        if let Some(index) = self.file_names.iter().position(|v| v == name) {
+            self.open_entry_by_index(index)
+        } else {
+            Err(
+                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
+            )
+        }
     }
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
@@ -730,10 +773,14 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
                 MzPeakArchiveType::ChromatogramDataArrays => {
                     members.chromatogram_data_arrays = Some(entry)
                 }
-                MzPeakArchiveType::Other => {}
+                MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary => {}
             }
         }
         Ok(Self { archive, members })
+    }
+
+    pub fn file_index(&self) -> &FileIndex {
+        self.archive.file_index()
     }
 
     pub fn from_path(archive_path: PathBuf) -> io::Result<Self> {
@@ -803,6 +850,16 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
                 "Spectrum metadata entry not found",
             ))
         }
+    }
+
+    /// List of the names of the files within the archive
+    pub fn list_files(&self) -> &[String] {
+        self.archive.file_names()
+    }
+
+    /// Open a raw readable stream for the requested file name
+    pub fn open_stream(&self, name: &str) -> Result<<T as ArchiveSource>::File, io::Error> {
+        self.archive.open_stream(name)
     }
 }
 

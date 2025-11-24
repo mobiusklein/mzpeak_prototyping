@@ -12,6 +12,8 @@ pub enum DataKind {
     Peaks,
     #[serde(rename="metadata")]
     Metadata,
+    #[serde(rename="proprietary")]
+    Proprietary,
     #[serde(rename="other")]
     Other(String),
 }
@@ -24,6 +26,7 @@ impl FromStr for DataKind {
             "data arrays" => Self::DataArray,
             "peaks" => Self::Peaks,
             "metadata" => Self::Metadata,
+            "proprietary" => Self::Proprietary,
             "other" => Self::Other("other".into()),
             _ => Self::Other(s.to_string())
         })
@@ -93,6 +96,7 @@ impl From<super::MzPeakArchiveType> for FileEntry {
             super::MzPeakArchiveType::ChromatogramMetadata => FileEntry::new(value.tag_file_suffix().into(), EntityType::Chromatogram, DataKind::Metadata),
             super::MzPeakArchiveType::ChromatogramDataArrays => FileEntry::new(value.tag_file_suffix().into(), EntityType::Chromatogram, DataKind::DataArray),
             super::MzPeakArchiveType::Other => FileEntry::new("".into(), "other".parse().unwrap(), DataKind::Other("other".into())),
+            super::MzPeakArchiveType::Proprietary => FileEntry::new("".into(), EntityType::Other("".into()), DataKind::Proprietary),
         }
     }
 }

@@ -11,9 +11,7 @@ use arrow::{
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::{
-    arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions},
-    basic::Compression,
-    format::KeyValue,
+    arrow::{ArrowWriter, arrow_writer::ArrowWriterOptions}, basic::Compression, file::metadata::KeyValue
 };
 
 use mzdata::{
@@ -24,9 +22,9 @@ use mzdata::{
 };
 
 use crate::{
-    archive::{MzPeakArchiveType, ZipArchiveWriter}, buffer_descriptors::{BufferOverrideTable, BufferPriority}, peak_series::{
-        ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays
-    }
+    archive::{MzPeakArchiveType, ZipArchiveWriter},
+    buffer_descriptors::{BufferOverrideTable, BufferPriority},
+    peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays}, writer::builder::SpectrumFieldVisitors,
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -88,7 +86,10 @@ fn _eval_spectra_from_iter_for_fields<
                     ArrowArrayChunk::from_arrays(
                         0,
                         None,
-                        MZ_ARRAY.clone().with_priority(BufferPriority::Primary),
+                        MZ_ARRAY
+                            .clone()
+                            .with_priority(Some(BufferPriority::Primary))
+                            .with_sorting_rank(Some(1)),
                         map,
                         use_chunked_encoding,
                         overrides,
@@ -278,7 +279,11 @@ impl<
 
     fn check_data_buffer(&mut self) -> io::Result<()> {
         if self.spectrum_counter() % (self.buffer_size as u64) == 0 {
-            log::debug!("Flushing data buffer. {} spectra written so far. {} rows in the buffer", self.spectrum_counter(), self.buffered_spectrum_data());
+            log::debug!(
+                "Flushing data buffer. {} spectra written so far. {} rows in the buffer",
+                self.spectrum_counter(),
+                self.buffered_spectrum_data()
+            );
             self.flush_data_arrays()?;
         }
         Ok(())
@@ -339,8 +344,13 @@ impl<
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
         write_batch_config: WriteBatchConfig,
+        spectrum_fields: SpectrumFieldVisitors,
     ) -> Self {
-        let spectrum_metadata_buffer = SpectrumBuilder::default();
+        let mut spectrum_metadata_buffer = SpectrumBuilder::default();
+        spectrum_metadata_buffer.spectrum.extend_extra_fields(spectrum_fields.spectrum_fields);
+        spectrum_metadata_buffer.scan.extend_extra_fields(spectrum_fields.spectrum_scan_fields);
+        spectrum_metadata_buffer.selected_ion.extend_extra_fields(spectrum_fields.spectrum_selected_ion_fields);
+        spectrum_metadata_buffer.precursor.extend_extra_activation_fields(spectrum_fields.spectrum_activation_fields);
 
         let spectrum_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
             spectrum_buffers_builder
@@ -545,7 +555,7 @@ impl<
                 writer.add_file_from_read(
                     &mut peak_file,
                     Some(&MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()),
-                    Some(MzPeakArchiveType::SpectrumPeakDataArrays.into())
+                    Some(MzPeakArchiveType::SpectrumPeakDataArrays.into()),
                 )?;
             }
 
@@ -658,6 +668,5 @@ impl<
         Ok(())
     }
 }
-
 
 pub type MzPeakWriter<W> = MzPeakWriterType<W, CentroidPeak, DeconvolutedPeak>;

@@ -63,8 +63,8 @@ pub fn array_map_to_schema_arrays_and_excess(
     context: BufferContext,
     array_map: &BinaryArrayMap,
     primary_array_len: usize,
-    spectrum_index: u64,
-    spectrum_time: Option<f32>,
+    source_index: u64,
+    source_time: Option<f32>,
     schema: Option<&Fields>,
     overrides: &BufferOverrideTable,
 ) -> Result<(Fields, Vec<ArrayRef>, Vec<AuxiliaryArray>), ArrayRetrievalError> {
@@ -73,12 +73,12 @@ pub fn array_map_to_schema_arrays_and_excess(
     let mut auxiliary = Vec::new();
 
     fields.push(context.index_field());
-    let index_array = Arc::new(UInt64Array::from_value(spectrum_index, primary_array_len));
+    let index_array = Arc::new(UInt64Array::from_value(source_index, primary_array_len));
     arrays.push(index_array as ArrayRef);
-    if let Some(spectrum_time) = spectrum_time {
+    if let Some(source_time) = source_time {
         fields.push(context.time_field());
         arrays.push(Arc::new(Float32Array::from_value(
-            spectrum_time,
+            source_time,
             primary_array_len,
         )));
     }
@@ -128,16 +128,16 @@ pub fn array_map_to_schema_arrays(
     context: BufferContext,
     array_map: &BinaryArrayMap,
     primary_array_len: usize,
-    spectrum_index: u64,
-    spectrum_time: Option<f32>,
+    source_index: u64,
+    source_time: Option<f32>,
     overrides: &BufferOverrideTable,
 ) -> Result<(Fields, Vec<ArrayRef>), ArrayRetrievalError> {
     let (fields, arrays, _aux) = array_map_to_schema_arrays_and_excess(
         context,
         array_map,
         primary_array_len,
-        spectrum_index,
-        spectrum_time,
+        source_index,
+        source_time,
         None,
         overrides,
     )?;
@@ -166,7 +166,8 @@ pub const MZ_ARRAY: BufferName = BufferName::new(
     ArrayType::MZArray,
     BinaryDataArrayType::Float64,
 )
-.with_unit(Unit::MZ);
+.with_unit(Unit::MZ)
+.with_sorting_rank(Some(0));
 pub const INTENSITY_ARRAY: BufferName = BufferName::new(
     BufferContext::Spectrum,
     ArrayType::IntensityArray,

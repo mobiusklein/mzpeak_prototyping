@@ -45,42 +45,17 @@ static size_t seg_read(void *ptr, size_t size, size_t nitems,
                        Rconnection con) {
   ConnectionSegment* myconn = con->private;
   size_t to_read = size * nitems;
-  // printf(
-  //   "Asked to read %zu bytes at position %zu, for %zu items of size %zu\n",
-  //   to_read,
-  //   myconn->position,
-  //   nitems,
-  //   size
-  // );
   fseeko64(myconn->stream, myconn->offset + myconn->position, SEEK_SET);
   if ((to_read + myconn->position) > myconn->size) {
     size_t remaining_bytes = (myconn->size - myconn->position);
     size_t remaining_items = remaining_bytes / size;
-    printf("Had to reduce to %zu items for a total of %zu bytes\n", remaining_items, remaining_bytes);
+    // printf("Had to reduce to %zu items for a total of %zu bytes\n", remaining_items, remaining_bytes);
     fread(ptr, size, remaining_items, myconn->stream);
     myconn->position += remaining_items * size;
     return remaining_items;
   } else {
-    size_t n_bytes_read = fread(ptr, size, nitems, myconn->stream) * size;
-    // printf(
-    //   "Expected to read %zu bytes, consumed %zu bytes\n",
-    //   to_read,
-    //   n_bytes_read
-    // );
+    fread(ptr, size, nitems, myconn->stream);
     myconn->position += to_read;
-    // char* data = (char*)ptr;
-    // size_t was_zero = 0;
-    // for(size_t i = 0; i < to_read; i++) {
-    //   was_zero += (data[i] == 0);
-    // }
-    // printf("%zu of %zu bytes read were null\n", was_zero, to_read);
-    // printf(
-    //   "Read ended at %zu, stream position %zu + %zu\n",
-    //   myconn->position,
-    //   ftello64(myconn->stream) - myconn->offset,
-    //   myconn->offset
-    // );
-
     return nitems;
   }
 }
@@ -143,7 +118,7 @@ static int read_zip_header_for_size(ConnectionSegment* myconn, size_t* bytes_rea
 static Rboolean seg_open(Rconnection con) {
   ConnectionSegment* myconn = (ConnectionSegment*) con->private;
   myconn->stream = fopen(myconn->source_name, "rb");
-  printf("Seeking to %zu within %s\n", myconn->offset, myconn->source_name);
+  // printf("Seeking to %zu within %s\n", myconn->offset, myconn->source_name);
   fseeko64(myconn->stream, myconn->offset, SEEK_SET);
   myconn->position = 0;
 
@@ -175,13 +150,13 @@ static void seg_close(Rconnection con) {
 
 static double seg_seek(Rconnection con, double where, int origin, int rw) {
   ConnectionSegment* myconn = (ConnectionSegment*) con->private;
-  printf("Seeking %f from origin %d\n", where, origin);
+  // printf("Seeking %f from origin %d\n", where, origin);
   if (isnan(where)) {
     return myconn->position;
   }
   if (origin == 1) {
     if ((size_t)where > myconn->size) {
-      printf("Asked to seek from start beyond %zu, clamping to size", myconn->size);
+      // printf("Asked to seek from start beyond %zu, clamping to size", myconn->size);
       where = myconn->size;
     }
     size_t newpos = myconn->offset + (size_t)where;
@@ -190,7 +165,7 @@ static double seg_seek(Rconnection con, double where, int origin, int rw) {
   }
   else if (origin == 3) {
     if (fabs(where) > myconn->size) {
-      printf("Asked to seek from end beyond %zu, clamping to size", myconn->size);
+      // printf("Asked to seek from end beyond %zu, clamping to size", myconn->size);
       where = myconn->size;
     }
     size_t newpos = (myconn->offset + myconn->size) - (size_t)where;
@@ -199,7 +174,7 @@ static double seg_seek(Rconnection con, double where, int origin, int rw) {
   }
   else if (origin == 2) {
     if ((where + myconn->position) > myconn->size) {
-      printf("Asked to seek from current beyond %zu, clamping to size", myconn->size);
+      // printf("Asked to seek from current beyond %zu, clamping to size", myconn->size);
       where = myconn->size - myconn->position;
     }
     fseeko64(myconn->stream, myconn->offset + myconn->position + where, SEEK_SET);
@@ -207,7 +182,7 @@ static double seg_seek(Rconnection con, double where, int origin, int rw) {
   } else {
     error("Could not interpret seek origin");
   }
-  printf("Stream position is %zu post-seek, virtual position is %zu\n", ftello64(myconn->stream), myconn->position);
+  // printf("Stream position is %zu post-seek, virtual position is %zu\n", ftello64(myconn->stream), myconn->position);
   return (double) myconn->position;
 }
 

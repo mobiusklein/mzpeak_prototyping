@@ -1,7 +1,9 @@
 use arrow::datatypes::{DataType, Field, FieldRef};
 use mzdata::{
     params::Unit,
-    spectrum::{ArrayType, BinaryDataArrayType},
+    spectrum::{
+        Activation, ArrayType, BinaryDataArrayType, ScanEvent, SelectedIon, SpectrumDescription,
+    },
 };
 
 use parquet::basic::{Compression, ZstdLevel};
@@ -11,7 +13,10 @@ use std::{io::prelude::*, sync::Arc};
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
     chunk_series::ChunkingStrategy,
-    writer::{ArrayBuffersBuilder, MzPeakWriterType, UnpackedMzPeakWriterType},
+    writer::{
+        ArrayBuffersBuilder, MzPeakWriterType, SpectrumVisitor, StructVisitorBuilder,
+        UnpackedMzPeakWriterType,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -21,6 +26,15 @@ pub struct WriteBatchConfig {
     pub row_group_size: Option<usize>,
     pub dictionary_page_size: Option<usize>,
 }
+
+
+pub struct SpectrumFieldVisitors {
+    pub(crate) spectrum_fields: Vec<SpectrumVisitor>,
+    pub(crate) spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
+    pub(crate) spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
+    pub(crate) spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
+}
+
 
 /// A builder for mzPeak writers
 ///
@@ -37,6 +51,10 @@ pub struct MzPeakWriterBuilder {
     // The schema to store peaks under, separate from the profile data (if any)
     store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
     write_batch_config: WriteBatchConfig,
+    spectrum_fields: Vec<SpectrumVisitor>,
+    spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
+    spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
+    spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
 }
 
 impl Default for MzPeakWriterBuilder {
@@ -54,6 +72,10 @@ impl Default for MzPeakWriterBuilder {
             compression: Compression::ZSTD(ZstdLevel::default()),
             store_peaks_and_profiles_apart: None,
             write_batch_config: Default::default(),
+            spectrum_fields: Vec::new(),
+            spectrum_selected_ion_fields: Vec::new(),
+            spectrum_scan_fields: Vec::new(),
+            spectrum_activation_fields: Vec::new(),
         }
     }
 }
@@ -89,7 +111,7 @@ impl MzPeakWriterBuilder {
 
     /// Add a rule to store the `from` buffer as the type given by the `to` buffer name for the
     /// spectrum data.
-    pub fn add_spectrum_override(
+    pub fn add_spectrum_array_override(
         mut self,
         from: impl Into<BufferName>,
         to: impl Into<BufferName>,
@@ -122,7 +144,7 @@ impl MzPeakWriterBuilder {
 
     /// Add a rule to store the `from` buffer as the type given by the `to` buffer name for the
     /// chromatogram data.
-    pub fn add_chromatogram_override(
+    pub fn add_chromatogram_array_override(
         mut self,
         from: impl Into<BufferName>,
         to: impl Into<BufferName>,
@@ -182,6 +204,39 @@ impl MzPeakWriterBuilder {
         self
     }
 
+    pub fn add_spectrum_param_field<T: StructVisitorBuilder<SpectrumDescription>>(
+        mut self,
+        visitor: T,
+    ) -> MzPeakWriterBuilder {
+        self.spectrum_fields
+            .push(SpectrumVisitor::Description(Box::new(visitor)));
+        self
+    }
+
+    pub fn add_spectrum_selected_ion_param_field<T: StructVisitorBuilder<SelectedIon>>(
+        mut self,
+        visitor: T,
+    ) -> MzPeakWriterBuilder {
+        self.spectrum_selected_ion_fields.push(Box::new(visitor));
+        self
+    }
+
+    pub fn add_spectrum_scan_field<T: StructVisitorBuilder<ScanEvent>>(
+        mut self,
+        visitor: T,
+    ) -> MzPeakWriterBuilder {
+        self.spectrum_scan_fields.push(Box::new(visitor));
+        self
+    }
+
+    pub fn add_spectrum_activation_field<T: StructVisitorBuilder<Activation>>(
+        mut self,
+        visitor: T,
+    ) -> MzPeakWriterBuilder {
+        self.spectrum_activation_fields.push(Box::new(visitor));
+        self
+    }
+
     /// Build an unpacked writer, a directory on disk where all files can be written to at once,
     /// but may be more work to move about.
     pub fn build_unpacked(
@@ -189,6 +244,12 @@ impl MzPeakWriterBuilder {
         path: PathBuf,
         mask_zero_intensity_runs: bool,
     ) -> UnpackedMzPeakWriterType {
+        let spectrum_fields = SpectrumFieldVisitors {
+            spectrum_activation_fields: self.spectrum_activation_fields,
+            spectrum_fields: self.spectrum_fields,
+            spectrum_scan_fields: self.spectrum_scan_fields,
+            spectrum_selected_ion_fields: self.spectrum_selected_ion_fields,
+        };
         UnpackedMzPeakWriterType::new(
             path,
             self.spectrum_arrays,
@@ -200,6 +261,7 @@ impl MzPeakWriterBuilder {
             self.compression,
             self.store_peaks_and_profiles_apart,
             self.write_batch_config,
+            spectrum_fields,
         )
     }
 
@@ -210,6 +272,12 @@ impl MzPeakWriterBuilder {
         writer: W,
         mask_zero_intensity_runs: bool,
     ) -> MzPeakWriterType<W> {
+        let spectrum_fields = SpectrumFieldVisitors {
+            spectrum_activation_fields: self.spectrum_activation_fields,
+            spectrum_fields: self.spectrum_fields,
+            spectrum_scan_fields: self.spectrum_scan_fields,
+            spectrum_selected_ion_fields: self.spectrum_selected_ion_fields,
+        };
         MzPeakWriterType::new(
             writer,
             self.spectrum_arrays,
@@ -221,6 +289,7 @@ impl MzPeakWriterBuilder {
             self.compression,
             self.store_peaks_and_profiles_apart,
             self.write_batch_config,
+            spectrum_fields,
         )
     }
 
