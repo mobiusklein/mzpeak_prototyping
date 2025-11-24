@@ -412,7 +412,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
                 MzPeakArchiveType::ChromatogramDataArrays => {
                     members.chromatogram_data_arrays = Some(entry)
                 }
-                MzPeakArchiveType::Other => {}
+                MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary => {}
             }
         }
         Ok(Self {

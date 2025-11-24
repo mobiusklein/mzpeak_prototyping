@@ -865,10 +865,7 @@ pub(crate) const fn arrow_to_array_type(data_type: &DataType) -> Option<BinaryDa
 
 impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
     fn from(value: ArrayIndexEntry) -> Self {
-        let context = match value.context {
-            BufferContext::Spectrum => "spectrum".into(),
-            BufferContext::Chromatogram => "chromatogram".into(),
-        };
+        let context = value.context.name().to_string();
 
         Self {
             context,

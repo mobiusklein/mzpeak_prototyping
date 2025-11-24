@@ -136,7 +136,7 @@ Keep in mind that all Numpress compression methods are still available and still
 
 When storing data arrays, the point layout stores the data as-is in parallel arrays alongside a repeated index column.
 
-| spectrum_index | mz_array | intensity_array |
+| spectrum_index | mz | intensity |
 | :-----:        | :------: | :---------: |
 | 1              | 213.2    | 1002 |
 | 1              | 506.9    | 500 |
@@ -152,7 +152,7 @@ This layout is simple, but carries several advantages. Scalar columns are easily
 
 When storing data arrays, the chunked layout treats one array, which must be sorted, as the "primary" axis, cutting the array into chunks of a fixed size along that coordinate space (e.g. steps of 50 m/z) and taking the same segments from parallel arrays. The primary axis chunks' start, end, and a repeated index are recorded as columns, and then each array may be encoded as-is or with an opaque transform (e.g. δ-encoding, Numpress). The start and end interval permits granular random access along the primary axis as well as the source index.
 
-| spectrum_index | mz_array_start | mz_array_end | mz_array_chunk_values | intensity_array |
+| spectrum_index | *mz_chunk_start* | *mz_chunk_end* | *mz_chunk_values* | intensity |
 | :-----:        | :------: | :---------: |:--- | :---
 | 1              | 200.0    | 250.0 | [0.0013, ..., 0.0013] | [...]
 | 1              | 250.0    | 300.0 | [0.0014, ..., 0.0014] | [...]
@@ -162,7 +162,7 @@ When storing data arrays, the chunked layout treats one array, which must be sor
 | 2              | 350.0    | 400.0 | [0.0014, ..., 0.0014] | [...]
 | 2              | 400.0    | 450.0 | [0.0013, ..., 0.0014] | [...]
 
-This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_array_chunk_values` list aren't accessible to the page index, but the start and end columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
+This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_chunk_values` list aren't accessible to the page index, but the `_chunk_start` and `_chunk_end` columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
 
 
 ## Conversion Program

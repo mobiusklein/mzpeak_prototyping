@@ -20,9 +20,14 @@ from pyarrow import parquet as pq
 
 from .mz_reader import _BatchIterator, MzPeakArrayDataReader, BufferFormat
 from .file_index import FileIndex, DataKind, EntityType
+from .util import OntologyMapper
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+CV_MAPPER = OntologyMapper(
+    overrides={"mz_signal_continuity": "spectrum representation"}
+)
 
 
 class ArchiveStorage(Enum):
@@ -145,6 +150,7 @@ def _format_param(param: dict):
 def _clean_frame(df: pd.DataFrame):
     columns = df.columns[~df.isna().all(axis=0)]
     df = df[columns]
+    df = CV_MAPPER.clean_column_names(df)
     return df
 
 

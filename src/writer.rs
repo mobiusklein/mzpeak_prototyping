@@ -24,7 +24,7 @@ use mzdata::{
 use crate::{
     archive::{MzPeakArchiveType, ZipArchiveWriter},
     buffer_descriptors::{BufferOverrideTable, BufferPriority},
-    peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays},
+    peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays}, writer::builder::SpectrumFieldVisitors,
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -344,8 +344,13 @@ impl<
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
         write_batch_config: WriteBatchConfig,
+        spectrum_fields: SpectrumFieldVisitors,
     ) -> Self {
-        let spectrum_metadata_buffer = SpectrumBuilder::default();
+        let mut spectrum_metadata_buffer = SpectrumBuilder::default();
+        spectrum_metadata_buffer.spectrum.extend_extra_fields(spectrum_fields.spectrum_fields);
+        spectrum_metadata_buffer.scan.extend_extra_fields(spectrum_fields.spectrum_scan_fields);
+        spectrum_metadata_buffer.selected_ion.extend_extra_fields(spectrum_fields.spectrum_selected_ion_fields);
+        spectrum_metadata_buffer.precursor.extend_extra_activation_fields(spectrum_fields.spectrum_activation_fields);
 
         let spectrum_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
             spectrum_buffers_builder

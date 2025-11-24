@@ -198,6 +198,7 @@ pub enum MzPeakArchiveType {
     ChromatogramMetadata,
     ChromatogramDataArrays,
     Other,
+    Proprietary,
 }
 
 impl MzPeakArchiveType {
@@ -209,6 +210,7 @@ impl MzPeakArchiveType {
             MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.mzpeak",
             MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.mzpeak",
             MzPeakArchiveType::Other => "",
+            MzPeakArchiveType::Proprietary => "",
         }
     }
 
@@ -771,7 +773,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
                 MzPeakArchiveType::ChromatogramDataArrays => {
                     members.chromatogram_data_arrays = Some(entry)
                 }
-                MzPeakArchiveType::Other => {}
+                MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary => {}
             }
         }
         Ok(Self { archive, members })

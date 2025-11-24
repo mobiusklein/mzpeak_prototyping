@@ -14,9 +14,15 @@ use parquet::{
 use mzdata::{meta::FileMetadataConfig, prelude::*};
 
 use crate::{
-    archive::MzPeakArchiveType, chunk_series::ChunkingStrategy, peak_series::ArrayIndex, writer::{
-        implement_mz_metadata, AbstractMzPeakWriter, ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder, VisitorBase, WriteBatchConfig
-    }, BufferContext, ToMzPeakDataSeries
+    BufferContext, ToMzPeakDataSeries,
+    archive::MzPeakArchiveType,
+    chunk_series::ChunkingStrategy,
+    peak_series::ArrayIndex,
+    writer::{
+        AbstractMzPeakWriter, ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder,
+        ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder, VisitorBase, WriteBatchConfig,
+        builder::SpectrumFieldVisitors, implement_mz_metadata,
+    },
 };
 
 /// Writer for the MzPeak format that writes the different data types to separate files
@@ -41,7 +47,6 @@ pub struct UnpackedMzPeakWriterType<
 
     #[allow(unused)]
     chromatogram_data_point_counter: u64,
-
 
     buffer_size: usize,
     compression: Compression,
@@ -132,6 +137,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
         write_batch_config: WriteBatchConfig,
+        spectrum_fields: SpectrumFieldVisitors,
     ) -> Self {
         let data_writer_path = path.join(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix());
         let metadata_writer_path = path.join(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix());
@@ -139,7 +145,19 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
         let spectrum_data_writer = fs::File::create(data_writer_path).unwrap();
         let spectrum_metadata_writer = fs::File::create(metadata_writer_path).unwrap();
 
-        let spectrum_metadata_buffer = SpectrumBuilder::default();
+        let mut spectrum_metadata_buffer = SpectrumBuilder::default();
+        spectrum_metadata_buffer
+            .spectrum
+            .extend_extra_fields(spectrum_fields.spectrum_fields);
+        spectrum_metadata_buffer
+            .scan
+            .extend_extra_fields(spectrum_fields.spectrum_scan_fields);
+        spectrum_metadata_buffer
+            .selected_ion
+            .extend_extra_fields(spectrum_fields.spectrum_selected_ion_fields);
+        spectrum_metadata_buffer
+            .precursor
+            .extend_extra_activation_fields(spectrum_fields.spectrum_activation_fields);
 
         let fields: Vec<FieldRef> = spectrum_metadata_buffer.fields();
         let metadata_fields: SchemaRef = Arc::new(Schema::new(fields));

@@ -51,7 +51,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       spectra <- data_table$GetColumnByName("spectrum")
       if (!is.null(spectra)) {
-        self$spectra <- chunks_to_table(spectra)
+        self$spectra <- .chunks_to_table(spectra)
       }
 
       # Extract the scan partition.
@@ -59,7 +59,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       scans <- data_table$GetColumnByName("scan")
       if (!is.null(scans)) {
-        self$scans <- chunks_to_table(scans)
+        self$scans <- .chunks_to_table(scans)
       }
 
       # Extract the precursor partition.
@@ -67,7 +67,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       precursors <- data_table$GetColumnByName("precursor")
       if (!is.null(precursors)) {
-        self$precursors <- chunks_to_table(precursors)
+        self$precursors <- .chunks_to_table(precursors)
       }
 
       # Extract the selected ion partition.
@@ -75,7 +75,7 @@ MZPeakSpectrumMetadataFile <- R6::R6Class(
       # column is NULL.
       selected_ions <- data_table$GetColumnByName("selected_ion")
       if (!is.null(selected_ions)) {
-        self$selected_ions <- chunks_to_table(selected_ions)
+        self$selected_ions <- .chunks_to_table(selected_ions)
       }
     }
   ),
@@ -115,7 +115,7 @@ MZPeakChromatogramMetadataFile <- R6::R6Class(
       # column is NULL.
       chromatograms <- data_table$GetColumnByName("chromatogram")
       if (!is.null(chromatograms)) {
-        self$chromatograms <- chunks_to_table(chromatograms)
+        self$chromatograms <- .chunks_to_table(chromatograms)
       }
 
       # Extract the precursor partition.
@@ -123,7 +123,7 @@ MZPeakChromatogramMetadataFile <- R6::R6Class(
       # column is NULL.
       precursors <- data_table$GetColumnByName("precursor")
       if (!is.null(precursors)) {
-        self$precursors <- chunks_to_table(precursors)
+        self$precursors <- .chunks_to_table(precursors)
       }
 
       # Extract the selected ion partition.
@@ -131,7 +131,7 @@ MZPeakChromatogramMetadataFile <- R6::R6Class(
       # column is NULL.
       selected_ions <- data_table$GetColumnByName("selected_ion")
       if (!is.null(selected_ions)) {
-        self$selected_ions <- chunks_to_table(selected_ions)
+        self$selected_ions <- .chunks_to_table(selected_ions)
       }
     }
   ),
@@ -164,13 +164,8 @@ MZPeakChromatogramDataFile <- R6::R6Class(
       # to read data later.
       self$index_bins <- build_index_bins_direct(self$handle, 0)
     },
-    # A helper method to determine which row group(s) to search
-    row_groups_for_index = function(index) {
-      row_groups = self$index_bins[(self$index_bins$min_value <= index) &&
-                                     (self$index_bins$max_value >= index), ]$row_group
-      row_groups
-    },
-    # Read the actual signal data associated with a spectrum
+    #' @description
+    #' Read the actual signal data associated with a chromatogram
     read_chromatogram = function(index) {
       if (length(index) > 1) {
         values <- lapply(index, self$read_chromatogram)
@@ -191,6 +186,14 @@ MZPeakChromatogramDataFile <- R6::R6Class(
       } else {
         stop("error: not implemented")
       }
+    }
+  ),
+  private = list(
+    # A helper method to determine which row group(s) to search
+    row_groups_for_index = function(index) {
+      row_groups = self$index_bins[(self$index_bins$min_value <= index) &&
+                                     (self$index_bins$max_value >= index), ]$row_group
+      row_groups
     }
   )
 )
@@ -223,13 +226,8 @@ MZPeakSpectrumDataFile <- R6::R6Class(
       # fill in NULL-marked positions.
       self$mz_delta_models <- NULL
     },
-    # A helper method to determine which row group(s) to search
-    row_groups_for_index = function(index) {
-      row_groups = self$index_bins[(self$index_bins$min_value <= index) &&
-                                     (self$index_bins$max_value >= index), ]$row_group
-      row_groups
-    },
-    # Read the actual signal data associated with a spectrum
+    #' @description
+    #' Read the actual signal data associated with a spectrum
     read_spectrum = function(index) {
       if (length(index) > 1) {
         values <- lapply(index, self$read_spectrum)
@@ -271,9 +269,19 @@ MZPeakSpectrumDataFile <- R6::R6Class(
         stop("error: not implemented")
       }
     },
+    #' @description
+    #' Configure the m/z delta models
     set_mz_delta_models = function(models) {
       self$mz_delta_models = models
     }
+  ),
+  private=list(
+    # A helper method to determine which row group(s) to search
+    row_groups_for_index = function(index) {
+      row_groups = self$index_bins[(self$index_bins$min_value <= index) &&
+                                     (self$index_bins$max_value >= index), ]$row_group
+      row_groups
+    },
   )
 )
 
@@ -431,6 +439,7 @@ MZPeakFile <- R6::R6Class(
 length.MZPeakSpectrumDataFile <- function(self) {
   as.numeric(self$meta$spectrum_count)
 }
+
 length.MZPeakFile <- function(self) {
   length(self$spectrum_metadata$spectra)
 }
@@ -440,7 +449,7 @@ dim.MZPeakFile <- function(self) {
 }
 
 
-chunks_to_table <- function(chunked_array, mask_column = 0) {
+.chunks_to_table <- function(chunked_array, mask_column = 0) {
   columns_of <- names(chunked_array$type)
   chunks <- lapply(chunked_array$chunks, function(chunk) {
     chunk <- if (chunk$field(mask_column)$null_count > 0) {

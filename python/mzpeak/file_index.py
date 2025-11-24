@@ -114,3 +114,6 @@ class FileIndex(MutableSequence[FileEntry]):
     def from_json(cls, data: dict) -> 'FileIndex':
         files = [FileEntry.from_json(f) for f in data['files']]
         return cls(files, data['metadata'])
+
+
+__all__ = ["FileIndex", "FileEntry", "EntityType", "DataKind"]

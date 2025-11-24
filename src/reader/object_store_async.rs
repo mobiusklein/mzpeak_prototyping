@@ -35,11 +35,22 @@ use parquet::{
 use url::Url;
 
 use crate::{
-    archive::{AsyncArchiveReader, AsyncArchiveSource, AsyncZipArchiveSource}, filter::RegressionDeltaModel, reader::{
-        chunk::{AsyncSpectrumChunkReader, DataChunkCache}, index::{PageQuery, QueryIndex, SpanDynNumeric}, metadata::{
-            AuxiliaryArrayCountDecoder, BaseMetadataQuerySource, ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource, DeltaModelDecoder, ParquetIndexExtractor, SpectrumMetadataDecoder, SpectrumMetadataQuerySource, TimeIndexDecoder
-        }, point::{AsyncPointDataReader, DataPointCache, PointDataArrayReader}, utils::MaskSet, visitor::AuxiliaryArrayVisitor, ReaderMetadata, CHUNK_CACHE_BLOCK_SIZE
-    }, BufferContext
+    BufferContext,
+    archive::{AsyncArchiveReader, AsyncArchiveSource, AsyncZipArchiveSource},
+    filter::RegressionDeltaModel,
+    reader::{
+        CHUNK_CACHE_BLOCK_SIZE, ReaderMetadata,
+        chunk::{AsyncSpectrumChunkReader, DataChunkCache},
+        index::{PageQuery, QueryIndex, SpanDynNumeric},
+        metadata::{
+            AuxiliaryArrayCountDecoder, BaseMetadataQuerySource, ChromatogramMetadataDecoder,
+            ChromatogramMetadataQuerySource, DeltaModelDecoder, ParquetIndexExtractor,
+            SpectrumMetadataDecoder, SpectrumMetadataQuerySource, TimeIndexDecoder,
+        },
+        point::{AsyncPointDataReader, DataPointCache, PointDataArrayReader},
+        utils::MaskSet,
+        visitor::AuxiliaryArrayVisitor,
+    },
 };
 
 pub(crate) struct SpectrumMetadataReader<T: AsyncFileReader + 'static + Unpin + Send>(
@@ -730,7 +741,11 @@ impl<
         let has_ms_level_range = ms_level_range.is_some();
         let ms_level_range = ms_level_range.unwrap_or_default();
         let columns_for_predicate: &[&str] = if has_ms_level_range {
-            &["spectrum.time", "spectrum.ms_level"]
+            &[
+                "spectrum.time",
+                "spectrum.ms_level",
+                "spectrum.MS_1000511_ms_level",
+            ]
         } else {
             &["spectrum.time"]
         };
@@ -741,12 +756,12 @@ impl<
         );
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
-            let times = batch.column(0).as_struct().column_by_name("time").unwrap();
+            let root = batch.column(0).as_struct();
+            let times = root.column_by_name("time").unwrap();
             if has_ms_level_range {
-                let ms_levels = batch
-                    .column(0)
-                    .as_struct()
+                let ms_levels = root
                     .column_by_name("ms_level")
+                    .or_else(|| root.column_by_name("MS_1000511_ms_level"))
                     .unwrap();
                 arrow::compute::and(
                     &time_range.contains_dy(times),
@@ -984,7 +999,7 @@ impl<
 
         let proj = match decoder.build_projection(&builder) {
             Some(proj) => proj,
-            None => return Ok(Vec::new())
+            None => return Ok(Vec::new()),
         };
 
         let mut reader = builder
@@ -1112,7 +1127,10 @@ impl<
         self.handle.list_files()
     }
 
-    pub fn open_stream(&self, name: &str) -> impl Future<Output = Result<<T as AsyncArchiveSource>::File, io::Error>> {
+    pub fn open_stream(
+        &self,
+        name: &str,
+    ) -> impl Future<Output = Result<<T as AsyncArchiveSource>::File, io::Error>> {
         self.handle.open_stream(name)
     }
 }

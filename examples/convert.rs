@@ -486,8 +486,8 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     .fold(writer, |writer, f| writer.add_spectrum_field(f));
 
     for (from, to) in overrides.iter() {
-        writer = writer.add_spectrum_override(from.clone(), to.clone());
-        writer = writer.add_chromatogram_override(from.clone(), to.clone());
+        writer = writer.add_spectrum_array_override(from.clone(), to.clone());
+        writer = writer.add_chromatogram_array_override(from.clone(), to.clone());
     }
 
     let mut writer = writer.build(handle, true);
