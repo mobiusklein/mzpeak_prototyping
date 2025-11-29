@@ -1,6 +1,6 @@
 # mzPeak file format prototyping
 
-This repository contains prototype implementations of the mzPeak format initially described in https://pubs.acs.org/doi/10.1021/acs.jproteome.5c00435. The latest presentation of the results took place on November 11, 2022 at the HUPO conference in Toronto, Canada. The slides can be retrieved [here](https://zenodo.org/records/17747369).
+This repository contains prototype implementations of the mzPeak format initially described in https://pubs.acs.org/doi/10.1021/acs.jproteome.5c00435. The latest presentation of the results took place on November 11, 2025 at the HUPO conference in Toronto, Canada. The slides can be retrieved [here](https://zenodo.org/records/17747369).
 
 **NOTE**: This is a **work in progress**, no stability is guaranteed at this point.
 
