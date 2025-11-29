@@ -174,7 +174,7 @@ pub fn process_files_parallel(
         let results = Arc::clone(&results);
         let convert_args = convert_args.clone();
         let temp_dir = temp_dir.to_path_buf();
-        let progress = progress.map(|p| p.clone());
+        let progress = progress.cloned();
 
         let handle = thread::spawn(move || {
             loop {
@@ -268,7 +268,7 @@ pub fn process_single_file(
 
     // Time the conversion
     let start = Instant::now();
-    let conversion_result = convert_file(&file_path, &output_path, &convert_args);
+    let conversion_result = convert_file(&file_path, &output_path, convert_args);
     let end = Instant::now();
     let time_taken = (end - start).as_secs_f64();
 
@@ -310,7 +310,7 @@ pub fn write_csv_results(results: &[BenchmarkResult], output_path: &Path) -> io:
     let mut writer = Writer::from_path(output_path)?;
 
     // Write header
-    writer.write_record(&[
+    writer.write_record([
         "filename",
         "originalsize",
         "finalsize",
@@ -320,7 +320,7 @@ pub fn write_csv_results(results: &[BenchmarkResult], output_path: &Path) -> io:
 
     // Write results
     for result in results {
-        writer.write_record(&[
+        writer.write_record([
             &result.filename,
             &result.original_size.to_string(),
             &result.final_size.to_string(),

@@ -56,7 +56,7 @@ fn main() -> io::Result<()> {
 fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
     if let Some((method, chunk_size)) = method_str
         .split_once(":")
-        .or_else(|| Some((method_str, "50")))
+        .or(Some((method_str, "50")))
     {
         let chunk_size = chunk_size.parse::<f64>().unwrap_or(50.0);
         let v = match method.to_ascii_lowercase().as_str() {
@@ -69,12 +69,10 @@ fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
             }
         };
         Ok(v)
+    } else if method_str.is_empty() {
+        Ok(ChunkingStrategy::Delta { chunk_size: 50.0 })
     } else {
-        if method_str == "" {
-            Ok(ChunkingStrategy::Delta { chunk_size: 50.0 })
-        } else {
-            Err(format!("Failed to parse {method_str}"))
-        }
+        Err(format!("Failed to parse {method_str}"))
     }
 }
 
@@ -273,7 +271,7 @@ impl ConvertArgs {
             }
         }
 
-        let intensity_transform = self.intensity_slof.then(|| BufferTransform::NumpressSLOF);
+        let intensity_transform = self.intensity_slof.then_some(BufferTransform::NumpressSLOF);
         if self.chunked_encoding.is_none() && intensity_transform.is_some() {
             log::warn!(
                 "Signal transforms require chunked encoding, without chunked encoding this will have no effect"
@@ -394,9 +392,7 @@ pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
     let start = Instant::now();
 
     let outpath = args
-        .outpath
-        .as_ref()
-        .map(|p| p.clone())
+        .outpath.clone()
         .unwrap_or_else(|| filename.with_extension("mzpeak"));
 
     convert_file(filename, &outpath, &args)?;
@@ -476,7 +472,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     }
 
     let handle = fs::File::create(output_path)?;
-    let mut writer = configure_writer_builder(&args);
+    let mut writer = configure_writer_builder(args);
 
     if args.write_peaks_and_profiles {
         let mut point_builder = ArrayBuffersBuilder::default()
@@ -522,11 +518,8 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     let write_peaks_and_profiles = args.write_peaks_and_profiles;
     let read_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            match &mut reader {
-                MZReaderType::BrukerTDF(tdfspectrum_reader_type) => {
-                    tdfspectrum_reader_type.set_consolidate_peaks(false);
-                }
-                _ => {}
+            if let MZReaderType::BrukerTDF(tdfspectrum_reader_type) = &mut reader {
+                tdfspectrum_reader_type.set_consolidate_peaks(false);
             }
             for mut entry in reader.iter() {
                 if write_peaks_and_profiles && entry.peaks.is_none() {
@@ -579,12 +572,12 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 
     if let Err(e) = read_handle.join() {
         eprintln!("Failed to join reader thread: {:?}", e);
-        return Err(io::Error::new(io::ErrorKind::Other, "Reader thread failed"));
+        return Err(io::Error::other("Reader thread failed"));
     }
 
     if let Err(e) = write_handle.join() {
         eprintln!("Failed to join writer thread: {:?}", e);
-        return Err(io::Error::new(io::ErrorKind::Other, "Writer thread failed"));
+        return Err(io::Error::other("Writer thread failed"));
     }
     Ok(())
 }
