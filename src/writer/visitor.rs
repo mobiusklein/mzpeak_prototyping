@@ -612,7 +612,7 @@ impl ParamListBuilder {
         self.0.append(true);
     }
 
-    pub fn as_mut(&mut self) -> &mut LargeListBuilder<ParamBuilder> {
+    pub fn as_builder(&mut self) -> &mut LargeListBuilder<ParamBuilder> {
         &mut self.0
     }
 
@@ -626,6 +626,12 @@ impl ParamListBuilder {
         }
         self.0.append(true);
         true
+    }
+}
+
+impl core::convert::AsMut<LargeListBuilder<ParamBuilder>> for ParamListBuilder {
+    fn as_mut(&mut self) -> &mut LargeListBuilder<ParamBuilder> {
+        &mut self.0
     }
 }
 
@@ -1644,7 +1650,7 @@ impl SpectrumDetailsBuilder {
         if let Some(arrays) = auxiliary_arrays.as_ref() {
             let b = self.auxiliary_arrays.values();
             for a in arrays {
-                b.append_value(&a);
+                b.append_value(a);
             }
             self.auxiliary_arrays.append(true);
         } else {

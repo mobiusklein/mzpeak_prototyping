@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 
-use arrow::array::AsArray;
+use arrow::{array::{AsArray, RecordBatch}, error::ArrowError};
 use identity_hash::BuildIdentityHasher;
 use mzpeaks::coordinate::{SimpleInterval, Span1D};
 
 use super::index::SpanDynNumeric;
+
+pub type BatchIterator<'a> = Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + 'a>;
 
 #[derive(Default, Debug)]
 pub(crate) struct OneCache<T: PartialEq + Eq, U> {
@@ -27,8 +29,8 @@ impl<T: PartialEq + Eq, U> OneCache<T, U> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaskSet {
-    pub range: SimpleInterval<u64>,
-    pub includes: Option<HashSet<u64, BuildIdentityHasher<u64>>>,
+    pub index_range: SimpleInterval<u64>,
+    pub sparse_includes: Option<HashSet<u64, BuildIdentityHasher<u64>>>,
 }
 
 impl From<SimpleInterval<u64>> for MaskSet {
@@ -42,22 +44,22 @@ impl MaskSet {
         range: SimpleInterval<u64>,
         includes: Option<HashSet<u64, BuildIdentityHasher<u64>>>,
     ) -> Self {
-        Self { range, includes }
+        Self { index_range: range, sparse_includes: includes }
     }
 
     pub fn split(&mut self) -> Option<Self> {
-        let halfway = (self.range.end - self.range.start) / 2;
+        let halfway = (self.index_range.end - self.index_range.start) / 2;
         if halfway < 2 {
             return None;
         }
 
-        self.range.end = self.range.start + halfway;
-        let mut other = Self::new(self.range.clone(), None);
-        other.range.start = self.end() + 1;
-        if let Some(includes) = self.includes.as_mut() {
+        self.index_range.end = self.index_range.start + halfway;
+        let mut other = Self::new(self.index_range.clone(), None);
+        other.index_range.start = self.end() + 1;
+        if let Some(includes) = self.sparse_includes.as_mut() {
             let mut other_includes = HashSet::with_capacity_and_hasher(includes.len() / 2, Default::default());
             includes.retain(|v| {
-                if other.range.contains(v) {
+                if other.index_range.contains(v) {
                     other_includes.insert(*v);
                     false
                 } else {
@@ -65,7 +67,7 @@ impl MaskSet {
                 }
             });
 
-            other.includes = Some(other_includes);
+            other.sparse_includes = Some(other_includes);
         }
         Some(other)
     }
@@ -81,7 +83,7 @@ impl MaskSet {
             let start = self.start().max(other.start());
             let end = self.end().min(other.end());
             let range = SimpleInterval::new(start, end);
-            let includes = match (self.includes.as_ref(), other.includes.as_ref()) {
+            let includes = match (self.sparse_includes.as_ref(), other.sparse_includes.as_ref()) {
                 (None, None) => None,
                 (None, Some(b)) => Some(b.iter().filter(|i| range.contains(*i)).copied().collect()),
                 (Some(a), None) => Some(a.iter().filter(|i| range.contains(*i)).copied().collect()),
@@ -102,17 +104,17 @@ impl Span1D for MaskSet {
     type DimType = u64;
 
     fn start(&self) -> Self::DimType {
-        self.range.start
+        self.index_range.start
     }
 
     fn end(&self) -> Self::DimType {
-        self.range.end
+        self.index_range.end
     }
 
     fn contains(&self, i: &Self::DimType) -> bool {
-        if !self.range.contains(i) {
+        if !self.index_range.contains(i) {
             false
-        } else if let Some(includes) = self.includes.as_ref() {
+        } else if let Some(includes) = self.sparse_includes.as_ref() {
             includes.contains(i)
         } else {
             true
@@ -122,8 +124,8 @@ impl Span1D for MaskSet {
 
 impl SpanDynNumeric for MaskSet {
     fn contains_dy(&self, array: &arrow::array::ArrayRef) -> arrow::array::BooleanArray {
-        let mask = self.range.contains_dy(array);
-        if let Some(includes) = self.includes.as_ref() {
+        let mask = self.index_range.contains_dy(array);
+        if let Some(includes) = self.sparse_includes.as_ref() {
             if let Some(arr) = array.as_primitive_opt::<arrow::datatypes::UInt64Type>() {
                 let is_in: arrow::array::BooleanArray = arr
                     .iter()

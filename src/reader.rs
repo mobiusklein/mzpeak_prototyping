@@ -6,8 +6,7 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, AsArray, Float32Array, RecordBatch, UInt64Array},
-    error::ArrowError,
+    array::{Array, AsArray, Float32Array, UInt64Array},
 };
 
 use identity_hash::BuildIdentityHasher;
@@ -17,8 +16,7 @@ use mzdata::{
     params::Unit,
     prelude::*,
     spectrum::{
-        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, DataArray,
-        MultiLayerSpectrum, PeakDataLevel, SpectrumDescription, bindata::BuildFromArrayMap,
+        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType, DataArray, MultiLayerSpectrum, PeakDataLevel, SpectrumDescription, bindata::BuildFromArrayMap
     },
 };
 use mzpeaks::{
@@ -49,7 +47,6 @@ use crate::{
         },
         point::PointDataReader,
         visitor::AuxiliaryArrayVisitor,
-        utils::MaskSet
     },
 };
 
@@ -66,6 +63,8 @@ mod object_store_async;
 
 pub use metadata::ReaderMetadata;
 use point::{DataPointCache, PointDataArrayReader};
+
+pub use crate::reader::utils::{BatchIterator, MaskSet};
 
 /// A reader for mzPeak files, abstract over the source type.
 pub struct MzPeakReaderTypeOfSource<
@@ -201,7 +200,9 @@ impl<
     where
         Self: Sized,
     {
-        if let Err(_) = self.load_all_spectrum_metadata() {}
+        if let Err(e) = self.load_all_spectrum_metadata() {
+            log::error!("Failed to eagerly load spectrum metadata: {e}")
+        }
         mzdata::io::SpectrumIterator::new(self)
     }
 }
@@ -486,18 +487,17 @@ impl<
             for v in self.load_auxiliary_arrays_for_spectrum(index)? {
                 out.add(v);
             }
-            return Ok(Some(out));
-        } else {
-            if let Ok(arrays) = self.load_auxiliary_arrays_for_spectrum(index) {
-                let mut out = BinaryArrayMap::new();
-                for arr in arrays {
-                    out.add(arr);
-                }
-                return Ok(Some(out));
-            } else {
-                return Ok(None);
+            Ok(Some(out))
+        } else if let Ok(arrays) = self.load_auxiliary_arrays_for_spectrum(index) {
+            let mut out = BinaryArrayMap::new();
+            for arr in arrays {
+                out.add(arr);
             }
+            Ok(Some(out))
+        } else {
+            Ok(None)
         }
+
     }
 
     pub fn get_spectrum_index_range_for_time_range(
@@ -532,7 +532,7 @@ impl<
 
         let predicate_mask = ProjectionMask::columns(
             builder.parquet_schema(),
-            columns_for_predicate.into_iter().copied(),
+            columns_for_predicate.iter().copied(),
         );
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
@@ -579,7 +579,7 @@ impl<
     /// - `ion_mobility_range`: An optional ion mobility range to filter within.
     ///
     /// # Returns
-    /// - An iterator over record batches covering the spectrum data: `Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>`.
+    /// - An iterator over record batches covering the spectrum data: `BatchIterator<'_>`.
     /// - A mapping from spectrum index to scan start time.
     pub fn extract_peaks(
         &mut self,
@@ -588,7 +588,7 @@ impl<
         ion_mobility_range: Option<SimpleInterval<f64>>,
         ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
-        Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>,
+        BatchIterator<'_>,
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
     )> {
         let (time_index, index_range) =
@@ -609,7 +609,7 @@ impl<
                 .spectrum_chunk_index
                 .query_pages_overlaps(&index_range);
 
-            let it: Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_> =
+            let it: BatchIterator<'_> =
                 if query.can_split() && self.handle.can_split() {
                     let mut index_range1 = index_range.clone();
                     if let Some(index_range2) = index_range1.split() {
@@ -658,7 +658,7 @@ impl<
                     )?)
                 };
 
-            let it: Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_> =
+            let it: BatchIterator<'_> =
                 if let Some(ion_mobility_range) = ion_mobility_range {
                     // If there is an ion mobility array constraint, the chunked encoding doesn't support filtering on this
                     // dimension directly.
@@ -760,8 +760,8 @@ impl<
             "peak data index was not found",
         ))?;
 
-        return PointDataReader(builder, BufferContext::Spectrum)
-            .get_peak_list_for(index, meta_index);
+        PointDataReader(builder, BufferContext::Spectrum)
+            .get_peak_list_for(index, meta_index)
     }
 
     /// Perform slicing random access over the peak data for spectra in this file.
@@ -775,7 +775,7 @@ impl<
     ///
     /// # Returns
     /// - If this mzPeak archive does not have a peak data file, this method will return an Err([`io::Error`])
-    /// - An iterator over record batches covering the spectrum data: `Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>`.
+    /// - An iterator over record batches covering the spectrum data: `BatchIterator<'_>`.
     /// - A mapping from spectrum index to scan start time.
     pub fn query_peaks(
         &mut self,
@@ -784,7 +784,7 @@ impl<
         ion_mobility_range: Option<SimpleInterval<f64>>,
         ms_level_range: Option<SimpleInterval<u8>>,
     ) -> io::Result<(
-        Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + '_>,
+        BatchIterator<'_>,
         HashMap<u64, f32, BuildIdentityHasher<u64>>,
     )> {
         let builder = self.handle.spectrum_peaks()?;
@@ -1230,11 +1230,13 @@ impl<
             }
         }
 
-        let mut descr = mzdata::spectrum::ChromatogramDescription::default();
-        descr.id = "TIC".to_string();
-        descr.index = 0;
-        descr.ms_level = None;
-        descr.chromatogram_type = mzdata::spectrum::ChromatogramType::TotalIonCurrentChromatogram;
+        let descr = ChromatogramDescription {
+            id: "TIC".into(),
+            index: 0,
+            ms_level: None,
+            chromatogram_type: ChromatogramType::TotalIonCurrentChromatogram,
+            ..Default::default()
+        };
 
         let mut arrays = BinaryArrayMap::new();
         let mut time_array = DataArray::wrap(
@@ -1305,11 +1307,13 @@ impl<
             }
         }
 
-        let mut descr = mzdata::spectrum::ChromatogramDescription::default();
-        descr.id = "BPC".to_string();
-        descr.index = 1;
-        descr.ms_level = None;
-        descr.chromatogram_type = mzdata::spectrum::ChromatogramType::TotalIonCurrentChromatogram;
+        let descr = ChromatogramDescription {
+            id: "BPC".into(),
+            index: 1,
+            ms_level: None,
+            chromatogram_type: ChromatogramType::BasePeakChromatogram,
+            ..Default::default()
+        };
 
         let mut arrays = BinaryArrayMap::new();
         let mut time_array = DataArray::wrap(

@@ -30,7 +30,7 @@ pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) 
         last = Some(v);
     }
     if sort {
-        deltas.sort_by(|a, b| a.partial_cmp(&b).unwrap());
+        deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
     }
     deltas
 }
@@ -38,7 +38,7 @@ pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) 
 /// Compute the median value of a sorted slice
 pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
     let n = deltas.len();
-    let median = if n <= 2 {
+    if n <= 2 {
         deltas.first().copied()
     } else {
         let mid = n / 2;
@@ -47,8 +47,7 @@ pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
         } else {
             Some((deltas[mid] + deltas[mid + 1]) / (T::one() + T::one()))
         }
-    };
-    median
+    }
 }
 
 /// Compute the median-below-median delta value of a series of sorted floating point numbers.
@@ -99,7 +98,7 @@ where
         }
     });
 
-    let y = nalgebra::DMatrix::from_column_slice(dx_data.len(), 1, &dx_data);
+    let y = nalgebra::DMatrix::from_column_slice(dx_data.len(), 1,&dx_data);
 
     if let Some(weights) = chol_weights {
         let weights = nalgebra::DVectorView::from_slice_generic(
@@ -148,7 +147,7 @@ where
 {
     let deltas = collect_deltas(mz_array.iter().copied(), false);
     let mut deltas_sorted = deltas.clone();
-    deltas_sorted.sort_by(|a, b| a.partial_cmp(&b).unwrap());
+    deltas_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median_of = median(&deltas_sorted).unwrap_or_else(|| T::zero());
     let delta_below: Vec<T> = deltas_sorted
         .iter()
@@ -462,7 +461,7 @@ impl<'a> NullTokenizer<'a> {
             self.i += 1;
             return true;
         }
-        return false;
+        false
     }
 
     fn find_next_null(&mut self) {
@@ -627,24 +626,25 @@ where
             was_zero = false;
         }
     }
-    acc.into()
+    acc
 }
 
 /// Find indices where `array` is not a consecutive run of zeros.
 ///
 /// This kernel is only implemented for `Float32Array` and `Float64Array`
 pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
-    if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
+    let array_ = array.as_any();
+    if let Some(array) = array_.downcast_ref::<Float32Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
+    } else if let Some(array) = array_.downcast_ref::<Float64Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
+    } else if let Some(array) = array_.downcast_ref::<Int32Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+    } else if let Some(array) = array_.downcast_ref::<Int64Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
+    } else if let Some(array) = array_.downcast_ref::<UInt32Array>() {
         Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
+    } else if let Some(array) = array_.downcast_ref::<UInt64Array>() {
         Some(_skip_zero_runs_gen(array))
     } else {
         None
@@ -657,7 +657,7 @@ pub fn drop_where_column_is_zero(
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
     let target_array = batch.column(column_index);
     if let Some(indices) = find_where_not_zeros(target_array) {
-        take_record_batch(&batch, &UInt64Array::from(indices))
+        take_record_batch(batch, &UInt64Array::from(indices))
     } else {
         Ok(batch.clone())
     }
@@ -829,7 +829,7 @@ where
     T::Native: Float,
 {
     let n = array.len();
-    let start = array.iter().find(|v| v.is_some()).map(|v| v.unwrap());
+    let start = array.iter().find_map(|v| v);
     if start.is_none() {
         return vec![SimpleInterval::new(0, n)];
     }

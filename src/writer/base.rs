@@ -11,17 +11,23 @@ use mzdata::{
 use parquet::{
     arrow::ArrowSchemaConverter,
     basic::{Compression, Encoding, ZstdLevel},
+    file::metadata::SortingColumn,
     file::properties::{
         DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT, EnabledStatistics, WriterProperties, WriterVersion,
     },
-    file::metadata::SortingColumn,
 };
 
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::BufferPriority, chunk_series::{ArrowArrayChunk, ChunkingStrategy}, filter::select_delta_model, peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess}, spectrum::AuxiliaryArray, writer::{
+    BufferContext, BufferName, ToMzPeakDataSeries,
+    buffer_descriptors::BufferPriority,
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
+    filter::select_delta_model,
+    peak_series::{MZ_ARRAY, array_map_to_schema_arrays_and_excess},
+    spectrum::AuxiliaryArray,
+    writer::{
         ArrayBufferWriter, ArrayBufferWriterVariants, ChromatogramBuilder, MiniPeakWriterType,
         SpectrumBuilder, WriteBatchConfig,
-    }
+    },
 };
 
 macro_rules! implement_mz_metadata {
@@ -93,6 +99,23 @@ macro_rules! implement_mz_metadata {
 }
 
 pub(crate) use implement_mz_metadata;
+
+pub struct EntryMetadataDerivedFromData {
+    pub mz_delta_model: Option<Vec<f64>>,
+    pub auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
+}
+
+impl EntryMetadataDerivedFromData {
+    pub fn new(
+        mz_delta_model: Option<Vec<f64>>,
+        auxiliary_arrays: Option<Vec<AuxiliaryArray>>,
+    ) -> Self {
+        Self {
+            mz_delta_model,
+            auxiliary_arrays,
+        }
+    }
+}
 
 pub trait AbstractMzPeakWriter {
     /// Append an arbitrary key bytestring with an optional value to the (current) Parquet file
@@ -183,8 +206,8 @@ pub trait AbstractMzPeakWriter {
                 n_points,
                 chromatogram_index,
                 None,
-                Some(&buffer.fields()),
-                &buffer.overrides(),
+                Some(buffer.fields()),
+                buffer.overrides(),
             )?;
 
             buffer.add_arrays(fields, data, n_points, true);
@@ -213,7 +236,10 @@ pub trait AbstractMzPeakWriter {
         spectrum: &S,
     ) -> io::Result<()> {
         log::trace!("Writing spectrum {}", spectrum.id());
-        let (mz_delta_model, aux_arrays) = self.write_spectrum_data(spectrum)?;
+        let EntryMetadataDerivedFromData {
+            mz_delta_model,
+            auxiliary_arrays: aux_arrays,
+        } = self.write_spectrum_data(spectrum)?;
         self.spectrum_entry_buffer_mut()
             .append_value(spectrum, mz_delta_model, aux_arrays);
         self.check_data_buffer()?;
@@ -258,7 +284,7 @@ pub trait AbstractMzPeakWriter {
         spectrum: &impl SpectrumLike<C, D>,
         spectrum_count: u64,
         binary_array_map: &BinaryArrayMap,
-    ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
+    ) -> Result<EntryMetadataDerivedFromData, ArrayRetrievalError> {
         let mzs = binary_array_map.mzs();
         let (_had_mzs, n_points) = if let Ok(mzs) = mzs {
             (true, mzs.len())
@@ -326,15 +352,18 @@ pub trait AbstractMzPeakWriter {
                 n_points,
                 spectrum_count,
                 spectrum_time,
-                Some(&buffer.fields()),
-                &buffer.overrides(),
+                Some(buffer.fields()),
+                buffer.overrides(),
             )?;
 
             buffer.add_arrays(fields, data, n_points, is_profile);
             (delta_model, Some(extra_arrays))
         };
 
-        Ok((delta_params, extra_arrays))
+        Ok(EntryMetadataDerivedFromData::new(
+            delta_params,
+            extra_arrays,
+        ))
     }
 
     /// Write a peak list to the data buffer.
@@ -345,7 +374,7 @@ pub trait AbstractMzPeakWriter {
         spectrum_count: u64,
         mut spectrum_time: Option<f32>,
         peaks: &[C],
-    ) -> Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>), ArrayRetrievalError> {
+    ) -> Result<EntryMetadataDerivedFromData, ArrayRetrievalError> {
         let include_time = self.spectrum_data_buffer_mut().include_time();
         if !include_time {
             spectrum_time = None;
@@ -356,7 +385,9 @@ pub trait AbstractMzPeakWriter {
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
                 spectrum_time,
-                MZ_ARRAY.clone().with_priority(Some(BufferPriority::Primary)),
+                MZ_ARRAY
+                    .clone()
+                    .with_priority(Some(BufferPriority::Primary)),
                 &arrays,
                 ChunkingStrategy::Basic {
                     chunk_size: encoding.chunk_size(),
@@ -383,11 +414,14 @@ pub trait AbstractMzPeakWriter {
                 let (fields, arrays, _nulls) = chunks.into_parts();
                 buffer_ref.add_arrays(fields, arrays, size, false);
             }
-            Ok((None, Some(auxiliary_arrays)))
+            Ok(EntryMetadataDerivedFromData::new(
+                None,
+                Some(auxiliary_arrays),
+            ))
         } else {
             self.spectrum_data_buffer_mut()
                 .add(spectrum_count, spectrum_time, peaks);
-            Ok((None, None))
+            Ok(EntryMetadataDerivedFromData::new(None, None))
         }
     }
 
@@ -400,7 +434,7 @@ pub trait AbstractMzPeakWriter {
     >(
         &mut self,
         spectrum: &impl SpectrumLike<CI, DI>,
-    ) -> io::Result<(Option<Vec<f64>>, Option<Vec<AuxiliaryArray>>)> {
+    ) -> io::Result<EntryMetadataDerivedFromData> {
         let spectrum_count = self.spectrum_counter();
 
         let peaks = spectrum.peaks();
@@ -421,15 +455,22 @@ pub trait AbstractMzPeakWriter {
         {
             log::trace!("Writing both profile signal and peaks for {spectrum_count}");
             let raw_arrays = spectrum.raw_arrays().unwrap();
-            let (delta_params, aux_arrays) =
-                self.write_spectrum_binary_array_map(spectrum, spectrum_count, raw_arrays)?;
+            let EntryMetadataDerivedFromData {
+                mz_delta_model: delta_params,
+                auxiliary_arrays: aux_arrays,
+            } = self.write_spectrum_binary_array_map(spectrum, spectrum_count, raw_arrays)?;
             self.separate_peak_writer()
                 .unwrap()
                 .add_peaks(spectrum_count, spectrum_time, peaks)?;
             (delta_params, aux_arrays)
         } else {
-            let (delta_params, aux_arrays) = match peaks {
-                mzdata::spectrum::RefPeakDataLevel::Missing => (None, None),
+            let EntryMetadataDerivedFromData {
+                mz_delta_model: delta_params,
+                auxiliary_arrays: aux_arrays,
+            } = match peaks {
+                mzdata::spectrum::RefPeakDataLevel::Missing => {
+                    EntryMetadataDerivedFromData::new(None, None)
+                }
                 mzdata::spectrum::RefPeakDataLevel::RawData(binary_array_map) => self
                     .write_spectrum_binary_array_map(spectrum, spectrum_count, binary_array_map)?,
                 mzdata::spectrum::RefPeakDataLevel::Centroid(peaks) => {
@@ -442,7 +483,7 @@ pub trait AbstractMzPeakWriter {
             (delta_params, aux_arrays)
         };
 
-        Ok((delta_params, aux_arrays))
+        Ok(EntryMetadataDerivedFromData::new(delta_params, aux_arrays))
     }
 
     fn separate_peak_writer(&mut self) -> Option<&mut MiniPeakWriterType<fs::File>> {
@@ -452,7 +493,7 @@ pub trait AbstractMzPeakWriter {
     fn spectrum_metadata_writer_props(metadata_fields: &SchemaRef) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
-                .convert(&metadata_fields)
+                .convert(metadata_fields)
                 .unwrap(),
         );
 
@@ -460,12 +501,17 @@ pub trait AbstractMzPeakWriter {
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
                 "spectrum.index" => {
-                    sorted.push(SortingColumn { column_idx: i as i32, descending: false, nulls_first: false});
+                    sorted.push(SortingColumn {
+                        column_idx: i as i32,
+                        descending: false,
+                        nulls_first: false,
+                    });
                 }
                 _ => {}
             }
         }
-        let metadata_props = WriterProperties::builder()
+
+        WriterProperties::builder()
             .set_compression(parquet::basic::Compression::ZSTD(
                 ZstdLevel::try_new(3).unwrap(),
             ))
@@ -474,9 +520,7 @@ pub trait AbstractMzPeakWriter {
             .set_column_bloom_filter_enabled("spectrum.id".into(), true)
             .set_writer_version(WriterVersion::PARQUET_2_0)
             .set_statistics_enabled(EnabledStatistics::Page)
-            .build();
-
-        metadata_props
+            .build()
     }
 
     fn chromatogram_data_writer_props(
@@ -487,7 +531,7 @@ pub trait AbstractMzPeakWriter {
     ) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
-                .convert(&data_buffer.schema())
+                .convert(data_buffer.schema())
                 .unwrap(),
         );
 
@@ -495,7 +539,11 @@ pub trait AbstractMzPeakWriter {
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
                 x if x == index_path => {
-                    sorted.push(SortingColumn { column_idx: i as i32, descending: false, nulls_first: false});
+                    sorted.push(SortingColumn {
+                        column_idx: i as i32,
+                        descending: false,
+                        nulls_first: false,
+                    });
                 }
                 _ => {}
             }
@@ -540,8 +588,7 @@ pub trait AbstractMzPeakWriter {
             }
         }
 
-        let data_props = data_props.build();
-        data_props
+        data_props.build()
     }
 
     fn spectrum_data_writer_props(
@@ -554,7 +601,7 @@ pub trait AbstractMzPeakWriter {
     ) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
-                .convert(&data_buffer.schema())
+                .convert(data_buffer.schema())
                 .unwrap(),
         );
 
@@ -562,15 +609,25 @@ pub trait AbstractMzPeakWriter {
         for (i, c) in parquet_schema.columns().iter().enumerate() {
             match c.path().string().as_ref() {
                 x if x == index_path => {
-                    sorted.push(SortingColumn { column_idx: i as i32, descending: false, nulls_first: false});
+                    sorted.push(SortingColumn {
+                        column_idx: i as i32,
+                        descending: false,
+                        nulls_first: false,
+                    });
                 }
                 _ => {}
             }
         }
 
-        let max_row_group_size = write_batch_config.row_group_size.unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE);
-        let data_page_size = write_batch_config.page_size.unwrap_or(parquet::file::properties::DEFAULT_PAGE_SIZE);
-        let write_batch_size = write_batch_config.write_batch_size.unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
+        let max_row_group_size = write_batch_config
+            .row_group_size
+            .unwrap_or(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE);
+        let data_page_size = write_batch_config
+            .page_size
+            .unwrap_or(parquet::file::properties::DEFAULT_PAGE_SIZE);
+        let write_batch_size = write_batch_config
+            .write_batch_size
+            .unwrap_or(parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE);
 
         let mut data_props = WriterProperties::builder()
             .set_compression(compression)
@@ -581,11 +638,14 @@ pub trait AbstractMzPeakWriter {
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_write_batch_size(write_batch_size);
 
-
         if use_chunked_encoding.is_some() {
-            data_props = data_props.set_max_row_group_size(max_row_group_size).set_data_page_size_limit(data_page_size / 4);
+            data_props = data_props
+                .set_max_row_group_size(max_row_group_size)
+                .set_data_page_size_limit(data_page_size / 4);
         } else {
-            data_props = data_props.set_max_row_group_size(max_row_group_size).set_data_page_row_count_limit(data_page_size);
+            data_props = data_props
+                .set_max_row_group_size(max_row_group_size)
+                .set_data_page_row_count_limit(data_page_size);
         }
 
         for c in parquet_schema.columns().iter() {
@@ -616,7 +676,6 @@ pub trait AbstractMzPeakWriter {
             }
         }
 
-        let data_props = data_props.build();
-        data_props
+        data_props.build()
     }
 }

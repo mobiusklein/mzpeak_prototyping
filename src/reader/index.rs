@@ -23,6 +23,7 @@ use parquet::{
 use mzdata::mzpeaks::coordinate::Span1D;
 use serde::{Deserialize, Serialize};
 
+use crate::BufferContext;
 use crate::buffer_descriptors::{ArrayIndex, BufferFormat};
 
 pub fn parquet_column(schema: &SchemaDescriptor, column: &str) -> Option<usize> {
@@ -729,28 +730,28 @@ impl SpectrumPointIndex {
         this.spectrum_index = read_u64_page_index_from(
             &spectrum_data_reader.metadata(),
             &peak_pq_schema,
-            &format!("{}.spectrum_index", spectrum_array_indices.prefix),
+            &format!("{}.{}", spectrum_array_indices.prefix, BufferContext::Spectrum.index_name()),
         )
         .unwrap_or_default();
 
         this.time_index = read_f32_page_index_from(
             spectrum_data_reader.metadata(),
             peak_pq_schema,
-            &format!("{}.spectrum_time", spectrum_array_indices.prefix),
+            &format!("{}.{}", spectrum_array_indices.prefix, BufferContext::Spectrum.time_name()),
         );
 
         for entry in spectrum_array_indices.iter() {
             if matches!(entry.array_type, ArrayType::MZArray) {
                 this.mz_index = read_f64_page_index_from(
-                    &spectrum_data_reader.metadata(),
-                    &peak_pq_schema,
+                    spectrum_data_reader.metadata(),
+                    peak_pq_schema,
                     &entry.path,
                 )
                 .unwrap_or_default();
             } else if entry.is_ion_mobility() {
                 this.im_index = read_f64_page_index_from(
-                    &spectrum_data_reader.metadata(),
-                    &peak_pq_schema,
+                    spectrum_data_reader.metadata(),
+                    peak_pq_schema,
                     &entry.path,
                 )
                 .unwrap_or_default();
@@ -862,32 +863,32 @@ impl SpectrumChunkIndex {
         spectrum_data_reader: &ArrowReaderBuilder<T>,
         spectrum_array_indices: &ArrayIndex,
     ) -> Self {
-        let peak_pq_schema = spectrum_data_reader.parquet_schema();
+        let pq_schema = spectrum_data_reader.parquet_schema();
         let mut this = Self::default();
 
         this.spectrum_index = read_u64_page_index_from(
-            &spectrum_data_reader.metadata(),
-            &peak_pq_schema,
+            spectrum_data_reader.metadata(),
+            pq_schema,
             &format!("{}.spectrum_index", spectrum_array_indices.prefix),
         )
         .unwrap_or_default();
         this.time_index = read_f32_page_index_from(
             spectrum_data_reader.metadata(),
-            peak_pq_schema,
+            pq_schema,
             &format!("{}.spectrum_time", spectrum_array_indices.prefix),
         );
 
         for entry in spectrum_array_indices.iter() {
             if matches!(entry.array_type, ArrayType::MZArray) {
                 this.start_mz_index = read_f64_page_index_from(
-                    &spectrum_data_reader.metadata(),
-                    &peak_pq_schema,
+                    spectrum_data_reader.metadata(),
+                    pq_schema,
                     &format!("{}_chunk_start", entry.path),
                 )
                 .unwrap_or_default();
                 this.end_mz_index = read_f64_page_index_from(
-                    &spectrum_data_reader.metadata(),
-                    &peak_pq_schema,
+                    spectrum_data_reader.metadata(),
+                    pq_schema,
                     &format!("{}_chunk_end", entry.path),
                 )
                 .unwrap_or_default();
@@ -1020,21 +1021,21 @@ impl ChromatogramPointIndex {
         chromatogram_data_reader: &ArrowReaderBuilder<T>,
         chromatogram_array_indices: &ArrayIndex,
     ) -> Self {
-        let peak_pq_schema = chromatogram_data_reader.parquet_schema();
+        let pq_schema = chromatogram_data_reader.parquet_schema();
         let mut this = Self::default();
 
         this.chromatogram_index = read_u64_page_index_from(
-            &chromatogram_data_reader.metadata(),
-            &peak_pq_schema,
-            &format!("{}.chromatogram_index", chromatogram_array_indices.prefix),
+            chromatogram_data_reader.metadata(),
+            pq_schema,
+            &format!("{}.{}", chromatogram_array_indices.prefix, BufferContext::Chromatogram.index_name()),
         )
         .unwrap_or_default();
 
         for entry in chromatogram_array_indices.iter() {
             if matches!(entry.array_type, ArrayType::TimeArray) {
                 this.time_index = read_f64_page_index_from(
-                    &chromatogram_data_reader.metadata(),
-                    &peak_pq_schema,
+                    chromatogram_data_reader.metadata(),
+                    pq_schema,
                     &entry.path,
                 )
                 .unwrap_or_default();
@@ -1141,8 +1142,8 @@ impl ChromatogramChunkIndex {
         let mut this = Self::default();
 
         this.chromatogram_index = read_u64_page_index_from(
-            &chromatogram_data_reader.metadata(),
-            &peak_pq_schema,
+            chromatogram_data_reader.metadata(),
+            peak_pq_schema,
             &format!("{}.chromatogram_index", chromatogram_array_indices.prefix),
         )
         .unwrap_or_default();
@@ -1150,16 +1151,16 @@ impl ChromatogramChunkIndex {
         for entry in chromatogram_array_indices.iter() {
             if matches!(entry.array_type, ArrayType::TimeArray) && matches!(entry.buffer_format, BufferFormat::ChunkBoundsStart) {
                 this.time_start_index = read_f64_page_index_from(
-                    &chromatogram_data_reader.metadata(),
-                    &peak_pq_schema,
+                    chromatogram_data_reader.metadata(),
+                    peak_pq_schema,
                     &entry.path,
                 )
                 .unwrap_or_default();
             }
             else if matches!(entry.array_type, ArrayType::TimeArray) && matches!(entry.buffer_format, BufferFormat::ChunkBoundsEnd) {
                 this.time_end_index = read_f64_page_index_from(
-                    &chromatogram_data_reader.metadata(),
-                    &peak_pq_schema,
+                    chromatogram_data_reader.metadata(),
+                    peak_pq_schema,
                     &entry.path,
                 )
                 .unwrap_or_default();
@@ -1300,38 +1301,38 @@ impl QueryIndex {
         let pq_schema = spectrum_metadata_reader.parquet_schema();
 
         self.spectrum_index_index = read_u64_page_index_from(
-            &spectrum_metadata_reader.metadata(),
-            &pq_schema,
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
             "spectrum.index",
         )
         .unwrap_or_default();
         self.spectrum_time_index = read_f32_page_index_from(
-            &spectrum_metadata_reader.metadata(),
-            &pq_schema,
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
             "spectrum.time",
         )
         .unwrap_or_default();
         self.spectrum_ms_level_index = read_u8_page_index_from(
-            &spectrum_metadata_reader.metadata(),
-            &pq_schema,
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
             "spectrum.ms_level",
         )
         .unwrap_or_default();
         self.spectrum_scan_index = read_u64_page_index_from(
-            &spectrum_metadata_reader.metadata(),
-            &pq_schema,
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
             "scan.spectrum_index",
         )
         .unwrap_or_default();
         self.spectrum_precursor_index = read_u64_page_index_from(
-            &spectrum_metadata_reader.metadata(),
-            &pq_schema,
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
             "precursor.spectrum_index",
         )
         .unwrap_or_default();
         self.spectrum_selected_ion_index = read_u64_page_index_from(
-            &spectrum_metadata_reader.metadata(),
-            &pq_schema,
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
             "selected_ion.spectrum_index",
         )
         .unwrap_or_default();
@@ -1344,20 +1345,20 @@ impl QueryIndex {
         let pq_schema = chromatogram_metadata_reader.parquet_schema();
 
         self.chromatogram_index_index = read_u64_page_index_from(
-            &chromatogram_metadata_reader.metadata(),
-            &pq_schema,
+            chromatogram_metadata_reader.metadata(),
+            pq_schema,
             "chromatogram.index",
         )
         .unwrap_or_default();
         self.chromatogram_precursor_index = read_u64_page_index_from(
-            &chromatogram_metadata_reader.metadata(),
-            &pq_schema,
+            chromatogram_metadata_reader.metadata(),
+            pq_schema,
             "precursor.spectrum_index",
         )
         .unwrap_or_default();
         self.chromatogram_selected_ion_index = read_u64_page_index_from(
-            &chromatogram_metadata_reader.metadata(),
-            &pq_schema,
+            chromatogram_metadata_reader.metadata(),
+            pq_schema,
             "selected_ion.spectrum_index",
         )
         .unwrap_or_default();
@@ -1461,9 +1462,7 @@ impl BasicQueryIndex for QueryIndex {
     }
 
     fn is_populated(&self) -> bool {
-        if self.spectrum_point_index.is_populated() {
-            true
-        } else if self.spectrum_chunk_index.is_populated() {
+        if self.spectrum_point_index.is_populated() || self.spectrum_chunk_index.is_populated() {
             true
         } else {
             false
@@ -1476,7 +1475,7 @@ impl BasicQueryIndex for QueryIndex {
         } else if self.spectrum_chunk_index.is_populated() {
             self.spectrum_chunk_index.primary_data_index()
         } else {
-            &self.spectrum_point_index.primary_data_index()
+            self.spectrum_point_index.primary_data_index()
         }
     }
 }
@@ -1609,7 +1608,7 @@ impl PageQuery {
             return None
         }
         let i = self.row_group_indices.len() / 2;
-        if let Some(_) = self.row_group_indices.get(i).copied() {
+        if self.row_group_indices.get(i).is_some() {
             let split_row_groups = self.row_group_indices.split_off(i);
             let row_group_i = split_row_groups.first().copied().unwrap();
             let page_i = self.pages.iter().position(|p| p.row_group() >= row_group_i).unwrap();

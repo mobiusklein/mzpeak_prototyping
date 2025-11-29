@@ -64,7 +64,7 @@ pub fn schema_to_metadata_cols<'a>(
                 mangled_name,
                 vec![prefix.clone(), f.name().to_string()],
                 i,
-                Some(curie.into()),
+                Some(curie),
             ))
         } else if let Some(defined) = defined_columns {
             if let Some(defined_col) = defined.get(f.name()) {
@@ -113,7 +113,7 @@ impl<'a> ParameterVisitor<'a> {
         {
             let arr = AnyCURIEArray::try_from(curie).unwrap();
             for i in 0..n {
-                if let Some(v) = arr.value(i).map(mzdata::params::CURIE::from) {
+                if let Some(v) = arr.value(i) {
                     let d = &mut self.destination[i];
                     d.accession = Some(v.accession);
                     d.controlled_vocabulary = Some(v.controlled_vocabulary);
@@ -208,7 +208,7 @@ impl<'a> VisitorBuilderBase<'a, SpectrumDescription> for MzSpectrumVisitor<'a> {
     }
 
     fn metadata_map(&self) -> &'a [MetadataColumn] {
-        &self.metadata_map
+        self.metadata_map
     }
 }
 
@@ -608,7 +608,7 @@ impl<'a> MzSpectrumVisitor<'a> {
             }
         }
 
-        return self.offsets.len();
+        self.offsets.len()
     }
 }
 
@@ -623,6 +623,10 @@ impl<'a> From<&'a StringArray> for CURIEStrArray<'a> {
 impl<'a> CURIEStrArray<'a> {
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     #[inline(always)]
@@ -673,6 +677,10 @@ impl<'a> CURIEStructArray<'a> {
 
     pub fn len(&self) -> usize {
         self.cv_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cv_id.is_empty()
     }
 
     pub fn from_struct_array(series: &'a StructArray) -> Self {
@@ -736,13 +744,17 @@ impl<'a> AnyCURIEArray<'a> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn to_vec(&self) -> Vec<mzdata::params::CURIE> {
         match self {
             AnyCURIEArray::Struct(curiearray) => {
                 let n = curiearray.len();
                 let mut acc: Vec<_> = Vec::with_capacity(n);
                 for i in 0..n {
-                    acc.push(curiearray.value(i).unwrap().into())
+                    acc.push(curiearray.value(i).unwrap())
                 }
                 acc
             }
@@ -769,7 +781,7 @@ impl<'a> AnyCURIEArray<'a> {
     pub fn value(&self, index: usize) -> Option<CURIE> {
         match self {
             AnyCURIEArray::Struct(curiearray) => curiearray.value(index),
-            AnyCURIEArray::String(curiestr_array) => curiestr_array.value(index).map(|v| v.into()),
+            AnyCURIEArray::String(curiestr_array) => curiestr_array.value(index),
         }
     }
 }
@@ -815,12 +827,16 @@ impl<'a> UnitArray<'a> {
     pub fn value(&self, index: usize) -> Unit {
         self.0
             .value(index)
-            .map(|v| Unit::from_curie(&(v.into())))
+            .map(|v| Unit::from_curie(&v))
             .unwrap_or_default()
     }
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
     }
 
     pub fn is_null(&self, index: usize) -> bool {
@@ -978,9 +994,9 @@ impl<'a, T> IntoIterator for OffsetCollection<'a, T> {
     #[inline(always)]
     fn into_iter(self) -> Self::IntoIter {
         self.offsets
-            .into_iter()
+            .iter()
             .copied()
-            .zip(self.descriptions.into_iter())
+            .zip(&mut *self.descriptions)
     }
 }
 
@@ -1009,12 +1025,12 @@ trait VisitorBuilder1<'a, T: ParamDescribed>: VisitorBuilderBase<'a, T> {
             let params = ParameterVisitor::new(params.as_struct()).build();
 
             for p in params {
-                if let Some(acc) = p.curie().map(CURIE::from) {
+                if let Some(acc) = p.curie() {
                     if !skip_params.contains(&acc) {
-                        descr.add_param(p.into());
+                        descr.add_param(p);
                     }
                 } else {
-                    descr.add_param(p.into());
+                    descr.add_param(p);
                 }
             }
         }
@@ -1027,7 +1043,7 @@ trait VisitorBuilder1<'a, T: ParamDescribed>: VisitorBuilderBase<'a, T> {
         }
 
         let units = extract_unit!(metacol, spec_arr);
-        let accession: Option<mzdata::params::CURIE> = metacol.accession.map(|v| v.into());
+        let accession: Option<mzdata::params::CURIE> = metacol.accession;
 
         macro_rules! convert {
             ($arr:ident) => {
@@ -1105,7 +1121,7 @@ where
         }
 
         let (name, unit, accession) = if let Some(metacol) = metacol {
-            let accession: Option<mzdata::params::CURIE> = metacol.accession.map(|v| v.into());
+            let accession: Option<mzdata::params::CURIE> = metacol.accession;
             let units = extract_unit!(metacol, spec_arr);
             (metacol.name.as_str(), units, accession)
         } else if let Some(name) = name {
@@ -1206,7 +1222,7 @@ where
 
         let (name, unit, accession) = if let Some(metacol) = metacol {
             let unit = extract_unit!(metacol, spec_arr);
-            let accession: Option<mzdata::params::CURIE> = metacol.accession.map(|v| v.into());
+            let accession: Option<mzdata::params::CURIE> = metacol.accession;
             (metacol.name.as_str(), unit, accession)
         } else if let Some(name) = name {
             (name, Default::default(), None)
@@ -1703,7 +1719,7 @@ impl<'a> MzScanVisitor<'a> {
                         let unit = match &col.unit {
                             crate::param::PathOrCURIE::Path(_items) => todo!(),
                             crate::param::PathOrCURIE::CURIE(curie) => {
-                                Some(Unit::from_curie(&((*curie).into())))
+                                Some(Unit::from_curie(curie))
                             }
                             crate::param::PathOrCURIE::None => None,
                         };
@@ -1765,15 +1781,12 @@ impl<'a> MzScanVisitor<'a> {
             }
         }
 
-        match (ion_mobility_value_index, ion_mobility_type_index) {
-            (Some(ion_mobility_value_index), Some(ion_mobility_type_index)) => {
-                self.visit_ion_mobility(
-                    spec_arr,
-                    ion_mobility_value_index,
-                    ion_mobility_type_index,
-                );
-            }
-            (_, _) => {}
+        if let (Some(ion_mobility_value_index), Some(ion_mobility_type_index)) = (ion_mobility_value_index, ion_mobility_type_index) {
+            self.visit_ion_mobility(
+                spec_arr,
+                ion_mobility_value_index,
+                ion_mobility_type_index,
+            );
         }
     }
 }
@@ -1836,7 +1849,7 @@ impl<'a> MzPrecursorVisitor<'a> {
                     continue;
                 }
                 let descr = descr.description_mut();
-                descr.isolation_window.target = arr.value(offset) as f32;
+                descr.isolation_window.target = arr.value(offset);
                 descr.isolation_window.flags = mzdata::spectrum::IsolationWindowState::Explicit;
             }
         }
@@ -1846,7 +1859,7 @@ impl<'a> MzPrecursorVisitor<'a> {
                 if arr.is_null(offset) {
                     continue;
                 }
-                descr.description_mut().isolation_window.lower_bound = arr.value(offset) as f32;
+                descr.description_mut().isolation_window.lower_bound = arr.value(offset);
                 descr.description_mut().isolation_window.flags =
                     mzdata::spectrum::IsolationWindowState::Explicit;
             }
@@ -1857,7 +1870,7 @@ impl<'a> MzPrecursorVisitor<'a> {
                 if arr.is_null(offset) {
                     continue;
                 }
-                descr.description_mut().isolation_window.upper_bound = arr.value(offset) as f32;
+                descr.description_mut().isolation_window.upper_bound = arr.value(offset);
                 descr.description_mut().isolation_window.flags =
                     mzdata::spectrum::IsolationWindowState::Explicit;
             }
@@ -1882,11 +1895,10 @@ impl<'a> MzPrecursorVisitor<'a> {
                             controlled_vocabulary: mzdata::params::ControlledVocabulary::MS,
                             accession: 1000045,
                         } => {
-                            let val: mzdata::params::Value = p.value.into();
+                            let val: mzdata::params::Value = p.value;
                             descr.activation.energy = val.to_f32().unwrap();
                         }
                         _ => {
-                            let p: mzdata::Param = p.into();
                             if mzdata::spectrum::Activation::is_param_activation(&p) {
                                 descr.activation.methods_mut().push(p.into());
                             } else {
@@ -1895,7 +1907,7 @@ impl<'a> MzPrecursorVisitor<'a> {
                         }
                     }
                 } else {
-                    descr.activation.add_param(p.into());
+                    descr.activation.add_param(p);
                 }
             }
         }
@@ -2217,15 +2229,15 @@ impl<'a> MzSelectedIonVisitor<'a> {
                 match accession {
                     curie!(MS:1000744) => {
                         self.visit_selected_ion_mz(spec_arr, col.index);
-                        visited[col.index];
+                        visited[col.index] = true;
                     }
                     curie!(MS:1000041) => {
                         self.visit_charge(spec_arr, col.index);
-                        visited[col.index];
+                        visited[col.index] = true;
                     }
                     curie!(MS:1000042) => {
                         self.visit_peak_intensity(spec_arr, col.index);
-                        visited[col.index];
+                        visited[col.index] = true;
                     }
                     _ => {
                         self.visit_as_param(spec_arr, col.index, Some(col), None);
@@ -2269,15 +2281,12 @@ impl<'a> MzSelectedIonVisitor<'a> {
             }
         }
 
-        match (ion_mobility_value_index, ion_mobility_type_index) {
-            (Some(ion_mobility_value_index), Some(ion_mobility_type_index)) => {
-                self.visit_ion_mobility(
-                    spec_arr,
-                    ion_mobility_value_index,
-                    ion_mobility_type_index,
-                );
-            }
-            (_, _) => {}
+        if let (Some(ion_mobility_value_index), Some(ion_mobility_type_index)) = (ion_mobility_value_index, ion_mobility_type_index) {
+            self.visit_ion_mobility(
+                spec_arr,
+                ion_mobility_value_index,
+                ion_mobility_type_index,
+            );
         }
     }
 }
@@ -2469,7 +2478,7 @@ impl AuxiliaryArrayVisitor {
 
         for (i, da) in self.0.iter_mut().enumerate() {
             let val = visitor.value(i).unwrap();
-            da.dtype = BinaryDataArrayType::from_accession(val.into()).unwrap();
+            da.dtype = BinaryDataArrayType::from_accession(val).unwrap();
         }
     }
 
@@ -2479,7 +2488,7 @@ impl AuxiliaryArrayVisitor {
 
         for (i, da) in self.0.iter_mut().enumerate() {
             let val = visitor.value(i).unwrap();
-            da.compression = BinaryCompressionType::from_accession(val.into()).unwrap();
+            da.compression = BinaryCompressionType::from_accession(val).unwrap();
         }
     }
 

@@ -126,14 +126,13 @@ fn _eval_spectra_from_iter_for_fields<
                 }
             })
         })
-        .map(|(fields, _arrs)| {
+        .flat_map(|(fields, _arrs)| {
             let fields: Vec<_> = fields.iter().cloned().collect();
             fields
-        })
-        .flatten();
+        });
 
     for field in field_it {
-        if arrays.iter().find(|f| f.name() == field.name()).is_none() {
+        if !arrays.iter().any(|f| f.name() == field.name()) {
             arrays.push(field);
         }
     }
@@ -197,14 +196,13 @@ pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
                 .ok()
             }
         })
-        .map(|(fields, _arrs)| {
+        .flat_map(|(fields, _arrs)| {
             let fields: Vec<_> = fields.iter().cloned().collect();
             fields
-        })
-        .flatten();
+        });
     let mut arrays: Vec<Arc<Field>> = Vec::new();
     for field in field_it {
-        if arrays.iter().find(|f| f.name() == field.name()).is_none() {
+        if !arrays.iter().any(|f| f.name() == field.name()) {
             arrays.push(field);
         }
     }
@@ -224,12 +222,11 @@ where
     MultiLayerSpectrum<C, D>: Clone,
 {
     reader.populate_buffer(10);
-    let fields = _eval_spectra_from_iter_for_fields(
+    _eval_spectra_from_iter_for_fields(
         reader.iter_buffer().cloned(),
         overrides,
         use_chunked_encoding,
-    );
-    fields
+    )
 }
 
 pub fn sample_array_types_from_file_reader<
@@ -248,7 +245,7 @@ pub fn sample_array_types_from_file_reader<
     let it = [0, 100.min(n - 1), n / 2]
         .into_iter()
         .flat_map(|i| reader.get_spectrum_by_index(i));
-    return _eval_spectra_from_iter_for_fields(it, overrides, use_chunked_encoding);
+    _eval_spectra_from_iter_for_fields(it, overrides, use_chunked_encoding)
 }
 
 /// Write an mzPeak archive to an uncompressed ZIP archive

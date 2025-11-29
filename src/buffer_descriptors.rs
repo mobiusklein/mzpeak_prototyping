@@ -337,20 +337,17 @@ impl BufferTransform {
                 .as_param()
                 .unwrap()
                 .curie()
-                .unwrap()
-                .into(),
+                .unwrap(),
             BufferTransform::NumpressPIC => BinaryCompressionType::NumpressPIC
                 .as_param()
                 .unwrap()
                 .curie()
-                .unwrap()
-                .into(),
+                .unwrap(),
             BufferTransform::NumpressLinear => BinaryCompressionType::NumpressLinear
                 .as_param()
                 .unwrap()
                 .curie()
-                .unwrap()
-                .into(),
+                .unwrap(),
         }
     }
 }
@@ -358,7 +355,6 @@ impl BufferTransform {
 /// Convert a [`CURIE`] into an [`ArrayType`], or return `None` if the CURIE
 /// doesn't correspond to an [`ArrayType`] term.
 pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<ArrayType> {
-    let accession = mzdata::params::CURIE::from(accession);
     let tp = if accession == ArrayType::MZArray.as_param_const().curie()? {
         ArrayType::MZArray
     } else if accession == ArrayType::IntensityArray.as_param_const().curie()? {
@@ -443,7 +439,6 @@ pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<Array
 pub fn binary_datatype_from_accession(
     accession: crate::param::CURIE,
 ) -> Option<BinaryDataArrayType> {
-    let accession = accession.into();
     match accession {
         x if Some(x) == BinaryDataArrayType::Float32.curie() => Some(BinaryDataArrayType::Float32),
         x if Some(x) == BinaryDataArrayType::Float64.curie() => Some(BinaryDataArrayType::Float64),
@@ -665,7 +660,7 @@ impl BufferName {
                         .parse::<CURIE>()
                         .inspect_err(|e| log::error!("Failed to parse transform: {e}"))
                         .ok()
-                        .and_then(|v| BufferTransform::from_curie(v));
+                        .and_then(BufferTransform::from_curie);
                 }
                 "data_processing_id" => data_processing_id = Some(v.clone().into_boxed_str()),
                 "buffer_priority" => {
@@ -883,19 +878,19 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
             prefix: value.prefix,
             path: value.path,
             data_type: match value.data_type {
-                DataType::LargeBinary => BinaryDataArrayType::ASCII.curie().unwrap().into(),
-                DataType::Int32 => BinaryDataArrayType::Int32.curie().unwrap().into(),
-                DataType::Int64 => BinaryDataArrayType::Int64.curie().unwrap().into(),
-                DataType::Float32 => BinaryDataArrayType::Float32.curie().unwrap().into(),
-                DataType::Float64 => BinaryDataArrayType::Float64.curie().unwrap().into(),
+                DataType::LargeBinary => BinaryDataArrayType::ASCII.curie().unwrap(),
+                DataType::Int32 => BinaryDataArrayType::Int32.curie().unwrap(),
+                DataType::Int64 => BinaryDataArrayType::Int64.curie().unwrap(),
+                DataType::Float32 => BinaryDataArrayType::Float32.curie().unwrap(),
+                DataType::Float64 => BinaryDataArrayType::Float64.curie().unwrap(),
                 _ => todo!("Cannot translate {:?} into CURIE", value.data_type),
             },
-            array_type: value.array_type.as_param(None).curie().unwrap().into(),
+            array_type: value.array_type.as_param(None).curie().unwrap(),
             array_name: match &value.array_type {
                 ArrayType::NonStandardDataArray { name } => name.to_string(),
                 _ => value.array_type.as_param_const().name().to_string(),
             },
-            unit: value.unit.to_curie().map(|c| c.into()),
+            unit: value.unit.to_curie(),
             buffer_format: value.buffer_format.to_string(),
             transform: value.transform.map(|t| t.curie()),
             data_processing_id: value.data_processing_id,
@@ -928,7 +923,7 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
             ),
             unit: value
                 .unit
-                .map(|x| Unit::from_curie(&x.into()))
+                .map(|x| Unit::from_curie(&x))
                 .unwrap_or_default(),
             buffer_format: value
                 .buffer_format
@@ -1023,7 +1018,7 @@ impl ArrayIndexEntry {
         buffer_name: BufferName,
         field: Option<&Field>,
     ) -> Self {
-        let path = vec![
+        let path = [
             prefix.clone(),
             field
                 .map(|f| f.name().to_string())
@@ -1107,6 +1102,10 @@ impl ArrayIndex {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn contains(&self, k: &ArrayType) -> bool {
         self.get(k).is_some()
     }
@@ -1156,7 +1155,7 @@ impl From<ArrayIndex> for SerializedArrayIndex {
         let entries = value
             .entries
             .into_iter()
-            .map(|v| SerializedArrayIndexEntry::from(v))
+            .map(SerializedArrayIndexEntry::from)
             .collect();
 
         Self {

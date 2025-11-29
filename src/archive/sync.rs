@@ -117,7 +117,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
     pub fn start_other<S: AsRef<str>>(&mut self, name: Option<&S>) -> ZipResult<()> {
         let name = name
             .map(|s| s.as_ref())
-            .unwrap_or_else(|| MzPeakArchiveType::Other.tag_file_suffix().as_ref());
+            .unwrap_or( MzPeakArchiveType::Other.tag_file_suffix().as_ref());
         self.archive_writer.start_file(name, file_options())?;
         self.state = ArchiveState::Other;
         self.index.push(FileEntry::new(
@@ -136,7 +136,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             super::EntityType::Other("other".into()),
             super::DataKind::Other("other".into()),
         );
-        let mut handle = fs::File::open(&path)?;
+        let mut handle = fs::File::open(path)?;
         self.add_file_from_read(&mut handle, p.as_ref(), Some(index_entry))
     }
 
@@ -149,7 +149,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         let p = path
             .file_name()
             .map(|p| p.to_string_lossy().to_string() + archive_type.tag_file_suffix());
-        let mut handle = fs::File::open(&path)?;
+        let mut handle = fs::File::open(path)?;
 
         let mut index_entry: FileEntry = archive_type.into();
         index_entry.name = p.as_ref().unwrap().to_string();
@@ -278,9 +278,9 @@ impl Seek for ArchiveFacetReader {
             io::SeekFrom::End(offset) => {
                 if offset < 0 {
                     let point = self.start_offset + self.length;
-                    let point = point.saturating_sub(offset.abs() as u64);
+                    let point = point.saturating_sub(offset.unsigned_abs());
                     self.archive.seek(io::SeekFrom::Start(point))?;
-                    self.at = self.length.saturating_sub(offset.abs() as u64);
+                    self.at = self.length.saturating_sub(offset.unsigned_abs());
                 } else {
                     self.archive
                         .seek(io::SeekFrom::Start(self.start_offset + self.length))?;
@@ -401,7 +401,7 @@ impl ZipArchiveSource {
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = self.archive_file.try_clone()?;
-        zip_archive_open_entry(handle, index, self.archive_offset.clone())
+        zip_archive_open_entry(handle, index, self.archive_offset)
     }
 
     pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
@@ -449,7 +449,7 @@ impl SplittingZipArchiveSource {
 
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = fs::File::open(self.archive_file.as_path())?;
-        zip_archive_open_entry(handle, index, self.archive_offset.clone())
+        zip_archive_open_entry(handle, index, self.archive_offset)
     }
 
     pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
@@ -888,11 +888,11 @@ impl ArchiveSource for DispatchArchiveSource {
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
         if fs::metadata(&path)?.is_dir() {
-            return Ok(Self::Directory(DirectorySource::from_path(path)?));
+            Ok(Self::Directory(DirectorySource::from_path(path)?))
         } else {
-            return Ok(Self::SplittingZip(SplittingZipArchiveSource::from_path(
+            Ok(Self::SplittingZip(SplittingZipArchiveSource::from_path(
                 path,
-            )?));
+            )?))
         }
     }
 

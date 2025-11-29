@@ -530,7 +530,7 @@ trait PointQuerySource {
         array_indices: &'a ArrayIndex,
         query: Option<PageQuery>,
     ) -> Option<(RowSelection, Vec<usize>, ProjectionMask, RowFilter)> {
-        let mut rows = query_index.index_overlaps(&index_range.range);
+        let mut rows = query_index.index_overlaps(&index_range.index_range);
 
         let query = query.unwrap_or_else(|| query_index.query_pages_overlaps(&index_range));
 

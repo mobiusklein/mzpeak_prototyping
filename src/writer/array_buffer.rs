@@ -120,7 +120,7 @@ pub trait ArrayBufferWriter {
     fn as_array_index(&self) -> ArrayIndex {
         let mut array_index: ArrayIndex =
             ArrayIndex::new(self.prefix().to_string(), HashMap::new());
-        if let Ok(sub) = self.schema().field_with_name(&self.prefix()).cloned() {
+        if let Ok(sub) = self.schema().field_with_name(self.prefix()).cloned() {
             if let DataType::Struct(fields) = sub.data_type() {
                 for f in fields.iter() {
                     if f.name() == BufferContext::Spectrum.index_field().name()
@@ -134,7 +134,7 @@ pub trait ArrayBufferWriter {
                         let aie = ArrayIndexEntry::from_buffer_name(
                             self.prefix().to_string(),
                             buffer_name,
-                            Some(&f),
+                            Some(f),
                         );
                         array_index.push(aie);
                     }
@@ -175,6 +175,10 @@ impl PointBuffers {
             .map(|v| v.iter().map(|s| s.len()).sum::<usize>())
             .max()
             .unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.array_chunks.values().all(|v| v.is_empty())
     }
 
     pub fn num_chunks(&self) -> usize {
@@ -439,6 +443,10 @@ impl ChunkBuffers {
     pub fn len(&self) -> usize {
         self.chunks.iter().map(|c| c.len()).sum()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
 }
 
 impl ArrayBufferWriter for ChunkBuffers {
@@ -543,6 +551,13 @@ impl ArrayBufferWriterVariants {
         match self {
             ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.len(),
             ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ArrayBufferWriterVariants::ChunkBuffers(chunk_buffers) => chunk_buffers.is_empty(),
+            ArrayBufferWriterVariants::PointBuffers(point_buffers) => point_buffers.is_empty(),
         }
     }
 }
@@ -717,7 +732,7 @@ impl ArrayBuffersBuilder {
     fn deduplicate_fields(&mut self) {
         let mut acc = Vec::new();
         for f in self.array_fields.iter() {
-            if !acc.iter().find(|(a, _)| *a == f.name()).is_some() {
+            if !acc.iter().any(|(a, _)| *a == f.name()) {
                 acc.push((f.name(), f.clone()));
             }
         }
@@ -750,11 +765,10 @@ impl ArrayBuffersBuilder {
     }
 
     pub fn add_field(mut self, field: FieldRef) -> Self {
-        if self
+        if !self
             .array_fields
             .iter()
-            .find(|f| f.name() == field.name())
-            .is_none()
+            .any(|f| f.name() == field.name())
         {
             self.array_fields.push(field);
         }
@@ -899,7 +913,7 @@ impl ArrayBuffersBuilder {
             }
             buffers.insert(name.to_string(), Vec::new());
         }
-        let drop_zero_column = mask_zero_intensity_runs.then(|| drop_zero_column);
+        let drop_zero_column = mask_zero_intensity_runs.then_some(drop_zero_column);
         PointBuffers {
             buffer_context,
             peak_array_fields: self.array_fields.clone().into(),

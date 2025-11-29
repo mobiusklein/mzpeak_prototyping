@@ -129,7 +129,7 @@ pub(crate) async fn load_indices_from<T: AsyncArchiveSource>(
     let spectrum_data_reader = handle.spectra_data().await?;
 
     let pq_schema = spectrum_metadata_reader.parquet_schema();
-    let spectrum_id_index = build_spectrum_index(&handle, pq_schema).await?;
+    let spectrum_id_index = build_spectrum_index(handle, pq_schema).await?;
 
     let mut this = ParquetIndexExtractor::default();
     this.visit_spectrum_metadata_reader(spectrum_metadata_reader)?;
@@ -286,46 +286,40 @@ impl<
 > AsyncRandomAccessSpectrumIterator<C, D, MultiLayerSpectrum<C, D>>
     for AsyncMzPeakReaderType<T, C, D>
 {
-    fn start_from_id(
+    async fn start_from_id(
         &mut self,
         id: &str,
-    ) -> impl Future<Output = Result<&mut Self, SpectrumAccessError>> {
-        async {
-            if let Some(idx) = self.metadata.spectrum_id_index.get(id) {
-                self.index = idx as usize;
-                Ok(self)
-            } else {
-                Err(SpectrumAccessError::SpectrumIdNotFound(id.to_string()))
-            }
+    ) -> Result<&mut Self, SpectrumAccessError> {
+        if let Some(idx) = self.metadata.spectrum_id_index.get(id) {
+            self.index = idx as usize;
+            Ok(self)
+        } else {
+            Err(SpectrumAccessError::SpectrumIdNotFound(id.to_string()))
         }
     }
 
-    fn start_from_index(
+    async fn start_from_index(
         &mut self,
         index: usize,
-    ) -> impl Future<Output = Result<&mut Self, SpectrumAccessError>> {
-        async move {
-            if index < self.len() {
-                self.index = index;
-                Ok(self)
-            } else {
-                Err(SpectrumAccessError::SpectrumIndexNotFound(index))
-            }
+    ) -> Result<&mut Self, SpectrumAccessError> {
+        if index < self.len() {
+            self.index = index;
+            Ok(self)
+        } else {
+            Err(SpectrumAccessError::SpectrumIndexNotFound(index))
         }
     }
 
-    fn start_from_time(
+    async fn start_from_time(
         &mut self,
         time: f64,
-    ) -> impl Future<Output = Result<&mut Self, SpectrumAccessError>> {
-        async move {
-            match self.get_spectrum_by_time(time).await {
-                Some(s) => {
-                    self.index = s.index();
-                    Ok(self)
-                }
-                None => Err(SpectrumAccessError::SpectrumNotFound),
+    ) -> Result<&mut Self, SpectrumAccessError> {
+        match self.get_spectrum_by_time(time).await {
+            Some(s) => {
+                self.index = s.index();
+                Ok(self)
             }
+            None => Err(SpectrumAccessError::SpectrumNotFound),
         }
     }
 }
@@ -336,10 +330,8 @@ impl<
     D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap + Send + Sync,
 > AsyncSpectrumSource<C, D, MultiLayerSpectrum<C, D>> for AsyncMzPeakReaderType<T, C, D>
 {
-    fn reset(&mut self) -> impl Future<Output = ()> {
-        async {
-            self.index = 0;
-        }
+    async fn reset(&mut self) {
+        self.index = 0;
     }
 
     fn detail_level(&self) -> &DetailLevel {
@@ -350,21 +342,19 @@ impl<
         self.detail_level = detail_level
     }
 
-    fn get_spectrum_by_id(
+    async fn get_spectrum_by_id(
         &mut self,
         id: &str,
-    ) -> impl Future<Output = Option<MultiLayerSpectrum<C, D>>> {
-        async {
-            let index = self.metadata.spectrum_id_index.get(id)?;
-            self.get_spectrum(index as usize).await
-        }
+    ) -> Option<MultiLayerSpectrum<C, D>> {
+        let index = self.metadata.spectrum_id_index.get(id)?;
+        self.get_spectrum(index as usize).await
     }
 
-    fn get_spectrum_by_index(
+    async fn get_spectrum_by_index(
         &mut self,
         index: usize,
-    ) -> impl Future<Output = Option<MultiLayerSpectrum<C, D>>> {
-        self.get_spectrum(index as usize)
+    ) -> Option<MultiLayerSpectrum<C, D>> {
+        self.get_spectrum(index).await
     }
 
     fn get_index(&self) -> &OffsetIndex {
@@ -377,15 +367,13 @@ impl<
         self.metadata = Arc::new(meta);
     }
 
-    fn read_next(&mut self) -> impl Future<Output = Option<MultiLayerSpectrum<C, D>>> {
-        async {
-            if self.spectrum_metadata_cache.is_none() {
-                self.load_all_spectrum_metadata().await.ok();
-            }
-            let spec = self.get_spectrum(self.index).await;
-            self.index += 1;
-            spec
+    async fn read_next(&mut self) -> Option<MultiLayerSpectrum<C, D>> {
+        if self.spectrum_metadata_cache.is_none() {
+            self.load_all_spectrum_metadata().await.ok();
         }
+        let spec = self.get_spectrum(self.index).await;
+        self.index += 1;
+        spec
     }
 }
 
@@ -616,7 +604,7 @@ impl<
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
             let it = AsyncSpectrumChunkReader::new(builder).scan_chunks_for(
-                index_range.into(),
+                index_range,
                 mz_range,
                 &self.metadata,
                 self.metadata.spectrum_array_indices(),
@@ -639,7 +627,7 @@ impl<
                             .as_struct()
                             .column_by_name(&im_name.name)
                             .unwrap();
-                        let mask = ion_mobility_range.unwrap().contains_dy(&arr);
+                        let mask = ion_mobility_range.unwrap().contains_dy(arr);
                         arrow::compute::filter_record_batch(&bat, &mask)
                     });
                     it.boxed()
@@ -657,7 +645,7 @@ impl<
 
         let reader = AsyncPointDataReader(builder, BufferContext::Spectrum)
             .query_points(
-                index_range.into(),
+                index_range,
                 mz_range,
                 ion_mobility_range,
                 &self.query_indices.spectrum_point_index,
@@ -710,7 +698,7 @@ impl<
 
         let iter = AsyncPointDataReader(builder, BufferContext::Spectrum)
             .query_points(
-                index_range.into(),
+                index_range,
                 mz_range,
                 ion_mobility_range,
                 &meta_index.query_index,
@@ -753,7 +741,7 @@ impl<
 
         let predicate_mask = ProjectionMask::columns(
             builder.parquet_schema(),
-            columns_for_predicate.into_iter().copied(),
+            columns_for_predicate.iter().copied(),
         );
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
