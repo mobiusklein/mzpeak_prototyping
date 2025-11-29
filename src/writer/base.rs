@@ -102,8 +102,13 @@ pub trait AbstractMzPeakWriter {
         value: impl Into<Option<String>>,
     );
 
-    /// Whether or not a chunking strategy is being used
+    /// Whether or not a chunking strategy is being used for spectra
     fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
+        None
+    }
+
+    /// Whether or not a chunking strategy is being used for chromatograms
+    fn use_chromatogram_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
         None
     }
 
@@ -141,8 +146,7 @@ pub trait AbstractMzPeakWriter {
         let n_points = time.data_len()?;
         let time_axis = BufferName::from_data_array(BufferContext::Chromatogram, time);
         let chromatogram_index = self.chromatogram_counter();
-        let extra_arrays = if let Some(chunking) = None
-        // self.use_chunked_encoding().copied()
+        let extra_arrays = if let Some(chunking) = self.use_chromatogram_chunked_encoding().copied()
         {
             let buffer_ref = self.chromatogram_data_buffer_mut();
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(

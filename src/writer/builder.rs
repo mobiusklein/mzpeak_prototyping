@@ -2,7 +2,8 @@ use arrow::datatypes::{DataType, Field, FieldRef};
 use mzdata::{
     params::Unit,
     spectrum::{
-        Activation, ArrayType, BinaryDataArrayType, ScanEvent, SelectedIon, SpectrumDescription,
+        Activation, ArrayType, BinaryArrayMap, BinaryDataArrayType, ScanEvent, SelectedIon,
+        SpectrumDescription,
     },
 };
 
@@ -11,12 +12,10 @@ use std::{fmt::Debug, path::PathBuf};
 use std::{io::prelude::*, sync::Arc};
 
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries,
-    chunk_series::ChunkingStrategy,
-    writer::{
+    BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::BufferOverrideTable, chunk_series::ChunkingStrategy, writer::{
         ArrayBuffersBuilder, MzPeakWriterType, SpectrumVisitor, StructVisitorBuilder,
         UnpackedMzPeakWriterType,
-    },
+    }
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -27,14 +26,12 @@ pub struct WriteBatchConfig {
     pub dictionary_page_size: Option<usize>,
 }
 
-
 pub struct SpectrumFieldVisitors {
     pub(crate) spectrum_fields: Vec<SpectrumVisitor>,
     pub(crate) spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
     pub(crate) spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
     pub(crate) spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
 }
-
 
 /// A builder for mzPeak writers
 ///
@@ -47,6 +44,7 @@ pub struct MzPeakWriterBuilder {
     buffer_size: usize,
     shuffle_mz: bool,
     chunked_encoding: Option<ChunkingStrategy>,
+    chromatogram_chunked_encoding: Option<ChunkingStrategy>,
     compression: Compression,
     // The schema to store peaks under, separate from the profile data (if any)
     store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
@@ -69,6 +67,7 @@ impl Default for MzPeakWriterBuilder {
             buffer_size: 5_000,
             shuffle_mz: false,
             chunked_encoding: None,
+            chromatogram_chunked_encoding: None,
             compression: Compression::ZSTD(ZstdLevel::default()),
             store_peaks_and_profiles_apart: None,
             write_batch_config: Default::default(),
@@ -106,6 +105,13 @@ impl MzPeakWriterBuilder {
     /// if `Some`, otherwise use the point list representation.
     pub fn chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
         self.chunked_encoding = value;
+        self
+    }
+
+    /// Use the chunked representation for chromatogram data using the provided chunking strategy
+    /// if `Some`, otherwise use the point list representation.
+    pub fn chromatogram_chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
+        self.chromatogram_chunked_encoding = value;
         self
     }
 
@@ -258,6 +264,7 @@ impl MzPeakWriterBuilder {
             mask_zero_intensity_runs,
             self.shuffle_mz,
             self.chunked_encoding,
+            self.chromatogram_chunked_encoding,
             self.compression,
             self.store_peaks_and_profiles_apart,
             self.write_batch_config,
@@ -286,11 +293,20 @@ impl MzPeakWriterBuilder {
             mask_zero_intensity_runs,
             self.shuffle_mz,
             self.chunked_encoding,
+            self.chromatogram_chunked_encoding,
             self.compression,
             self.store_peaks_and_profiles_apart,
             self.write_batch_config,
             spectrum_fields,
         )
+    }
+
+    pub fn spectrum_overrides(&self) -> BufferOverrideTable {
+        self.spectrum_arrays.overrides()
+    }
+
+    pub fn chromatogram_overrides(&self) -> BufferOverrideTable {
+        self.chromatogram_arrays.overrides()
     }
 
     /// Add the default time (f64) and intensity (f32) arrays for chromatograms
@@ -300,24 +316,57 @@ impl MzPeakWriterBuilder {
             ArrayType::TimeArray,
             BinaryDataArrayType::Float64,
         )
-        .with_unit(Unit::Minute)
-        .to_field();
+        .with_unit(Unit::Minute);
         let intensity = BufferName::new(
             BufferContext::Chromatogram,
             ArrayType::IntensityArray,
             BinaryDataArrayType::Float32,
         )
-        .with_unit(Unit::DetectorCounts)
-        .to_field();
+        .with_unit(Unit::DetectorCounts);
 
-        self = self
-            .add_chromatogram_field(time)
-            .add_chromatogram_field(intensity)
-            .add_chromatogram_field(Arc::new(Field::new(
-                "chromatogram_index",
-                DataType::UInt64,
+        let overrides = self.chromatogram_overrides();
+
+        if self.chunked_encoding.is_some() {
+            let mut proxy = BinaryArrayMap::new();
+            proxy.add(time.as_data_array(1));
+            proxy.add(intensity.as_data_array(1));
+            let use_chunked_encoding = self.chunked_encoding.unwrap();
+            let chunk = crate::chunk_series::ArrowArrayChunk::from_arrays(
+                0,
+                None,
+                time.clone(),
+                &proxy,
+                use_chunked_encoding,
+                &overrides,
                 false,
-            )));
-        self
+                false,
+                None,
+            ).map(|s| {
+                s.0[0]
+                        .to_schema(
+                            BufferContext::Chromatogram,
+                            &[
+                                use_chunked_encoding,
+                                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                            ],
+                            false,
+                        )
+                        .fields
+            }).unwrap();
+            for f in chunk.iter().cloned() {
+                self = self.add_chromatogram_field(f);
+            }
+            self
+        } else {
+            self = self
+                .add_chromatogram_field(overrides.map(&time).to_field())
+                .add_chromatogram_field(overrides.map(&intensity).to_field())
+                .add_chromatogram_field(Arc::new(Field::new(
+                    "chromatogram_index",
+                    DataType::UInt64,
+                    false,
+                )));
+            self
+        }
     }
 }

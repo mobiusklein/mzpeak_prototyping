@@ -232,6 +232,21 @@ class _BatchIterator:
     Incrementally partition a stream of :class:`pyarrow.RecordBatch` instances into
     blocks of single spectrum or chromatogram data.
 
+    This class serves two purposes:
+        1. Providing a more efficient sequential scan of a data file that pre-fetches larger
+           blocks of data.
+        2. Granular reading for single entities if row group filters are applied, even if the
+           entity spans multiple row groups.
+
+    .. note::
+
+        The iterator will *start* from the first index in the first row group that
+        :attr:`it` spans, so care must be taken to ensure that the desired entity is
+        fully contained in :attr:`it`'s spanned row groups **and** :meth:`seek` must
+        be used to advance the iterator to the desired entity's index if a sequential
+        scan is not desired.
+
+
     Attributes
     ----------
     it : :class:`Iterator` of :class:`pyarrow.RecordBatch`
@@ -266,6 +281,8 @@ class _BatchIterator:
         self.current_index = current_index
         self.index_column = index_column
         self._read_next_chunk(update_index=True)
+        if current_index is not None:
+            self.seek(current_index)
 
     def _infer_starting_index(self):
         return pc.min(pc.struct_field(self.batch, self.index_column)).as_py()
@@ -280,29 +297,52 @@ class _BatchIterator:
         return self
 
     def _read_next_chunk(self, update_index: bool):
-        logger.debug("Reading next batch looking for %r", self.current_index)
-        batch = next(self.it).column(0)
+        is_initialized = self.current_index is not None
+        if is_initialized:
+            logger.debug("Reading next batch looking for %r", self.current_index)
+        try:
+            batch = next(self.it).column(0)
+        except StopIteration:
+            logger.debug("Reached the end of the batch stream")
+            self.batch = None
+            return
         lowest_index = pc.min(pc.struct_field(batch, self.index_column)).as_py()
         if update_index and (
             (self.current_index is not None and lowest_index > self.current_index)
             or self.current_index is None
         ):
             self.current_index = lowest_index
-        logger.debug("New batch starts with %r", self.current_index)
+        if is_initialized:
+            logger.debug("New batch starts with %r", self.current_index)
+        else:
+            logger.debug("Batch iterator stream starts from %r", self.current_index)
         self.batch = batch
 
     def _batch_has_index(self) -> bool:
+        if self.batch is None:
+            return False
         mask = pc.equal(
             pc.struct_field(self.batch, self.index_column), self.current_index
         )
         return np.any(mask)
 
+    def _batch_before_current_index(self) -> bool:
+        if self.batch is None:
+            return False
+        index_col = pc.struct_field(self.batch, self.index_column)
+        mask = pc.less(index_col, self.current_index)
+        return np.all(mask)
+
     def _extract_for_index(self):
+        if self.batch is None:
+            raise StopIteration()
         mask = pc.equal(
             pc.struct_field(self.batch, self.index_column), self.current_index
         )
         indices = np.where(mask)[0]
+        last_possible_row_index = len(self.batch) - 1
         if len(indices) == 0:
+            logger.debug("No rows match the requested index %r from _BatchIterator", self.current_index)
             n = len(self.batch)
             chunk = self.batch.slice(0, 0)
         else:
@@ -311,9 +351,11 @@ class _BatchIterator:
 
             chunk = self.batch.slice(start, n)
 
-        if n == len(self.batch):
-            # This batch is only composed of the current index, so we should also read the next batch in and
-            # take whatever rows correspond to this index too before advancing.
+        if n == len(self.batch) or last_possible_row_index in indices:
+            # This batch is only composed of the current index or the
+            # current index starts somewhere in the middle, so we should
+            # also read the next batch in and take whatever rows correspond
+            # to this index too before advancing.
             self._read_next_chunk(update_index=False)
             if self._batch_has_index():
                 rest = self._extract_for_index()
@@ -961,7 +1003,8 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
     ) -> _SpectrumArrays:
         chunks = []
         it = _BatchIterator(
-            self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"])
+            self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"]),
+            index_column=f"{self._namespace}_index"
         )
         it.seek(index)
         batch: pa.RecordBatch

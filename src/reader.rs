@@ -31,30 +31,25 @@ use parquet::arrow::{
     arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReader, RowFilter},
 };
 
-#[allow(unused_imports)]
 use crate::{
     BufferContext,
     archive::{
-        ArchiveReader, ArchiveSource, DirectorySource, SplittingZipArchiveSource, ZipArchiveSource,
+        ArchiveReader, ArchiveSource, DirectorySource, SplittingZipArchiveSource,
+        DispatchArchiveSource,
     },
     filter::RegressionDeltaModel,
     reader::{
-        chunk::{DataChunkCache, SpectrumChunkReader},
-        index::{PageQuery, QueryIndex, SpanDynNumeric, SpectrumQueryIndex},
+        chunk::{DataChunkCache, ChunkDataReader},
+        index::{PageQuery, QueryIndex, SpanDynNumeric, BasicQueryIndex, ChromatogramQueryIndex},
         metadata::{
             ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource,
             ChromatogramMetadataReader, SpectrumMetadataDecoder, SpectrumMetadataQuerySource,
             SpectrumMetadataReader, TimeIndexDecoder,
+            AuxiliaryArrayCountDecoder, DeltaModelDecoder
         },
         point::PointDataReader,
         visitor::AuxiliaryArrayVisitor,
-    },
-};
-use crate::{
-    archive::DispatchArchiveSource,
-    reader::{
-        metadata::{AuxiliaryArrayCountDecoder, DeltaModelDecoder},
-        utils::MaskSet,
+        utils::MaskSet
     },
 };
 
@@ -330,11 +325,11 @@ impl SpectrumDataCache {
             Ok(Some(Self::Point(cache)))
         } else if reader.query_indices.spectrum_chunk_index.is_populated() {
             let builder = reader.handle.spectra_data()?;
-            let builder = SpectrumChunkReader::new(builder);
+            let builder = ChunkDataReader::new(builder, BufferContext::Spectrum);
             let cache = builder.load_cache_block(
                 SimpleInterval::new(spectrum_index, spectrum_index + CHUNK_CACHE_BLOCK_SIZE),
                 &reader.metadata,
-                &reader.query_indices,
+                &reader.query_indices.spectrum_chunk_index,
             )?;
             Ok(Some(Self::Chunk(cache)))
         } else {
@@ -470,10 +465,10 @@ impl<
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
             log::trace!("Using chunk strategy for reading spectrum {index}");
-            return SpectrumChunkReader::new(builder)
-                .read_chunks_for_spectrum(
+            return ChunkDataReader::new(builder, BufferContext::Spectrum)
+                .read_chunks_for(
                     index,
-                    &self.query_indices,
+                    &self.query_indices.spectrum_chunk_index,
                     &self.metadata.spectrum_array_indices,
                     delta_model.as_ref(),
                     Some(PageQuery::new(row_group_indices, pages)),
@@ -607,7 +602,7 @@ impl<
         };
 
         if self.query_indices.spectrum_chunk_index.is_populated() {
-            let reader = SpectrumChunkReader::new(builder);
+            let reader = ChunkDataReader::new(builder, BufferContext::Spectrum);
 
             let query = self
                 .query_indices
@@ -620,14 +615,15 @@ impl<
                     if let Some(index_range2) = index_range1.split() {
                         log::trace!("Splitting chunk query");
                         let builder2 = self.handle.spectra_data()?;
-                        let reader2 = SpectrumChunkReader::new(builder2);
+                        let reader2 = ChunkDataReader::new(builder2, BufferContext::Spectrum);
                         std::thread::scope(|ctx| -> io::Result<_> {
                             let handle = ctx.spawn(|| {
                                 reader.scan_chunks_for(
                                     index_range1,
                                     mz_range,
                                     &self.metadata,
-                                    &self.query_indices,
+                                    self.metadata.spectrum_array_indices(),
+                                    &self.query_indices.spectrum_chunk_index,
                                 )
                             });
                             let handle2 = ctx.spawn(|| {
@@ -635,7 +631,8 @@ impl<
                                     index_range2,
                                     mz_range,
                                     &self.metadata,
-                                    &self.query_indices,
+                                    self.metadata.spectrum_array_indices(),
+                                    &self.query_indices.spectrum_chunk_index,
                                 )
                             });
                             let reader = handle.join().unwrap()?;
@@ -647,7 +644,8 @@ impl<
                             index_range,
                             mz_range,
                             &self.metadata,
-                            &self.query_indices,
+                            self.metadata.spectrum_array_indices(),
+                            &self.query_indices.spectrum_chunk_index,
                         )?)
                     }
                 } else {
@@ -655,7 +653,8 @@ impl<
                         index_range,
                         mz_range,
                         &self.metadata,
-                        &self.query_indices,
+                        self.metadata.spectrum_array_indices(),
+                        &self.query_indices.spectrum_chunk_index,
                     )?)
                 };
 
@@ -856,6 +855,23 @@ impl<
 
     pub fn get_chromatogram_arrays(&mut self, index: u64) -> io::Result<Option<BinaryArrayMap>> {
         let builder = self.handle.chromatograms_data()?;
+
+        let PageQuery {
+            pages,
+            row_group_indices,
+        } = self.query_indices.query_chromatrogram_pages(index);
+
+        if self.query_indices.chromatogram_chunk_index.is_populated() {
+            let reader = ChunkDataReader::new(builder, BufferContext::Chromatogram);
+            return reader.read_chunks_for(
+                index,
+                &self.query_indices.chromatogram_chunk_index,
+                &self.metadata.chromatogram_array_indices,
+                None,
+                Some(PageQuery::new(row_group_indices, pages)),
+            ).map(Some);
+        }
+
         let reader = PointDataReader(builder, BufferContext::Chromatogram);
         let out = reader.read_points_of(
             index,
@@ -1378,6 +1394,16 @@ mod test {
     #[test_log::test]
     fn test_read_chromatogram() -> io::Result<()> {
         let mut reader = MzPeakReader::new("small.mzpeak").unwrap();
+        let tic = reader.get_chromatogram(0).unwrap();
+        eprintln!("{tic:?}");
+        assert_eq!(tic.index(), 0);
+        assert_eq!(tic.time()?.len(), 48);
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn test_read_chromatogram_chunked() -> io::Result<()> {
+        let mut reader = MzPeakReader::new("small.chunked.mzpeak").unwrap();
         let tic = reader.get_chromatogram(0).unwrap();
         eprintln!("{tic:?}");
         assert_eq!(tic.index(), 0);

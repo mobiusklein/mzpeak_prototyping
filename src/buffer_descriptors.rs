@@ -142,6 +142,10 @@ impl PartialEq<str> for BufferFormat {
     }
 }
 
+
+/// Whether or not a [`BufferName`] (or equivalent) is the main instance of [`BufferName::array_type`]
+/// or not. This lets us reliably simplify the names of some arrays to be easy to recognize without
+/// metadata parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Hash)]
 pub enum BufferPriority {
     /// This is the primary array of this type, it receives the short naming scheme, along with the
@@ -258,21 +262,28 @@ impl PartialEq for BufferName {
 
 impl Ord for BufferName {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Buffers from different contexts in the same schema should be separated
         match self.context.cmp(&other.context) {
             core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
+
+        /*
+        Buffers in different formats should be ordered separately,
+        with chunked formats internally sub-divided by disposition.
+        */
+        match self.buffer_format.cmp(&other.buffer_format) {
+            core::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+
+        // Different arrays should occur in a certain order
         match array_priority(&self.array_type).cmp(&array_priority(&other.array_type)) {
             core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
 
         match self.buffer_priority.cmp(&other.buffer_priority) {
-            core::cmp::Ordering::Equal => {}
-            ord => return ord,
-        }
-
-        match self.buffer_format.cmp(&other.buffer_format) {
             core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
@@ -447,26 +458,26 @@ pub fn binary_datatype_from_accession(
 pub const fn array_priority(array_type: &ArrayType) -> u64 {
     match array_type {
         ArrayType::MZArray => 1,
-        ArrayType::IntensityArray => 2,
-        ArrayType::ChargeArray => 3,
-        ArrayType::SignalToNoiseArray => 4,
-        ArrayType::TimeArray => 5,
-        ArrayType::WavelengthArray => 6,
-        ArrayType::IonMobilityArray => 7,
-        ArrayType::MeanIonMobilityArray => 8,
-        ArrayType::MeanDriftTimeArray => 9,
-        ArrayType::MeanInverseReducedIonMobilityArray => 10,
-        ArrayType::RawIonMobilityArray => 11,
-        ArrayType::RawDriftTimeArray => 12,
-        ArrayType::RawInverseReducedIonMobilityArray => 13,
-        ArrayType::DeconvolutedIonMobilityArray => 14,
-        ArrayType::DeconvolutedDriftTimeArray => 15,
-        ArrayType::DeconvolutedInverseReducedIonMobilityArray => 16,
-        ArrayType::BaselineArray => 17,
-        ArrayType::ResolutionArray => 18,
-        ArrayType::PressureArray => 19,
-        ArrayType::TemperatureArray => 20,
-        ArrayType::FlowRateArray => 21,
+        ArrayType::TimeArray => 2,
+        ArrayType::IntensityArray => 5,
+        ArrayType::ChargeArray => 6,
+        ArrayType::SignalToNoiseArray => 7,
+        ArrayType::WavelengthArray => 8,
+        ArrayType::IonMobilityArray => 9,
+        ArrayType::MeanIonMobilityArray => 10,
+        ArrayType::MeanDriftTimeArray => 11,
+        ArrayType::MeanInverseReducedIonMobilityArray => 12,
+        ArrayType::RawIonMobilityArray => 13,
+        ArrayType::RawDriftTimeArray => 14,
+        ArrayType::RawInverseReducedIonMobilityArray => 15,
+        ArrayType::DeconvolutedIonMobilityArray => 16,
+        ArrayType::DeconvolutedDriftTimeArray => 17,
+        ArrayType::DeconvolutedInverseReducedIonMobilityArray => 18,
+        ArrayType::BaselineArray => 19,
+        ArrayType::ResolutionArray => 20,
+        ArrayType::PressureArray => 21,
+        ArrayType::TemperatureArray => 22,
+        ArrayType::FlowRateArray => 22,
         ArrayType::NonStandardDataArray { name } => {
             let b = name.as_bytes();
             let n = b.len();
@@ -1001,6 +1012,12 @@ impl ArrayIndexEntry {
         }
     }
 
+    /// Create an [`ArrayIndexEntry`] from a [`BufferName`] given some context.
+    ///
+    /// # Arguments
+    /// - `prefix`: The parent path this array lives under
+    /// - `bufer_name`: The description of the array to create an entry for
+    /// - `field`: An extant column definition from a schema to get the column's name from instead of `buffer_name`, if available
     pub fn from_buffer_name(
         prefix: String,
         buffer_name: BufferName,
@@ -1030,6 +1047,7 @@ impl ArrayIndexEntry {
         }
     }
 
+    /// Create a [`BufferName`] from this [`ArrayIndexEntry`]
     pub fn as_buffer_name(&self) -> BufferName {
         let mut this = BufferName::new_with_buffer_format(
             self.context,
@@ -1045,6 +1063,7 @@ impl ArrayIndexEntry {
         this
     }
 
+    /// Whether this describes an ion mobility array
     pub const fn is_ion_mobility(&self) -> bool {
         self.array_type.is_ion_mobility()
     }

@@ -134,6 +134,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
         mask_zero_intensity_runs: bool,
         shuffle_mz: bool,
         use_chunked_encoding: Option<ChunkingStrategy>,
+        use_chromatogram_chunked_encoding: Option<ChunkingStrategy>,
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
         write_batch_config: WriteBatchConfig,
@@ -167,12 +168,19 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             mask_zero_intensity_runs,
         );
 
-        let chromatogram_buffers =
+        let chromatogram_buffers = if let Some(_encoding) = use_chromatogram_chunked_encoding {
+            ArrayBufferWriterVariants::ChunkBuffers(chromatogram_buffers_builder.build_chunked(
+                Arc::new(Schema::empty()),
+                BufferContext::Chromatogram,
+                false
+            ))
+        } else {
             ArrayBufferWriterVariants::PointBuffers(chromatogram_buffers_builder.build(
                 Arc::new(Schema::empty()),
                 BufferContext::Chromatogram,
                 false,
-            ));
+            ))
+        };
 
         let data_props = Self::spectrum_data_writer_props(
             &spectrum_buffers,

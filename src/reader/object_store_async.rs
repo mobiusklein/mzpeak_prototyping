@@ -235,7 +235,7 @@ impl AsyncSpectrumDataCache {
                 .load_cache_block(
                     SimpleInterval::new(spectrum_index, spectrum_index + CHUNK_CACHE_BLOCK_SIZE),
                     &reader.metadata,
-                    &reader.query_indices,
+                    &reader.query_indices.spectrum_chunk_index,
                 )
                 .await?;
             Ok(Some(Self::Chunk(cache)))
@@ -619,7 +619,8 @@ impl<
                 index_range.into(),
                 mz_range,
                 &self.metadata,
-                &self.query_indices,
+                self.metadata.spectrum_array_indices(),
+                &self.query_indices.spectrum_chunk_index,
             )?;
             let it: BoxStream<'_, Result<RecordBatch, ArrowError>> = if ion_mobility_range.is_some()
             {
@@ -1043,9 +1044,9 @@ impl<
         if self.query_indices.spectrum_chunk_index.is_populated() {
             log::trace!("Using chunk strategy for reading spectrum {index}");
             let mut out = AsyncSpectrumChunkReader::new(builder)
-                .read_chunks_for_spectrum(
+                .read_chunks_for_entity(
                     index,
-                    &self.query_indices,
+                    &self.query_indices.spectrum_chunk_index,
                     &self.metadata.spectrum_array_indices,
                     delta_model.as_ref(),
                     Some(PageQuery::new(row_group_indices, pages)),

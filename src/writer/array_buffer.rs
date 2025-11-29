@@ -69,9 +69,20 @@ pub trait ArrayBufferWriter {
         schema: SchemaRef,
     ) -> RecordBatch {
         let num_rows = batch.num_rows();
-        let src_schema = batch.schema();
+        let batch_schema = batch.schema();
         let mut batch = Some(batch);
         let mut arrays = Vec::with_capacity(schema.fields().len());
+
+        /*
+        Search the host schema for this buffer's prefix, and fill in those arrays with
+        the incoming batch of data. Otherwise fill those rows with nulls. In the simplest
+        case, those branches do not exist.
+
+        NB: When things are really messed up, this can lead to misleading error messages
+        implying that the prefix is missing from the batch's schema. This is where the
+        prefix is *added* to the incoming data! In that case, it's usually that the arrays
+        are in a different order.
+        */
         for f in schema.fields().iter() {
             if f.name() == prefix {
                 if let Some(batch) = batch.take() {
@@ -83,8 +94,23 @@ pub trait ArrayBufferWriter {
             }
         }
         RecordBatch::try_new(schema.clone(), arrays).unwrap_or_else(|e| {
-            log::error!("Expected: {schema:#?}");
-            log::error!("Source: {src_schema:#?}");
+
+            // Try to explain why the schema failed to be projected onto the arrays:
+            match schema.field_with_name(prefix) {
+                // We found the prefix data type, so we can show
+                Ok(subset) => {
+                    if let DataType::Struct(fields) = subset.data_type() {
+                        let expected = Schema::new(fields.clone());
+                        log::error!("Expected: {expected:#?}");
+                        log::error!("Received: {:#?}", batch_schema);
+                    } else {
+                        log::error!("Expected data type is malformed: {prefix} => {subset:?}, expected struct/group")
+                    }
+                }
+                Err(e2) => {
+                    log::error!("Expected data type is malformed: {prefix} not found: {e2}")
+                }
+            }
             panic!("Failed to convert arrays to record batch: {e:#?}");
         })
     }
@@ -111,14 +137,6 @@ pub trait ArrayBufferWriter {
                             Some(&f),
                         );
                         array_index.push(aie);
-                    } else {
-                        if f.name().ends_with("_chunk_end")
-                            || f.name().ends_with("_chunk_start")
-                            || f.name() == "chunk_encoding"
-                        {
-                            continue;
-                        }
-                        log::warn!("Failed to construct metadata index for {f:#?}");
                     }
                 }
             }
@@ -230,7 +248,7 @@ impl PointBuffers {
             self.array_chunks
                 .get_mut(f.name())
                 .unwrap_or_else(|| {
-                    panic!("Unexpected field {f:?} for {:?}", self.peak_array_fields)
+                    panic!("Unexpected field {f:?}\nfor\n{:#?}", self.peak_array_fields)
                 })
                 .push(arr);
             visited.insert(f.name());
@@ -721,6 +739,10 @@ impl ArrayBuffersBuilder {
         self.overrides.insert(from.into(), to.into());
         self.apply_overrides();
         self
+    }
+
+    pub fn overrides(&self) -> BufferOverrideTable {
+        self.overrides.clone()
     }
 
     pub fn dtype(&self) -> DataType {

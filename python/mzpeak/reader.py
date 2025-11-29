@@ -713,10 +713,12 @@ class MzPeakFileIter(Iterator[_SpectrumType]):
     def _make_data_iter(self):
         if self.buffer_format == BufferFormat.Point:
             it = self.archive.spectrum_data.handle.iter_batches(columns=["point"])
-            self.data_iter = _BatchIterator(it, self.index)
+            self.data_iter = _BatchIterator(it, self.index, index_column="spectrum_index")
         elif self.buffer_format == BufferFormat.ChunkValues:
             it = self.archive.spectrum_data.handle.iter_batches(128, columns=["chunk"])
-            self.data_iter = _BatchIterator(it, self.index)
+            self.data_iter = _BatchIterator(
+                it, self.index, index_column="spectrum_index"
+            )
         else:
             raise ValueError(self.buffer_format)
 

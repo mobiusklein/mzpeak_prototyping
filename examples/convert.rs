@@ -12,7 +12,7 @@ use mzpeak_prototyping::{
     peak_series::{BufferContext, BufferName},
     writer::{
         AbstractMzPeakWriter, ArrayBuffersBuilder, MzPeakWriterType,
-        sample_array_types_from_file_reader,
+        sample_array_types_from_chromatograms, sample_array_types_from_file_reader,
     },
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
@@ -209,12 +209,23 @@ pub struct ConvertArgs {
     #[arg(
         short,
         long,
-        help = "Use the chunked encoding instead of the flat peak array layout, valid options are 'delta', 'basic', 'numpress'. You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'",
+        help = "Use the chunked encoding instead of the flat point array layout, valid options are 'delta', 'basic', 'numpress'. \
+You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'",
         value_parser=chunk_encoding_parser,
         default_missing_value="delta:50",
         num_args=0..=1,
     )]
     pub chunked_encoding: Option<ChunkingStrategy>,
+
+    #[arg(
+        long,
+        help = "Use the chunked encoding instead of the flat point array layout, valid options are 'delta', 'basic', 'numpress'. \
+You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'. It will default to `chunked-encoding`",
+        value_parser=chunk_encoding_parser,
+        default_missing_value="delta:50",
+        num_args=0..=1,
+    )]
+    pub chromatogram_chunked_encoding: Option<ChunkingStrategy>,
 
     #[arg(
         short = 'k',
@@ -373,6 +384,10 @@ impl ConvertArgs {
         }
         overrides.into()
     }
+
+    pub fn chromatogram_chunked_encoding(&self) -> Option<ChunkingStrategy> {
+        self.chromatogram_chunked_encoding.or(self.chunked_encoding)
+    }
 }
 
 pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
@@ -399,11 +414,11 @@ pub fn configure_writer_builder(
     args: &ConvertArgs,
 ) -> mzpeak_prototyping::writer::MzPeakWriterBuilder {
     MzPeakWriterType::<fs::File>::builder()
-        .add_default_chromatogram_fields()
         .buffer_size(args.buffer_size)
         .include_time_with_spectrum_data(args.include_time_with_spectrum_data)
         .shuffle_mz(args.shuffle_mz)
         .chunked_encoding(args.chunked_encoding)
+        .chromatogram_chunked_encoding(args.chromatogram_chunked_encoding())
         .null_zeros(args.null_zeros)
         .write_batch_size(args.write_batch_size.map(usize::from))
         .page_size(
@@ -489,6 +504,14 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         writer = writer.add_spectrum_array_override(from.clone(), to.clone());
         writer = writer.add_chromatogram_array_override(from.clone(), to.clone());
     }
+
+    writer = sample_array_types_from_chromatograms(
+        reader.iter_chromatograms().take(10),
+        &overrides,
+        args.chromatogram_chunked_encoding(),
+    )
+    .into_iter()
+    .fold(writer, |writer, f| writer.add_chromatogram_field(f));
 
     let mut writer = writer.build(handle, true);
     writer.copy_metadata_from(&reader);

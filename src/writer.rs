@@ -24,7 +24,7 @@ use mzdata::{
 use crate::{
     archive::{MzPeakArchiveType, ZipArchiveWriter},
     buffer_descriptors::{BufferOverrideTable, BufferPriority},
-    peak_series::{ArrayIndex, BufferContext, ToMzPeakDataSeries, array_map_to_schema_arrays}, writer::builder::SpectrumFieldVisitors,
+    peak_series::{ArrayIndex, BufferContext, TIME_ARRAY, ToMzPeakDataSeries, array_map_to_schema_arrays}, writer::builder::SpectrumFieldVisitors,
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -146,25 +146,56 @@ fn _eval_spectra_from_iter_for_fields<
 pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
     iter: I,
     overrides: &BufferOverrideTable,
+    use_chunked_encoding: Option<ChunkingStrategy>,
 ) -> Vec<Arc<Field>> {
     let field_it = iter
         .flat_map(|s| {
             log::trace!("Sampling arrays from {}", s.id());
-            Some(&s.arrays).and_then(|map| {
-                {
-                    array_map_to_schema_arrays(
-                        BufferContext::Chromatogram,
-                        map,
-                        map.get(&ArrayType::TimeArray)
-                            .and_then(|a| a.data_len().ok())
-                            .unwrap_or_default(),
-                        0,
-                        None,
-                        overrides,
+            let map = &s.arrays;
+            if let Some(use_chunked_encoding) = use_chunked_encoding {
+                ArrowArrayChunk::from_arrays(
+                    0,
+                    None,
+                    TIME_ARRAY
+                        .clone()
+                        .with_priority(Some(BufferPriority::Primary))
+                        .with_sorting_rank(Some(1)),
+                    map,
+                    use_chunked_encoding,
+                    overrides,
+                    false,
+                    false,
+                    None,
+                )
+                .ok()
+                .map(|s| {
+                    (
+                        s.0[0]
+                            .to_schema(
+                                BufferContext::Chromatogram,
+                                &[
+                                    use_chunked_encoding,
+                                    ChunkingStrategy::Basic { chunk_size: 50.0 },
+                                ],
+                                false,
+                            )
+                            .fields,
+                        Vec::new(),
                     )
-                    .ok()
-                }
-            })
+                })
+            } else {
+                array_map_to_schema_arrays(
+                    BufferContext::Chromatogram,
+                    map,
+                    map.get(&ArrayType::TimeArray)
+                        .and_then(|a| a.data_len().ok())
+                        .unwrap_or_default(),
+                    0,
+                    None,
+                    overrides,
+                )
+                .ok()
+            }
         })
         .map(|(fields, _arrs)| {
             let fields: Vec<_> = fields.iter().cloned().collect();
@@ -236,6 +267,7 @@ pub struct MzPeakWriterType<
     chromatogram_metadata_buffer: ChromatogramBuilder,
 
     use_chunked_encoding: Option<ChunkingStrategy>,
+    use_chromatogram_chunked_encoding: Option<ChunkingStrategy>,
 
     spectrum_data_point_counter: u64,
     chromatogram_data_point_counter: u64,
@@ -267,6 +299,10 @@ impl<
 
     fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
         self.use_chunked_encoding.as_ref()
+    }
+
+    fn use_chromatogram_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
+        self.use_chromatogram_chunked_encoding.as_ref()
     }
 
     fn spectrum_entry_buffer_mut(&mut self) -> &mut SpectrumBuilder {
@@ -341,6 +377,7 @@ impl<
         mask_zero_intensity_runs: bool,
         shuffle_mz: bool,
         use_chunked_encoding: Option<ChunkingStrategy>,
+        use_chromatogram_chunked_encoding: Option<ChunkingStrategy>,
         compression: Compression,
         store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
         write_batch_config: WriteBatchConfig,
@@ -369,12 +406,19 @@ impl<
             spectrum_buffers.into()
         };
 
-        let chromatogram_buffers =
-            ArrayBufferWriterVariants::PointBuffers(chromatogram_buffers_builder.build(
+        let chromatogram_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
+            chromatogram_buffers_builder.build_chunked(
+                Arc::new(Schema::empty()),
+                BufferContext::Chromatogram,
+                false
+            ).into()
+        } else {
+            chromatogram_buffers_builder.build(
                 Arc::new(Schema::empty()),
                 BufferContext::Chromatogram,
                 false,
-            ));
+            ).into()
+        };
 
         let mut writer = ZipArchiveWriter::new(writer);
         writer.start_spectrum_data().unwrap();
@@ -432,6 +476,7 @@ impl<
             ),
             separate_peak_writer,
             use_chunked_encoding,
+            use_chromatogram_chunked_encoding,
             spectrum_metadata_buffer,
             spectrum_buffers,
             chromatogram_buffers,

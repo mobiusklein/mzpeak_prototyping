@@ -168,12 +168,22 @@ pub const MZ_ARRAY: BufferName = BufferName::new(
 )
 .with_unit(Unit::MZ)
 .with_sorting_rank(Some(0));
+
+pub const TIME_ARRAY: BufferName = BufferName::new(
+    BufferContext::Chromatogram,
+    ArrayType::TimeArray,
+    BinaryDataArrayType::Float64,
+)
+.with_unit(Unit::Minute)
+.with_sorting_rank(Some(0));
+
 pub const INTENSITY_ARRAY: BufferName = BufferName::new(
     BufferContext::Spectrum,
     ArrayType::IntensityArray,
     BinaryDataArrayType::Float32,
 )
 .with_unit(Unit::DetectorCounts);
+
 pub const CHARGE_ARRAY: BufferName = BufferName::new(
     BufferContext::Spectrum,
     ArrayType::ChargeArray,

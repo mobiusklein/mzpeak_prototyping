@@ -14,7 +14,7 @@ use mzpeak_prototyping::{
     ToMzPeakDataSeries,
     buffer_descriptors::BufferOverrideTable,
     peak_series::{BufferContext, BufferName},
-    writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_file_reader},
+    writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_chromatograms, sample_array_types_from_file_reader},
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use std::{
@@ -378,6 +378,14 @@ fn convert_file(
     )
     .into_iter()
     .fold(writer, |writer, f| writer.add_spectrum_field(f));
+
+    writer = sample_array_types_from_chromatograms(
+        reader.iter_chromatograms().take(10),
+        &overrides,
+        args.chromatogram_chunked_encoding(),
+    )
+    .into_iter()
+    .fold(writer, |writer, f| writer.add_chromatogram_field(f));
 
     for (from, to) in overrides.iter() {
         writer = writer.add_spectrum_array_override(from.clone(), to.clone());
