@@ -125,9 +125,9 @@ static Rboolean seg_open(Rconnection con) {
   size_t header_bytes = 0;
   int rc = read_zip_header_for_size(myconn, &header_bytes);
   if (rc == 1) {
-    error("Failed to verify ZIP local header magic");
+    Rf_error("Failed to verify ZIP local header magic");
   } else if (rc == 2) {
-    error("Compression detected, only uncompressed ZIP archives are supported");
+    Rf_error("Compression detected, only uncompressed ZIP archives are supported");
   }
 
   myconn->offset += header_bytes;
@@ -180,7 +180,7 @@ static double seg_seek(Rconnection con, double where, int origin, int rw) {
     fseeko64(myconn->stream, myconn->offset + myconn->position + where, SEEK_SET);
     myconn->position += where;
   } else {
-    error("Could not interpret seek origin");
+    Rf_error("Could not interpret seek origin");
   }
   // printf("Stream position is %zu post-seek, virtual position is %zu\n", ftello64(myconn->stream), myconn->position);
   return (double) myconn->position;
@@ -220,7 +220,7 @@ SEXP R_make_connection_segment(SEXP source_file, SEXP member_name, SEXP offset, 
   );
 
   if (ec != 0) {
-    error("Failed to allocate connection segment");
+    Rf_error("Failed to allocate connection segment");
   }
   char* description = malloc(255);
   sprintf(description, "a connection segment starting at %zu with size %zu",

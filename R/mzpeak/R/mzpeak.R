@@ -156,9 +156,7 @@ MZPeakChromatogramDataFile <- R6::R6Class(
       # Parse the array metadata from the JSON blob. This will
       # help us understand what kind of data is in each array
       # and un-mangle names, if needed.
-      self$array_metadata <- .format_array_meta(
-        jsonlite::fromJSON(self$meta$chromatogram_array_index)
-      )
+      self$array_metadata <- .format_array_meta(jsonlite::fromJSON(self$meta$chromatogram_array_index))
       # Read the chromatogram index column from each row group, building
       # up a min-max index for each row group to help reduce work to
       # to read data later.
@@ -173,16 +171,29 @@ MZPeakChromatogramDataFile <- R6::R6Class(
         return(values)
       }
       index = index - 1
-      row_groups = self$row_groups_for_index(index)
+      row_groups = private$row_groups_for_index(index)
 
       if (length(row_groups) == 1) {
         rg <- self$handle$ReadRowGroup(row_groups[1])
         points <- rg$GetColumnByName("point")
-        points <- dplyr::bind_rows(lapply(points$chunks, function(chunk) {
-          chunk$Filter(chunk$field(0) == index)$as_vector()
-        }))
-        k <- dim(points)[2]
-        return(points[, 2:k])
+
+        if (!is.null(points)) {
+          points <- dplyr::bind_rows(lapply(points$chunks, function(chunk) {
+            chunk$Filter(chunk$field(0) == index)$as_vector()
+          }))
+          k <- dim(points)[2]
+          points <- points[, 2:k]
+          return(points)
+        }
+        chunks <- rg$GetColumnByName("chunk")
+        if (!is.null(chunks)) {
+          chunks <- dplyr::bind_rows(lapply(chunks$chunks, function(chunk) {
+            chunk$Filter(chunk$field(0) == index)$as_vector()
+          }))
+          values <- decode_chunks_for(chunks, NULL, self$array_metadata)
+          return(values)
+        }
+        stop(paste("Don't know how to handle schema of", rg$schema))
       } else {
         stop("error: not implemented")
       }
@@ -191,9 +202,8 @@ MZPeakChromatogramDataFile <- R6::R6Class(
   private = list(
     # A helper method to determine which row group(s) to search
     row_groups_for_index = function(index) {
-      row_groups = self$index_bins[(self$index_bins$min_value <= index) &&
-                                     (self$index_bins$max_value >= index), ]$row_group
-      row_groups
+      self$index_bins[(self$index_bins$min_value <= index) &&
+                        (self$index_bins$max_value >= index), ]$row_group
     }
   )
 )
@@ -234,14 +244,16 @@ MZPeakSpectrumDataFile <- R6::R6Class(
         names(values) <- index
         return(values)
       }
+
       index = index - 1
-      row_groups = self$row_groups_for_index(index)
+      row_groups = private$row_groups_for_index(index)
 
       if (length(row_groups) == 1) {
         rg <- self$handle$ReadRowGroup(row_groups[1])
-        points <- rg$GetColumnByName("point")
 
-        if(!is.null(points)) {
+        # If this is a `point` layout data file, unpack the table directly
+        points <- rg$GetColumnByName("point")
+        if (!is.null(points)) {
           points <- dplyr::bind_rows(lapply(points$chunks, function(chunk) {
             chunk$Filter(chunk$field(0) == index)$as_vector()
           }))
@@ -249,21 +261,25 @@ MZPeakSpectrumDataFile <- R6::R6Class(
           points <- points[, 2:k]
           if (any(is.na(points[, 1]))) {
             model = self$mz_delta_models[[index + 2]]
-            points[[1]] <- mzpeak:::.fill_nulls_with_model_or_local(points[[1]], model)
+            points[[1]] <- .fill_nulls_with_model_or_local(points[[1]], model)
             na_mask <- is.na(points[[2]])
             points[na_mask, 2] = 0
           }
           return(points)
         }
+
+        # Otherwise, if this a `chunk` layout data file, we will need to decode
+        # the chunks
         chunks <- rg$GetColumnByName("chunk")
         if (!is.null(chunks)) {
           chunks <- dplyr::bind_rows(lapply(chunks$chunks, function(chunk) {
             chunk$Filter(chunk$field(0) == index)$as_vector()
           }))
-          model = self$mz_delta_models[[index + 2]]
-          values <- decode_chunks_for(chunks, model, self$array_metadata)
+          delta_model = self$mz_delta_models[[index + 1]]
+          values <- decode_chunks_for(chunks, delta_model, self$array_metadata)
           return(values)
         }
+
         stop(paste("Don't know how to handle schema of", rg$schema))
       } else {
         stop("error: not implemented")
@@ -275,13 +291,12 @@ MZPeakSpectrumDataFile <- R6::R6Class(
       self$mz_delta_models = models
     }
   ),
-  private=list(
+  private = list(
     # A helper method to determine which row group(s) to search
     row_groups_for_index = function(index) {
-      row_groups = self$index_bins[(self$index_bins$min_value <= index) &&
-                                     (self$index_bins$max_value >= index), ]$row_group
-      row_groups
-    },
+      self$index_bins[(self$index_bins$min_value <= index) &&
+                        (self$index_bins$max_value >= index), ]$row_group
+    }
   )
 )
 
@@ -332,7 +347,7 @@ MZPeakFile <- R6::R6Class(
     #' This type will load metadata eagerly into memory, but will load signal data
     #' only when requested.
     #'
-    #' @param path(character(1))\cr
+    #' @param path(character(1)) \cr
     #'   The path to where on the file system the mzPeak archive is. It may be a
     #'   ZIP archive or an unpacked directory.
     initialize = function(path) {
@@ -343,7 +358,8 @@ MZPeakFile <- R6::R6Class(
       spectrum_data_name <- (
         self$file_index$files |> filter(entity_type == "spectrum", data_kind == "data arrays") |> select(name) |> pull() |> first()
       )
-      if(!is.na(spectrum_data_name) && self$handle$has_file(spectrum_data_name)) {
+      if (!is.na(spectrum_data_name) &&
+          self$handle$has_file(spectrum_data_name)) {
         self$spectrum_data = MZPeakSpectrumDataFile$new(self$handle$connect_file(spectrum_data_name))
       }
 
@@ -351,7 +367,8 @@ MZPeakFile <- R6::R6Class(
         self$file_index$files |> filter(entity_type == "spectrum", data_kind == "metadata") |> select(name) |> pull() |> first()
       )
 
-      if(!is.na(spectrum_metadata_name) && self$handle$has_file(spectrum_metadata_name)) {
+      if (!is.na(spectrum_metadata_name) &&
+          self$handle$has_file(spectrum_metadata_name)) {
         self$spectrum_metadata = MZPeakSpectrumMetadataFile$new(self$handle$connect_file(spectrum_metadata_name))
       }
 
@@ -363,14 +380,16 @@ MZPeakFile <- R6::R6Class(
         self$file_index$files |> filter(entity_type == "spectrum", data_kind == "peaks") |> select(name) |> pull() |> first()
       )
 
-      if (!is.na(spectrum_peak_name) && self$handle$has_file(spectrum_peak_name)) {
+      if (!is.na(spectrum_peak_name) &&
+          self$handle$has_file(spectrum_peak_name)) {
         self$spectrum_peak_data <- MZPeakSpectrumDataFile$new(self$handle$connect_file(spectrum_peak_name))
       }
 
       chromatogram_data_name <- (
         self$file_index$files |> filter(entity_type == "chromatogram", data_kind == "data arrays") |> select(name) |> pull() |> first()
       )
-      if(!is.na(chromatogram_data_name) && self$handle$has_file(chromatogram_data_name)) {
+      if (!is.na(chromatogram_data_name) &&
+          self$handle$has_file(chromatogram_data_name)) {
         self$chromatogram_data = MZPeakChromatogramDataFile$new(self$handle$connect_file(chromatogram_data_name))
       }
 
@@ -378,7 +397,8 @@ MZPeakFile <- R6::R6Class(
         self$file_index$files |> filter(entity_type == "chromatogram", data_kind == "metadata") |> select(name) |> pull() |> first()
       )
 
-      if(!is.na(chromatogram_metadata_name) && self$handle$has_file(chromatogram_metadata_name)) {
+      if (!is.na(chromatogram_metadata_name) &&
+          self$handle$has_file(chromatogram_metadata_name)) {
         self$chromatogram_metadata = MZPeakChromatogramMetadataFile$new(self$handle$connect_file(chromatogram_metadata_name))
       }
 
@@ -402,6 +422,19 @@ MZPeakFile <- R6::R6Class(
         is.null(self$spectrum_peak_data),
         NULL,
         self$spectrum_peak_data$read_spectrum(index)
+      )
+    },
+
+    #' @description
+    #' Read a chromatogram's signal arrays.
+    #'
+    #' @param index (`integer(1)`)
+    #' @return [tibble]
+    read_chromatogram = function(index) {
+      ifelse(
+        is.null(self$chromatogram_data),
+        NULL,
+        self$chromatogram_data$read_chromatogram(index)
       )
     }
   ),
@@ -448,7 +481,9 @@ dim.MZPeakFile <- function(self) {
   dim(self$spectra)
 }
 
-
+#' @description
+#' Convert a `ChunkedArray` of `StructArray` into a `Table`
+#' without making copies.
 .chunks_to_table <- function(chunked_array, mask_column = 0) {
   columns_of <- names(chunked_array$type)
   chunks <- lapply(chunked_array$chunks, function(chunk) {
