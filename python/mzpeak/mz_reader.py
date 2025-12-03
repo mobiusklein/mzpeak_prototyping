@@ -668,6 +668,7 @@ class _ChunkBatchCleaner:
         offset = 0
         had_nulls = False
         numpress_chunks_it = iter(numpress_chunks)
+        skip = set()
         for _i, chunk in enumerate(chunks):
             start = chunk[f"{self.axis_prefix}_chunk_start"].as_py()
             end = chunk[f"{self.axis_prefix}_chunk_end"].as_py()
@@ -731,18 +732,22 @@ class _ChunkBatchCleaner:
                         arrays_of[k][offset : offset + chunk_size] = index_val
                 elif k in ("chunk_encoding", self.time_label) or k.startswith(
                     self.axis_prefix
-                ):
+                ) or k in skip:
                     continue
                 else:
-                    values = np.asarray(v.values)
-                    if k in self.has_transforms:
-                        if self.has_transforms[k] == NUMPRESS_SLOF_CURIE:
-                            values = pynumpress.decode_slof(values)
-                        elif self.has_transforms[k] == NUMPRESS_PIC_CURIE:
-                            values = pynumpress.decode_pic(values)
-                        else:
-                            raise NotImplementedError(self.has_transforms[k])
-                    arrays_of[k][offset : offset + chunk_size] = values
+                    if v.values is not None:
+                        values = np.asarray(v.values)
+                        if k in self.has_transforms:
+                            if self.has_transforms[k] == NUMPRESS_SLOF_CURIE:
+                                values = pynumpress.decode_slof(values)
+                            elif self.has_transforms[k] == NUMPRESS_PIC_CURIE:
+                                values = pynumpress.decode_pic(values)
+                            else:
+                                raise NotImplementedError(self.has_transforms[k])
+                        arrays_of[k][offset : offset + chunk_size] = values
+                    else:
+                        arrays_of.pop(k)
+                        skip.add(k)
 
             offset += chunk_size
         arrays_of[self.axis_prefix] = main_axis_array

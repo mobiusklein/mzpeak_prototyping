@@ -1091,7 +1091,10 @@ impl ArrayIndex {
     }
 
     pub fn get_all(&self, key: &ArrayType) -> impl Iterator<Item = &ArrayIndexEntry> {
-        self.entries.iter().filter(|v| v.array_type == *key)
+        self.entries
+            .iter()
+            .filter(|v| matches!(v.buffer_format, BufferFormat::Chunked | BufferFormat::Point))
+            .filter(|v| v.array_type == *key)
     }
 
     pub fn as_slice(&self) -> &[ArrayIndexEntry] {

@@ -160,6 +160,7 @@ impl DataChunkCache {
         ));
 
         let out = ChunkDataReader::<std::fs::File>::decode_chunks(
+            BufferContext::Spectrum,
             [batch].into_iter(),
             &self.spectrum_array_indices,
             mz_delta_model,
@@ -374,7 +375,7 @@ trait ChunkQuerySource {
             ]);
         }
 
-        if let Some(e) = array_indices.get(&ArrayType::IntensityArray) {
+        for e in array_indices.get_all(&ArrayType::IntensityArray) {
             fields.push(e.path.to_string());
         }
 
@@ -499,6 +500,7 @@ trait ChunkQuerySource {
 }
 
 struct ChunkDecoder<'a> {
+    buffer_context: BufferContext,
     buffers: HashMap<BufferName, Vec<ArrayRef>>,
     main_axis_buffers: Vec<(BufferName, ArrayRef)>,
     main_axis_starts: Vec<ArrayRef>,
@@ -511,10 +513,12 @@ struct ChunkDecoder<'a> {
 
 impl<'a> ChunkDecoder<'a> {
     fn new(
+        buffer_context: BufferContext,
         array_indices: &'a ArrayIndex,
         delta_model: Option<&'a RegressionDeltaModel<f64>>,
     ) -> Self {
         Self {
+            buffer_context,
             buffers: Default::default(),
             main_axis_buffers: Default::default(),
             main_axis_starts: Default::default(),
@@ -580,7 +584,7 @@ impl<'a> ChunkDecoder<'a> {
                         .peekable();
 
                     // Use the first array post-decode here to infer the "real" data type
-                    let first = arr_iter.peek().unwrap();
+                    if let Some(first) = arr_iter.peek()
                     {
                         match first.data_type() {
                             DataType::Float32 => {
@@ -619,10 +623,9 @@ impl<'a> ChunkDecoder<'a> {
                     }
                 }
             }
-            // log::debug!(
-            //     "Unpacked {} values, main axis had {n}",
-            //     store.data_len().unwrap()
-            // );
+            if store.raw_len() == 0 {
+                continue;
+            }
             self.bin_map.add(store);
         }
         Ok(self.bin_map)
@@ -647,7 +650,7 @@ impl<'a> ChunkDecoder<'a> {
                 }
                 _ => {
                     if let Some(name) =
-                        BufferName::from_field(crate::BufferContext::Spectrum, f.clone())
+                        BufferName::from_field(self.buffer_context, f.clone())
                     {
                         match name.buffer_format {
                             BufferFormat::Chunked => {
@@ -659,6 +662,11 @@ impl<'a> ChunkDecoder<'a> {
                                 self.main_axis_buffers.push((name, arr.clone()));
                             }
                             BufferFormat::ChunkedSecondary | BufferFormat::Point => {
+                                log::trace!(
+                                    "Storing (secondary) {name} with {:?} and {} entries",
+                                    arr.data_type(),
+                                    arr.len()
+                                );
                                 self.buffers.entry(name).or_default().push(arr.clone());
                             }
                             BufferFormat::ChunkBoundsStart => {
@@ -800,6 +808,7 @@ impl<'a> ChunkDecoder<'a> {
 }
 
 struct ChunkScanDecoder<'a> {
+    buffer_context: BufferContext,
     buffers: HashMap<BufferName, Vec<ArrayRef>>,
     main_axis_buffers: Vec<(BufferName, ArrayRef)>,
     main_axis_starts: Vec<ArrayRef>,
@@ -811,8 +820,9 @@ struct ChunkScanDecoder<'a> {
 }
 
 impl<'a> ChunkScanDecoder<'a> {
-    fn new(metadata: &'a ReaderMetadata, query_range: Option<SimpleInterval<f64>>) -> Self {
+    fn new(buffer_context: BufferContext, metadata: &'a ReaderMetadata, query_range: Option<SimpleInterval<f64>>) -> Self {
         Self {
+            buffer_context,
             buffers: Default::default(),
             main_axis_buffers: Default::default(),
             main_axis_starts: Default::default(),
@@ -855,7 +865,7 @@ impl<'a> ChunkScanDecoder<'a> {
                 }
                 _ => {
                     if let Some(name) =
-                        BufferName::from_field(crate::BufferContext::Spectrum, f.clone())
+                        BufferName::from_field(self.buffer_context, f.clone())
                     {
                         match name.buffer_format {
                             BufferFormat::Chunked => {
@@ -1078,7 +1088,7 @@ impl<'a> ChunkScanDecoder<'a> {
         }
 
         let axis = self.main_axis.take().unwrap();
-        let buffer_name = BufferName::from_data_array(crate::BufferContext::Spectrum, &axis);
+        let buffer_name = BufferName::from_data_array(self.buffer_context, &axis);
         let axis = data_array_to_arrow_array(&buffer_name, &axis).unwrap();
 
         let mut fields = Vec::with_capacity(self.buffers.len() + 1);
@@ -1244,6 +1254,7 @@ impl<T: ChunkReader + 'static> ChunkDataReader<T> {
         array_indices: &ArrayIndex,
         query_indices: &impl BasicChunkQueryIndex,
     ) -> io::Result<impl Iterator<Item = Result<RecordBatch, ArrowError>>> {
+        let buffer_context = self.buffer_context();
         let (rows, row_group_indices, predicate) =
             self.prepare_scan(index_range, query_range, array_indices, query_indices);
 
@@ -1255,7 +1266,7 @@ impl<T: ChunkReader + 'static> ChunkDataReader<T> {
             .with_batch_size(4096)
             .build()?;
 
-        let mut decoder = ChunkScanDecoder::new(metadata, query_range);
+        let mut decoder = ChunkScanDecoder::new(buffer_context, metadata, query_range);
 
         let it = reader.map(move |batch| -> Result<RecordBatch, ArrowError> {
             batch.and_then(|batch| decoder.decode_batch(batch))
@@ -1265,11 +1276,12 @@ impl<T: ChunkReader + 'static> ChunkDataReader<T> {
     }
 
     pub fn decode_chunks<I: Iterator<Item = RecordBatch>>(
+        buffer_context: BufferContext,
         reader: I,
-        spectrum_array_indices: &ArrayIndex,
+        array_indices: &ArrayIndex,
         delta_model: Option<&RegressionDeltaModel<f64>>,
     ) -> io::Result<BinaryArrayMap> {
-        let mut decoder = ChunkDecoder::new(spectrum_array_indices, delta_model);
+        let mut decoder = ChunkDecoder::new(buffer_context, array_indices, delta_model);
         for batch in reader {
             decoder.decode_batch(batch);
         }
@@ -1285,6 +1297,7 @@ impl<T: ChunkReader + 'static> ChunkDataReader<T> {
         delta_model: Option<&RegressionDeltaModel<f64>>,
         page_query: Option<PageQuery>,
     ) -> io::Result<BinaryArrayMap> {
+        let buffer_context = self.buffer_context();
         if let Some((rows, rg_idx_acc, proj, predicate)) =
             self.prepare_chunks_of(query, query_indices, page_query)
         {
@@ -1297,7 +1310,7 @@ impl<T: ChunkReader + 'static> ChunkDataReader<T> {
                 .with_projection(proj)
                 .build()?;
 
-            Self::decode_chunks(reader.flatten(), array_indices, delta_model)
+            Self::decode_chunks(buffer_context, reader.flatten(), array_indices, delta_model)
         } else {
             let mut bin_map = BinaryArrayMap::new();
             for k in array_indices.iter() {
@@ -1333,6 +1346,7 @@ mod async_impl {
             array_indices: &'a ArrayIndex,
             query_indices: &'a impl BasicChunkQueryIndex,
         ) -> io::Result<BoxStream<'a, Result<RecordBatch, ArrowError>>> {
+            let buffer_context = self.buffer_context();
             let (rows, row_group_indices, predicate) =
                 self.prepare_scan(index_range, query_range, array_indices, query_indices);
 
@@ -1344,7 +1358,7 @@ mod async_impl {
                 .with_batch_size(4096)
                 .build()?;
 
-            let mut decoder = ChunkScanDecoder::new(metadata, query_range);
+            let mut decoder = ChunkScanDecoder::new(buffer_context, metadata, query_range);
 
             let it = reader.map(move |batch| -> Result<RecordBatch, ArrowError> {
                 decoder.decode_batch(batch?)
@@ -1361,6 +1375,7 @@ mod async_impl {
             delta_model: Option<&RegressionDeltaModel<f64>>,
             page_query: Option<PageQuery>,
         ) -> io::Result<BinaryArrayMap> {
+            let buffer_context = self.buffer_context();
             if let Some((rows, rg_idx_acc, proj, predicate)) =
                 self.prepare_chunks_of(query, query_indices, page_query)
             {
@@ -1373,7 +1388,7 @@ mod async_impl {
                     .with_projection(proj)
                     .build()?;
 
-                let mut decoder = ChunkDecoder::new(array_indices, delta_model);
+                let mut decoder = ChunkDecoder::new(buffer_context, array_indices, delta_model);
 
                 while let Some(bat) = reader.next().await.transpose()? {
                     decoder.decode_batch(bat);
