@@ -1317,24 +1317,45 @@ impl QueryIndex {
             pq_schema,
             "spectrum.ms_level",
         )
-        .unwrap_or_default();
+        .or_else(|| read_u8_page_index_from(
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
+            "spectrum.MS_1000511_ms_level",
+        )).unwrap_or_default();
         self.spectrum_scan_index = read_u64_page_index_from(
             spectrum_metadata_reader.metadata(),
             pq_schema,
             "scan.spectrum_index",
         )
+        .or_else(|| read_u64_page_index_from(
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
+            "scan.source_index",
+        ))
         .unwrap_or_default();
         self.spectrum_precursor_index = read_u64_page_index_from(
             spectrum_metadata_reader.metadata(),
             pq_schema,
             "precursor.spectrum_index",
         )
+        .or_else(|| {
+            read_u64_page_index_from(
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
+            "precursor.source_index",
+        )
+        })
         .unwrap_or_default();
         self.spectrum_selected_ion_index = read_u64_page_index_from(
             spectrum_metadata_reader.metadata(),
             pq_schema,
             "selected_ion.spectrum_index",
         )
+        .or_else(|| read_u64_page_index_from(
+            spectrum_metadata_reader.metadata(),
+            pq_schema,
+            "selected_ion.source_index",
+        ))
         .unwrap_or_default();
     }
 

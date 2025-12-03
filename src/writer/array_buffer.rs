@@ -85,7 +85,19 @@ pub trait ArrayBufferWriter {
         */
         for f in schema.fields().iter() {
             if f.name() == prefix {
-                if let Some(batch) = batch.take() {
+                if let Some(mut batch) = batch.take() {
+                    let mut columns = Vec::with_capacity(batch.num_columns());
+                    if let DataType::Struct(fields_of) = f.data_type() {
+                        for col in fields_of.iter() {
+                            if let Some(col) = batch.column_by_name(col.name()).cloned() {
+                                columns.push(col);
+                            } else {
+                                log::trace!("{col:?} was not found in the schema, populating with {num_rows} nulls");
+                                columns.push(arrow::array::new_null_array(col.data_type(), num_rows));
+                            }
+                        }
+                        batch = RecordBatch::try_new(Arc::new(Schema::new(fields_of.clone())), columns).unwrap();
+                    }
                     let x = Arc::new(StructArray::from(batch));
                     arrays.push(x as ArrayRef);
                 }
@@ -490,31 +502,11 @@ impl ArrayBufferWriter for ChunkBuffers {
         let prefix = self.prefix().to_string();
         let schema = self.schema.clone();
         let is_profile = core::mem::take(&mut self.is_profile_buffer);
-        let drop_zero_columns = self.drop_zero_column.clone();
         self.chunks
             .drain(..)
             .zip(is_profile)
-            .map(move |(batch, is_profile)| {
-                let mut batch = RecordBatch::from(batch);
-                if is_profile {
-                    if let Some(cols) = drop_zero_columns.as_ref() {
-                        for (i, _f) in schema
-                            .fields()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, f)| cols.contains(f.name()))
-                        {
-                            match drop_where_column_is_zero(&batch, i) {
-                                Ok(b) => {
-                                    batch = b;
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to subset batch: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
+            .map(move |(batch, _is_profile)| {
+                let batch = RecordBatch::from(batch);
                 Self::promote_record_batch_to_struct(&prefix, batch, schema.clone())
             })
     }

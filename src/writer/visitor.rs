@@ -12,7 +12,7 @@ use mzdata::{
     curie,
     params::{CURIE, Unit},
     prelude::*,
-    spectrum::{Chromatogram, ScanPolarity, SpectrumDescription},
+    spectrum::{Chromatogram, RefPeakDataLevel, ScanPolarity, SpectrumDescription},
 };
 
 use crate::spectrum::AuxiliaryArray;
@@ -126,7 +126,7 @@ macro_rules! anyways {
 /// This involves `${cv}_${accession}_${formatted_name}` where formatted name
 /// is the name of the term with all non alphanumeric characters are replaced
 /// with '_'.
-pub fn inflect_cv_term_to_column_name(curie: CURIE, name: &str) -> String {
+pub fn inflect_cv_term_to_column_name(curie: CURIE, name: &str, unit: Option<CURIE>) -> String {
     let cv_part = curie.to_string().replace(":", "_");
     let mut buffer = String::with_capacity(name.len() + cv_part.len() + 1);
     buffer.push_str(&cv_part);
@@ -138,11 +138,16 @@ pub fn inflect_cv_term_to_column_name(curie: CURIE, name: &str) -> String {
             buffer.push('_');
         }
     }
+    if let Some(unit) = unit {
+        buffer.push_str("_unit_");
+        buffer.push_str(unit.to_string().replace(":", "_").as_str());
+    }
     buffer
 }
 
 pub struct CustomBuilderFromParameter {
     accession: CURIE,
+    name: String,
     value: Box<dyn ArrayBuilder>,
     field: FieldRef,
     unit: Option<CURIEBuilder>,
@@ -160,13 +165,20 @@ impl Debug for CustomBuilderFromParameter {
 }
 
 impl CustomBuilderFromParameter {
-    pub fn with_unit(mut self) -> Self {
+    pub fn with_unit_field(mut self) -> Self {
         self.unit = Some(CURIEBuilder::default());
         self
     }
 
+    pub fn with_unit_fixed(mut self, unit: Option<CURIE>) -> CustomBuilderFromParameter {
+        let name = inflect_cv_term_to_column_name(self.accession, &self.name, unit);
+        self.field = Arc::new(self.field.as_ref().clone().with_name(name));
+        self
+    }
+
     pub fn with_name(mut self, name: &str) -> Self {
-        let name = inflect_cv_term_to_column_name(self.accession, name);
+        self.name = name.to_string();
+        let name = inflect_cv_term_to_column_name(self.accession, name, None);
         self.field = Arc::new(self.field.as_ref().clone().with_name(name));
         self
     }
@@ -176,36 +188,42 @@ impl CustomBuilderFromParameter {
     }
 
     pub fn from_spec(curie: CURIE, name: &str, dtype: DataType) -> Self {
-        let name = inflect_cv_term_to_column_name(curie, name);
+        let original_name = name.to_string();
+        let name = inflect_cv_term_to_column_name(curie, name, None);
         let field = field!(name, dtype.clone());
         let unit = None;
         match dtype {
             DataType::Null => Self {
                 accession: curie,
+                name: original_name,
                 field,
                 value: Box::new(NullBuilder::new()),
                 unit,
             },
             DataType::Boolean => Self {
                 accession: curie,
+                name: original_name,
                 field,
                 value: Box::new(BooleanBuilder::new()),
                 unit,
             },
             DataType::Int64 => Self {
                 accession: curie,
+                name: original_name,
                 field,
                 value: Box::new(Int64Builder::new()),
                 unit,
             },
             DataType::Float64 => Self {
                 accession: curie,
+                name: original_name,
                 field,
                 value: Box::new(Float64Builder::new()),
                 unit,
             },
             DataType::LargeUtf8 => Self {
                 accession: curie,
+                name: original_name,
                 field,
                 value: Box::new(LargeStringBuilder::new()),
                 unit,
@@ -413,7 +431,6 @@ impl ArrayBuilder for CURIEBuilder {
 
     anyways!();
 }
-
 
 #[derive(Debug, Default)]
 pub struct ParamValueBuilder {
@@ -774,7 +791,10 @@ pub struct ScanBuilder {
 }
 
 impl ScanBuilder {
-    pub fn extend_extra_fields(&mut self, iter: impl IntoIterator<Item = Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>>>) {
+    pub fn extend_extra_fields(
+        &mut self,
+        iter: impl IntoIterator<Item = Box<dyn StructVisitorBuilder<mzdata::spectrum::ScanEvent>>>,
+    ) {
         self.extra.extend(iter);
     }
 }
@@ -783,10 +803,24 @@ impl VisitorBase for ScanBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("source_index", DataType::UInt64),
-            field!("MS_1000016_scan_start_time", DataType::Float32),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000016),
+                    "scan start time",
+                    Unit::Minute.to_curie()
+                ),
+                DataType::Float32
+            ),
             field!("MS_1000616_preset_scan_configuration", DataType::UInt32),
             field!("MS_1000512_filter_string", DataType::LargeUtf8),
-            field!("MS_1000927_ion_injection_time", DataType::Float32),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000927),
+                    "ion injection time",
+                    Unit::Millisecond.to_curie()
+                ),
+                DataType::Float32
+            ),
             field!("ion_mobility_value", DataType::Float64),
             field!("ion_mobility_type", self.ion_mobility_type.as_struct_type()),
             field!("instrument_configuration_ref", DataType::UInt32),
@@ -822,10 +856,7 @@ impl VisitorBase for ScanBuilder {
     }
 }
 
-const BUILTIN_SCAN_PARAMS: &[CURIE] = &[
-    curie!(MS:1000512),
-    curie!(MS:1000616),
-];
+const BUILTIN_SCAN_PARAMS: &[CURIE] = &[curie!(MS:1000512), curie!(MS:1000616)];
 
 impl StructVisitor<(u64, &mzdata::spectrum::ScanEvent)> for ScanBuilder {
     fn append_value(&mut self, item: &(u64, &mzdata::spectrum::ScanEvent)) -> bool {
@@ -1076,7 +1107,10 @@ pub struct PrecursorBuilder {
 }
 
 impl PrecursorBuilder {
-    pub fn extend_extra_activation_fields(&mut self, iter: impl IntoIterator<Item = Box<dyn StructVisitorBuilder<mzdata::spectrum::Activation>>>) {
+    pub fn extend_extra_activation_fields(
+        &mut self,
+        iter: impl IntoIterator<Item = Box<dyn StructVisitorBuilder<mzdata::spectrum::Activation>>>,
+    ) {
         self.activation.extra.extend(iter);
     }
 }
@@ -1164,7 +1198,10 @@ pub struct SelectedIonBuilder {
 }
 
 impl SelectedIonBuilder {
-    pub fn extend_extra_fields(&mut self, iter: impl IntoIterator<Item = Box<dyn StructVisitorBuilder<mzdata::spectrum::SelectedIon>>>) {
+    pub fn extend_extra_fields(
+        &mut self,
+        iter: impl IntoIterator<Item = Box<dyn StructVisitorBuilder<mzdata::spectrum::SelectedIon>>>,
+    ) {
         self.extra.extend(iter);
     }
 }
@@ -1257,9 +1294,23 @@ impl VisitorBase for SelectedIonBuilder {
         let mut fields = vec![
             field!("source_index", DataType::UInt64),
             field!("precursor_index", DataType::UInt64),
-            field!("MS_1000744_selected_ion_mz", DataType::Float64),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000744),
+                    "selected ion m/z",
+                    Unit::MZ.to_curie()
+                ),
+                DataType::Float64
+            ),
             field!("MS_1000041_charge_state", DataType::Int32),
-            field!("MS_1000042_intensity", DataType::Float32),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000042),
+                    "intensity",
+                    Unit::DetectorCounts.to_curie()
+                ),
+                DataType::Float32
+            ),
             field!("ion_mobility", DataType::Float64),
             field!("ion_mobility_type", self.ion_mobility_type.as_struct_type()),
         ];
@@ -1497,20 +1548,58 @@ impl VisitorBase for SpectrumDetailsBuilder {
         let mut fields = vec![
             field!("index", DataType::UInt64),
             field!("id", DataType::LargeUtf8),
-            field!("ms_level", DataType::UInt8),
+            field!("MS_1000511_ms_level", DataType::UInt8),
             field!("time", DataType::Float32),
             field!("MS_1000465_scan_polarity", DataType::Int8),
             field!(
                 "MS_1000525_spectrum_representation",
                 self.mz_signal_continuity.as_struct_type()
             ),
-            field!("MS_1000559_spectrum_type", self.spectrum_type.as_struct_type()),
-            field!("MS_1000528_lowest_observed_mz", DataType::Float64),
-            field!("MS_1000527_highest_observed_mz", DataType::Float64),
+            field!(
+                "MS_1000559_spectrum_type",
+                self.spectrum_type.as_struct_type()
+            ),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000528),
+                    "lowest observed m/z",
+                    Unit::MZ.to_curie()
+                ),
+                DataType::Float64
+            ),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000527),
+                    "highest observed m/z",
+                    Unit::MZ.to_curie()
+                ),
+                DataType::Float64
+            ),
             field!("MS_1003060_number_of_data_points", DataType::UInt64), //MS_1003059_number_of_peaks
-            field!("MS_1000504_base_peak_mz", DataType::Float64),
-            field!("MS_1000505_base_peak_intensity", DataType::Float32),
-            field!("MS_1000285_total_ion_current", DataType::Float32),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000504),
+                    "base peak m/z",
+                    Unit::MZ.to_curie()
+                ),
+                DataType::Float64
+            ),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000505),
+                    "base peak intensity",
+                    Unit::DetectorCounts.to_curie()
+                ),
+                DataType::Float32
+            ),
+            field!(
+                inflect_cv_term_to_column_name(
+                    curie!(MS:1000285),
+                    "total ion current",
+                    Unit::DetectorCounts.to_curie()
+                ),
+                DataType::Float32
+            ),
             field!("data_processing_ref", DataType::UInt32),
             field!(
                 "parameters",
@@ -1564,7 +1653,6 @@ impl VisitorBase for SpectrumDetailsBuilder {
     }
 }
 
-
 const BUILTIN_SPECTRUM_PARAMS: &[CURIE] = &[
     curie!(MS:1000504),
     curie!(MS:1000505),
@@ -1574,7 +1662,6 @@ const BUILTIN_SPECTRUM_PARAMS: &[CURIE] = &[
     curie!(MS:1000579),
     curie!(MS:1000580),
 ];
-
 
 impl SpectrumDetailsBuilder {
     pub fn append_value<
@@ -1590,7 +1677,10 @@ impl SpectrumDetailsBuilder {
     ) -> bool {
         self.curies_to_mask.clear();
 
-        let summaries = item.peaks().fetch_summaries();
+        let summaries = item
+            .raw_arrays()
+            .map(|v| RefPeakDataLevel::<C, D>::RawData(v).fetch_summaries())
+            .unwrap_or_else(|| item.peaks().fetch_summaries());
 
         let n_pts = summaries.len();
         let base_peak_mz = if n_pts > 0 {
@@ -1681,7 +1771,8 @@ impl SpectrumDetailsBuilder {
             }
         }
 
-        self.curies_to_mask.extend_from_slice(BUILTIN_SPECTRUM_PARAMS);
+        self.curies_to_mask
+            .extend_from_slice(BUILTIN_SPECTRUM_PARAMS);
 
         self.parameters
             .append_iter(item.params().iter().filter(|p| {
@@ -1991,7 +2082,10 @@ impl VisitorBase for ChromatogramDetailsBuilder {
             field!("index", DataType::UInt64),
             field!("id", DataType::LargeUtf8),
             field!("MS_1000465_scan_polarity", DataType::Int8),
-            field!("MS_1000626_chromatogram_type", self.chromatogram_type.as_struct_type()),
+            field!(
+                "MS_1000626_chromatogram_type",
+                self.chromatogram_type.as_struct_type()
+            ),
             field!("data_processing_ref", DataType::UInt32),
         ];
         fields.extend(self.parameters.fields());
@@ -2208,8 +2302,17 @@ mod test {
                 "base peak m/z",
                 DataType::Float64,
             )
-            .with_unit()
-            .with_name("base peak m/z 2"),
+            .with_name("base_peak_mz_3")
+            .with_unit_fixed(Unit::MZ.to_curie()),
+        );
+        builder.add_spectrum_param_field(
+            CustomBuilderFromParameter::from_spec(
+                mzdata::curie!(MS:1000504),
+                "base peak m/z",
+                DataType::Float64,
+            )
+            .with_unit_field()
+            .with_name("base_peak_mz_2"),
         );
 
         builder.append_value(&spec, None, None);
@@ -2220,8 +2323,12 @@ mod test {
 
         eprintln!("{:?}", arrays.column_names());
 
-        let arr1 = arrays.column_by_name("MS_1000504_base_peak_mz").unwrap();
-        let arr2 = arrays.column_by_name("MS_1000504_base_peak_mz_2").unwrap();
+        let arr1 = arrays
+            .column_by_name("MS_1000504_base_peak_mz_unit_MS_1000040")
+            .unwrap();
+        let arr2 = arrays
+            .column_by_name("MS_1000504_base_peak_mz_3_unit_MS_1000040")
+            .unwrap();
         let arr1 = arr1.as_primitive::<Float64Type>();
         let arr2 = arr2.as_primitive::<Float64Type>();
 

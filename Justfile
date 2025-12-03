@@ -1,4 +1,4 @@
-export RUST_LOG := "debug"
+export RUST_LOG := "trace"
 
 small:
     cargo r -r --example convert -- -y -z -u small.mzML -o small.mzpeak
@@ -8,6 +8,6 @@ small_chunked:
     cargo r --example convert -- -p -c -y -z -u small.mzML -o small.chunked.mzpeak
 
 test:
-    cargo t --tests
+    cargo t --tests -- --no-capture
 
 alias t := test

@@ -5,18 +5,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow::{
-    array::{Array, AsArray, Float32Array, UInt64Array},
-};
+use arrow::array::{Array, AsArray, Float32Array, UInt64Array};
 
 use identity_hash::BuildIdentityHasher;
 use mzdata::{
+    curie,
     io::{DetailLevel, OffsetIndex},
     meta::MSDataFileMetadata,
     params::Unit,
     prelude::*,
     spectrum::{
-        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType, DataArray, MultiLayerSpectrum, PeakDataLevel, SpectrumDescription, bindata::BuildFromArrayMap
+        ArrayType, BinaryArrayMap, Chromatogram, ChromatogramDescription, ChromatogramType,
+        DataArray, MultiLayerSpectrum, PeakDataLevel, SpectrumDescription,
+        bindata::BuildFromArrayMap,
     },
 };
 use mzpeaks::{
@@ -32,21 +33,21 @@ use parquet::arrow::{
 use crate::{
     BufferContext,
     archive::{
-        ArchiveReader, ArchiveSource, DirectorySource, SplittingZipArchiveSource,
-        DispatchArchiveSource,
+        ArchiveReader, ArchiveSource, DirectorySource, DispatchArchiveSource,
+        SplittingZipArchiveSource,
     },
     filter::RegressionDeltaModel,
     reader::{
-        chunk::{DataChunkCache, ChunkDataReader},
-        index::{PageQuery, QueryIndex, SpanDynNumeric, BasicQueryIndex, ChromatogramQueryIndex},
+        chunk::{ChunkDataReader, DataChunkCache},
+        index::{BasicQueryIndex, ChromatogramQueryIndex, PageQuery, QueryIndex, SpanDynNumeric},
         metadata::{
-            ChromatogramMetadataDecoder, ChromatogramMetadataQuerySource,
-            ChromatogramMetadataReader, SpectrumMetadataDecoder, SpectrumMetadataQuerySource,
-            SpectrumMetadataReader, TimeIndexDecoder,
-            AuxiliaryArrayCountDecoder, DeltaModelDecoder
+            AuxiliaryArrayCountDecoder, ChromatogramMetadataDecoder,
+            ChromatogramMetadataQuerySource, ChromatogramMetadataReader, DeltaModelDecoder,
+            SpectrumMetadataDecoder, SpectrumMetadataQuerySource, SpectrumMetadataReader,
+            TimeIndexDecoder,
         },
         point::PointDataReader,
-        visitor::AuxiliaryArrayVisitor,
+        visitor::{AuxiliaryArrayVisitor, parse_column_to_curie},
     },
 };
 
@@ -497,7 +498,6 @@ impl<
         } else {
             Ok(None)
         }
-
     }
 
     pub fn get_spectrum_index_range_for_time_range(
@@ -609,45 +609,35 @@ impl<
                 .spectrum_chunk_index
                 .query_pages_overlaps(&index_range);
 
-            let it: BatchIterator<'_> =
-                if query.can_split() && self.handle.can_split() {
-                    let mut index_range1 = index_range.clone();
-                    if let Some(index_range2) = index_range1.split() {
-                        log::trace!("Splitting chunk query");
-                        let builder2 = self.handle.spectra_data()?;
-                        let reader2 = ChunkDataReader::new(builder2, BufferContext::Spectrum);
-                        std::thread::scope(|ctx| -> io::Result<_> {
-                            let handle = ctx.spawn(|| {
-                                reader.scan_chunks_for(
-                                    index_range1,
-                                    mz_range,
-                                    &self.metadata,
-                                    self.metadata.spectrum_array_indices(),
-                                    &self.query_indices.spectrum_chunk_index,
-                                )
-                            });
-                            let handle2 = ctx.spawn(|| {
-                                reader2.scan_chunks_for(
-                                    index_range2,
-                                    mz_range,
-                                    &self.metadata,
-                                    self.metadata.spectrum_array_indices(),
-                                    &self.query_indices.spectrum_chunk_index,
-                                )
-                            });
-                            let reader = handle.join().unwrap()?;
-                            let reader2 = handle2.join().unwrap()?;
-                            Ok(Box::new(reader.chain(reader2)))
-                        })?
-                    } else {
-                        Box::new(reader.scan_chunks_for(
-                            index_range,
-                            mz_range,
-                            &self.metadata,
-                            self.metadata.spectrum_array_indices(),
-                            &self.query_indices.spectrum_chunk_index,
-                        )?)
-                    }
+            let it: BatchIterator<'_> = if query.can_split() && self.handle.can_split() {
+                let mut index_range1 = index_range.clone();
+                if let Some(index_range2) = index_range1.split() {
+                    log::trace!("Splitting chunk query");
+                    let builder2 = self.handle.spectra_data()?;
+                    let reader2 = ChunkDataReader::new(builder2, BufferContext::Spectrum);
+                    std::thread::scope(|ctx| -> io::Result<_> {
+                        let handle = ctx.spawn(|| {
+                            reader.scan_chunks_for(
+                                index_range1,
+                                mz_range,
+                                &self.metadata,
+                                self.metadata.spectrum_array_indices(),
+                                &self.query_indices.spectrum_chunk_index,
+                            )
+                        });
+                        let handle2 = ctx.spawn(|| {
+                            reader2.scan_chunks_for(
+                                index_range2,
+                                mz_range,
+                                &self.metadata,
+                                self.metadata.spectrum_array_indices(),
+                                &self.query_indices.spectrum_chunk_index,
+                            )
+                        });
+                        let reader = handle.join().unwrap()?;
+                        let reader2 = handle2.join().unwrap()?;
+                        Ok(Box::new(reader.chain(reader2)))
+                    })?
                 } else {
                     Box::new(reader.scan_chunks_for(
                         index_range,
@@ -656,25 +646,33 @@ impl<
                         self.metadata.spectrum_array_indices(),
                         &self.query_indices.spectrum_chunk_index,
                     )?)
-                };
+                }
+            } else {
+                Box::new(reader.scan_chunks_for(
+                    index_range,
+                    mz_range,
+                    &self.metadata,
+                    self.metadata.spectrum_array_indices(),
+                    &self.query_indices.spectrum_chunk_index,
+                )?)
+            };
 
-            let it: BatchIterator<'_> =
-                if let Some(ion_mobility_range) = ion_mobility_range {
-                    // If there is an ion mobility array constraint, the chunked encoding doesn't support filtering on this
-                    // dimension directly.
-                    if let Some(im_name) = self
-                        .metadata
-                        .spectrum_array_indices
-                        .iter()
-                        .find(|v| v.is_ion_mobility())
-                    {
-                        chunk::make_ion_mobility_filter(it, ion_mobility_range, im_name)
-                    } else {
-                        it
-                    }
+            let it: BatchIterator<'_> = if let Some(ion_mobility_range) = ion_mobility_range {
+                // If there is an ion mobility array constraint, the chunked encoding doesn't support filtering on this
+                // dimension directly.
+                if let Some(im_name) = self
+                    .metadata
+                    .spectrum_array_indices
+                    .iter()
+                    .find(|v| v.is_ion_mobility())
+                {
+                    chunk::make_ion_mobility_filter(it, ion_mobility_range, im_name)
                 } else {
                     it
-                };
+                }
+            } else {
+                it
+            };
             return Ok((it, time_index));
         }
 
@@ -760,8 +758,7 @@ impl<
             "peak data index was not found",
         ))?;
 
-        PointDataReader(builder, BufferContext::Spectrum)
-            .get_peak_list_for(index, meta_index)
+        PointDataReader(builder, BufferContext::Spectrum).get_peak_list_for(index, meta_index)
     }
 
     /// Perform slicing random access over the peak data for spectra in this file.
@@ -863,13 +860,15 @@ impl<
 
         if self.query_indices.chromatogram_chunk_index.is_populated() {
             let reader = ChunkDataReader::new(builder, BufferContext::Chromatogram);
-            return reader.read_chunks_for(
-                index,
-                &self.query_indices.chromatogram_chunk_index,
-                &self.metadata.chromatogram_array_indices,
-                None,
-                Some(PageQuery::new(row_group_indices, pages)),
-            ).map(Some);
+            return reader
+                .read_chunks_for(
+                    index,
+                    &self.query_indices.chromatogram_chunk_index,
+                    &self.metadata.chromatogram_array_indices,
+                    None,
+                    Some(PageQuery::new(row_group_indices, pages)),
+                )
+                .map(Some);
         }
 
         let reader = PointDataReader(builder, BufferContext::Chromatogram);
@@ -1190,14 +1189,26 @@ impl<
             .spectrum_index_index
             .row_selection_is_not_null();
 
-        let proj = ProjectionMask::columns(
-            builder.parquet_schema(),
-            [
-                "spectrum.time",
-                "spectrum.total_ion_current",
-                "spectrum.MS_1000285_total_ion_current",
-            ],
-        );
+        let mut target_col = None;
+        for col in builder.parquet_schema().columns() {
+            if let Some(parsed) = parse_column_to_curie(col.name()) {
+                if parsed.accession == Some(curie!(MS:1000285)) {
+                    target_col = Some(col.clone());
+                }
+            }
+        }
+
+        let mut targets = vec![
+            "spectrum.time".to_string(),
+            "spectrum.total_ion_current".to_string(), // deprecated name
+        ];
+
+        if let Some(col) = target_col.as_ref() {
+            targets.push(col.path().string())
+        }
+
+        let proj =
+            ProjectionMask::columns(builder.parquet_schema(), targets.iter().map(String::as_str));
 
         let reader = builder
             .with_projection(proj)
@@ -1215,7 +1226,14 @@ impl<
                 .unwrap();
             let ints: &Float32Array = root
                 .column_by_name("total_ion_current")
-                .or_else(|| root.column_by_name("MS_1000285_total_ion_current"))
+                .or_else(|| {
+                    root.column_by_name(
+                        target_col
+                            .as_ref()
+                            .map(|v| v.name())
+                            .unwrap(),
+                    )
+                })
                 .unwrap()
                 .as_any()
                 .downcast_ref()
@@ -1272,7 +1290,7 @@ impl<
             [
                 "spectrum.time",
                 "spectrum.base_peak_intensity",
-                "spectrum.MS_1000505_base_peak_intensity",
+                "spectrum.MS_1000505_base_peak_intensity_unit_MS_1000131",
             ],
         );
 

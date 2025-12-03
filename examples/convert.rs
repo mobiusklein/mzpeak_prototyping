@@ -290,6 +290,7 @@ impl ConvertArgs {
                 Unit::Psi,
                 Unit::Kelvin,
                 Unit::MicrolitersPerMinute,
+                Unit::Celsius,
             ] {
                 if self.intensity_f32 {
                     overrides.insert(

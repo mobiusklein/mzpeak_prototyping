@@ -877,8 +877,7 @@ impl ArrowArrayChunk {
         ];
 
         for buffer_name in self.arrays.keys().sorted() {
-            if let Ok(transform) = BufferTransformEncoder::try_from(buffer_name.transform)
-            {
+            if let Ok(transform) = BufferTransformEncoder::try_from(buffer_name.transform) {
                 let f_of = transform.to_field(buffer_name);
                 fields_of.push(Arc::new(f_of));
             } else {
@@ -968,7 +967,8 @@ impl ArrowArrayChunk {
             let buffer_name = fields_of.map(&buffer_name0);
 
             if let Some(fields) = fields {
-                let field_name = if let Ok(transform) = BufferTransformEncoder::try_from(buffer_name.transform)
+                let field_name = if let Ok(transform) =
+                    BufferTransformEncoder::try_from(buffer_name.transform)
                 {
                     transform.to_field(&buffer_name).name().clone()
                 } else {
@@ -1105,8 +1105,7 @@ impl ArrowArrayChunk {
             {
                 let k = k.clone().with_format(BufferFormat::ChunkedSecondary);
                 let v = v.slice(step.start, step.end - step.start);
-                if let Ok(transform) = BufferTransformEncoder::try_from(k.transform)
-                {
+                if let Ok(transform) = BufferTransformEncoder::try_from(k.transform) {
                     let vi = transform.encode_arrow(&k, &v);
                     chunk_arrays.insert(k, vi);
                 } else {

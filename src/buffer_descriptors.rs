@@ -54,7 +54,7 @@ impl BufferContext {
     pub const fn default_sorted_array(&self) -> ArrayType {
         match self {
             BufferContext::Spectrum => ArrayType::MZArray,
-            BufferContext::Chromatogram => ArrayType::TimeArray
+            BufferContext::Chromatogram => ArrayType::TimeArray,
         }
     }
 }
@@ -141,7 +141,6 @@ impl PartialEq<str> for BufferFormat {
         self.to_string().eq_ignore_ascii_case(other)
     }
 }
-
 
 /// Whether or not a [`BufferName`] (or equivalent) is the main instance of [`BufferName::array_type`]
 /// or not. This lets us reliably simplify the names of some arrays to be easy to recognize without
@@ -283,7 +282,11 @@ impl Ord for BufferName {
             ord => return ord,
         }
 
-        match self.buffer_priority.cmp(&other.buffer_priority) {
+        match self
+            .buffer_priority
+            .unwrap_or(BufferPriority::Secondary)
+            .cmp(&other.buffer_priority.unwrap_or(BufferPriority::Secondary))
+        {
             core::cmp::Ordering::Equal => {}
             ord => return ord,
         }
@@ -921,10 +924,7 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
             data_type: array_to_arrow_type(
                 binary_datatype_from_accession(value.data_type).unwrap_or_default(),
             ),
-            unit: value
-                .unit
-                .map(|x| Unit::from_curie(&x))
-                .unwrap_or_default(),
+            unit: value.unit.map(|x| Unit::from_curie(&x)).unwrap_or_default(),
             buffer_format: value
                 .buffer_format
                 .parse::<BufferFormat>()
