@@ -4,7 +4,7 @@ use mzdata::{
     io::MZReaderType,
     params::Unit,
     prelude::*,
-    spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity},
+    spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity, bindata::BinaryArrayMap3D},
 };
 use mzpeak_prototyping::{
     buffer_descriptors::{BufferOverrideTable, BufferTransform},
@@ -523,6 +523,16 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
                 tdfspectrum_reader_type.set_consolidate_peaks(false);
             }
             for mut entry in reader.iter() {
+                if entry.has_ion_mobility_dimension() {
+                    if let Some(arrays) = entry.arrays.as_mut() {
+                        let mzs_not_sorted = arrays.mzs().is_ok_and(|v| !v.is_sorted());
+                        if mzs_not_sorted {
+                            if let Ok(sorted) = BinaryArrayMap3D::stack(&arrays).and_then(|v| v.unstack()) {
+                                *arrays = sorted;
+                            }
+                        }
+                    }
+                }
                 if write_peaks_and_profiles && entry.peaks.is_none() {
                     entry.pick_peaks(3.0).unwrap();
                 }

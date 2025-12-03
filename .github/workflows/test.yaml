@@ -46,10 +46,12 @@ jobs:
             python-version: '3.12'
             cache: 'pip'
       - name: install library
+        shell: bash
         run: |
           pip install -v python/
           pip install coverage pytest pytest-cov -U
       - name: run tests
+        shell: bash
         run: |
           py.test -l -s -v python/test/ \
             --cov=mzpeak --cov-report term \
