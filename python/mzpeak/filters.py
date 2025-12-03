@@ -5,10 +5,15 @@ from enum import Enum, auto
 import numpy as np
 import pyarrow as pa
 
-from scipy.linalg import solve_triangular
+try:
+    from scipy.linalg import solve_triangular
+except ImportError:
+    solve_triangular = None
 
 
 def fit_qr(x: np.ndarray, y: np.ndarray):
+    if solve_triangular is None:
+        raise ImportError("To fit a linear model, install scipy")
     quadx = np.stack([np.ones_like(x), x, x**2], axis=-1)
     qr = np.linalg.qr(quadx)
     v = qr.Q.T.dot(y)
@@ -16,6 +21,8 @@ def fit_qr(x: np.ndarray, y: np.ndarray):
 
 
 def fit_qr_weighted(x: np.ndarray, y: np.ndarray, weights: np.ndarray):
+    if solve_triangular is None:
+        raise ImportError("To fit a linear model, install scipy")
     quadx = np.stack([np.ones_like(x), x, x**2], axis=-1)
     chol_w = np.sqrt(weights)
     qr = np.linalg.qr(chol_w[:, None] * quadx)
@@ -129,6 +136,8 @@ class DeltaCurveRegressionModel(DeltaModelBase):
             The rank of the feature polynomial to construct, e.g. ``2 = β_0 + β_1 mz + β_2 mz^2``.
             Defaults to ``2``.
         """
+        if solve_triangular is None:
+            raise ImportError("To fit a linear model, install scipy")
         if delta_array is None:
             delta_array = np.diff(mz_array)
 
