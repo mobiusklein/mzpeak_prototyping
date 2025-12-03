@@ -301,12 +301,12 @@ class MzPeakSpectrumMetadataReader:
 
     def tic(self):
         return np.array(self.spectra["time"]), np.array(
-            self.spectra["total_ion_current"]
+            self.spectra["total ion current"]
         )
 
     def bpc(self):
         return np.array(self.spectra["time"]), np.array(
-            self.spectra["base_peak_intensity"]
+            self.spectra["base peak intensity"]
         )
 
     def _infer_schema_idx(self):
@@ -446,7 +446,7 @@ class MzPeakSpectrumMetadataReader:
             self.selected_ions = pd.DataFrame(
                 [],
                 columns=[
-                    index_col,
+                    "source_index",
                     "precursor_index",
                 ],
             )

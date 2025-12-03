@@ -999,14 +999,36 @@ class MzPeakArrayDataReader(Sequence[_SpectrumArrays]):
         return data
 
     def _read_chunk(
-        self, index: int, rgs: list[int], debug: bool = False, buffer_size: int = 512
+        self, index: int, rgs: list[int], debug: bool = False, batch_size: int = 512
     ) -> _SpectrumArrays:
+        """
+        Implementation to read a single chunk layout entry by index.
+
+        Parameters
+        ----------
+        index : int
+            The entity index to be read
+        rgs : list[int]
+            The row group indices which contain ``index``
+        debug : bool, optional
+            This internal option will skip unpacking and expanding the
+            :class:`pyarrow.ChunkedArray` into NumPy arrays.
+        batch_size : int, optional
+            The number of rows to buffer in memory at any given time. This
+            trades performance for memory consumption when scanning over many
+            rows. For single index reads the default value is safe.
+
+        Returns
+        -------
+        :class:`_SpectrumArrays`
+            The unpacked mapping of :class:`np.ndarray`
+        """
         chunks = []
         it = _BatchIterator(
-            self.handle.iter_batches(buffer_size, row_groups=rgs, columns=["chunk"]),
+            self.handle.iter_batches(batch_size, row_groups=rgs, columns=["chunk"]),
+            current_index=index,
             index_column=f"{self._namespace}_index"
         )
-        it.seek(index)
         batch: pa.RecordBatch
         for idx, batch in it:
             if idx > index:

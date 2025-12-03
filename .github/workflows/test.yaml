@@ -8,11 +8,11 @@ env:
 name: Test
 jobs:
 
-  test:
+  test-rust:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-    name: Test Suite
+    name: Rust Test Suite
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout sources
@@ -31,3 +31,26 @@ jobs:
         with:
           command: test
           args: -- --nocapture --show-output
+  test-python:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    name: Python Test Suite
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v6.1.0
+        with:
+            python-version: '3.12'
+            cache: 'pip'
+      - name: install library
+        run: |
+          pip install -v python/
+          pip install coverage pytest pytest-cov -U
+      - name: run tests
+        run: |
+          py.test -l -s -v python/test/ \
+            --cov=mzpeak --cov-report term \
+            --log-level=DEBUG

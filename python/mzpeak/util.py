@@ -1,6 +1,7 @@
 import re
 import logging
 
+from dataclasses import dataclass, field
 from numbers import Number
 from typing import Any, Generic, Mapping, TypeVar
 
@@ -50,17 +51,51 @@ def inflect_cv_name(accession: str, name: str) -> str:
     return "_".join(parts)
 
 
-def parse_inflected_cv_name(name: str) -> tuple[str | None, str]:
+@dataclass(frozen=True)
+class ColumnName:
+    accession: str | None
+    name: str
+    is_unit: bool | str = field(default=False)
+
+    def has_unit_curie(self) -> bool:
+        return isinstance(self.is_unit, str)
+
+    def is_unit_column(self) -> bool:
+        return self.is_unit and isinstance(self.is_unit, bool)
+
+    def __iter__(self):
+        yield self.accession
+        yield self.name
+        yield self.is_unit
+
+
+def parse_inflected_cv_name(name: str) -> ColumnName:
     tokens = iter(name.split("_"))
     try:
         prefix = next(tokens)
         accession = next(tokens)
         rest = '_'.join(tokens)
     except StopIteration:
-        return (None, name)
+        return ColumnName(None, name, False)
+
     if not rest or prefix not in PERMITTED_CV_NAMES:
-        return (None, name)
-    return (f"{prefix}:{accession}", rest)
+        return ColumnName(None, name, False)
+
+    curie = f"{prefix}:{accession}"
+
+    if rest.endswith("_unit"):
+        return ColumnName(curie, rest, True)
+
+    if "_unit_" in rest:
+        try:
+            (rest, unit) = rest.rsplit("_unit_", 1)
+            (unit_cv, unit_accession) = unit.split("_", 1)
+            unit_curie = f"{unit_cv}:{unit_accession}"
+            return ColumnName(curie, rest, unit_curie)
+        except ValueError:
+            pass
+
+    return ColumnName(curie, rest, False)
 
 
 
@@ -127,23 +162,25 @@ class OntologyMapper:
         self.overrides = overrides or {}
 
     def __getitem__(self, value: str):
-        accession, name = parse_inflected_cv_name(value)
+        colname = parse_inflected_cv_name(value)
+        accession, name, _unit = colname
+        suffix = ' unit' if colname.is_unit_column() else ''
         if accession is None:
             alt_name = name.replace("_", " ").replace("mz", 'm/z')
             alt_term = self.cv_psims.get(alt_name)
             if alt_term and alt_name not in ('id', 'index', 'name'):
                 return alt_term['name']
-            return self.overrides.get(name, name)
+            return self.overrides.get(name, name) + suffix
         cv_id = accession.split(":")[0]
         if cv_id == "MS":
             term = self.cv_psims[accession]
-            return term['name']
+            return term["name"] + suffix
         elif cv_id == "UO":
             term = self.cv_uo[accession]
-            return term['name']
+            return term["name"] + suffix
         else:
             logger.warning("Unknown prefix %r from %r", cv_id, value)
-            return self.overrides.get(name, name)
+            return self.overrides.get(name, name) + suffix
 
     def __call__(self, value: str):
         return self[value]

@@ -10,4 +10,9 @@ small_chunked:
 test:
     cargo t --tests -- --no-capture
 
+pytest:
+    py.test -l -s -v python/test/ \
+        --cov=mzpeak --cov-report term \
+        --log-level=DEBUG
+
 alias t := test

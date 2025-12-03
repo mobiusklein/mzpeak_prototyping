@@ -5,3 +5,4 @@
 .Rproj.user
 *delta*.pq
 *error*.pq
+.coverage
