@@ -20,8 +20,8 @@ use crate::{
     peak_series::ArrayIndex,
     writer::{
         AbstractMzPeakWriter, ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder,
-        ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder, VisitorBase, WriteBatchConfig,
-        builder::SpectrumFieldVisitors, implement_mz_metadata,
+        ChromatogramBuilder, MiniPeakWriterType, SpectrumBuilder, VisitorBase,
+        WriteBatchConfig, builder::SpectrumFieldVisitors, implement_mz_metadata,
     },
 };
 
@@ -42,6 +42,9 @@ pub struct UnpackedMzPeakWriterType<
 
     spectrum_metadata_buffer: SpectrumBuilder,
     chromatogram_metadata_buffer: ChromatogramBuilder,
+
+    use_chunked_encoding: Option<ChunkingStrategy>,
+    use_chromatogram_chunked_encoding: Option<ChunkingStrategy>,
 
     spectrum_data_point_counter: u64,
 
@@ -75,11 +78,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
 impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPeakDataSeries>
     AbstractMzPeakWriter for UnpackedMzPeakWriterType<C, D>
 {
-    fn append_key_value_metadata(
-        &mut self,
-        key: impl Into<String>,
-        value: impl Into<Option<String>>,
-    ) {
+    fn append_key_value_metadata(&mut self, key: String, value: Option<String>) {
         self.append_key_value_metadata(key, value);
     }
 
@@ -104,6 +103,14 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
 
     fn separate_peak_writer(&mut self) -> Option<&mut MiniPeakWriterType<fs::File>> {
         self.separate_peak_writer.as_mut()
+    }
+
+    fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
+        self.use_chunked_encoding.as_ref()
+    }
+
+    fn use_chromatogram_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
+        self.use_chromatogram_chunked_encoding.as_ref()
     }
 
     fn spectrum_precursor_counter(&self) -> u64 {
@@ -172,7 +179,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             ArrayBufferWriterVariants::ChunkBuffers(chromatogram_buffers_builder.build_chunked(
                 Arc::new(Schema::empty()),
                 BufferContext::Chromatogram,
-                false
+                false,
             ))
         } else {
             ArrayBufferWriterVariants::PointBuffers(chromatogram_buffers_builder.build(
@@ -232,7 +239,7 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             path,
             spectrum_data_writer: ArrowWriter::try_new_with_options(
                 spectrum_data_writer,
-                spectrum_buffers.schema.clone(),
+                spectrum_buffers.schema().clone(),
                 ArrowWriterOptions::new().with_properties(data_props),
             )
             .unwrap(),
@@ -248,6 +255,9 @@ impl<C: CentroidLike + ToMzPeakDataSeries, D: DeconvolutedCentroidLike + ToMzPea
             chromatogram_buffers,
             chromatogram_metadata_buffer: Default::default(),
             spectrum_data_point_counter: 0,
+
+            use_chunked_encoding,
+            use_chromatogram_chunked_encoding,
 
             chromatogram_data_point_counter: 0,
             compression,

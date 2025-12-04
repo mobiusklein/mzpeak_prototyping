@@ -402,6 +402,19 @@ def is_zero_pair_mask(data: Sequence[Number]):
 
 
 def null_delta_encode(data: pa.Array) -> pa.Array:
+    """
+    Delta-encode an Arrow array containing nulls. Nulls are encoded as null values, and treated as 0.0
+    for the purposes of computing the next delta.
+
+    Parameters
+    ----------
+    data : pa.Array
+        The data to delta encode
+
+    Returns
+    -------
+    pa.Array
+    """
     acc = []
     it = iter(data)
     last = next(it)
@@ -423,6 +436,22 @@ def null_delta_encode(data: pa.Array) -> pa.Array:
 
 
 def null_delta_decode(data: pa.Array, start: pa.Scalar) -> pa.Array:
+    """
+    Decode an Arrow array that was delta-encoded *with* nulls.
+
+    This is necessarily a copying operation.
+
+    Parameters
+    ----------
+    data : pa.Array
+        The data to be decoded.
+    start : pa.Scalar
+        The starting value, an offset
+
+    Returns
+    -------
+    pa.Array
+    """
     acc = []
     if not data[0].is_valid:
         if not data[1].is_valid:
@@ -447,6 +476,23 @@ def null_delta_decode(data: pa.Array, start: pa.Scalar) -> pa.Array:
 
 
 def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
+    """
+    Partition a sorted numerical array into segments spanning no more than `k` units.
+
+    This operation is null-aware, so sparse arrays can be partitioned.
+
+    Parameter
+    ---------
+    data : pa.Array
+        The data to be partitioned
+    k : float
+        The spacing between chunks
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        The start and end index of each chunk
+    """
     start = None
     n = len(data)
     i = 0

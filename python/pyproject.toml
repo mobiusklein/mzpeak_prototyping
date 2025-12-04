@@ -10,3 +10,5 @@ dependencies = [
     "psims",
     "pynumpress",
 ]
+
+license = "Apache-2.0"

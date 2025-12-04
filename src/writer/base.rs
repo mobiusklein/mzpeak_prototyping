@@ -34,7 +34,7 @@ macro_rules! implement_mz_metadata {
     () => {
         pub(crate) fn append_metadata(&mut self) {
             self.append_key_value_metadata(
-                "file_description",
+                "file_description".to_string(),
                 Some(
                     serde_json::to_string_pretty(&$crate::param::FileDescription::from(
                         self.mz_metadata.file_description(),
@@ -49,7 +49,7 @@ macro_rules! implement_mz_metadata {
                 .map(|v| $crate::param::InstrumentConfiguration::from(v))
                 .collect();
             self.append_key_value_metadata(
-                "instrument_configuration_list",
+                "instrument_configuration_list".to_string(),
                 Some(serde_json::to_string_pretty(&tmp).unwrap()),
             );
 
@@ -60,7 +60,7 @@ macro_rules! implement_mz_metadata {
                 .map(|v| $crate::param::DataProcessing::from(v))
                 .collect();
             self.append_key_value_metadata(
-                "data_processing_method_list",
+                "data_processing_method_list".to_string(),
                 Some(serde_json::to_string_pretty(&tmp).unwrap()),
             );
 
@@ -71,7 +71,7 @@ macro_rules! implement_mz_metadata {
                 .map(|v| $crate::param::Software::from(v))
                 .collect();
             self.append_key_value_metadata(
-                "software_list",
+                "software_list".to_string(),
                 Some(serde_json::to_string_pretty(&tmp).unwrap()),
             );
 
@@ -83,12 +83,12 @@ macro_rules! implement_mz_metadata {
                 .collect();
 
             self.append_key_value_metadata(
-                "sample_list",
+                "sample_list".to_string(),
                 Some(serde_json::to_string_pretty(&tmp).unwrap()),
             );
 
             self.append_key_value_metadata(
-                "run",
+                "run".to_string(),
                 Some(
                     serde_json::to_string_pretty(self.mz_metadata.run_description().unwrap())
                         .unwrap(),
@@ -121,19 +121,15 @@ pub trait AbstractMzPeakWriter {
     /// Append an arbitrary key bytestring with an optional value to the (current) Parquet file
     fn append_key_value_metadata(
         &mut self,
-        key: impl Into<String>,
-        value: impl Into<Option<String>>,
+        key: String,
+        value: Option<String>,
     );
 
     /// Whether or not a chunking strategy is being used for spectra
-    fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
-        None
-    }
+    fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy>;
 
     /// Whether or not a chunking strategy is being used for chromatograms
-    fn use_chromatogram_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
-        None
-    }
+    fn use_chromatogram_chunked_encoding(&self) -> Option<&ChunkingStrategy>;
 
     /// Get a mutable reference to the buffer of spectrum metadata values,
     /// for appending only
@@ -147,6 +143,8 @@ pub trait AbstractMzPeakWriter {
     /// for appending only
     fn spectrum_data_buffer_mut(&mut self) -> &mut ArrayBufferWriterVariants;
 
+    /// Get a mutable reference to the buffer of chromatogram signal data values,
+    /// for appending only
     fn chromatogram_data_buffer_mut(&mut self) -> &mut ArrayBufferWriterVariants;
 
     /// Check if the data buffers are full, and flush them if so
@@ -158,8 +156,13 @@ pub trait AbstractMzPeakWriter {
     /// The current number of distinct precursors having been written to the MzPeak file
     fn spectrum_precursor_counter(&self) -> u64;
 
+    /// The current number of chromatograms having been written to the MzPeak file or buffer
     fn chromatogram_counter(&self) -> u64;
 
+    /// Write a [`BinaryArrayMap`] to the data buffer for chromatograms.
+    ///
+    /// If chunked encoding is enabled, the [`ChunkingStrategy`] will be applied, regardless of whether or not the
+    /// spectrum is in profile mode. This might change in the future.
     fn write_chromatogram_arrays(
         &mut self,
         _chromatogram: &impl ChromatogramLike,
@@ -217,6 +220,10 @@ pub trait AbstractMzPeakWriter {
         Ok(extra_arrays)
     }
 
+    /// Write a `chromatogram` to the MzPeak file
+    ///
+    /// Data may be buffered until the chromatogram data file is ready
+    /// to be written.
     fn write_chromatogram(&mut self, chromatogram: &Chromatogram) -> io::Result<()> {
         log::trace!("Writing chromatogram {}", chromatogram.id());
         let aux_arrays = self.write_chromatogram_arrays(chromatogram, &chromatogram.arrays)?;
@@ -227,6 +234,9 @@ pub trait AbstractMzPeakWriter {
     }
 
     /// Write a `spectrum` to the MzPeak file
+    ///
+    /// Data may be buffered until the spectrum data file is ready to be written, but the spectrum data file
+    /// is likely being actively written out as the the buffer grows.
     fn write_spectrum<
         C: ToMzPeakDataSeries + CentroidLike,
         D: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -267,7 +277,7 @@ pub trait AbstractMzPeakWriter {
         }
     }
 
-    /// Write a [`BinaryArrayMap`] to the data buffer.
+    /// Write a [`BinaryArrayMap`] to the data buffer for spectra.
     ///
     /// If sparse data encoding is enabled ([`ArrayBufferWriter::nullify_zero_intensity`]), and the
     /// `spectrum` is in profile mode, this will fit a delta model with [`AbstractMzPeakWriter::build_delta_model`].
@@ -486,10 +496,15 @@ pub trait AbstractMzPeakWriter {
         Ok(EntryMetadataDerivedFromData::new(delta_params, aux_arrays))
     }
 
+    /// Get the writer for the separate peak list file, if one is available
     fn separate_peak_writer(&mut self) -> Option<&mut MiniPeakWriterType<fs::File>> {
         None
     }
 
+    /// Generate the [`WriterProperties`] for the the spectrum metadata file, based upon
+    /// the provided schema.
+    ///
+    /// This currently uses a constant Zstd compression level.
     fn spectrum_metadata_writer_props(metadata_fields: &SchemaRef) -> WriterProperties {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
@@ -523,6 +538,11 @@ pub trait AbstractMzPeakWriter {
             .build()
     }
 
+    /// Generate the [`WriterProperties`] for the spectrum signal data file, based upon
+    /// the provided schema and caller configuration.
+    ///
+    /// If `use_chunked_encoding` is enabled, it can have far-reaching effects on all other
+    /// parameters.
     fn chromatogram_data_writer_props(
         data_buffer: &impl ArrayBufferWriter,
         index_path: String,
@@ -591,6 +611,14 @@ pub trait AbstractMzPeakWriter {
         data_props.build()
     }
 
+    /// Generate the [`WriterProperties`] for the spectrum signal data file, based upon
+    /// the provided schema and caller configuration.
+    ///
+    /// If `use_chunked_encoding` is enabled, it can have far-reaching effects on all other
+    /// parameters.
+    ///
+    /// If an `ion_mobility` array is detected based upon column name, it will increase
+    /// the dictionary page size.
     fn spectrum_data_writer_props(
         data_buffer: &impl ArrayBufferWriter,
         index_path: String,

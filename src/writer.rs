@@ -271,6 +271,7 @@ pub struct MzPeakWriterType<
 
     buffer_size: usize,
     compression: Compression,
+
     #[allow(unused)]
     write_batch_config: WriteBatchConfig,
     mz_metadata: FileMetadataConfig,
@@ -285,13 +286,13 @@ impl<
 {
     fn append_key_value_metadata(
         &mut self,
-        key: impl Into<String>,
-        value: impl Into<Option<String>>,
+        key: String,
+        value: Option<String>,
     ) {
         self.archive_writer
             .as_mut()
             .unwrap()
-            .append_key_value_metadata(KeyValue::new(key.into(), value));
+            .append_key_value_metadata(KeyValue::new(key, value));
     }
 
     fn use_chunked_encoding(&self) -> Option<&ChunkingStrategy> {
@@ -496,7 +497,7 @@ impl<
         let spectrum_array_index: ArrayIndex = self.spectrum_buffers.as_array_index();
         self.append_key_value_metadata(
             "spectrum_array_index".to_string(),
-            spectrum_array_index.to_json(),
+            spectrum_array_index.to_json().into(),
         );
     }
 
@@ -504,7 +505,7 @@ impl<
         let chromatogram_array_index: ArrayIndex = self.chromatogram_buffers.as_array_index();
         self.append_key_value_metadata(
             "chromatogram_array_index".to_string(),
-            chromatogram_array_index.to_json(),
+            Some(chromatogram_array_index.to_json()),
         );
     }
 
@@ -580,11 +581,11 @@ impl<
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
             self.append_key_value_metadata(
-                "spectrum_count",
+                "spectrum_count".into(),
                 Some(self.spectrum_counter().to_string()),
             );
             self.append_key_value_metadata(
-                "spectrum_data_point_count",
+                "spectrum_data_point_count".into(),
                 Some(self.spectrum_data_point_counter.to_string()),
             );
 
@@ -612,11 +613,11 @@ impl<
             self.flush_spectrum_metadata_records()?;
             self.append_metadata();
             self.append_key_value_metadata(
-                "spectrum_count",
+                "spectrum_count".into(),
                 Some(self.spectrum_counter().to_string()),
             );
             self.append_key_value_metadata(
-                "spectrum_data_point_count",
+                "spectrum_data_point_count".into(),
                 Some(self.spectrum_data_point_counter.to_string()),
             );
 
@@ -633,11 +634,11 @@ impl<
                 )?);
                 self.flush_chromatogram_metadata_records()?;
                 self.append_key_value_metadata(
-                    "chromatogram_count",
+                    "chromatogram_count".into(),
                     Some(self.chromatogram_counter().to_string()),
                 );
                 self.append_key_value_metadata(
-                    "chromatogram_data_point_count",
+                    "chromatogram_data_point_count".into(),
                     Some(self.chromatogram_data_point_counter.to_string()),
                 );
                 writer = self.archive_writer.take().unwrap().into_inner()?;
@@ -658,7 +659,7 @@ impl<
                 self.flush_chromatogram_data_records()?;
                 self.add_chromatogram_array_metadata();
                 self.append_key_value_metadata(
-                    "chromatogram_data_point_count",
+                    "chromatogram_data_point_count".into(),
                     Some(self.chromatogram_data_point_counter.to_string()),
                 );
                 self.append_metadata();

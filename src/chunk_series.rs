@@ -21,6 +21,7 @@ use mzdata::spectrum::{
 use mzpeaks::coordinate::SimpleInterval;
 
 use bytemuck::Pod;
+use mzpeaks::prelude::Span1D;
 use num_traits::{Float, NumCast, ToPrimitive};
 
 use crate::buffer_descriptors::{BufferOverrideTable, BufferPriority};
@@ -590,7 +591,7 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
 pub struct ArrowArrayChunk {
     /// The index of source entity
     pub series_index: u64,
-    pub series_time: Option<f32>,
+    series_time: Option<f32>,
     /// The starting coordinate of the chunk axis
     pub chunk_start: f64,
     /// The ending coordinate of the chunk axis
@@ -605,7 +606,22 @@ pub struct ArrowArrayChunk {
     pub arrays: HashMap<BufferName, ArrayRef>,
 }
 
+impl Span1D for ArrowArrayChunk {
+    type DimType = f64;
+
+    fn start(&self) -> Self::DimType {
+        self.chunk_start
+    }
+
+    fn end(&self) -> Self::DimType {
+        self.chunk_end
+    }
+}
+
 impl ArrowArrayChunk {
+    /// Low level constructor for a single chunk record.
+    ///
+    /// Prefer [`ArrowArrayChunk::from_arrays`] for constructing a block of [`ArrowArrayChunk`]
     pub fn new(
         series_index: u64,
         series_time: Option<f32>,
@@ -837,6 +853,10 @@ impl ArrowArrayChunk {
     }
 
     /// Construct an Arrow schema from this chunk.
+    ///
+    /// This schema must hold for just *this* block of chunks. It will
+    /// be adapted by [`ChunkBuffers`](crate::writer::ChunkBuffers) to
+    /// the file-level schema.
     pub fn to_schema(
         &self,
         buffer_context: BufferContext,

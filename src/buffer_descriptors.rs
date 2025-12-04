@@ -164,6 +164,9 @@ impl Display for BufferPriority {
     }
 }
 
+
+/// Greater priority translates to a greater than relationship, i.e. `Primary > Secondary`
+/// for sorting convenience.
 impl Ord for BufferPriority {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         if matches!(self, Self::Primary) {
@@ -1178,37 +1181,56 @@ pub struct SerializedArrayIndex {
     pub entries: Vec<SerializedArrayIndexEntry>,
 }
 
+
+/// A mapping from one [`BufferName`] to another [`BufferName`] that is used to
+/// tell an [`ArrayBufferWriter`](crate::writer::ArrayBufferWriter) how to recast
+/// data types, units, and other metadata. Needed to enforce consistent array typing
+/// unless special care is taken.
 #[derive(Debug, Default, Clone)]
 pub struct BufferOverrideTable(HashMap<BufferName, BufferName>);
 
 impl BufferOverrideTable {
+    /// Check if a [`BufferName`] is overridden
     pub fn contains_key(&self, k: &BufferName) -> bool {
         self.0.contains_key(k)
     }
 
+    /// Get the overriding [`BufferName`], if any
     fn get(&self, k: &BufferName) -> Option<&BufferName> {
         self.0.get(k)
     }
 
+    /// See [`HashMap::iter`]
     pub fn iter(&self) -> std::collections::hash_map::Iter<'_, BufferName, BufferName> {
         self.0.iter()
     }
 
+    /// See [`HashMap::iter_mut`]
     pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, BufferName, BufferName> {
         self.0.iter_mut()
     }
 
+    /// Given a list of [`BufferName`] whose [`BufferPriority`] has been set, make sure all
     pub fn propagate_priorities(&mut self, buffer_names: &[BufferName]) {
+        // TODO: Check this loop. It seems to ensure that all arrays in the table have the greatest
+        // priority of all the entries in `buffer_names`. It might just be a side-effect of how it
+        // is invoked.
         for (_, val) in self.iter_mut() {
             for alt in buffer_names {
                 val.buffer_priority = val.buffer_priority.max(alt.buffer_priority);
             }
         }
+
+        // Ensure that the provided buffer names are self-mapping
         for v in buffer_names {
             self.insert(v.clone(), v.clone());
         }
     }
 
+    /// Map one [`BufferName`] to its pair, if it exists, or itself if no pair exists.
+    ///
+    /// The returned [`BufferName`] will have the greater of the two's [`BufferName::buffer_priority`]
+    /// and will inherit the sorting rank of `k` or else of the mapped [`BufferName`].
     pub fn map(&self, k: &BufferName) -> BufferName {
         let mut name = self.get(k).or(Some(k)).cloned().unwrap();
         name.buffer_priority = k.buffer_priority.max(name.buffer_priority);
@@ -1216,10 +1238,12 @@ impl BufferOverrideTable {
         name
     }
 
+    /// See [`HashMap::insert`]
     pub fn insert(&mut self, k: BufferName, v: BufferName) -> Option<BufferName> {
         self.0.insert(k, v)
     }
 
+    /// See [`HashMap::remove`]
     pub fn remove(&mut self, k: &BufferName) -> Option<BufferName> {
         self.0.remove(k)
     }

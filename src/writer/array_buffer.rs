@@ -27,6 +27,7 @@ pub trait ArrayBufferWriter {
     /// The name of the prefix in the schema for these fields
     fn prefix(&self) -> &str;
 
+    /// Whether or not to write a separate time series for each entry
     fn include_time(&self) -> bool;
 
     /// The path in the schema to reach the spectrum index column
@@ -127,8 +128,12 @@ pub trait ArrayBufferWriter {
         })
     }
 
+    /// Get the override table to control how array data types should be mapped to [`BufferName`]
     fn overrides(&self) -> &BufferOverrideTable;
 
+    /// Convert the registered set of [`BufferName`] embedded in the Arrow schema.
+    ///
+    /// If the column doesn't have any Arrow metadata, it will not be tracked.
     fn as_array_index(&self) -> ArrayIndex {
         let mut array_index: ArrayIndex =
             ArrayIndex::new(self.prefix().to_string(), HashMap::new());
@@ -162,18 +167,20 @@ pub trait ArrayBufferWriter {
     }
 }
 
+
+/// A data buffer for the `point layout`
 #[derive(Debug)]
 pub struct PointBuffers {
-    pub peak_array_fields: Fields,
-    pub buffer_context: BufferContext,
-    pub schema: SchemaRef,
-    pub prefix: String,
-    pub array_chunks: HashMap<String, Vec<ArrayRef>>,
-    pub overrides: BufferOverrideTable,
-    pub drop_zero_column: Option<Vec<String>>,
-    pub null_zeros: bool,
-    pub is_profile_buffer: Vec<bool>,
-    pub include_time: bool,
+    peak_array_fields: Fields,
+    buffer_context: BufferContext,
+    schema: SchemaRef,
+    prefix: String,
+    array_chunks: HashMap<String, Vec<ArrayRef>>,
+    overrides: BufferOverrideTable,
+    drop_zero_column: Option<Vec<String>>,
+    null_zeros: bool,
+    is_profile_buffer: Vec<bool>,
+    include_time: bool,
 }
 
 impl PointBuffers {
@@ -411,18 +418,21 @@ impl ArrayBufferWriter for PointBuffers {
     }
 }
 
+
+/// A data buffer for the `chunked layout`
 #[derive(Debug)]
 pub struct ChunkBuffers {
-    pub chunk_array_fields: Fields,
-    pub buffer_context: BufferContext,
-    pub schema: SchemaRef,
-    pub prefix: String,
-    pub chunks: Vec<StructArray>,
-    pub overrides: BufferOverrideTable,
-    pub drop_zero_column: Option<Vec<String>>,
-    pub null_zeros: bool,
-    pub is_profile_buffer: Vec<bool>,
-    pub include_time: bool,
+    chunk_array_fields: Fields,
+    buffer_context: BufferContext,
+    schema: SchemaRef,
+    prefix: String,
+    chunk_buffer: Vec<StructArray>,
+    overrides: BufferOverrideTable,
+    /// Currently not used. This requires supporting changes in [`ArrowArrayChunk`](crate::chunk_series::ArrowArrayChunk).
+    drop_zero_column: Option<Vec<String>>,
+    null_zeros: bool,
+    is_profile_buffer: Vec<bool>,
+    include_time: bool,
 }
 
 impl ChunkBuffers {
@@ -443,7 +453,7 @@ impl ChunkBuffers {
             buffer_context,
             schema,
             prefix,
-            chunks,
+            chunk_buffer: chunks,
             overrides,
             drop_zero_column,
             null_zeros,
@@ -453,11 +463,11 @@ impl ChunkBuffers {
     }
 
     pub fn len(&self) -> usize {
-        self.chunks.iter().map(|c| c.len()).sum()
+        self.chunk_buffer.iter().map(|c| c.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
+        self.chunk_buffer.is_empty()
     }
 }
 
@@ -481,12 +491,12 @@ impl ArrayBufferWriter for ChunkBuffers {
         _size: usize,
         is_profile: bool,
     ) {
-        self.chunks.push(StructArray::new(fields, arrays, None));
+        self.chunk_buffer.push(StructArray::new(fields, arrays, None));
         self.is_profile_buffer.push(is_profile);
     }
 
     fn num_chunks(&self) -> usize {
-        self.chunks.len()
+        self.chunk_buffer.len()
     }
 
     fn add<T: ToMzPeakDataSeries>(
@@ -502,7 +512,7 @@ impl ArrayBufferWriter for ChunkBuffers {
         let prefix = self.prefix().to_string();
         let schema = self.schema.clone();
         let is_profile = core::mem::take(&mut self.is_profile_buffer);
-        self.chunks
+        self.chunk_buffer
             .drain(..)
             .zip(is_profile)
             .map(move |(batch, _is_profile)| {
@@ -532,9 +542,12 @@ impl ArrayBufferWriter for ChunkBuffers {
     }
 }
 
+/// An abstraction over [`ArrayBufferWriter`] types
 #[derive(Debug)]
 pub enum ArrayBufferWriterVariants {
+    /// This writer uses the `chunked` layout
     ChunkBuffers(ChunkBuffers),
+    /// This writer uses the `point` layout
     PointBuffers(PointBuffers),
 }
 
@@ -716,6 +729,7 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    /// Set the [`BufferContext`] that this will build arrays for
     pub fn with_context(mut self, value: BufferContext) -> Self {
         self.buffer_context = value;
         self
@@ -742,20 +756,25 @@ impl ArrayBuffersBuilder {
         self.deduplicate_fields();
     }
 
+    /// Register an new rule mapping from one [`BufferName`]-like to another [`BufferName`]-like
+    /// when later writing arrays
     pub fn add_override(mut self, from: impl Into<BufferName>, to: impl Into<BufferName>) -> Self {
         self.overrides.insert(from.into(), to.into());
         self.apply_overrides();
         self
     }
 
+    /// Get a copy of the set of registered override rules
     pub fn overrides(&self) -> BufferOverrideTable {
         self.overrides.clone()
     }
 
+    /// Get the current set of [`arrow::datatypes::Field`] for the set of arrays to be written
     pub fn dtype(&self) -> DataType {
         DataType::Struct(self.array_fields.clone().into())
     }
 
+    /// Register a new [`arrow::datatypes::FieldRef`] with the current schema
     pub fn add_field(mut self, field: FieldRef) -> Self {
         if !self
             .array_fields
@@ -768,6 +787,10 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    /// Register all the fields of `T` as given by [`ToMzPeakDataSeries::to_fields`]
+    /// with the current schema.
+    ///
+    /// See [`Self::add_field`]
     pub fn add_peak_type<T: ToMzPeakDataSeries>(mut self) -> Self {
         for f in T::to_fields().iter().cloned() {
             self = self.add_field(f);
@@ -828,6 +851,7 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    /// Build a [`ChunkBuffer`], configuring the underlying schema
     pub fn build_chunked(
         mut self,
         schema: SchemaRef,
@@ -851,7 +875,7 @@ impl ArrayBuffersBuilder {
             Some(
                 fields
                     .iter()
-                    .filter(|c| c.name().starts_with("spectrum_intensity_"))
+                    .filter(|c| c.name().starts_with("_intensity"))
                     .map(|s| s.to_string())
                     .collect(),
             )
@@ -877,6 +901,7 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    /// Build a [`PointBuffers`], configuring the underlying schema
     pub fn build(
         mut self,
         schema: SchemaRef,
