@@ -997,7 +997,7 @@ impl ArrowArrayChunk {
                 // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
                 if !fields.find(&field_name).is_some() && buffer_name != main_axis {
                     log::debug!(
-                        "Skipping {:?}, not in schema: {fields:?}",
+                        "Skipping {:?} from {arr:?}, not in schema: {fields:?}",
                         buffer_name.to_field().name()
                     );
                     auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);

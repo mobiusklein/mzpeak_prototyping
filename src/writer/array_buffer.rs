@@ -823,8 +823,9 @@ impl ArrayBuffersBuilder {
         let mut has_priority = Vec::new();
         for f in self.array_fields.iter_mut() {
             if let Some(mut buff) = BufferName::from_field(self.buffer_context, f.clone()) {
-                if !seen.contains(&buff.array_type) {
-                    seen.insert(buff.array_type.clone());
+                if !seen.contains(&(buff.array_type.clone(), buff.buffer_format)) {
+                    seen.insert((buff.array_type.clone(), buff.buffer_format));
+                    log::debug!("Setting {buff} {buff:?} to be primary");
                     buff = buff.with_priority(Some(BufferPriority::Primary));
                     has_priority.push(buff.clone());
                     *f = Arc::new(

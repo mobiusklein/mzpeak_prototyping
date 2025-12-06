@@ -1,4 +1,4 @@
-export RUST_LOG := "trace"
+export RUST_LOG := "info"
 
 small:
     cargo r -r --example convert -- -y -z -u small.mzML -o small.mzpeak

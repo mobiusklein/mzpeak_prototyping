@@ -1212,12 +1212,18 @@ impl BufferOverrideTable {
 
     /// Given a list of [`BufferName`] whose [`BufferPriority`] has been set, make sure all
     pub fn propagate_priorities(&mut self, buffer_names: &[BufferName]) {
-        // TODO: Check this loop. It seems to ensure that all arrays in the table have the greatest
-        // priority of all the entries in `buffer_names`. It might just be a side-effect of how it
-        // is invoked.
+        // Make sure all overrides for the same destination array type are equal priority
         for (_, val) in self.iter_mut() {
             for alt in buffer_names {
-                val.buffer_priority = val.buffer_priority.max(alt.buffer_priority);
+                // {
+                if alt.array_type == val.array_type && alt.unit == val.unit && alt.dtype == val.dtype {
+                    let before = val.buffer_priority;
+                    if alt.buffer_priority != before {
+                        let name_before = format!("{val:?}");
+                        val.buffer_priority = val.buffer_priority.max(alt.buffer_priority);
+                        log::debug!("{name_before} priority before {before:?} to {:?}", val.buffer_priority);
+                    }
+                }
             }
         }
 
@@ -1258,5 +1264,17 @@ impl From<HashMap<BufferName, BufferName>> for BufferOverrideTable {
 impl FromIterator<(BufferName, BufferName)> for BufferOverrideTable {
     fn from_iter<T: IntoIterator<Item = (BufferName, BufferName)>>(iter: T) -> Self {
         HashMap::from_iter(iter).into()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_priority_cmp() {
+        assert_eq!(None.max(Some(BufferPriority::Primary)), Some(BufferPriority::Primary));
+        assert_eq!(Some(BufferPriority::Primary).max(None), Some(BufferPriority::Primary));
+        assert_eq!(Some(BufferPriority::Secondary).max(Some(BufferPriority::Primary)), Some(BufferPriority::Primary));
     }
 }
