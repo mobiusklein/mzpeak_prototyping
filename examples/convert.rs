@@ -2,7 +2,8 @@ use clap::Parser;
 use mzdata::{
     self,
     io::MZReaderType,
-    params::Unit,
+    meta::{DataProcessing, ProcessingMethod, Software},
+    params::{Unit, Param},
     prelude::*,
     spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity, bindata::BinaryArrayMap3D},
 };
@@ -12,7 +13,7 @@ use mzpeak_prototyping::{
     peak_series::{BufferContext, BufferName},
     writer::{
         AbstractMzPeakWriter, ArrayBuffersBuilder, MzPeakWriterType,
-        sample_array_types_from_chromatograms, sample_array_types_from_file_reader,
+        sample_array_types_from_chromatograms, sample_array_types_from_spectrum_source,
     },
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
@@ -54,10 +55,7 @@ fn main() -> io::Result<()> {
 // ============================================================================
 
 fn chunk_encoding_parser(method_str: &str) -> Result<ChunkingStrategy, String> {
-    if let Some((method, chunk_size)) = method_str
-        .split_once(":")
-        .or(Some((method_str, "50")))
-    {
+    if let Some((method, chunk_size)) = method_str.split_once(":").or(Some((method_str, "50"))) {
         let chunk_size = chunk_size.parse::<f64>().unwrap_or(50.0);
         let v = match method.to_ascii_lowercase().as_str() {
             "delta" => ChunkingStrategy::Delta { chunk_size },
@@ -393,7 +391,8 @@ pub fn run_convert(filename: &Path, args: ConvertArgs) -> io::Result<()> {
     let start = Instant::now();
 
     let outpath = args
-        .outpath.clone()
+        .outpath
+        .clone()
         .unwrap_or_else(|| filename.with_extension("mzpeak"));
 
     convert_file(filename, &outpath, &args)?;
@@ -439,26 +438,24 @@ pub fn configure_writer_builder(
 }
 
 pub fn add_processing_metadata(writer: &mut MzPeakWriterType<fs::File>) {
-    writer.softwares_mut().push(mzdata::meta::Software::new(
+    writer.softwares_mut().push(Software::new(
         "mzpeak_prototyping_convert1".into(),
         "0.1.0".into(),
         vec![mzdata::meta::custom_software_name(
             "mzpeak_prototyping_convert",
         )],
     ));
-    writer
-        .data_processings_mut()
-        .push(mzdata::meta::DataProcessing {
-            id: "mzpeak_conversion1".to_string(),
-            methods: vec![mzdata::meta::ProcessingMethod {
-                order: 1,
-                software_reference: "mzpeak_prototyping_convert1".to_string(),
-                params: vec![mzdata::Param::new_key_value(
-                    "conversion options",
-                    std::env::args().skip(1).collect::<Vec<String>>().join(" "),
-                )],
-            }],
-        });
+    writer.data_processings_mut().push(DataProcessing {
+        id: "mzpeak_conversion1".to_string(),
+        methods: vec![ProcessingMethod {
+            order: 1,
+            software_reference: "mzpeak_prototyping_convert1".to_string(),
+            params: vec![Param::new_key_value(
+                "conversion options",
+                std::env::args().skip(1).collect::<Vec<String>>().join(" "),
+            )],
+        }],
+    });
 }
 
 pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -> io::Result<()> {
@@ -473,74 +470,86 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
     }
 
     let handle = fs::File::create(output_path)?;
-    let mut writer = configure_writer_builder(args);
+    let mut builder = configure_writer_builder(args);
 
+    // Apply all the data type conversion rules generated from the user input
+    for (from, to) in overrides.iter() {
+        builder = builder.add_spectrum_array_override(from.clone(), to.clone());
+        builder = builder.add_chromatogram_array_override(from.clone(), to.clone());
+    }
+
+    // If we are storing peaks too, add configure the extra builder.
     if args.write_peaks_and_profiles {
         let mut point_builder = ArrayBuffersBuilder::default()
             .prefix("point")
             .with_context(BufferContext::Spectrum);
-        for f in sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
-            &mut reader,
-            &overrides,
-            None,
-        ) {
+        for f in sample_array_types_from_spectrum_source(&mut reader, &overrides, None) {
             point_builder = point_builder.add_field(f);
         }
-        writer = writer.store_peaks_and_profiles_apart(Some(point_builder));
+        builder = builder.store_peaks_and_profiles_apart(Some(point_builder));
     }
 
-    writer = sample_array_types_from_file_reader::<CentroidPeak, DeconvolutedPeak>(
-        &mut reader,
-        &overrides,
-        args.chunked_encoding,
-    )
-    .into_iter()
-    .fold(writer, |writer, f| writer.add_spectrum_field(f));
-
-    for (from, to) in overrides.iter() {
-        writer = writer.add_spectrum_array_override(from.clone(), to.clone());
-        writer = writer.add_chromatogram_array_override(from.clone(), to.clone());
+    // Populate the spectrum data schema from whatever data is available
+    for field in
+        sample_array_types_from_spectrum_source(&mut reader, &overrides, args.chunked_encoding)
+    {
+        builder = builder.add_spectrum_field(field);
     }
 
-    writer = sample_array_types_from_chromatograms(
+    // Populate the chromatogram data schema from whatever data is available
+    for field in sample_array_types_from_chromatograms(
         reader.iter_chromatograms().take(10),
         &overrides,
         args.chromatogram_chunked_encoding(),
-    )
-    .into_iter()
-    .fold(writer, |writer, f| writer.add_chromatogram_field(f));
+    ) {
+        builder = builder.add_chromatogram_field(field);
+    }
 
-    let mut writer = writer.build(handle, true);
+    let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
     add_processing_metadata(&mut writer);
 
+    // Permit a backlog of exactly one spectrum or chromatogram at a time
     let (send, recv) = sync_channel(1);
 
     let write_peaks_and_profiles = args.write_peaks_and_profiles;
+
+    // Read entries out of the input file in another thread
     let read_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Disable old behavior of flattening 3D spectra removing the ion mobility dimension
             if let MZReaderType::BrukerTDF(tdfspectrum_reader_type) = &mut reader {
                 tdfspectrum_reader_type.set_consolidate_peaks(false);
             }
+            // Loop over the spectra in the file and send them to be written
             for mut entry in reader.iter() {
+                // Make sure that if there's ion mobility that the spectrum is sorted by m/z
                 if entry.has_ion_mobility_dimension() {
                     if let Some(arrays) = entry.arrays.as_mut() {
                         let mzs_not_sorted = arrays.mzs().is_ok_and(|v| !v.is_sorted());
                         if mzs_not_sorted {
-                            if let Ok(sorted) = BinaryArrayMap3D::stack(&arrays).and_then(|v| v.unstack()) {
+                            if let Ok(sorted) =
+                                BinaryArrayMap3D::stack(&arrays).and_then(|v| v.unstack())
+                            {
                                 *arrays = sorted;
                             }
                         }
                     }
                 }
+
+                // Pick peaks. This uses a generic centroiding algorithm, a vendor writer would use their
+                // proprietary method
                 if write_peaks_and_profiles && entry.peaks.is_none() {
                     entry.pick_peaks(3.0).unwrap();
                 }
+
+                // Send the spectrum
                 if send.send((Some(entry), None)).is_err() {
                     break; // Receiver dropped
                 }
             }
 
+            // Loop over the chromatogram in the file and send them to be written
             for entry in reader.iter_chromatograms() {
                 if send.send((None, Some(entry))).is_err() {
                     break; // Receiver dropped
@@ -552,6 +561,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         }
     });
 
+    // Write out entries in a separate thread
     let write_handle = thread::spawn(move || {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             for (i, (spectrum, chromatogram)) in recv.into_iter().enumerate() {

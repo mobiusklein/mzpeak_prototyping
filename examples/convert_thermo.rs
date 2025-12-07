@@ -1,3 +1,5 @@
+//! A very sloppy converter that is tailored to Thermo RAW files
+
 use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, UInt64Array};
 use clap::Parser;
 use mzdata::{
@@ -14,7 +16,7 @@ use mzpeak_prototyping::{
     ToMzPeakDataSeries,
     buffer_descriptors::BufferOverrideTable,
     peak_series::{BufferContext, BufferName},
-    writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_chromatograms, sample_array_types_from_file_reader},
+    writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_chromatograms, sample_array_types_from_spectrum_source},
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use std::{
@@ -352,47 +354,47 @@ fn convert_file(
     }
 
     let handle = fs::File::create(output_path)?;
-    let mut writer = convert::configure_writer_builder(&args);
+    let mut builder = convert::configure_writer_builder(&args);
 
-    writer = writer.add_spectrum_peak_type::<ThermoPeak>();
+    for (from, to) in overrides.iter() {
+        builder = builder.add_spectrum_array_override(from.clone(), to.clone());
+        builder = builder.add_chromatogram_array_override(from.clone(), to.clone());
+    }
+
+    builder = builder.add_spectrum_peak_type::<ThermoPeak>();
 
     if args.write_peaks_and_profiles {
         let mut point_builder = ArrayBuffersBuilder::default()
             .prefix("point")
             .with_context(BufferContext::Spectrum)
             .add_peak_type::<ThermoPeak>();
-        for f in sample_array_types_from_file_reader::<ThermoPeak, DeconvolutedPeak>(
+        for f in sample_array_types_from_spectrum_source(
             &mut reader,
             &overrides,
             None,
         ) {
             point_builder = point_builder.add_field(f);
         }
-        writer = writer.store_peaks_and_profiles_apart(Some(point_builder));
+        builder = builder.store_peaks_and_profiles_apart(Some(point_builder));
     }
 
-    writer = sample_array_types_from_file_reader::<ThermoPeak, DeconvolutedPeak>(
-        &mut reader,
-        &overrides,
-        args.chunked_encoding,
-    )
-    .into_iter()
-    .fold(writer, |writer, f| writer.add_spectrum_field(f));
+    // Populate the spectrum data schema from whatever data is available
+    for field in
+        sample_array_types_from_spectrum_source(&mut reader, &overrides, args.chunked_encoding)
+    {
+        builder = builder.add_spectrum_field(field);
+    }
 
-    writer = sample_array_types_from_chromatograms(
+    // Populate the chromatogram data schema from whatever data is available
+    for field in sample_array_types_from_chromatograms(
         reader.iter_chromatograms().take(10),
         &overrides,
         args.chromatogram_chunked_encoding(),
-    )
-    .into_iter()
-    .fold(writer, |writer, f| writer.add_chromatogram_field(f));
-
-    for (from, to) in overrides.iter() {
-        writer = writer.add_spectrum_array_override(from.clone(), to.clone());
-        writer = writer.add_chromatogram_array_override(from.clone(), to.clone());
+    ) {
+        builder = builder.add_chromatogram_field(field);
     }
 
-    let mut writer = writer.build(handle, true);
+    let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);
     convert::add_processing_metadata(&mut writer);
 

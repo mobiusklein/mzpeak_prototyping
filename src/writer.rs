@@ -17,7 +17,7 @@ use parquet::{
 };
 
 use mzdata::{
-    io::{MZReaderType, StreamingSpectrumIterator},
+    io::{RandomAccessSpectrumSource, StreamingSpectrumIterator},
     meta::{FileMetadataConfig, MSDataFileMetadata},
     prelude::*,
     spectrum::{ArrayType, Chromatogram, MultiLayerSpectrum, SignalContinuity},
@@ -64,7 +64,7 @@ pub(crate) use mini_peak::MiniPeakWriterType;
 /*
 Internal helper function that, given an iterator over spectra, will
 perform the requested overrides and encodings to the data buffers and
-construct a
+construct a Parquet schema.
 */
 fn _eval_spectra_from_iter_for_fields<
     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
@@ -147,6 +147,14 @@ fn _eval_spectra_from_iter_for_fields<
     arrays
 }
 
+/// Collect arrays fields from an iterator of chromatograms to prepare the data file schema.
+///
+/// This consumes the entire iterator.
+///
+/// # Arguments
+/// `reader`: The stream of chromatograms to read from
+/// `overrides`: The array mapping rules override array data types.
+/// `use_chunked_encoding`: The chunk encoding format to use, if any
 pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
     iter: I,
     overrides: &BufferOverrideTable,
@@ -214,7 +222,16 @@ pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
     arrays
 }
 
-pub fn sample_array_types_from_stream<
+/// Collect arrays fields from spectra in a [`StreamingSpectrumIterator`] to prepare
+/// the data file schema.
+///
+/// This consumes only the next 10 spectra.
+///
+/// # Arguments
+/// `reader`: The stream of spectra to read from
+/// `overrides`: The array mapping rules override array data types.
+/// `use_chunked_encoding`: The chunk encoding format to use, if any
+pub fn sample_array_types_from_spectrum_stream<
     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
     I: Iterator<Item = MultiLayerSpectrum<C, D>>,
@@ -222,7 +239,7 @@ pub fn sample_array_types_from_stream<
     reader: &mut StreamingSpectrumIterator<C, D, MultiLayerSpectrum<C, D>, I>,
     overrides: &BufferOverrideTable,
     use_chunked_encoding: Option<ChunkingStrategy>,
-) -> Vec<std::sync::Arc<arrow::datatypes::Field>>
+) -> Vec<Arc<Field>>
 where
     MultiLayerSpectrum<C, D>: Clone,
 {
@@ -234,14 +251,25 @@ where
     )
 }
 
-pub fn sample_array_types_from_file_reader<
+
+/// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
+/// the data file schema.
+///
+/// This examines the first, 100th, and middle spectrum from `reader`.
+///
+/// # Arguments
+/// `reader`: The stream of spectra to read from
+/// `overrides`: The array mapping rules override array data types.
+/// `use_chunked_encoding`: The chunk encoding format to use, if any
+pub fn sample_array_types_from_spectrum_source<
     C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
     D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+    R: RandomAccessSpectrumSource<C, D, MultiLayerSpectrum<C, D>>,
 >(
-    reader: &mut MZReaderType<std::fs::File, C, D>,
+    reader: &mut R,
     overrides: &BufferOverrideTable,
     use_chunked_encoding: Option<ChunkingStrategy>,
-) -> Vec<Arc<arrow::datatypes::Field>> {
+) -> Vec<Arc<Field>> {
     let n = reader.len();
     if n == 0 {
         return Vec::new();
@@ -740,7 +768,7 @@ mod test {
     fn test_array_type_sampling() -> io::Result<()> {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
         let overrides1 = BufferOverrideTable::default();
-        let array_types = sample_array_types_from_file_reader(&mut reader, &overrides1, None);
+        let array_types = sample_array_types_from_spectrum_source(&mut reader, &overrides1, None);
 
         assert_eq!(array_types.len(), 3);
         let mz_buffer = BufferName::new(
@@ -765,7 +793,7 @@ mod test {
             }
         }
 
-        let array_types = sample_array_types_from_file_reader(&mut reader, &overrides1, Some(ChunkingStrategy::Delta { chunk_size: 50.0 }));
+        let array_types = sample_array_types_from_spectrum_source(&mut reader, &overrides1, Some(ChunkingStrategy::Delta { chunk_size: 50.0 }));
 
         assert_eq!(array_types.len(), 6);
         for f in array_types {
@@ -783,7 +811,7 @@ mod test {
 
         let mut it = StreamingSpectrumIterator::new(reader.iter());
 
-        let array_types = sample_array_types_from_stream(&mut it, &overrides1, None);
+        let array_types = sample_array_types_from_spectrum_stream(&mut it, &overrides1, None);
         assert_eq!(array_types.len(), 3);
         for f in array_types {
             if let Some(name) = BufferName::from_field(BufferContext::Spectrum, f.clone()) {
@@ -803,7 +831,7 @@ mod test {
         let mut builder = MzPeakWriter::<fs::File>::builder();
         let overrides = BufferOverrideTable::default();
 
-        builder = sample_array_types_from_file_reader(
+        builder = sample_array_types_from_spectrum_source(
             &mut reader,
             &overrides,
             None,
