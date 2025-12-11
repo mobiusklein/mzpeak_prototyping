@@ -7,6 +7,9 @@ dependencies = [
     "pyarrow",
     "pandas",
     "numpy",
+    "click",
+    "pynumpress",
+    "scipy",
     "psims",
     "pynumpress",
 ]
