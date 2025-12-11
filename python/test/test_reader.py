@@ -5,6 +5,7 @@ from mzpeak.mz_reader import BufferFormat
 
 point_path = Path("small.mzpeak")
 chunk_path = Path("small.chunked.mzpeak")
+unpacked_path = Path("small.unpacked.mzpeak")
 
 
 def common_checks(reader: MzPeakFile):
@@ -25,4 +26,10 @@ def test_load_base_point():
 def test_load_base_chunk():
     reader = MzPeakFile(chunk_path)
     assert reader.spectrum_data.buffer_format() == BufferFormat.Chunk
+    common_checks(reader)
+
+
+def test_load_unpacked():
+    reader = MzPeakFile(unpacked_path)
+    assert reader.spectrum_data.buffer_format() == BufferFormat.Point
     common_checks(reader)

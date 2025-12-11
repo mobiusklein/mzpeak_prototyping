@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 use serde_with::DeserializeFromStr;
 
 
+/// The facet of the thing being described in this file
 #[derive(Debug, Serialize, DeserializeFromStr, Clone)]
 pub enum DataKind {
     #[serde(rename="data arrays")]
@@ -33,6 +34,8 @@ impl FromStr for DataKind {
     }
 }
 
+
+/// The things being described in one facet or another by this file
 #[derive(Debug, Serialize, DeserializeFromStr, Clone)]
 pub enum EntityType {
     #[serde(rename="spectrum")]
@@ -59,10 +62,15 @@ impl FromStr for EntityType {
     }
 }
 
+
+/// A single file in the mzPeak archive of a certain type
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEntry {
+    /// The name of the file, relative to the root of the archive
     pub name: String,
+    /// The entity this file describes
     pub entity_type: EntityType,
+    /// The data this file describes
     pub data_kind: DataKind,
 }
 
@@ -101,7 +109,7 @@ impl From<super::MzPeakArchiveType> for FileEntry {
     }
 }
 
-
+/// A collection of [`FileEntry`] and associated JSON-compatible metadata
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileIndex {
     pub files: Vec<FileEntry>,

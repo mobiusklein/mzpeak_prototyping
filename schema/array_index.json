@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak array index schema",
+  "description": "Describe the JSON format of the mzPeak signal data array index that will be serialized in the file metadata",
+  "required": ["prefix"],
+  "type": "object",
+  "properties": {
+    "prefix": {
+        "type": "string",
+        "description": "The root node in the schema under which these arrays are organized.",
+        "examples": ["point", "chunk"]
+    }
+  },
+  "definitions": {
+    "array_index_entry": {
+        "description": "Describe single type of array encoded as a Parquet column. If this array is one of the chunked layout's supporting formats, the properties should still refer to complete array.",
+        "type": "object",
+        "required": [
+            "array_name",
+            "buffer_format",
+            "context",
+            "path",
+            "data_type",
+            "array_type",
+            "unit"
+        ],
+        "properties": {
+            "array_name": {
+                "type": "string",
+                "description": "The name of the array being described. If this is an MS:1000786|non-standard array, this should be the descriptive name for the array, otherwise it should be the human-readable name for the `array_type` from the PSI-MS controlled vocabulary.",
+                "examples": [
+                    "m/z array",
+                    "time array"
+                ]
+            },
+            "buffer_format": {
+                "type": "string",
+                "description": "How the array data is stored in the Parquet file.",
+                "enum": [
+                    "point",
+                    "chunk_start",
+                    "chunk_end",
+                    "chunk_values",
+                    "chunk_encoding",
+                    "secondary_chunk"
+                ]
+            },
+            "context": {
+                "type": "string",
+                "description": "The entity type this array belongs to.",
+                "examples": [
+                    "spectrum",
+                    "chromatogram"
+                ]
+            },
+            "prefix": {
+                "type": "string",
+                "description": "TODO: Remove"
+            },
+            "path": {
+              "type": "string",
+              "description": "The path from the *root* of the Parquet file's schema to this column.",
+              "pattern": "^(([A-Za-z0-9_]+)(?:\\.([A-Za-z0-9_]+))+)$"
+            },
+            "data_type": {
+                "type": "string",
+                "description": "The data type for this array, denoted using a CURIE from the PSI-MS controlled vocabulary for a child of MS:1000518|binary data type.",
+                "examples": [
+                    "MS:1000521",
+                    "MS:1000522",
+                    "MS:1000519",
+                    "MS:1000479"
+                ]
+            },
+            "array_type": {
+                "type": "string",
+                "description": "The type of array this is, semantically, denoted using a CURIE from the PSI-MS controlled vocabulary for a child of MS:1000513|binary data array. If no existing array fits, use MS:1000786|non-standard array.",
+                "examples": ["MS:1000514", "MS:1000515", "MS:1000595", "MS:1003006"]
+            },
+            "unit": {
+                "type": "string",
+                "description": "The unit describing the measurment, denoted using a CURIE from the PSI-MS controlled vocabulary or the unit ontology.",
+                "examples": [
+                    "MS:1000040",
+                    "MS:1000131",
+                    "UO:0000010"
+                ]
+            },
+            "buffer_priority": {
+                "type": "string",
+                "description": "A flag to indicate this array is the representative instance of this array type. The primary array of its type SHOULD have a simplified name, otherwise the writer should make it as unique as possible without sacrificing readability.",
+                "enum": [
+                    "primary",
+                    "secondary"
+                ]
+            },
+            "sorting_rank": {
+                "type": ["integer", "null"],
+                "description": "What order, following the entity index, this column was sorted in ascending order if any. If this value is null or absent, this array is assumed not to be sorted.",
+                "default": null
+            },
+            "data_processing_id": {
+                "type": ["integer", "string", "null"],
+                "description": "The identifier of a data processing method that governs this array. If not specified, assumed to be the default data processing method for this run.",
+                "default": null
+            },
+            "transform": {
+                "type": ["string", "null"],
+                "description": "A data-obscuring transformation that may be applied to this array such as Numpress compression, denoted as a CURIE from the PSI-MS controlled vocabulary. This is only valid if using the chunked layout.",
+                "default": null
+            }
+        }
+    }
+  }
+}

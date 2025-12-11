@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, prelude::*};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bytes::Bytes;
 use parquet::file::reader::{ChunkReader, Length};
@@ -17,17 +17,6 @@ use parquet::arrow::arrow_reader::{
 
 use crate::archive::{FileEntry, FileIndex};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ArchiveState {
-    #[default]
-    Opened,
-    SpectrumDataArrays,
-    SpectrumMetadata,
-    ChromatogramDataArrays,
-    ChromatogramMetadata,
-    Other,
-    Closed,
-}
 
 fn file_options() -> SimpleFileOptions {
     SimpleFileOptions::default()
@@ -35,10 +24,10 @@ fn file_options() -> SimpleFileOptions {
         .large_file(true)
 }
 
+/// A ZIP archive writer for writing mzPeak archives
 #[derive(Debug)]
 pub struct ZipArchiveWriter<W: Write + Send + Seek> {
     archive_writer: ZipWriter<W>,
-    state: ArchiveState,
     index: FileIndex,
 }
 
@@ -55,71 +44,68 @@ impl<W: Write + Send + Seek> Write for ZipArchiveWriter<W> {
 impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
     pub fn new(writer: W) -> Self {
         let archive_writer = ZipWriter::new(writer);
-        let state = ArchiveState::Opened;
         Self {
             archive_writer,
-            state,
             index: Default::default(),
         }
     }
 
+    /// Start writing the file corresponding to [`MzPeakArchiveType::SpectrumDataArrays`].
     pub fn start_spectrum_data(&mut self) -> ZipResult<()> {
         self.archive_writer.start_file(
             MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix(),
             file_options(),
         )?;
-        self.state = ArchiveState::SpectrumDataArrays;
         self.index
             .push(FileEntry::from(MzPeakArchiveType::SpectrumDataArrays));
         Ok(())
     }
 
+    /// Start writing the file corresponding to [`MzPeakArchiveType::SpectrumMetadata`].
     pub fn start_spectrum_metadata(&mut self) -> ZipResult<()> {
         self.archive_writer.start_file(
             MzPeakArchiveType::SpectrumMetadata.tag_file_suffix(),
             file_options(),
         )?;
-        self.state = ArchiveState::SpectrumMetadata;
         self.index
             .push(FileEntry::from(MzPeakArchiveType::SpectrumMetadata));
         Ok(())
     }
 
+    /// Start writing the file corresponding to [`MzPeakArchiveType::ChromatogramMetadata`].
     pub fn start_chromatogram_metadata(&mut self) -> ZipResult<()> {
         self.archive_writer.start_file(
             MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix(),
             file_options(),
         )?;
-        self.state = ArchiveState::ChromatogramMetadata;
         self.index
             .push(FileEntry::from(MzPeakArchiveType::ChromatogramMetadata));
         Ok(())
     }
 
+    /// Start writing the file corresponding to [`MzPeakArchiveType::ChromatogramDataArrays`].
     pub fn start_chromatogram_data(&mut self) -> ZipResult<()> {
         self.archive_writer.start_file(
             MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix(),
             file_options(),
         )?;
-        self.state = ArchiveState::ChromatogramDataArrays;
         self.index
             .push(FileEntry::from(MzPeakArchiveType::ChromatogramDataArrays));
         Ok(())
     }
 
+    /// Start writing a specific [`FileEntry`]. The underlying state will be [`MzPeakArchiveType::Other`]
+    /// but the file name and index metadata will come from the [`FileEntry`] fields.
     pub fn start_for_entry(&mut self, entry: FileEntry) -> ZipResult<()> {
-        self.state = ArchiveState::Other;
         self.archive_writer.start_file(entry.name.clone(), file_options())?;
         self.index.push(entry);
         Ok(())
     }
 
-    pub fn start_other<S: AsRef<str>>(&mut self, name: Option<&S>) -> ZipResult<()> {
-        let name = name
-            .map(|s| s.as_ref())
-            .unwrap_or( MzPeakArchiveType::Other.tag_file_suffix().as_ref());
+    /// Start writing any other kind of file by name.
+    pub fn start_other<S: AsRef<str>>(&mut self, name: &S) -> ZipResult<()> {
+        let name = name.as_ref();
         self.archive_writer.start_file(name, file_options())?;
-        self.state = ArchiveState::Other;
         self.index.push(FileEntry::new(
             name.to_string(),
             super::EntityType::Other("other".into()),
@@ -128,34 +114,8 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         Ok(())
     }
 
-    pub fn add_other_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let path = path.as_ref();
-        let p = path.file_name().map(|p| p.to_string_lossy().to_string());
-        let index_entry = FileEntry::new(
-            p.as_ref().unwrap().to_string(),
-            super::EntityType::Other("other".into()),
-            super::DataKind::Other("other".into()),
-        );
-        let mut handle = fs::File::open(path)?;
-        self.add_file_from_read(&mut handle, p.as_ref(), Some(index_entry))
-    }
-
-    pub fn add_file<P: AsRef<Path>>(
-        &mut self,
-        path: P,
-        archive_type: MzPeakArchiveType,
-    ) -> io::Result<()> {
-        let path = path.as_ref();
-        let p = path
-            .file_name()
-            .map(|p| p.to_string_lossy().to_string() + archive_type.tag_file_suffix());
-        let mut handle = fs::File::open(path)?;
-
-        let mut index_entry: FileEntry = archive_type.into();
-        index_entry.name = p.as_ref().unwrap().to_string();
-        self.add_file_from_read(&mut handle, p.as_ref(), Some(index_entry))
-    }
-
+    /// Copy an arbitrary [`io::Read`] into the mzPeak archive. It must either be identified by
+    /// a [`FileEntry`] `entry` or a file name-like `name` parameter.
     pub fn add_file_from_read<S: AsRef<str>>(
         &mut self,
         read: &mut impl io::Read,
@@ -165,7 +125,16 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         if let Some(entry) = entry {
             self.start_for_entry(entry)?
         } else {
-            self.start_other(name)?;
+            if let Some(name) = name {
+                self.start_other(name)?;
+            } else {
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::InvalidFilename,
+                        r#"No file name was provided to add an arbitrary byte stream to the mzPeak
+archive, nor was one given via the file index entry"#)
+                    )
+            }
         }
 
         let mut buffer = [0u8; 65536];
