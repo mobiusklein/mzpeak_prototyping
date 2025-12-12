@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak metadata data processing method list",
+  "description": "Describe the JSON format of data processing method list",
+  "type": "array",
+  "items": {
+    "$ref": "#/definitions/data_processing_method"
+  },
+  "definitions": {
+    "data_processing_method": {
+      "type": "object",
+      "description": "Describes a single instrument configuration that was used. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#dataProcessingList",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "A unique identifier for the data processing method."
+        },
+        "methods": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/processing_method" }
+        }
+      }
+    },
+    "processing_method": {
+      "type": "object",
+      "description": "Describes a single step of data processing.",
+      "properties": {
+        "order": {
+          "type": "integer",
+          "description": "The order in which the step is applied in the data processing pipeline."
+        },
+        "software_reference": {
+            "type": "string",
+            "description": "The identifier for a software entry that performed this operation."
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
+          },
+          "description": "Additional parameters describing this data processing step denoting actions, parameters, and other descriptors."
+        }
+      }
+    }
+  }
+}

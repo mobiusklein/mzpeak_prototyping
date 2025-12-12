@@ -6,7 +6,7 @@
   "properties": {
     "contents": {
         "type": "array",
-        "items": {"$ref": "https://github.com/mobiusklein/mzpeak_prototyping/schema/param.json"},
+        "items": {"$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"},
         "description": "Parameters describing the contents of the file, such as types of spectra. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#fileContent"
     },
     "source_files": {
@@ -23,6 +23,10 @@
         "description": "A data file that was read in order to produce this mzPeak file. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#sourceFile",
         "required": ["name", "location", "parameters"],
         "properties": {
+            "id": {
+              "type": "string",
+              "description": "A unique identifier for this source file."
+            },
             "name": {
                 "type": "string",
                 "description": "The name of the source file, not including parent directory"
@@ -34,7 +38,7 @@
             "parameters": {
                 "type": "array",
                 "items": {
-                  "$ref": "https://github.com/mobiusklein/mzpeak_prototyping/schema/param.json"
+                  "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
                 },
                 "description": "Additional parameters describing this source file, like checksums, nativeID format, or file format"
             }

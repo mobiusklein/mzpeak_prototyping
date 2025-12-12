@@ -18,7 +18,7 @@
     - [File-Level Metadata](#file-level-metadata)
   - [Signal Data Layouts](#signal-data-layouts)
     - [Arrays and Columns](#arrays-and-columns)
-      - [The Array Index](#the-array-index)
+    - [The Array Index](#the-array-index)
     - [Data Arrays, Encoding, Transformations and Parquet](#data-arrays-encoding-transformations-and-parquet)
       - [Zero Run Stripping](#zero-run-stripping)
         - [Null Marking](#null-marking)
@@ -47,6 +47,7 @@ to re-use concepts like controlled vocabularies where feasible as well as arbitr
 
 Components of an mzPeak archive:
 
+- `mzpeak_index.json`: Definition of the files present in the archive, encoded as JSON. This makes resolving files by controlled terms easier than matching file names.
 - `spectra_metadata.mzpeak`: Spectrum level metadata and file-level metadata. Includes spectrum descriptions, scans, precursors, and selected ions using packed parallel tables.
 - `spectra_data.mzpeak`: Spectrum signal data in either profile or centroid mode. May be in point layout or chunked layout which have different size and random access characteristics.
 - `spectra_peaks.mzpeak` (optional): Spectrum centroids stored explicitly separately from whatever signal is in `spectra_data.mzpeak`, such as from instrument vendors who store both profile and centroid versions of the same spectra. This file may not always be present.
@@ -204,21 +205,61 @@ A writer implementation is _SHOULD_ to minimize the number of interspersed rows 
 
 ### File-Level Metadata
 
-Some metadata is not arranged
+Some metadata is descriptive of the entire run and does not make sense to store in the rows of a table. This data is stored as JSON in the [Parquet key-value metadata](#the-metadata-key-value-pairs) of the `metadata` [data kind](#data-kind) files.
 
 ## Signal Data Layouts
 
 ### Arrays and Columns
 
-It is common in mass spectrometry to talk about a spectrum *having* an m/z array as synonymous with having been measured in the m/z dimension, and those m/z values are represented using some kind of physical data type in memory, likewise having an intensity array corresponding to the abundance of the signal parallel to the m/z array. In mzML, it is possible to use different physical data types for these two dimensions on different spectra in the same file, and there may well be legitimate use-cases for that. mzPeak can store array data in two ways. One way to store the arrays as columns in a signal data layout, burning the column into the schema and added to the `array index`. Another way is to store it as an `auxiliary array` which will be stored in the associated metadata table's `*.auxiliary_arrays` value for that entity's row. Auxiliary data arrays can be individually configured by the writer, have custom compression or data type decoding or cvParams, but it cannot be searched or sliced (read a segment of) without decoding the entire array, just as in mzML. By contrast, any array that is written as a column is encoded directly in Parquet, is part of the schema, and subject to its adaptive encoding process and compression. Currently, we assume that the first sorted array is the axis around which all other values are arranged, and any arrays that are shorter or longer _SHOULD_ instead be stored in `auxiliary_arrays` as well.
+It is common in mass spectrometry to talk about a spectrum _having_ an m/z array as synonymous with having been measured in the m/z dimension, and those m/z values are represented using some kind of physical data type in memory, likewise having an intensity array corresponding to the abundance of the signal parallel to the m/z array. In mzML, it is possible to use different physical data types for these two dimensions on different spectra in the same file, and there may well be legitimate use-cases for that. mzPeak can store array data in two ways. One way to store the arrays as columns in a signal data layout, burning the column into the schema and added to the `array index`. Another way is to store it as an `auxiliary array` which will be stored in the associated metadata table's `*.auxiliary_arrays` value for that entity's row. Auxiliary data arrays can be individually configured by the writer, have custom compression or data type decoding or cvParams, but it cannot be searched or sliced (read a segment of) without decoding the entire array, just as in mzML. By contrast, any array that is written as a column is encoded directly in Parquet, is part of the schema, and subject to its adaptive encoding process and compression. Currently, we assume that the first sorted array is the axis around which all other values are arranged, and any arrays that are shorter or longer _SHOULD_ instead be stored in `auxiliary_arrays` as well.
 
-#### The Array Index
+### The Array Index
 
-In order to properly annotate what kind of array a column *is*, we include a JSON-serialized `array index`, a table of data structures that describe each array in controlled vocabulary. A column is part of the Parquet file's schema and must always exist and have a homogenous type of value or a be marked `null` for each row. Columns can be sliced without needing to read the entire array.
+In order to properly annotate what kind of array a column _is_, we include a JSON-serialized `array index` in the [Parquet key-value metadata](#the-metadata-key-value-pairs), an list of data structures that describe each array in controlled vocabulary. A column is part of the Parquet file's schema and must always exist and have a homogenous type of value or a be marked `null` for each row.
+
+```json
+{
+  "prefix": "point",
+  "entries": [
+    {
+      "context": "spectrum",
+      "prefix": "point",
+      "path": "point.mz",
+      "data_type": "MS:1000523",
+      "array_type": "MS:1000514",
+      "array_name": "m/z array",
+      "unit": "MS:1000040",
+      "buffer_format": "point",
+      "transform": null,
+      "data_processing_id": null,
+      "buffer_priority": "primary",
+      "sorting_rank": 0
+    },
+    {
+      "context": "spectrum",
+      "prefix": "point",
+      "path": "point.intensity",
+      "data_type": "MS:1000521",
+      "array_type": "MS:1000515",
+      "array_name": "intensity array",
+      "unit": "MS:1000131",
+      "buffer_format": "point",
+      "transform": null,
+      "data_processing_id": null,
+      "buffer_priority": "primary",
+      "sorting_rank": null
+    }
+  ]
+}
+```
+
+This array index describes the table shown below for the [`point layout`](#example-point-table)
+
+Governed by `schema/array_index.json`.
 
 ### Data Arrays, Encoding, Transformations and Parquet
 
-Parquet can write [page indices](https://parquet.apache.org/docs/file-format/pageindex/) on any column that is a *leaf* node in the schema based upon the value being stored prior to applying [encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/) and [compression](https://parquet.apache.org/docs/file-format/data-pages/compression/). To that effect, we must take care when trying to store data cleverly. The following section may refer to spectra, but these are applicable more broadly.
+Parquet can write [page indices](https://parquet.apache.org/docs/file-format/pageindex/) on any column that is a _leaf_ node in the schema based upon the value being stored prior to applying [encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/) and [compression](https://parquet.apache.org/docs/file-format/data-pages/compression/). To that effect, we must take care when trying to store data cleverly. The following section may refer to spectra, but these are applicable more broadly.
 
 #### Zero Run Stripping
 
@@ -233,6 +274,7 @@ $$
 $$
 
 or using the following Python code:
+
 <details>
 
 <summary>Python code for fitting the weighted least squares model</summary>
@@ -315,7 +357,7 @@ When storing data arrays, the point layout stores the data as-is in parallel arr
     text-align: center;
   }
 </style>
-<table class="point-table">
+<table id="example-point-table" class="point-table">
   <thead>
     <tr>
       <th colspan=3>point</th>
@@ -382,8 +424,9 @@ This example uses a δ-encoding for the m/z array chunks' values, which can be e
 
 Perhaps, but the top-level structure leaves the door open for two use-cases:
 
-1. Unaligned proprietary data. A specialized writer or reader might wish to embed other information that is not directly connected to the primary schema's addressible unit (e.g. a spectrum, a data point), and this leaves open a door for that to be introduced. It is assumed that this is unlikely at this time, but it is a quantum physics universe.
-2. More table packing. Early in mzPeak's design, we tried to pack tables together as much as possible as in the [packed parallel table](#packed-parallel-metadata-tables) layout, but this proved to be very inefficient to _write_ despite being no slower to _read_. This might have been an implementation detail, and not Parquet itself. We don't want to throw out the opportunity to return to that in the future, requiring a schema-breaking change rather than just how we get to the tables that break.
+1. Clear schema signaling. When you see `point` at the root of the schema, you know this is a [point layout](#point-layout), not a [chunked layout](#chunked-layout) file.
+2. Unaligned proprietary data. A specialized writer or reader might wish to embed other information that is not directly connected to the primary schema's addressible unit (e.g. a spectrum, a data point), and this leaves open a door for that to be introduced. It is assumed that this is unlikely at this time, but it is a quantum physics universe.
+3. More table packing. Early in mzPeak's design, we tried to pack tables together as much as possible as in the [packed parallel table](#packed-parallel-metadata-tables) layout, but this proved to be very inefficient to _write_ despite being no slower to _read_. This might have been an implementation detail, and not Parquet itself. We don't want to throw out the opportunity to return to that in the future, requiring a schema-breaking change rather than just how we get to the tables that break.
 
 # Index File - `mzpeak_index.json`
 

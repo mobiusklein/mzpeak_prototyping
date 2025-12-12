@@ -10,16 +10,26 @@
     "instrument_configuration": {
       "type": "object",
       "description": "Describes a single instrument configuration that was used. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#instrumentConfiguration",
+      "required": ["identifier", "components"],
       "properties": {
         "components": {
           "type": "array",
           "items": { "$ref": "#/definitions/component_type" }
+        },
+        "software_reference": {
+          "type": "string",
+          "description": "The identifier for a software that was associated with the data acquisition process."
+        },
+        "identifier": {
+          "type": "integer",
+          "description": "A unique identifier for this instrument configuration."
         }
       }
     },
     "component_type": {
       "type": "object",
       "description": "Describes an instrument component like the ion source, mass analyzer, or detector",
+      "required": ["component_type", "order", "parameters"],
       "properties": {
         "component_type": {
           "enum": ["ionsource", "analyzer", "detector"],
@@ -32,7 +42,7 @@
         "parameters": {
           "type": "array",
           "items": {
-            "$ref": "https://github.com/mobiusklein/mzpeak_prototyping/schema/param.json"
+            "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
           },
           "description": "Additional parameters describing this component, like the particular hardware type or components"
         }

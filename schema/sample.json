@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak metadata sample list",
+  "description": "Describe the JSON format of sample list",
+  "type": "array",
+  "items": {
+    "$ref": "#/definitions/sample"
+  },
+  "definitions": {
+    "sample": {
+      "type": "object",
+      "description": "A description (one) of the samples used to generate this dataset. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#sample.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "A unique identifier for this sample."
+        },
+        "name": {
+          "type": "string",
+          "description": "A human-readable name for this sample that might be easier to recognize."
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
+          },
+          "description": "Additional parameters describing this sample."
+        }
+      }
+    }
+  }
+}

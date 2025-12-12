@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak metadata software list",
+  "description": "Describe the JSON format of software list",
+  "type": "array",
+  "items": {
+    "$ref": "#/definitions/software"
+  },
+  "definitions": {
+    "software": {
+      "type": "object",
+      "description": "A piece of software. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#software.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "A unique identifier for this software, even amongst different versions of the same software."
+        },
+        "version": {
+          "type": "string",
+          "description": "The version of the software."
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
+          },
+          "description": "Additional parameters describing this software, such as its controlled vocabulary identifier, or the term MS:1000799 for custom unreleased software to denote its name."
+        }
+      }
+    }
+  }
+}
