@@ -1,22 +1,22 @@
 {
   "files": [
     {
-      "name": "spectra_data.mzpeak",
+      "name": "spectra_data.parquet",
       "entity_type": "spectrum",
       "data_kind": "data arrays"
     },
     {
-      "name": "spectra_metadata.mzpeak",
+      "name": "spectra_metadata.parquet",
       "entity_type": "spectrum",
       "data_kind": "metadata"
     },
     {
-      "name": "chromatograms_metadata.mzpeak",
+      "name": "chromatograms_metadata.parquet",
       "entity_type": "chromatogram",
       "data_kind": "metadata"
     },
     {
-      "name": "chromatograms_data.mzpeak",
+      "name": "chromatograms_data.parquet",
       "entity_type": "chromatogram",
       "data_kind": "data arrays"
     }

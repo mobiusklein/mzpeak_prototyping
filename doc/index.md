@@ -14,25 +14,30 @@
     - [Unpacked archives](#unpacked-archives)
 - [Data Layouts](#data-layouts)
   - [Packed Parallel Metadata Tables](#packed-parallel-metadata-tables)
-    - [Null semantics](#null-semantics)
+    - [Controlled Vocabulary Terms and Column Name Inflection](#controlled-vocabulary-terms-and-column-name-inflection)
+    - [Null Semantics for Metadata](#null-semantics-for-metadata)
     - [File-Level Metadata](#file-level-metadata)
   - [Signal Data Layouts](#signal-data-layouts)
     - [Arrays and Columns](#arrays-and-columns)
     - [The Array Index](#the-array-index)
+      - [Buffer Priority, Naming](#buffer-priority-naming)
     - [Data Arrays, Encoding, Transformations and Parquet](#data-arrays-encoding-transformations-and-parquet)
       - [Zero Run Stripping](#zero-run-stripping)
         - [Null Marking](#null-marking)
+        - [Null Semantics for Signal Data](#null-semantics-for-signal-data)
     - [Point Layout](#point-layout)
     - [Chunked Layout](#chunked-layout)
+      - [Opaque Array Transforms](#opaque-array-transforms)
   - [Why all these root nodes?](#why-all-these-root-nodes)
 - [Index File - `mzpeak_index.json`](#index-file---mzpeak_indexjson)
   - [Data Kind](#data-kind)
   - [Entity Type](#entity-type)
-- [Spectrum Signal Data File - `spectra_data.mzpeak`](#spectrum-signal-data-file---spectra_datamzpeak)
-- [Spectrum Metadata File - `spectra_metadata.mzpeak`](#spectrum-metadata-file---spectra_metadatamzpeak)
-- [Spectrum Peak Data - `spectra_peaks.mzpeak`](#spectrum-peak-data---spectra_peaksmzpeak)
-- [Chromatogram Signal Data - `chromatograms_data.mzpeak`](#chromatogram-signal-data---chromatograms_datamzpeak)
-- [Chromatogram Metadata - `chromatograms_metadata.mzpeak`](#chromatogram-metadata---chromatograms_metadatamzpeak)
+- [Spectrum Signal Data File - `spectra_data.parquet`](#spectrum-signal-data-file---spectra_dataparquet)
+  - [Recommendations](#recommendations)
+- [Spectrum Metadata File - `spectra_metadata.parquet`](#spectrum-metadata-file---spectra_metadataparquet)
+- [Spectrum Peak Data - `spectra_peaks.parquet`](#spectrum-peak-data---spectra_peaksparquet)
+- [Chromatogram Signal Data - `chromatograms_data.parquet`](#chromatogram-signal-data---chromatograms_dataparquet)
+- [Chromatogram Metadata - `chromatograms_metadata.parquet`](#chromatogram-metadata---chromatograms_metadataparquet)
 
 # Introduction
 
@@ -195,7 +200,19 @@ Here is a stripped down example where two rows of related MS1 and MS2 spectra. T
   </tbody>
 </table>
 
-### Null semantics
+### Controlled Vocabulary Terms and Column Name Inflection
+
+When representing a controlled vocabulary term concept as a column in the table, the column name _SHOULD_ use the following inflection rules to construct the column name:
+
+1. The base column name is `${CV_CODE}_${CV_ACCESSION}_${CLEANED_NAME}` where:
+   1. `${CV_CODE}` is the identifier for the controlled vocabulary itself, `MS` for PSI-MS or `UO` for the unit ontology.
+   2. `${CV_ACCESSION}` is the accession number. `MS:1000016` for "scan start time" would be `1000016`.
+   3. `${CLEANED_NAME}` is the term's name with any non-Parquet column compatible characters replaced with `_`. The regular expression `/[^a-zA-Z0-9_\\\\-]+/` is sufficient to match all of these characters in ASCII. For `MS:1000016` for "scan start time", this would be `MS_1000016_scan_start_time`
+   4. The string "m/z" appears so frequently it _SHOULD_ be rewritten `mz` to avoid unnecessary additional underscores. For `MS:1000504` for "base peak m/z", this would be written `MS_1000504_base_peak_mz`.
+2. _IF_ there is a single unit kind specified for all values in the column it _SHOULD_ be specified by appending `_unit_${UNIT_CV_CODE}_${UNIT_CV_ACCESSION}` to the inflected name. `MS_1000528_lowest_observed_mz_unit_MS_1000040` would correspond to `MS:1000528` "lowest observed m/z" with a unit of `MS:1000040` "m/z".
+3. _IF_ the unit for this column varies it _SHOULD_ be specified as a separate column with `_unit` appended to the column name whose value is the unit's CURIE.
+
+### Null Semantics for Metadata
 
 A row value that is `null` should be treated as being absent, having no value. If a foreign key column is `null`, assume the entry does not exist in the table, as in the case where an MS2 spectrum is stored without MS1 spectra as in MGF files, or a slice of an MS run. If it is the primary key of the table, the reader _SHOULD_ skip of the columns in that row for that table.
 
@@ -222,18 +239,18 @@ In order to properly annotate what kind of array a column _is_, we include a JSO
   "prefix": "point",
   "entries": [
     {
-      "context": "spectrum",
-      "prefix": "point",
-      "path": "point.mz",
-      "data_type": "MS:1000523",
-      "array_type": "MS:1000514",
-      "array_name": "m/z array",
-      "unit": "MS:1000040",
-      "buffer_format": "point",
-      "transform": null,
-      "data_processing_id": null,
-      "buffer_priority": "primary",
-      "sorting_rank": 0
+      "context": "spectrum", // This is an array describing a spectrum
+      "prefix": "point", // The root of the structure this array is a part of
+      "path": "point.mz", // The path to the column for this array in the Parquet schema
+      "data_type": "MS:1000523", // The controlled vocabulary term  for the data type of this array
+      "array_type": "MS:1000514", // The controlled vocabulary term for the array itself
+      "array_name": "m/z array", // A human readable name and a place to store a custom name through `non-standard array`
+      "unit": "MS:1000040", // The values in this array have the unit m/z
+      "buffer_format": "point", // This column uses the point layout
+      "transform": null, // No transformation was applied to this data
+      "data_processing_id": null, // No specific data processing pipeline was applied, use the default data processing method
+      "buffer_priority": "primary", // This is the primary m/z array, default all queries to read this column when looking for m/z values
+      "sorting_rank": 0 // This array's column is assumed to be sorted within entries, with all other arrays' columns sorted afterwards
     },
     {
       "context": "spectrum",
@@ -242,12 +259,12 @@ In order to properly annotate what kind of array a column _is_, we include a JSO
       "data_type": "MS:1000521",
       "array_type": "MS:1000515",
       "array_name": "intensity array",
-      "unit": "MS:1000131",
+      "unit": "MS:1000131", // The unit of this array is detector counts
       "buffer_format": "point",
       "transform": null,
       "data_processing_id": null,
       "buffer_priority": "primary",
-      "sorting_rank": null
+      "sorting_rank": null // This array does not impose any sorting order on the data
     }
   ]
 }
@@ -256,6 +273,38 @@ In order to properly annotate what kind of array a column _is_, we include a JSO
 This array index describes the table shown below for the [`point layout`](#example-point-table)
 
 Governed by `schema/array_index.json`.
+
+#### Buffer Priority, Naming
+
+In Parquet, all column names and types need to be known before you can begin writing, and no two columns can have the same name + path. Normally, we have a coordinate array column (e.g. m/z or time) and an intensity array column. If you have intensity arrays with different units or different data types, they would need to be defined as separate arrays in the [array index](#the-array-index) and thus have distinct names. While this case may be uncommon for spectra, when working with diagnostic traces stored as chromatograms this can be unavoidable. For ergonomics, we want to use simple column names most of the time, and it would be ideal if the most common columns had consistent names as this makes using files from raw Parquet tools easier. To that end, the most common (as defined by the implementation) version of each array type _SHOULD_ have a `buffer_priority` property of `"primary"` and receive a short and consistent name. The [table](#array-name-recommendations) below lists recommended short names:
+
+<figure id="array-name-recommendations">
+
+| accession  | name                                            | column name                               |
+| :--------- | :---------------------------------------------- | :---------------------------------------- |
+| MS:1000514 | m/z array                                       | mz                                        |
+| MS:1000515 | intensity array                                 | intensity                                 |
+| MS:1000516 | charge array                                    | charge                                    |
+| MS:1000517 | signal to noise array                           | signal_to_noise                           |
+| MS:1000595 | time array                                      | time                                      |
+| MS:1000617 | wavelength array                                | wavelength                                |
+| MS:1002530 | baseline array                                  | baseline                                  |
+| MS:1002529 | resolution array                                | resolution                                |
+| MS:1002893 | ion mobility array                              | ion_mobility                              |
+| MS:1003007 | raw ion mobility array                          | raw_ion_mobility                          |
+| MS:1002816 | mean ion mobility array                         | mean_ion_mobility                         |
+| MS:1003154 | deconvoluted ion mobility array                 | deconvoluted_ion_mobility                 |
+| MS:1003008 | raw inverse reduced ion mobility array          | raw_inverse_reduced_ion_mobility          |
+| MS:1003006 | mean inverse reduced ion mobility array         | mean_inverse_reduced_ion_mobility         |
+| MS:1003155 | deconvoluted inverse reduced ion mobility array | deconvoluted_inverse_reduced_ion_mobility |
+| MS:1003153 | raw ion mobility drift time array               | raw_drift_time                            |
+| MS:1002477 | mean ion mobility drift time array              | mean_drift_time                           |
+| MS:1003156 | deconvoluted ion mobility drift time array      | deconvoluted_ion_mobility_drift_time      |
+
+<figcaption>
+  Array name recommendations
+</figcaption>
+</figure>
 
 ### Data Arrays, Encoding, Transformations and Parquet
 
@@ -276,7 +325,6 @@ $$
 or using the following Python code:
 
 <details>
-
 <summary>Python code for fitting the weighted least squares model</summary>
 
 ```python
@@ -335,12 +383,16 @@ class DeltaCurveRegressionModel:
 
 </details>
 
-Then when reading the the null-marked data, use either the local median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve an very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the minute angle change this would induce are still effectively lossless.
+Then when reading the the null-marked data, use either the local median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve a very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the minute angle change this would induce are still effectively lossless.
 
 ![Thermo dataset with null marking](../static/thermo_null_marking_err.png)
 ![Sciex dataset with delta encoding and null marking](../static/sciex_null_marking_delta_encoding_error.png)
 
 Keep in mind that all Numpress compression methods are still available and still provide superior size reduction, but carry this slightly larger loss of accuracy. Using a Numpress compression is a transformation that requires the [Chunked Layout](#chunked-layout).
+
+##### Null Semantics for Signal Data
+
+Unless otherwise noted, readers _SHOULD_ treat `null` values in sorting dimension `0` of the entry as governed by this model with parallel `null` values in any intensity arrays as 0. The former should have a `transformation` value of [`MS:1003901`]() and the latter should have a `transformation` value [`MS:1003902`](). All other values for those points should be read as-is with null semantics meaning that the value was absent. Writers using null marking _SHOULD_ only use `null` for the first sorting dimension and associated intensity value, all other columns should be written as-is.
 
 ### Point Layout
 
@@ -418,6 +470,11 @@ When storing data arrays, the chunked layout treats one array, which must be sor
 
 This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_chunk_values` list aren't accessible to the page index, but the `_start` and `_end` columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
 
+#### Opaque Array Transforms
+
+TODO: Describe how to use Numpress encodings in the chunked encoding.
+TODO: Consider if we should split out the fixed point into a separate column and then we can store this data as a uniform length unsigned int32.
+
 ## Why all these root nodes?
 
 **Couldn't we just unwrap the top-level struct and move on with things?**
@@ -436,22 +493,22 @@ An mzPeak archive is made up of multiple named files. To leave room for future f
 {
   "files": [
     {
-      "name": "spectra_data.mzpeak",
+      "name": "spectra_data.parquet",
       "entity_type": "spectrum",
       "data_kind": "data arrays"
     },
     {
-      "name": "spectra_metadata.mzpeak",
+      "name": "spectra_metadata.parquet",
       "entity_type": "spectrum",
       "data_kind": "metadata"
     },
     {
-      "name": "chromatograms_data.mzpeak",
+      "name": "chromatograms_data.parquet",
       "entity_type": "chromatogram",
       "data_kind": "data arrays"
     },
     {
-      "name": "chromatograms_metadata.mzpeak",
+      "name": "chromatograms_metadata.parquet",
       "entity_type": "chromatogram",
       "data_kind": "metadata"
     }
@@ -490,62 +547,123 @@ There are currently 3 controlled values for `entity_type`
 
 Any value outside of these is assumed to be treated as `other`.
 
-# Spectrum Signal Data File - `spectra_data.mzpeak`
+# Spectrum Signal Data File - `spectra_data.parquet`
 
 **File index entry:**
 
 ```json
 {
-  "name": "spectra_data.mzpeak",
-  "entry_kind": "spectrum",
+  "name": "spectra_data.parquet",
+  "entity_type": "spectrum",
   "data_kind": "data arrays"
 }
 ```
 
-# Spectrum Metadata File - `spectra_metadata.mzpeak`
+The spectrum signal data is encoded using either [point layout](#point-layout) or [chunked layout](#chunked-layout). The `entity index` column _MUST_ be named `spectrum_index`, and if a time column is written alongside it, it _SHOULD_ be named `spectrum_time`. Non-mass spectra _MAY_ store those dimensions as either auxiliary arrays or as additional columns, depending upon the relative proportion of mass spectra to other kinds of spectra (QUESTION: Should UV, PA, etc. spectra be made separate `entity_type` from mass spectra? They'd get separate metadata and signal data tables then and be easier to distinguish, but more complicated to implement).
+
+When using [null marking](#null-marking), follow the [null semantics for signal data](#null-semantics-for-signal-data) with care for profile data.
+
+When writing data of mixed continuity, write the highest data complexity representation available for each spectrum to this data file. If also writing [peak data](#spectrum-peak-data---spectra_peaksparquet), write the centroid data for the profile spectra there.
+
+## Recommendations
+
+When selecting a [Parquet encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/) for columns, favor:
+
+- `spectrum_index`: [delta encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/#delta-encoding-delta_binary_packed--5). This encoding is ideal for repetitive or slowly increasing integer series.
+- `spectrum_time`: [byte stream split](https://parquet.apache.org/docs/file-format/data-pages/encodings/#byte-stream-split-byte_stream_split--9)
+- m/z arrays: [byte stream split](https://parquet.apache.org/docs/file-format/data-pages/encodings/#byte-stream-split-byte_stream_split--9), also called byte shuffling, or [RLE dictionary encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/#dictionary-encoding-plain_dictionary--2-and-rle_dictionary--8) when there is ion mobility data.
+- ion mobility arrays: [RLE dictionary encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/#dictionary-encoding-plain_dictionary--2-and-rle_dictionary--8), byte shuffling tends to not be very helpful. Also consider increasing the dictionary page size.
+
+# Spectrum Metadata File - `spectra_metadata.parquet`
 
 **File index entry:**
 
 ```json
 {
-  "name": "spectra_metadata.mzpeak",
-  "entry_kind": "spectrum",
+  "name": "spectra_metadata.parquet",
+  "entity_type": "spectrum",
   "data_kind": "metadata"
 }
 ```
 
-# Spectrum Peak Data - `spectra_peaks.mzpeak`
+This metadata table uses the [packed parallel metadata table](#packed-parallel-metadata-tables) schema. The parallel schemas are:
+
+- `spectrum`
+  - `index`
+  - `id`
+  - `time`
+  - `data_processing_ref`
+  - `parameters`
+  - `auxiliary_arrays`
+  - `number_of_auxiliary_arrays`
+  - `mz_delta_model`
+  - `MS_1000525_spectrum_representation`
+  - `MS_1000465_scan_polarity`
+  - `MS_1000559_spectrum_type`
+  - MAY supply a *child* term of MS:1000499 (spectrum attribute) one or more times
+    - __Examples:__
+- `scan`
+  - `source_index`
+  - `instrument_configuration_ref`
+  - `parameters`
+  - `scan_windows`
+  - MAY supply a *child* term of MS:1000503 (scan attribute) one or more times
+    - __Examples:__
+  - MAY supply a *child* term of MS:1000018 (scan direction) only once
+  - MAY supply a *child* term of MS:1000019 (scan law) only once
+- `precursor`
+  - `source_index`
+  - `precursor_index`
+  - `precursor_id`
+  - `isolation_window`
+  - `activation`
+    - `parameters`
+    - MAY supply a *child* term of MS:1000510 (precursor activation attribute) one or more times
+    - MUST supply term MS:1000044 (dissociation method) or any of its children one or more times
+- `selected_ion`
+  - `source_index`
+  - `precursor_index`
+  - `ion_mobility`
+  - `ion_mobility_type`
+  - `parameters`
+  - MUST supply a *child* term of MS:1000455 (ion selection attribute) one or more times
+    - __Examples:__
+    - `MS_1000744_selected_ion_mz_unit_MS_1000040`
+    - `MS_1000041_charge_state`
+    - `MS_1000042_intensity_unit_MS_1000131`
+
+# Spectrum Peak Data - `spectra_peaks.parquet`
 
 **File index entry:**
 
 ```json
 {
-  "name": "spectra_peaks.mzpeak",
-  "entry_kind": "spectrum",
+  "name": "spectra_peaks.parquet",
+  "entity_type": "spectrum",
   "data_kind": "peaks"
 }
 ```
 
-# Chromatogram Signal Data - `chromatograms_data.mzpeak`
+# Chromatogram Signal Data - `chromatograms_data.parquet`
 
 **File index entry:**
 
 ```json
 {
-  "name": "chromatograms_data.mzpeak",
-  "entry_kind": "chromatogram",
+  "name": "chromatograms_data.parquet",
+  "entity_type": "chromatogram",
   "data_kind": "data arrays"
 }
 ```
 
-# Chromatogram Metadata - `chromatograms_metadata.mzpeak`
+# Chromatogram Metadata - `chromatograms_metadata.parquet`
 
 **File index entry:**
 
 ```json
 {
-  "name": "chromatograms_metadata.mzpeak",
-  "entry_kind": "chromatogram",
+  "name": "chromatograms_metadata.parquet",
+  "entity_type": "chromatogram",
   "data_kind": "metadata"
 }
 ```

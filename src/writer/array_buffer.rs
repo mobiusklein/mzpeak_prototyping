@@ -12,7 +12,7 @@ use mzdata::spectrum::ArrayType;
 
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
-    buffer_descriptors::{BufferOverrideTable, BufferPriority},
+    buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform},
     filter::{drop_where_column_is_zero, nullify_at_zero},
     peak_series::{ArrayIndex, ArrayIndexEntry},
 };
@@ -93,11 +93,16 @@ pub trait ArrayBufferWriter {
                             if let Some(col) = batch.column_by_name(col.name()).cloned() {
                                 columns.push(col);
                             } else {
-                                log::trace!("{col:?} was not found in the schema, populating with {num_rows} nulls");
-                                columns.push(arrow::array::new_null_array(col.data_type(), num_rows));
+                                log::trace!(
+                                    "{col:?} was not found in the schema, populating with {num_rows} nulls"
+                                );
+                                columns
+                                    .push(arrow::array::new_null_array(col.data_type(), num_rows));
                             }
                         }
-                        batch = RecordBatch::try_new(Arc::new(Schema::new(fields_of.clone())), columns).unwrap();
+                        batch =
+                            RecordBatch::try_new(Arc::new(Schema::new(fields_of.clone())), columns)
+                                .unwrap();
                     }
                     let x = Arc::new(StructArray::from(batch));
                     arrays.push(x as ArrayRef);
@@ -167,14 +172,17 @@ pub trait ArrayBufferWriter {
     }
 }
 
-
 /// A data buffer for the `point layout`
 #[derive(Debug)]
 pub struct PointBuffers {
+    /// The materialized columns
     peak_array_fields: Fields,
     buffer_context: BufferContext,
+    /// The complete schema for this table
     schema: SchemaRef,
+    /// The name of the top-level node for this group
     prefix: String,
+    /// Field name to chunks of array data for each column
     array_chunks: HashMap<String, Vec<ArrayRef>>,
     overrides: BufferOverrideTable,
     drop_zero_column: Option<Vec<String>>,
@@ -418,7 +426,6 @@ impl ArrayBufferWriter for PointBuffers {
     }
 }
 
-
 /// A data buffer for the `chunked layout`
 #[derive(Debug)]
 pub struct ChunkBuffers {
@@ -491,7 +498,8 @@ impl ArrayBufferWriter for ChunkBuffers {
         _size: usize,
         is_profile: bool,
     ) {
-        self.chunk_buffer.push(StructArray::new(fields, arrays, None));
+        self.chunk_buffer
+            .push(StructArray::new(fields, arrays, None));
         self.is_profile_buffer.push(is_profile);
     }
 
@@ -776,11 +784,7 @@ impl ArrayBuffersBuilder {
 
     /// Register a new [`arrow::datatypes::FieldRef`] with the current schema
     pub fn add_field(mut self, field: FieldRef) -> Self {
-        if !self
-            .array_fields
-            .iter()
-            .any(|f| f.name() == field.name())
-        {
+        if !self.array_fields.iter().any(|f| f.name() == field.name()) {
             self.array_fields.push(field);
         }
         self.apply_overrides();
@@ -852,6 +856,78 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    /// Inject zero null marking transform post-array schema inference because it complicates hash matching buffer names.
+    ///
+    /// This special case will be handled by [`ArrowArrayChunk`](crate::chunk_series::ArrowArrayChunk) which is sensitive
+    /// to the schema itself. The point layout managed by [`PointBuffers`] doesn't check [`BufferName`] mapping as strictly
+    /// and needs no special treatment.
+    fn apply_null_zero_transform_modifier(&mut self) {
+        if self.null_zeros {
+            for f in self.array_fields.iter_mut() {
+                if let Some(mut name) = BufferName::from_field(self.buffer_context, f.clone()) {
+                    match self.buffer_context {
+                        BufferContext::Spectrum => match name.array_type {
+                            ArrayType::MZArray => {
+                                if name.transform.is_none() {
+                                    let new_name = name
+                                        .clone()
+                                        .with_transform(Some(BufferTransform::NullInterpolate));
+                                    self.overrides.insert(name.clone(), new_name.clone());
+                                    let to_replace: Vec<_> = self
+                                        .overrides
+                                        .iter()
+                                        .filter_map(|(k, v)| {
+                                            (k.array_type == ArrayType::MZArray)
+                                                .then(|| (k.clone(), v.clone()))
+                                        })
+                                        .collect();
+                                    for (k, v) in to_replace {
+                                        self.overrides.insert(
+                                            k.clone(),
+                                            v.clone().with_transform(Some(
+                                                BufferTransform::NullInterpolate,
+                                            )),
+                                        );
+                                    }
+                                    name = new_name;
+                                }
+                            }
+                            ArrayType::IntensityArray => {
+                                if name.transform.is_none() {
+                                    let new_name = name
+                                        .clone()
+                                        .with_transform(Some(BufferTransform::NullZero));
+                                    self.overrides.insert(name.clone(), new_name.clone());
+                                    let to_replace: Vec<_> = self
+                                        .overrides
+                                        .iter()
+                                        .filter_map(|(k, v)| {
+                                            (k.array_type == ArrayType::IntensityArray)
+                                                .then(|| (k.clone(), v.clone()))
+                                        })
+                                        .collect();
+                                    for (k, v) in to_replace {
+                                        self.overrides.insert(
+                                            k.clone(),
+                                            v.clone()
+                                                .with_transform(Some(BufferTransform::NullZero)),
+                                        );
+                                    }
+                                    name = new_name;
+                                }
+                            }
+                            _ => {}
+                        },
+                        BufferContext::Chromatogram => match name.array_type {
+                            _ => {}
+                        },
+                    }
+                    *f = name.update_field(f.clone());
+                }
+            }
+        }
+    }
+
     /// Build a [`ChunkBuffer`], configuring the underlying schema
     pub fn build_chunked(
         mut self,
@@ -867,6 +943,9 @@ impl ArrayBuffersBuilder {
         self.overrides.propagate_priorities(&primaries);
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
         self.prefix = "chunk".to_string();
+        if self.null_zeros {
+            self.apply_null_zero_transform_modifier()
+        };
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
         let schema = Arc::new(Schema::new_with_metadata(
             fields.clone(),
@@ -916,6 +995,9 @@ impl ArrayBuffersBuilder {
         let primaries = self.mark_primary_arrays();
         self.overrides.propagate_priorities(&primaries);
         let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+        if self.null_zeros {
+            self.apply_null_zero_transform_modifier()
+        };
         fields.push(Field::new(self.prefix.clone(), self.dtype(), true).into());
         let mut buffers: HashMap<String, Vec<ArrayRef>> =
             HashMap::with_capacity(self.array_fields.len());

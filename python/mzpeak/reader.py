@@ -386,6 +386,7 @@ class MzPeakSpectrumMetadataReader:
                     self.scans.index[0],
                     self.scans.index[-1] + 1,
                 )
+                self.scans.index.name = "source_index"
         else:
             self.scans = pd.DataFrame(
                 [],
@@ -1184,3 +1185,13 @@ class MzPeakFile(Sequence[_SpectrumType]):
     def chromatograms(self) -> pd.DataFrame | None:
         if self.chromatogram_metadata is not None:
             return self.chromatogram_metadata.chromatograms
+
+    def to_sql(self, **kwargs):
+        import datafusion
+        ctx = datafusion.SessionContext(**kwargs)
+        ctx.from_arrow(pa.table(self.spectra.reset_index()), "spectra")
+        ctx.from_arrow(pa.table(self.scans.reset_index()), "scans")
+        ctx.from_arrow(pa.table(self.precursors.reset_index()), "precursors")
+        ctx.from_arrow(pa.table(self.selected_ions.reset_index()), "selected_ions")
+        ctx.from_arrow(pa.table(self.chromatograms.reset_index()), "chromatograms")
+        return ctx

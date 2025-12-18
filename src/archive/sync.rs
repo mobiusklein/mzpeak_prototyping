@@ -173,11 +173,11 @@ pub enum MzPeakArchiveType {
 impl MzPeakArchiveType {
     pub const fn tag_file_suffix(&self) -> &'static str {
         match self {
-            MzPeakArchiveType::SpectrumMetadata => "spectra_metadata.mzpeak",
-            MzPeakArchiveType::SpectrumDataArrays => "spectra_data.mzpeak",
-            MzPeakArchiveType::SpectrumPeakDataArrays => "spectra_peaks.mzpeak",
-            MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.mzpeak",
-            MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.mzpeak",
+            MzPeakArchiveType::SpectrumMetadata => "spectra_metadata.parquet",
+            MzPeakArchiveType::SpectrumDataArrays => "spectra_data.parquet",
+            MzPeakArchiveType::SpectrumPeakDataArrays => "spectra_peaks.parquet",
+            MzPeakArchiveType::ChromatogramMetadata => "chromatograms_metadata.parquet",
+            MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.parquet",
             MzPeakArchiveType::Other => "",
             MzPeakArchiveType::Proprietary => "",
         }
@@ -304,9 +304,9 @@ pub struct ZipArchiveSource {
     pub file_index: FileIndex,
 }
 
-fn zip_archive_to_config(
-    archive_file: fs::File,
-) -> io::Result<(fs::File, Vec<String>, Config, Option<FileIndex>)> {
+fn zip_archive_to_config<R: io::Read + io::Seek>(
+    archive_file: R,
+) -> io::Result<(R, Vec<String>, Config, Option<FileIndex>)> {
     let mut arch = ZipArchive::new(archive_file)?;
     let offset = arch.offset();
     let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();

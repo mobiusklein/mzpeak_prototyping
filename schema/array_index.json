@@ -106,7 +106,7 @@
             },
             "transform": {
                 "type": ["string", "null"],
-                "description": "A data-obscuring transformation that may be applied to this array such as Numpress compression, denoted as a CURIE from the PSI-MS controlled vocabulary. This is only valid if using the chunked layout.",
+                "description": "A transformation that may be applied to this array such as zero trimming and null marking or Numpress compression, denoted as a CURIE from the PSI-MS controlled vocabulary. Some values are only usable with the chunked layout.",
                 "default": null
             }
         }

@@ -12,3 +12,6 @@ dependencies = [
 ]
 
 license = "Apache-2.0"
+
+[project.optional-dependencies]
+sql = ["datafusion"]

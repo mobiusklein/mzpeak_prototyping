@@ -1089,6 +1089,7 @@ impl<'a> ChunkScanDecoder<'a> {
 
         let axis = self.main_axis.take().unwrap();
         let buffer_name = BufferName::from_data_array(self.buffer_context, &axis);
+        eprintln!("Main axis: {buffer_name:?}");
         let axis = data_array_to_arrow_array(&buffer_name, &axis).unwrap();
 
         let mut fields = Vec::with_capacity(self.buffers.len() + 1);
@@ -1169,7 +1170,7 @@ impl<'a> ChunkScanDecoder<'a> {
         }
 
         let fields: Fields = fields.into();
-
+        eprintln!("{fields:?}");
         let mut batch: ArrayRef = Arc::new(StructArray::new(fields.clone(), arrays, None));
 
         if let Some(query_range) = self.query_range.as_ref() {

@@ -604,4 +604,14 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+    // use super::*;
+
+    // #[test]
+    // fn test_chunked() -> io::Result<()> {
+    //     env_logger::init();
+    //     let args = ConvertCli::parse_from("-p -c -y -z -u small.mzML -o small.chunked.mzpeak".split(" "));
+    //     run_convert(&args.filename, args.convert_args)
+    // }
+
+}

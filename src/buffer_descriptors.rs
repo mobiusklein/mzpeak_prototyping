@@ -325,7 +325,12 @@ pub enum BufferTransform {
     NumpressLinear,
     NumpressSLOF,
     NumpressPIC,
+    NullInterpolate,
+    NullZero,
 }
+
+const NULL_INTERPOLATE: CURIE = mzdata::curie!(MS:1003901);
+const NULL_ZERO: CURIE = mzdata::curie!(MS:1003902);
 
 impl BufferTransform {
     pub fn from_curie(accession: crate::param::CURIE) -> Option<Self> {
@@ -333,6 +338,8 @@ impl BufferTransform {
             x if x == Self::NumpressSLOF.curie() => Some(Self::NumpressSLOF),
             x if x == Self::NumpressPIC.curie() => Some(Self::NumpressPIC),
             x if x == Self::NumpressLinear.curie() => Some(Self::NumpressLinear),
+            x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
+            x if x == NULL_ZERO => Some(Self::NullZero),
             _ => None,
         }
     }
@@ -354,6 +361,8 @@ impl BufferTransform {
                 .unwrap()
                 .curie()
                 .unwrap(),
+            BufferTransform::NullInterpolate => NULL_INTERPOLATE,
+            BufferTransform::NullZero => NULL_ZERO,
         }
     }
 }
@@ -727,10 +736,17 @@ impl BufferName {
         Some((start, end))
     }
 
+    /// Create an Arrow field for this buffer name
     pub fn to_field(&self) -> FieldRef {
         let f = Field::new(self.to_string(), array_to_arrow_type(self.dtype), true)
             .with_metadata(self.as_field_metadata());
         Arc::new(f)
+    }
+
+    /// Update [`FieldRef`] metadata, creating a new field and returning it
+    pub fn update_field(&self, field: FieldRef) -> FieldRef {
+        let metadata = self.as_field_metadata();
+        Arc::new(field.as_ref().clone().with_metadata(metadata))
     }
 }
 
@@ -741,7 +757,7 @@ impl Display for BufferName {
             ArrayType::MZArray => Cow::Borrowed("mz"),
             ArrayType::IntensityArray => Cow::Borrowed("intensity"),
             ArrayType::ChargeArray => Cow::Borrowed("charge"),
-            ArrayType::SignalToNoiseArray => Cow::Borrowed("snr"),
+            ArrayType::SignalToNoiseArray => Cow::Borrowed("signal_to_noise"),
             ArrayType::TimeArray => Cow::Borrowed("time"),
             ArrayType::WavelengthArray => Cow::Borrowed("wavelength"),
             ArrayType::IonMobilityArray => Cow::Borrowed("ion_mobility"),
@@ -1208,6 +1224,11 @@ impl BufferOverrideTable {
     /// See [`HashMap::iter_mut`]
     pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, BufferName, BufferName> {
         self.0.iter_mut()
+    }
+
+    /// See [`HashMap::keys`]
+    pub fn keys(&self) -> std::collections::hash_map::Keys<'_, BufferName, BufferName> {
+        self.0.keys()
     }
 
     /// Given a list of [`BufferName`] whose [`BufferPriority`] has been set, make sure all

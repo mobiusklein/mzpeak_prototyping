@@ -24,12 +24,9 @@ use mzdata::{
 };
 
 use crate::{
-    archive::{MzPeakArchiveType, ZipArchiveWriter},
-    buffer_descriptors::{BufferOverrideTable, BufferPriority},
-    peak_series::{
+    BufferName, archive::{MzPeakArchiveType, ZipArchiveWriter}, buffer_descriptors::{BufferOverrideTable, BufferPriority}, peak_series::{
         ArrayIndex, BufferContext, TIME_ARRAY, ToMzPeakDataSeries, array_map_to_schema_arrays,
-    },
-    writer::builder::SpectrumFieldVisitors,
+    }, writer::builder::SpectrumFieldVisitors
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -138,6 +135,9 @@ fn _eval_spectra_from_iter_for_fields<
 
     for field in field_it {
         if !arrays.iter().any(|f| f.name() == field.name()) {
+            if let Some(buffer) = BufferName::from_field(BufferContext::Spectrum, field.clone()) {
+                log::trace!("Adding {buffer:?} to schema")
+            }
             arrays.push(field);
         }
     }

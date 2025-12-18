@@ -391,6 +391,7 @@ impl TryFrom<BufferTransform> for BufferTransformEncoder {
             BufferTransform::NumpressLinear => Ok(Self(value)),
             BufferTransform::NumpressSLOF => Ok(Self(value)),
             BufferTransform::NumpressPIC => Ok(Self(value)),
+            BufferTransform::NullInterpolate | BufferTransform::NullZero => Err(format!("{value:?} does not have an encoder"))
         }
     }
 }
@@ -413,6 +414,7 @@ impl BufferTransformEncoder {
             )
             .with_format(BufferFormat::ChunkedSecondary)
             .with_transform(Some(self.0)),
+            _ => unimplemented!("{:?} does not have a buffer name", self.0)
         }
     }
 
@@ -439,6 +441,7 @@ impl BufferTransformEncoder {
                 .with_metadata(meta);
                 bytes
             }
+            _ => unimplemented!("{:?} does not have a field conversion", self.0)
         }
     }
 
@@ -513,6 +516,7 @@ impl BufferTransformEncoder {
                 let bytes = UInt8Array::from(bytes);
                 Arc::new(bytes)
             }
+            _ => unimplemented!("{:?} does not have an encoder", self.0)
         }
     }
 }
@@ -560,6 +564,7 @@ impl BufferTransformDecoder {
                     _ => todo!(),
                 }
             }
+            _ => unimplemented!("{:?} does not have a decoder", self.0)
         }
     }
 }
@@ -583,6 +588,7 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
             BufferTransform::NumpressLinear => Ok(Self(value)),
             BufferTransform::NumpressSLOF => Ok(Self(value)),
             BufferTransform::NumpressPIC => Ok(Self(value)),
+            BufferTransform::NullInterpolate | BufferTransform::NullZero => Err(format!("{value:?} does not have a decoder"))
         }
     }
 }
@@ -780,9 +786,8 @@ impl ArrowArrayChunk {
                 {
                     let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                         this_builder.field_builder(i).unwrap();
-                    if let Some(transform) = buf_name
-                        .transform
-                        .and_then(|x| BufferTransformEncoder::try_from(x).ok())
+
+                    if let Some(transform) = BufferTransformEncoder::try_from(buf_name.transform).ok()
                     {
                         transform.visit_builder(
                             &buf_name,
@@ -950,15 +955,20 @@ impl ArrowArrayChunk {
             .with_priority(Some(BufferPriority::Primary))
             .with_sorting_rank(Some(0));
 
-        let fields_of: BufferOverrideTable = fields
-            .as_ref()
-            .map(|v| {
-                v.iter()
-                    .flat_map(|f| BufferName::from_field(main_axis.context, f.clone()))
-                    .map(|f| (f.clone(), f))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Ensure that non-hashing properties of [`BufferName`] propagate from the
+        // schema down to physical arrays constructed. Also propagate any transformations
+        // in the schema, which *are* hash-dependent but considered safe here.
+        let mut fields_of = BufferOverrideTable::default();
+        if let Some(fields) = fields.as_ref() {
+            for f in fields.iter() {
+                if let Some(f) = BufferName::from_field(main_axis.context, f.clone()) {
+                    fields_of.insert(f.clone(), f.clone());
+                    if f.transform.is_some() {
+                        fields_of.insert(f.clone().with_transform(None), f.clone());
+                    }
+                }
+            }
+        }
 
         let empty_main_axis = match arrays.get(&main_axis.array_type) {
             Some(v) => v.raw_len() == 0,

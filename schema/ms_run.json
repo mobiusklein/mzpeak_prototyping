@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak metadata MS run",
+  "description": "Describe the JSON format of the run-level metadata section, analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#run",
+  "type": "object",
+  "required": [
+    "id",
+    "default_instrument_id",
+    "default_data_processing_id",
+    "default_source_file_id"
+  ],
+  "properties": {
+    "parameters": {
+      "type": "array",
+      "items": {
+        "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
+      },
+      "description": "Parameters describing the run not otherwise covered by the attributes.",
+      "default": []
+    },
+    "id": {
+        "type": "string",
+        "description": "A unique identifier for the run"
+    },
+    "default_data_processing_id": {
+        "type": "string",
+        "description": "The default data processing identifier, as drawn from https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/data_processing.json"
+    },
+    "default_instrument_id": {
+        "type": "integer",
+        "description": "The default instrument configuration, as drawn from https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/instrument_configuration.json"
+    },
+    "default_source_file_id": {
+        "type": "string",
+        "description": "The default source file the content references, as drawn from https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/file_description.json"
+    },
+    "start_time": {
+        "type": "string",
+        "description": "The time that data acquistion started, encoded in an RFC 3339 format (https://datatracker.ietf.org/doc/html/rfc3339)",
+        "format": "date-time",
+        "examples": [
+            "2005-07-20T19:44:22Z"
+        ]
+    }
+  }
+}
