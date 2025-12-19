@@ -14,7 +14,8 @@
     - [Unpacked archives](#unpacked-archives)
 - [Data Layouts](#data-layouts)
   - [Packed Parallel Metadata Tables](#packed-parallel-metadata-tables)
-    - [Controlled Vocabulary Terms and Column Name Inflection](#controlled-vocabulary-terms-and-column-name-inflection)
+    - [Controlled Vocabulary Terms](#controlled-vocabulary-terms)
+      - [Column Name Inflection](#column-name-inflection)
     - [Null Semantics for Metadata](#null-semantics-for-metadata)
     - [File-Level Metadata](#file-level-metadata)
   - [Signal Data Layouts](#signal-data-layouts)
@@ -200,7 +201,34 @@ Here is a stripped down example where two rows of related MS1 and MS2 spectra. T
   </tbody>
 </table>
 
-### Controlled Vocabulary Terms and Column Name Inflection
+### Controlled Vocabulary Terms
+
+Like mzML before it, mzPeak makes heavy use of controlled vocabularies for representing rich metadata. mzPeak uses controlled vocabulary terms in several ways:
+
+1. As columns. When a term is used as a column name, that column's values are either the defined value of an expected type for the term (e.g. the term `has_value_type`) _OR_ the a CURIE for a child of the column name. For example
+   1. The column [`MS_1000525_spectrum_representation`](https://www.ebi.ac.uk/ols4/ontologies/ms/classes/http%253A%252F%252Fpurl.obolibrary.org%252Fobo%252FMS_1000525) would have values that are CURIEs for a child term, `MS:1000127` "centroid spectrum" or `MS:1000128` "profile spectrum", as appropriate for the spectrum the row is describing.
+   2. The column [`MS_1000511_ms_level`](https://www.ebi.ac.uk/ols4/ontologies/ms/classes/http%253A%252F%252Fpurl.obolibrary.org%252Fobo%252FMS_1000511) would hold an integer value, as appropriate for the spectrum the row is describing.
+2. As structural elements. In several places in the format, like the [array index](#the-array-index), we use CURIEs to reference named concepts that are explain the semantics of the data structure without changing the shape of the data structure.
+3. As pluggable metadata carriers in `parameters` arrays. For every schema facet of a metadata table, a `parameters` column is allowed. These columns _MUST_ be a list of the following schema:
+```
+optional group field_id=-1 parameters (List) {
+  repeated group field_id=-1 list {
+    optional group field_id=-1 item {
+      optional group field_id=-1 value {
+        optional int64 field_id=-1 integer;
+        optional double field_id=-1 float;
+        optional binary field_id=-1 string (String);
+        optional boolean field_id=-1 boolean;
+      }
+      optional binary field_id=-1 accession (String);
+      optional binary field_id=-1 name (String);
+      optional binary field_id=-1 unit (String);
+    }
+  }
+}
+```
+
+#### Column Name Inflection
 
 When representing a controlled vocabulary term concept as a column in the table, the column name _SHOULD_ use the following inflection rules to construct the column name:
 
