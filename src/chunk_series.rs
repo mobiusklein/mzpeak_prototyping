@@ -1250,7 +1250,25 @@ mod test {
             false,
         );
 
-        eprintln!("{:?}", rendered.slice(0, 1));
+        let f = rendered.column_by_name("mz_chunk_start").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::Float64);
+        let f = rendered.column_by_name("mz_chunk_end").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::Float64);
+
+        let f = rendered.column_by_name("mz_chunk_values").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(f.len(), 36);
+        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        assert_eq!(k, 13553);
+
+        let f = rendered.column_by_name("chunk_encoding").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::Utf8);
+
+        let f = rendered.column_by_name("intensity_f32_dc").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(f.len(), 36);
+        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        assert_eq!(k, 13589);
 
         Ok(())
     }
@@ -1434,9 +1452,9 @@ mod test {
             false,
         );
 
-        for col in rendered.column_names() {
-            eprintln!("{col}, {}", rendered.column_by_name(col).unwrap().len());
-        }
+        // for col in rendered.column_names() {
+        //     eprintln!("{col}, {}", rendered.column_by_name(col).unwrap().len());
+        // }
 
         assert!(
             rendered
@@ -1480,7 +1498,29 @@ mod test {
             true,
         );
 
-        eprintln!("{:?}", rendered.slice(0, 1));
+        let names = rendered.column_names();
+        assert!(names.contains(&"spectrum_time"));
+
+        let f = rendered.column_by_name("mz_chunk_start").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::Float64);
+        let f = rendered.column_by_name("mz_chunk_end").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::Float64);
+        let f = rendered.column_by_name("mz_chunk_values").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+
+        assert_eq!(f.len(), 36);
+        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        assert_eq!(k, 19877);
+
+        let f = rendered.column_by_name("chunk_encoding").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::Utf8);
+
+        let f = rendered.column_by_name("intensity_f32_dc").unwrap();
+        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(f.len(), 36);
+        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        assert_eq!(k, 19913);
+
 
         Ok(())
     }

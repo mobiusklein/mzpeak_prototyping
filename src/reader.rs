@@ -1372,8 +1372,12 @@ mod test {
     use mzdata::spectrum::{ChromatogramLike, SignalContinuity};
 
     #[test_log::test]
-    fn test_read_spectrum() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.mzpeak")?;
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::chunked("small.chunked.mzpeak")]
+    fn test_read_spectrum(#[case] path: &str) -> io::Result<()> {
+        let mut reader = MzPeakReader::new(path)?;
         let descr = reader.get_spectrum(0).unwrap();
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
@@ -1388,25 +1392,12 @@ mod test {
     }
 
     #[test_log::test]
-    fn test_read_spectrum_chunked() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
-        let descr = reader.get_spectrum(0).unwrap();
-        assert_eq!(descr.index(), 0);
-        assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
-        assert_eq!(descr.peaks().len(), 13589);
-        let descr = reader.get_spectrum(5).unwrap();
-        assert_eq!(descr.index(), 5);
-        assert_eq!(descr.peaks().len(), 650);
-        eprintln!("{:#?}", descr.description());
-        let descr = reader.get_spectrum(25).unwrap();
-        assert_eq!(descr.index(), 25);
-        assert_eq!(descr.peaks().len(), 789);
-        Ok(())
-    }
-
-    #[test_log::test]
-    fn test_tic() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.mzpeak")?;
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::packed_chunks("small.chunked.mzpeak")]
+    fn test_tic(#[case] path: &str) -> io::Result<()> {
+        let mut reader = MzPeakReader::new(path)?;
         let tic = reader.encoded_tic()?;
         assert_eq!(tic.index(), 0);
         assert_eq!(tic.time()?.len(), 48);
@@ -1414,50 +1405,56 @@ mod test {
     }
 
     #[test_log::test]
-    fn test_read_chromatogram() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.mzpeak").unwrap();
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::packed_chunks("small.chunked.mzpeak")]
+    fn test_read_chromatogram(#[case] path: &str) -> io::Result<()> {
+        let mut reader = MzPeakReader::new(path).unwrap();
         let tic = reader.get_chromatogram(0).unwrap();
-        eprintln!("{tic:?}");
         assert_eq!(tic.index(), 0);
         assert_eq!(tic.time()?.len(), 48);
         Ok(())
     }
 
     #[test_log::test]
-    fn test_read_chromatogram_chunked() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.chunked.mzpeak").unwrap();
-        let tic = reader.get_chromatogram(0).unwrap();
-        eprintln!("{tic:?}");
-        assert_eq!(tic.index(), 0);
-        assert_eq!(tic.time()?.len(), 48);
-        Ok(())
-    }
-
-    #[test_log::test]
-    fn test_load_all_metadata() -> io::Result<()> {
-        let reader = MzPeakReader::new("small.mzpeak")?;
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::packed_chunks("small.chunked.mzpeak")]
+    fn test_load_all_metadata(#[case] path: &str) -> io::Result<()> {
+        let reader = MzPeakReader::new(path)?;
         let out = reader.load_all_spectrum_metadata_impl()?;
         assert_eq!(out.len(), 48);
         Ok(())
     }
 
     #[test_log::test]
-    fn test_load_all_chromatogram_metadata() -> io::Result<()> {
-        let reader = MzPeakReader::new("small.mzpeak")?;
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    #[case::packed_chunks("small.chunked.mzpeak")]
+    fn test_load_all_chromatogram_metadata(#[case] path: &str) -> io::Result<()> {
+        let reader = MzPeakReader::new(path)?;
         let out = reader.load_all_chromatgram_metadata_impl()?;
-        eprintln!("{out:?}");
+        // eprintln!("{out:?}");
+        assert_eq!(out.len(), 1);
         Ok(())
     }
 
     #[test_log::test]
-    fn test_eic() -> io::Result<()> {
-        let mut reader = MzPeakReader::new("small.mzpeak")?;
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::unpacked("small.unpacked.mzpeak")]
+    fn test_eic(#[case] path: &str) -> io::Result<()> {
+        let mut reader = MzPeakReader::new(path)?;
 
         let (it, _time_index) =
             reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
 
         for batch in it.flatten() {
-            eprintln!("{:?}", batch);
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
         }
         Ok(())
     }
@@ -1470,7 +1467,8 @@ mod test {
             reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
 
         for batch in it.flatten() {
-            eprintln!("{:?}", batch);
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
         }
         Ok(())
     }

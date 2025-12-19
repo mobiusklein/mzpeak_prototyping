@@ -388,6 +388,7 @@ impl<'a> Iterator for NullTokenizer<'a> {
 }
 
 impl<'a> NullTokenizer<'a> {
+
     fn new(array: &'a NullBuffer) -> Self {
         let mut this = Self {
             array,
@@ -424,13 +425,14 @@ impl<'a> NullTokenizer<'a> {
         }
     }
 
-    fn update_next_state(&mut self) {
+    fn update_next_state(&mut self) -> bool {
         let prev = self.i;
         self.find_next_null();
         let diff = self.i.saturating_sub(prev);
         if diff == 0 {
             // We are at the end
-            self.next_state = NullFillState::Done
+            self.next_state = NullFillState::Done;
+            true
         } else if diff == 1 {
             // We stepped from one null to another
             let start = self.i;
@@ -441,10 +443,12 @@ impl<'a> NullTokenizer<'a> {
             } else {
                 self.next_state = NullFillState::NullStart(start);
             }
+            true
         } else {
             // We stepped from one null into a run of values, this is probably not
             // right. We don't have a way to back-fill these accurately.
-            eprintln!("Trip run: {prev} -> {}", self.i);
+            log::error!("Null array tokenizer trip run: stepped from index {prev} -> {}", self.i);
+            false
         }
     }
 
@@ -887,7 +891,7 @@ mod test {
 
     use super::*;
 
-    #[test]
+    #[test_log::test]
     fn test_zero_runs() {
         let data = Float64Array::from(vec![
             Some(0.0),    // 0
@@ -905,10 +909,10 @@ mod test {
             !indices.contains(&5),
             "index 5 should not be in {indices:?}"
         );
-        eprintln!("{indices:?}");
+        // eprintln!("{indices:?}");
     }
 
-    #[test]
+    #[test_log::test]
     fn test_null_singleton() {
         let data = Float64Array::from(vec![None, Some(50.0), None]);
         let it = NullTokenizer::new(data.nulls().unwrap());
@@ -924,24 +928,6 @@ mod test {
     }
 
     #[test]
-    fn test_null_prefix_doubled() {
-        let data = Float64Array::from(vec![
-            None,
-            None,
-            Some(670.6584674493117),
-            Some(0.01864632523461296),
-            Some(0.01864710288123206),
-            Some(0.018647880570824782),
-            Some(0.018648658303959564),
-            None,
-        ]);
-
-        let it = NullTokenizer::new(data.nulls().unwrap());
-        let vals: Vec<_> = it.collect();
-        eprintln!("{vals:?}");
-    }
-
-    #[test]
     fn test_zero_runs_tailed() {
         let data = Float64Array::from(vec![
             0., 0., 0., 0., 0., 0., 0., 0., 14627.247, 24097.691, 27908.545, 23742.236, 14179.794,
@@ -954,10 +940,9 @@ mod test {
         assert!(indices.contains(&7));
         assert!(indices.contains(&26));
         assert!(!indices.contains(&27));
-        eprintln!("{indices:?}")
     }
 
-    #[test]
+    #[test_log::test]
     fn test_null_filling() {
         let data = Float64Array::from(vec![
             None,
@@ -976,10 +961,13 @@ mod test {
         assert_eq!(b, NullFillState::NullBounded(5, 7));
 
         let filled = fill_nulls_for(&data, &ConstantDeltaModel::from(0.015f64));
-        eprintln!("{filled:?}");
+        assert_eq!(data.len(), filled.len());
+        for v in filled {
+            assert_ne!(v, 0.0);
+        }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_null_filling_tailed() {
         let data = Float64Array::from(vec![
             None,
@@ -998,24 +986,9 @@ mod test {
         assert_eq!(b, NullFillState::NullStart(5));
 
         let filled = fill_nulls_for(&data, &ConstantDeltaModel::from(0.015f64));
-        eprintln!("{filled:?}");
-    }
-
-    #[test]
-    fn test_null_filling_long_prefix() {
-        let data = Float64Array::from(vec![
-            None,
-            None,
-            Some(101.0),
-            Some(101.01),
-            Some(101.02),
-            None,
-            None,
-            Some(101.5),
-        ]);
-        let tokenizer = NullTokenizer::new(data.nulls().unwrap());
-        for tok in tokenizer {
-            eprintln!("{tok:?}");
+        assert_eq!(data.len(), filled.len());
+        for v in filled {
+            assert_ne!(v, 0.0);
         }
     }
 
@@ -1038,7 +1011,10 @@ mod test {
         assert_eq!(b, NullFillState::NullStart(4));
 
         let filled = fill_nulls_for(&data, &ConstantDeltaModel::from(0.015f64));
-        eprintln!("{filled:?}");
+        assert_eq!(data.len(), filled.len());
+        for v in filled {
+            assert_ne!(v, 0.0);
+        }
     }
 
     #[test]
@@ -2679,7 +2655,7 @@ mod test {
         let weights_trans: Vec<_> = weights.iter().map(|v| (v + 1.0).ln().sqrt()).collect();
 
         let m = select_delta_model(&data, Some(&weights_trans));
-        eprintln!("Selected betas: {m:?}");
+        // eprintln!("Selected betas: {m:?}");
 
         let (delta, data, weights): (Vec<_>, Vec<_>, Vec<_>) = delta
             .into_iter()
@@ -2695,7 +2671,13 @@ mod test {
             .collect();
 
         let betas = fit_delta_model(&data, &delta, Some(&weights), 2).unwrap();
-        eprintln!("{betas:?}");
+        // eprintln!("{betas:?}");
+        for i in 0..betas.len() {
+            let a = betas[i];
+            let b = m[i];
+            let e = a - b;
+            assert!(e.abs() < 1e-3, "[{i}] {a} - {b} = {e} > 1e-3");
+        }
     }
 
     #[test]

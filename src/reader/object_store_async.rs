@@ -1139,8 +1139,7 @@ mod test {
         let mut handle =
             AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from("small.mzpeak"))
                 .await?;
-        let spec = handle.get_spectrum(0).await.unwrap();
-        eprintln!("{spec:?}");
+        let _spec = handle.get_spectrum(0).await.unwrap();
         Ok(())
     }
 }

@@ -2321,7 +2321,11 @@ mod test {
         let arrays = arrays.column_by_name("spectrum").unwrap();
         let arrays = arrays.as_struct();
 
-        eprintln!("{:?}", arrays.column_names());
+        let names = arrays.column_names();
+
+        assert!(names.contains(&"MS_1000504_base_peak_mz_2"));
+        assert!(names.contains(&"MS_1000504_base_peak_mz_2_unit"));
+        assert!(names.contains(&"MS_1000504_base_peak_mz_3_unit_MS_1000040"));
 
         let arr1 = arrays
             .column_by_name("MS_1000504_base_peak_mz_unit_MS_1000040")
