@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mzPeak auxiliary data array",
+  "description": "Describe the JSON format of auxliary data array",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json",
+      "description": "A controlled vocabulary term naming this data array. Must be a child of MS:1000513.",
+      "examples": [
+        { "name": "m/z array", "accession": "MS:1000514" },
+        { "name": "temperature array", "accession": "MS:1000822" },
+        { "name": "non-standard data array", "accession": "MS:1000786", "value": "frobnication factor array" }
+      ]
+    },
+    "data": {
+      "type": "array",
+      "item": {
+        "type": "integer"
+      },
+      "contentMediaType": "application/octet-stream",
+      "description": "The encoded bytes of this array. They may be compressed or not according to `compression`. The binary data type is defined by `data_type`, is stored in little endian order. No base64 encoding is used."
+    },
+    "data_type": {
+      "type": "string",
+      "description": "The binary data type stored in this array's bytes, e.g. integer, float, ASCII string, encoded as a CURIE. Must be a child of MS:1000518.",
+      "examples": ["MS:1000519", "MS:1000523", "MS:1001479"],
+      "pattern": "\\S+:\\S+",
+      "format": "curie"
+    },
+    "compression": {
+      "type": "string",
+      "description": "The compression method applied to this array's bytes, encoded as a CURIE. Must be a child of MS:1000572.",
+      "examples": [
+        "MS:1000574",
+        "MS:1000576",
+        "MS:1002312"
+      ],
+      "pattern": "\\S+:\\S+",
+      "format": "curie"
+    },
+    "unit": {
+      "type": "string",
+      "description": "The unit of the measurements in this array, encoded as a CURIE. Must be a child of UO:0000000.",
+      "examples": ["MS:1000040", "MS:1000131", "UO:0000012", "UO:0000031"],
+      "pattern": "\\S+:\\S+",
+      "format": "curie"
+    },
+    "parameters": {
+      "type": "array",
+      "items": {
+        "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
+      },
+      "description": "Additional parameters describing this data array"
+    }
+  }
+}

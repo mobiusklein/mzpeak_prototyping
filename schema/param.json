@@ -15,12 +15,11 @@
         ]
     },
     "accession": {
-        "type": ["string", "null"],
-        "description": "The compact CURIE for the controlled vocabulary term, if it exists, null otherwise",
-        "examples": [
-            "MS:1000580",
-            "MS:1000768"
-        ]
+      "type": ["string", "null"],
+      "description": "The compact CURIE for the controlled vocabulary term, if it exists, null otherwise",
+      "examples": ["MS:1000580", "MS:1000768"],
+      "pattern": "\\S+:\\S+",
+      "format": "curie"
     },
     "value": {
         "type": ["number", "string", "boolean", "null"],

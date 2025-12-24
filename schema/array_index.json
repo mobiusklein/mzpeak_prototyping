@@ -63,28 +63,35 @@
               "pattern": "^(([A-Za-z0-9_]+)(?:\\.([A-Za-z0-9_]+))+)$"
             },
             "data_type": {
-                "type": "string",
-                "description": "The data type for this array, denoted using a CURIE from the PSI-MS controlled vocabulary for a child of MS:1000518|binary data type.",
-                "examples": [
-                    "MS:1000521",
-                    "MS:1000522",
-                    "MS:1000519",
-                    "MS:1000479"
-                ]
+              "type": "string",
+              "description": "The data type for this array, denoted using a CURIE from the PSI-MS controlled vocabulary for a child of MS:1000518|binary data type.",
+              "examples": [
+                "MS:1000521",
+                "MS:1000522",
+                "MS:1000519",
+                "MS:1000479"
+              ],
+              "pattern": "\\S+:\\S+",
+              "format": "curie"
             },
             "array_type": {
-                "type": "string",
-                "description": "The type of array this is, semantically, denoted using a CURIE from the PSI-MS controlled vocabulary for a child of MS:1000513|binary data array. If no existing array fits, use MS:1000786|non-standard array.",
-                "examples": ["MS:1000514", "MS:1000515", "MS:1000595", "MS:1003006"]
+              "type": "string",
+              "description": "The type of array this is, semantically, denoted using a CURIE from the PSI-MS controlled vocabulary for a child of MS:1000513|binary data array. If no existing array fits, use MS:1000786|non-standard array.",
+              "examples": [
+                "MS:1000514",
+                "MS:1000515",
+                "MS:1000595",
+                "MS:1003006"
+              ],
+              "pattern": "\\S+:\\S+",
+              "format": "curie"
             },
             "unit": {
-                "type": "string",
-                "description": "The unit describing the measurment, denoted using a CURIE from the PSI-MS controlled vocabulary or the unit ontology.",
-                "examples": [
-                    "MS:1000040",
-                    "MS:1000131",
-                    "UO:0000010"
-                ]
+              "type": "string",
+              "description": "The unit describing the measurment, denoted using a CURIE from the PSI-MS controlled vocabulary or the unit ontology.",
+              "examples": ["MS:1000040", "MS:1000131", "UO:0000010"],
+              "pattern": "\\S+:\\S+",
+              "format": "curie"
             },
             "buffer_priority": {
                 "type": "string",

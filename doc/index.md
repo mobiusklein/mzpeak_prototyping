@@ -15,6 +15,7 @@
 - [Data Layouts](#data-layouts)
   - [Packed Parallel Metadata Tables](#packed-parallel-metadata-tables)
     - [Controlled Vocabulary Terms](#controlled-vocabulary-terms)
+      - [The `parameters` list](#the-parameters-list)
       - [Column Name Inflection](#column-name-inflection)
     - [Null Semantics for Metadata](#null-semantics-for-metadata)
     - [File-Level Metadata](#file-level-metadata)
@@ -26,9 +27,15 @@
       - [Zero Run Stripping](#zero-run-stripping)
         - [Null Marking](#null-marking)
         - [Null Semantics for Signal Data](#null-semantics-for-signal-data)
+    - [Auxiliary Data Arrays](#auxiliary-data-arrays)
     - [Point Layout](#point-layout)
     - [Chunked Layout](#chunked-layout)
-      - [Opaque Array Transforms](#opaque-array-transforms)
+      - [Splitting Data Into Chunks](#splitting-data-into-chunks)
+      - [Chunk Encodings](#chunk-encodings)
+        - [Basic Encoding](#basic-encoding)
+        - [Delta Encoding](#delta-encoding)
+        - [Numpress Linear Encoding](#numpress-linear-encoding)
+        - [Opaque Array Transforms](#opaque-array-transforms)
   - [Why all these root nodes?](#why-all-these-root-nodes)
 - [Index File - `mzpeak_index.json`](#index-file---mzpeak_indexjson)
   - [Data Kind](#data-kind)
@@ -206,11 +213,15 @@ Here is a stripped down example where two rows of related MS1 and MS2 spectra. T
 Like mzML before it, mzPeak makes heavy use of controlled vocabularies for representing rich metadata. mzPeak uses controlled vocabulary terms in several ways:
 
 1. As columns. When a term is used as a column name, that column's values are either the defined value of an expected type for the term (e.g. the term `has_value_type`) _OR_ the a CURIE for a child of the column name. For example
-   1. The column [`MS_1000525_spectrum_representation`](https://www.ebi.ac.uk/ols4/ontologies/ms/classes/http%253A%252F%252Fpurl.obolibrary.org%252Fobo%252FMS_1000525) would have values that are CURIEs for a child term, `MS:1000127` "centroid spectrum" or `MS:1000128` "profile spectrum", as appropriate for the spectrum the row is describing.
-   2. The column [`MS_1000511_ms_level`](https://www.ebi.ac.uk/ols4/ontologies/ms/classes/http%253A%252F%252Fpurl.obolibrary.org%252Fobo%252FMS_1000511) would hold an integer value, as appropriate for the spectrum the row is describing.
-2. As structural elements. In several places in the format, like the [array index](#the-array-index), we use CURIEs to reference named concepts that are explain the semantics of the data structure without changing the shape of the data structure.
-3. As pluggable metadata carriers in `parameters` arrays. For every schema facet of a metadata table, a `parameters` column is allowed. These columns _MUST_ be a list of the following schema:
-```
+   1. The column [`MS_1000525_spectrum_representation`](http://purl.obolibrary.org/obo/MS_1000525) would have values that are CURIEs for a child term, `MS:1000127` "centroid spectrum" or `MS:1000128` "profile spectrum", as appropriate for the spectrum the row is describing.
+   2. The column [`MS_1000511_ms_level`](http://purl.obolibrary.org/obo/MS_1000511) would hold an integer value, as appropriate for the spectrum the row is describing.
+2. As structural elements. In several places in the format, like the [array index](#the-array-index), we use CURIEs to reference named concepts that explain the semantics of the data structure without changing the shape of the data structure.
+3. As pluggable metadata carriers in `parameters` arrays, akin to `<cvParam />` in mzML. For every schema facet of a metadata table, a `parameters` column is allowed. See the [parameters list](#the-parameters-list) for details on
+
+#### The `parameters` list
+
+The `parameters` column may be present in any facet of a metadata table. It _MUST_ be a list of the following schema:
+```python
 optional group field_id=-1 parameters (List) {
   repeated group field_id=-1 list {
     optional group field_id=-1 item {
@@ -227,6 +238,10 @@ optional group field_id=-1 parameters (List) {
   }
 }
 ```
+
+The `parameters.list.item.value` group must have a column for each data type so a parameter can take on one of these value types. Unused type slots _MUST_ be `null`. (QUESTION: Should this support lists/maps?). `parameters` entries _MAY_ have unit defined by a controlled vocabulary term CURIE stored in the `parameters.list.item.unit` column. As in mzML's `<userParam />`, uncontrolled parameters may also be included in the `parameters` list by simply storing a parameter _WITHOUT_ a value in the `parameters.list.item.accession` column.
+
+__NOTE:__ Writers are encouraged to, when sufficient context is available, encode parameters that are present in most rows of a table as columns. This more space efficient and opens the door to easy predicate filtering.
 
 #### Column Name Inflection
 
@@ -422,13 +437,61 @@ Keep in mind that all Numpress compression methods are still available and still
 
 Unless otherwise noted, readers _SHOULD_ treat `null` values in sorting dimension `0` of the entry as governed by this model with parallel `null` values in any intensity arrays as 0. The former should have a `transformation` value of [`MS:1003901`]() and the latter should have a `transformation` value [`MS:1003902`](). All other values for those points should be read as-is with null semantics meaning that the value was absent. Writers using null marking _SHOULD_ only use `null` for the first sorting dimension and associated intensity value, all other columns should be written as-is.
 
+### Auxiliary Data Arrays
+
+TODO: Expand on this.
+
+```
+optional group auxiliary_arrays (List) {
+  repeated group list {
+    optional group item {
+      optional group data (List) {
+        repeated group list {
+          required int32 item (Int(bitWidth=8, isSigned=false));
+        }
+      }
+      optional group name {
+        optional group value {
+          optional int64 integer;
+          optional double float;
+          optional binary string (String);
+          optional boolean boolean;
+        }
+        optional binary accession (String);
+        optional binary name (String);
+        optional binary unit (String);
+      }
+      optional binary data_type (String);
+      optional binary compression (String);
+      optional binary unit (String);
+      optional group parameters (List) {
+        repeated group list {
+          optional group item {
+            optional group value {
+              optional int64 integer;
+              optional double float;
+              optional binary string (String);
+              optional boolean boolean;
+            }
+            optional binary accession (String);
+            optional binary name (String);
+            optional binary unit (String);
+          }
+        }
+      }
+      optional binary data_processing_ref (String);
+    }
+  }
+}
+```
+
 ### Point Layout
 
 When storing data arrays, the point layout stores the data as-is in parallel arrays alongside a repeated index column. The top-level node is named `point` and it is a group with an arbitrary number of columns. The entity index column _MUST_ be the first column under `point`.
 
 <img src="static/img/point_layout.png" height="600pt" style="background-color: white; padding: 1em;"/>
 
-<style>
+<style style="display: none">
   .point-table {
     text-align: center;
   }
@@ -465,7 +528,7 @@ This layout is simple, but carries several advantages. Scalar columns are easily
 
 ### Chunked Layout
 
-When storing data arrays, the chunked layout treats one array, which must be sorted, as the "primary" axis, cutting the array into chunks of a fixed size along that coordinate space (e.g. steps of 50 m/z) and taking the same segments from parallel arrays. The primary axis chunks' start, end, and a repeated index are recorded as columns, and then each array may be encoded as-is or with an opaque transform (e.g. δ-encoding, Numpress). The start and end interval permits granular random access along the primary axis as well as the source index. The top-level node is named `chunk` and it has a layout as shown below. The entity index column _MUST_ be the first column under `chunk`.
+When storing data arrays, the chunked layout treats one array, which must be sorted, as the "main" axis, cutting the array into chunks of a fixed size along that coordinate space (e.g. steps of 50 m/z) and taking the same segments from parallel arrays. The main axis chunks' start, end, and a repeated index are recorded as columns, and then each array may be encoded as-is or with an opaque transform (e.g. delta-encoding, Numpress). The start and end interval permits granular random access along the main axis as well as the source index. The top-level node is named `chunk` and it has a layout as shown below. The entity index column _MUST_ be the first column under `chunk`.
 
 <img src="static/img/chunked_layout.png" height="600pt" style="background-color: white; padding: 1em;"/>
 
@@ -496,12 +559,239 @@ When storing data arrays, the chunked layout treats one array, which must be sor
 </tbody>
 </table>
 
-This example uses a δ-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_chunk_values` list aren't accessible to the page index, but the `_start` and `_end` columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
+This example uses a delta-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_chunk_values` list aren't accessible to the page index, but the `_start` and `_end` columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
 
-#### Opaque Array Transforms
+The chunked layout's column naming rules:
+
+1. `<entity>_index` (integer): The index key for the entity this chunk belongs to.
+2. `<array_name>_start` (float64): The first coordinate value in this chunk, where it _starts_ at inclusively.
+3. `<array_name>_end` (float64): The last coordinate value in this chunk, where it _ends_ at inclusively.
+4. `<array_name>_chunk_values` (list): The encoded coordinates from `array_name` according to the `chunk_encoding` column.
+5. `chunk_encoding` (CURIE): The method by which `<array_name>_chunk_values` were encoded. See [Chunk Encodings](#chunk-encodings) for more details.
+
+All other columns are expected to be `list` arrays whose names are simply their `array_name` as described in the index, or surrogate arrays not named in the array index that hold additional encoded bytes.
+
+#### Splitting Data Into Chunks
+
+The process for constructing a chunk table for a signal entry may break in any pattern so long as the chunks are non-overlapping and ascending. The chunking procedure needs to be `null`-aware, particularly aware of `null` pairs used to denote masked regions. An algorithm for producing equal width chunks is given below. The granularity of the chunking is configurable, trading off random access granularity vs. compression efficiency.
+
+<details>
+
+<summary>Python code for partitioning chunks of up to width <span style="font: italic 1em serif;">k</span> with null pairs present</summary>
+
+```python
+import pyarrow as pa
+
+def null_chunk_every(data: pa.Array, width: float) -> list[tuple[int, int]]:
+    """
+    Partition a sorted numerical array into segments spanning `width` units.
+
+    This operation is null-aware, so sparse arrays can be partitioned.
+
+    Parameter
+    ---------
+    data : pa.Array
+        The data to be partitioned
+    width : float
+        The spacing (in units along the data dimension) between chunks
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        The start and end index of each chunk
+    """
+    start = None
+    n = len(data)
+    i = 0
+    # Find the first non-null position
+    while i < n:
+        v = data[i]
+        if v.is_valid:
+            start = v.as_py()
+            break
+        else:
+            i += 1
+
+    # If we never found a non-null position, just return a single chunk
+    if start is None:
+        return [(0, n)]
+
+    chunks = []
+    offset = 0
+    threshold = start + width
+    i = 0
+    while i < n:
+        v = data[i]
+        if v.is_valid:
+            v = v.as_py()
+            if v > threshold:
+                if ((i + 1) < n) and (not data[i + 1].is_valid):
+                    while ((i + 1) < n) and (not data[i + 1].is_valid):
+                        i += 1
+                # We don't want to create a chunk of length 1, especially not if it is a null
+                # point. If not, we have to relax the width requirement.
+                if i - offset > 1:
+                    chunks.append((offset, i))
+                    offset = i
+                # Update the threshold. We might need to update multiple times if the next value
+                # is far away.
+                while threshold < v:
+                    threshold += width
+        # Look ahead and see if the next value is not null since this one is.
+        elif ((i + 1) < n) and (data[i + 1].is_valid):
+            i += 1
+            v = data[i].as_py()
+            if v > threshold:
+                i -= 1
+                chunks.append((offset, i))
+                offset = i
+                # Update the threshold. We might need to update multiple times if the next value
+                # is far away.
+                while threshold < v:
+                    threshold += width
+        i += 1
+    if offset != n:
+        chunks.append((offset, n))
+    return chunks
+```
+
+</details>
+
+#### Chunk Encodings
+
+##### Basic Encoding
+
+Chunk Encoding Controlled Vocabulary: [`MS:1000576|no compression`](http://purl.obolibrary.org/obo/MS_1000576)
+
+When storing centroids or data that are not similarly spaced as is usually the case for pre-centroided spectra, but still want to use the chunked layout, no special encoding of the chunked values is necessary. The values within each chunk are written as-is to the chunk values array. This doesn't improve compressibility but it maintains a consistent schema for other entries that would benefit from a different encoding.
+
+__Note__: The start point is _excluded_ from the chunk values array.
+
+##### Delta Encoding
+
+Chunk Encoding Controlled Vocabulary: [`MS:1003089|truncation, delta prediction and zlib compression`](http://purl.obolibrary.org/obo/MS_1003089)
+
+When working with data that is laid out on a locally (*almost*) uniform grid using 64-bit floats, it is possible to improve compression by computing a delta encoding of the coordinates.
+
+__Note__: The start point is _excluded_ from the chunk values array.
+
+<details>
+
+<summary>Python code for delta encode/decode with null awareness</summary>
+
+```python
+import pyarrow as pa
+
+def null_delta_encode(data: pa.Array) -> pa.Array:
+    """
+    Delta-encode an Arrow array containing nulls. Nulls are encoded as null values, and treated as 0.0
+    for the purposes of computing the next delta.
+
+    Parameters
+    ----------
+    data : pa.Array
+        The data to delta encode
+
+    Returns
+    -------
+    pa.Array
+    """
+    acc = []
+    it = iter(data)
+    # Get the first entry in the array. It will be the first point of reference but not part
+    # of the delta sequence unless it is `null`
+    last = next(it)
+    if not last.is_valid:
+        acc.append(last)
+
+    for item in it:
+        # If the value isn't `null`,
+        if item.is_valid:
+            val = item.as_py()
+            # Compute a delta relative to the last item if it was not `null`
+            if last.is_valid:
+                acc.append(pa.scalar(val - last.as_py()))
+            # otherwise treat the last value as 0.0, the additive identity
+            else:
+                acc.append(item)
+            # Update last item
+            last = item
+        else:
+            # Append the `null` unmodified and update the last item.
+            acc.append(item)
+            last = item
+    return pa.array(acc)
+
+
+def null_delta_decode(data: pa.Array, start: pa.Scalar) -> pa.Array:
+    """
+    Decode an Arrow array that was delta-encoded *with* nulls.
+
+    This is necessarily a copying operation.
+
+    Parameters
+    ----------
+    data : pa.Array
+        The data to be decoded.
+    start : pa.Scalar
+        The starting value, an offset
+
+    Returns
+    -------
+    pa.Array
+    """
+    acc = []
+    # If the first value is `null`,
+    if not data[0].is_valid:
+        # and the second value is `null`,
+        if not data[1].is_valid:
+            # then append the `start` value, we started at a non-null value immediately followed by a null pair.
+            acc.append(start)
+        start = pa.scalar(None, data.type)
+    else:
+        # otherwise use the starting point
+        acc.append(start.as_py())
+    last = start
+    for item in data:
+        # if the current point is valid
+        if item.is_valid:
+            val = item.as_py()
+            # and the last is valid
+            if last.is_valid:
+                # reconstitute the delta encoded value at this position
+                last = pa.scalar(val + last.as_py())
+                acc.append(last)
+            else:
+                # otherwise the last value is assumed to be zero so it does
+                # not need to be adjusted
+                acc.append(item)
+                last = item
+        else:
+            # otherwise this position is null and we carry it forward as such
+            acc.append(item)
+            last = item
+    return pa.array(acc)
+```
+
+</details>
+
+##### Numpress Linear Encoding
+
+Chunk Encoding Controlled Vocabulary: [`MS:1002312|MS-Numpress linear prediction compression`](http://purl.obolibrary.org/obo/MS_1002312)
+
+This uses the Numpress linear prediction method ([10.1074/mcp.O114.037879](https://www.mcponline.org/article/S1535-9476(20)33083-8/fulltext)) to compress the chunk's values as raw bytes. Numpress creates a buffer containing an 8 byte fixed point, 4 byte value 0, 4 byte value 1, followed by 2 byte residuals for all subsequent values in the array. This means that the array is by definition not alignable to a 4- or 8-byte type. It also has no concept of nullity, which means it is _not compatible_ with [null marking](#null-marking).
+
+To store Numpress linear encoded arrays, an extra column is added `<array_name>_numpress_bytes` is added. It is a list of byte arrays (`large_list<u8>` in Arrow parlance, __not__ `large_binary`, see [discussion of string type "optimization"](https://arrow.apache.org/docs/format/Intro.html#variable-length-binary-and-string)).
+
+__Note__: The start point is _INCLUDED_ from the chunk values array. It is a specific component of the Numpress encoded bytes.
+
+TODO: Consider if we should split out the fixed point into a separate column and then we can store this data as a uniform length unsigned int16 or int32.
+
+##### Opaque Array Transforms
 
 TODO: Describe how to use Numpress encodings in the chunked encoding.
-TODO: Consider if we should split out the fixed point into a separate column and then we can store this data as a uniform length unsigned int32.
+
+
 
 ## Why all these root nodes?
 
@@ -614,51 +904,76 @@ When selecting a [Parquet encoding](https://parquet.apache.org/docs/file-format/
 }
 ```
 
-This metadata table uses the [packed parallel metadata table](#packed-parallel-metadata-tables) schema. The parallel schemas are:
+The [file level metadata](#file-level-metadata) for this Parquet file should include the following JSON-encoded metadata:
+  - [`file_description`](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/file_description.json)
+  - [`instrument_configuration_list`](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/instrument_configuration.json)
+  - [`data_processing_method_list`](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/data_processing.json)
+  - [`software_list`](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/software.json)
+  - [`sample_list`](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/sample.json)
+  - [`run`](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/ms_run.json)
+
+This metadata table uses the [packed parallel metadata table](#packed-parallel-metadata-tables) schema. The parallel schemas are shown below. The general order of columns in unspecified, but `spectrum.index`, `scan.source_index`, `precursor.source_index`, and `selected_ion.source_index` _MUST_ be the first column of their respective schemas. Wherever these lists say _MAY_, that value may either be stored as a column or as an entry in the [parameter list](#the-parameters-list) but a column tends to make more sense if it is usually present.
 
 - `spectrum`
-  - `index`
-  - `id`
-  - `time`
-  - `data_processing_ref`
-  - `parameters`
-  - `auxiliary_arrays`
-  - `number_of_auxiliary_arrays`
-  - `mz_delta_model`
-  - `MS_1000525_spectrum_representation`
-  - `MS_1000465_scan_polarity`
-  - `MS_1000559_spectrum_type`
-  - MAY supply a *child* term of MS:1000499 (spectrum attribute) one or more times
+  - `index` (integer): The ascending 0-based index. This _MUST_ be incrementally increasing by 1 per entry and _SHOULD_ be written in time-sorted ascending order (QUESTION: Should there be a CV to denote this state?). This is the "primary key" for the `spectrum` schema, making it the root unit of addressability.
+  - `id` (string): The "nativeID" string identifier for the spectrum, formatted according to to a [native identifier format](http://purl.obolibrary.org/obo/MS_1000767). The specific nativeID format _SHOULD_ be specified in the [file level metadata](#file-level-metadata) under `.file_description.source_files[0].parameters`, as in mzML.
+  - `time` (float): The starting time for data acquisition for this spectrum. This value _SHOULD_ be replicated from the parallel `scan` schema for simpler filtering, but when a spectrum has multiple scans, it _SHOULD_ refer to the minimum value if the run is defined in acquisition time order.
+  - [`MS_1000511_ms_level`](http://purl.obolibrary.org/obo/MS_1000511) (integer): Stage number achieved in a multi stage mass spectrometry acquisition as an integer, or `null` for non-mass spectra.
+  - `data_processing_ref` (integer): The identifier for a `data_processing` that governs this spectrum if it deviates from the default method specified in [file level metadata](#file-level-metadata) under `.run.default_data_processing_id`, `null` otherwise.
+  - `parameters` (list): A list of controlled or uncontrolled parameters that describe this spectrum. See [the parameter list section](#the-parameters-list) for more details.
+  - `number_of_auxiliary_arrays` (integer): The number of auxiliary arrays that are stored with this row's `auxiliary_arrays` column. This is useful for quickly telling if a reader needs to go through the more expensive process of reading these and decoding them.
+  - `auxiliary_arrays` (list): A list of structures that describe a data array that did not fit within the constraints as described in the [arrays and columns](#arrays-and-columns) section. These may be large and care should be used in deciding to eagerly load them (or not). They are described in the [auxiliary data arrays](#auxiliary-data-arrays)
+  - `mz_delta_model` (list of float64): A list of double-precision floating point values that parameterize the m/z delta model for reconstructing [null marked data](#null-marking)
+  - `MS_1000525_spectrum_representation` (CURIE):
     - __Examples:__
+      - [MS:1000128](http://purl.obolibrary.org/obo/MS_1000128) "profile spectrum"
+      - [MS:1000127](http://purl.obolibrary.org/obo/MS_1000127) "centroid spectrum"
+  - [`MS_1000465_scan_polarity`](http://purl.obolibrary.org/obo/MS_1000465) (integer): The polarity of the spectrum represented as either a `1` (positive), `-1` (negative), or `null`. (QUESTION: This could also just be a CURIE)
+  - [`MS_1000559_spectrum_type`](http://purl.obolibrary.org/obo/MS_1000559) (CURIE): A child of [MS:1000559](http://purl.obolibrary.org/obo/MS_1000559):
+    - __Examples:__
+      - [MS:1000579](http://purl.obolibrary.org/obo/MS_1000579) "MS1 spectrum"
+      - [MS:1000580](http://purl.obolibrary.org/obo/MS_1000580) "MSn spectrum"
+      - [MS:1000804](http://purl.obolibrary.org/obo/MS_1000804) "electromagnetic radiation spectrum"
+      - [MS:1000928](http://purl.obolibrary.org/obo/MS_1000928) "calibration spectrum"
+  - MAY supply a *child* term of [MS:1003058](http://purl.obolibrary.org/obo/MS_1003058) (spectrum property) one or more times
+    - __Examples:__
+      - [`MS_1003060_number_of_data_points`](http://purl.obolibrary.org/obo/MS_1003060)
+      - [`MS_1000504_base_peak_mz_unit_MS_1000040`](http://purl.obolibrary.org/obo/MS_1000504)
+      - [`MS_1000285_total_ion_current_unit_MS_1000131`](http://purl.obolibrary.org/obo/MS_1000285)
+  - MAY supply a *child* term of [MS:1000499](http://purl.obolibrary.org/obo/MS_1000499) (spectrum attribute) one or more times
+    - __Examples:__
+      - [`MS_1000796_spectrum_title`](http://purl.obolibrary.org/obo/MS_1000796)
 - `scan`
-  - `source_index`
-  - `instrument_configuration_ref`
-  - `parameters`
+  - `source_index` (integer)
+  - `instrument_configuration_ref` (integer)
+  - `parameters` (list): A list of controlled or uncontrolled parameters that describe this scan. See [the parameter list section](#the-parameters-list) for more details.
   - `scan_windows`
-  - MAY supply a *child* term of MS:1000503 (scan attribute) one or more times
+  - MAY supply a *child* term of [MS:1000503](http://purl.obolibrary.org/obo/MS_1000503) (scan attribute) one or more times
     - __Examples:__
-  - MAY supply a *child* term of MS:1000018 (scan direction) only once
-  - MAY supply a *child* term of MS:1000019 (scan law) only once
+  - MAY supply a *child* term of [MS:1000018](http://purl.obolibrary.org/obo/MS_1000018) (scan direction) only once
+  - MAY supply a *child* term of [MS:1000019](http://purl.obolibrary.org/obo/MS_1000019) (scan law) only once
 - `precursor`
   - `source_index`
   - `precursor_index`
   - `precursor_id`
   - `isolation_window`
   - `activation`
-    - `parameters`
-    - MAY supply a *child* term of MS:1000510 (precursor activation attribute) one or more times
-    - MUST supply term MS:1000044 (dissociation method) or any of its children one or more times
+    - `parameters` (list): A list of controlled or uncontrolled parameters that describe this precursor's activation. See [the parameter list section](#the-parameters-list) for more details.
+    - MAY supply a *child* term of [MS:1000510](http://purl.obolibrary.org/obo/MS_1000510) (precursor activation attribute) one or more times
+    - MUST supply term [MS:1000044](http://purl.obolibrary.org/obo/MS_1000044) (dissociation method) or any of its children one or more times
 - `selected_ion`
   - `source_index`
   - `precursor_index`
   - `ion_mobility`
   - `ion_mobility_type`
-  - `parameters`
-  - MUST supply a *child* term of MS:1000455 (ion selection attribute) one or more times
+  - `parameters` (list): A list of controlled or uncontrolled parameters that describe this selected ion. See [the parameter list section](#the-parameters-list) for more details.
+  - MUST supply a *child* term of [MS:1000455](http://purl.obolibrary.org/obo/MS_1000455) (ion selection attribute) one or more times
     - __Examples:__
-    - `MS_1000744_selected_ion_mz_unit_MS_1000040`
-    - `MS_1000041_charge_state`
-    - `MS_1000042_intensity_unit_MS_1000131`
+    - [`MS_1000744_selected_ion_mz_unit_MS_1000040`](http://purl.obolibrary.org/obo/MS_10004744)
+    - [`MS_1000041_charge_state`](http://purl.obolibrary.org/obo/MS_1000041)
+    - [`MS_1000042_intensity_unit_MS_1000131`](http://purl.obolibrary.org/obo/MS_1000131)
+
+QUESTION: Is there a better way to make ion mobility storage generic over type ("ion mobility drift time", "inverse reduced ion mobility", "FAIMS compensation voltage")?
 
 # Spectrum Peak Data - `spectra_peaks.parquet`
 

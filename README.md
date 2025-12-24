@@ -4,17 +4,13 @@ This repository contains prototype implementations of the mzPeak format initiall
 
 **NOTE**: This is a **work in progress**, no stability is guaranteed at this point.
 
-The primary work shown here is written in Rust at the repository root, including a library for reading and writing mzPeak files,
-as well as command line tools for converting existing formats into mzPeak. There is a separate Python implementation in `python/`
-which is a complete re-implementation for _reading_ mzPeak files using [`pyarrow`](https://arrow.apache.org/docs/python/index.html),
-and the PyData stack. The Python codebase does not support writing at this time although this is subject to change in the future.
+The primary work shown here is written in Rust at the repository root, including a library for reading and writing mzPeak files, as well as command line tools for converting existing formats into mzPeak. There is a separate Python implementation in `python/` which is a complete re-implementation for _reading_ mzPeak files using [`pyarrow`](https://arrow.apache.org/docs/python/index.html), and the PyData stack. The Python codebase does not support writing at this time although this is subject to change in the future. There is also an R implementation in `R/`, which is also a complete re-implementation using the [`arrow`](https://arrow.apache.org/docs/r/) for _reading_ only at this time.
 
 Other languages are planned in the future in rough order of priority:
 
 - C++
 - C#
 - Java
-- R
 - JavaScript/WebAssembly
 
 ## Table of contents
@@ -38,11 +34,11 @@ to re-use concepts like controlled vocabularies where feasible as well as arbitr
 
 Components of an mzPeak archive:
 
-- `spectra_metadata.mzpeak`: Spectrum level metadata and file-level metadata. Includes spectrum descriptions, scans, precursors, and selected ions using packed parallel tables.
-- `spectra_data.mzpeak`: Spectrum signal data in either profile or centroid mode. May be in point layout or chunked layout which have different size and random access characteristics.
-- `spectra_peaks.mzpeak` (optional): Spectrum centroids stored explicitly separately from whatever signal is in `spectra_data.mzpeak`, such as from instrument vendors who store both profile and centroid versions of the same spectra. This file may not always be present.
-- `chromatograms_metadata.mzpeak` (optional): Chromatogram-level metadata and file-level metadata. Includes chromatogram descriptions, as well as precursors and selected ions using packed parallel tables.
-- `chromatograms_data.mzpeak` (optional): Chromatogram signal data. May be in point layout or chunked layout which have different size and random access characteristics. Intensity measures with different units may be stored in parallel.
+- `spectra_metadata.parquet`: Spectrum level metadata and file-level metadata. Includes spectrum descriptions, scans, precursors, and selected ions using packed parallel tables.
+- `spectra_data.parquet`: Spectrum signal data in either profile or centroid mode. May be in point layout or chunked layout which have different size and random access characteristics.
+- `spectra_peaks.parquet` (optional): Spectrum centroids stored explicitly separately from whatever signal is in `spectra_data.parquet`, such as from instrument vendors who store both profile and centroid versions of the same spectra. This file may not always be present.
+- `chromatograms_metadata.parquet` (optional): Chromatogram-level metadata and file-level metadata. Includes chromatogram descriptions, as well as precursors and selected ions using packed parallel tables.
+- `chromatograms_data.parquet` (optional): Chromatogram signal data. May be in point layout or chunked layout which have different size and random access characteristics. Intensity measures with different units may be stored in parallel.
 
 ### File level metadata
 
@@ -50,7 +46,7 @@ mzPeak file-level metadata, including descriptions of the file's contents, the i
 
 ### Packed Parallel Tables
 
-The `spectra_metadata.mzpeak` and `chromatograms_metadata.mzpeak` store multiple schemas in parallel. In these Parquet files, the root schema is made up of several branched "group" or "struct" (Parquet vs. Arrow nomenclature) that may be null at any level.
+The `spectra_metadata.parquet` and `chromatograms_metadata.parquet` store multiple schemas in parallel. In these Parquet files, the root schema is made up of several branched "group" or "struct" (Parquet vs. Arrow nomenclature) that may be null at any level.
 
 ### Zero Run Stripping
 
