@@ -8,8 +8,7 @@ use arrow::{
     },
     buffer::NullBuffer,
     datatypes::{
-        DataType, FieldRef, Float32Type, Float64Type, Int32Type, Int64Type, UInt8Type, UInt32Type,
-        UInt64Type,
+        DataType, FieldRef, Fields, Float32Type, Float64Type, Int32Type, Int64Type, UInt8Type, UInt32Type, UInt64Type
     },
 };
 use itertools::Itertools;
@@ -1515,6 +1514,33 @@ impl<'a> VisitorBuilderBase<'a, Indexed<ScanEvent>> for MzScanVisitor<'a> {
 
 impl<'a> VisitorBuilder2<'a, ScanEvent> for MzScanVisitor<'a> {}
 
+#[allow(unused)]
+#[derive(Debug, Clone, Copy)]
+struct ScanWindowSchema {
+    lower_limit: Option<usize>,
+    upper_limit: Option<usize>,
+    unit: Option<CURIE>,
+    parameters: Option<usize>
+}
+
+impl ScanWindowSchema {
+    fn new(lower_limit: Option<usize>, upper_limit: Option<usize>, unit: Option<CURIE>, parameters: Option<usize>) -> Self {
+        Self { lower_limit, upper_limit, unit, parameters }
+    }
+
+    fn has_window(&self) -> bool {
+        self.lower_limit.is_some() && self.upper_limit.is_some()
+    }
+
+    fn limit_arrays<'a>(&self, scan_window_array: &'a StructArray) -> Option<(&'a std::sync::Arc<dyn Array>, &'a std::sync::Arc<dyn Array>)> {
+        self.has_window().then(|| {
+            let lower_limit_arr = scan_window_array.column(self.lower_limit.unwrap());
+            let upper_limit_arr = scan_window_array.column(self.upper_limit.unwrap());
+            (lower_limit_arr, upper_limit_arr)
+        })
+    }
+}
+
 impl<'a> MzScanVisitor<'a> {
     pub(crate) fn new(
         descriptions: &'a mut [(u64, ScanEvent)],
@@ -1718,11 +1744,20 @@ impl<'a> MzScanVisitor<'a> {
         }
     }
 
-    fn visit_scan_windows_inner(scan_window_array: &StructArray) -> Vec<ScanWindow> {
-        let lower_limit_arr = scan_window_array.column(0);
-        let upper_limit_arr = scan_window_array.column(1);
-        // let unit_arr = scan_window_array.column(2);
-        // let params_arr = scan_window_array.column(3);
+    fn visit_scan_windows_inner(scan_window_array: &StructArray, spec: Option<&ScanWindowSchema>) -> Vec<ScanWindow> {
+        let (lower_limit_arr, upper_limit_arr) = if let Some(spec) = spec {
+            if let Some((lower_limit_arr, upper_limit_arr)) = spec.limit_arrays(scan_window_array) {
+                (lower_limit_arr, upper_limit_arr)
+            } else {
+                let lower_limit_arr = scan_window_array.column(0);
+                let upper_limit_arr = scan_window_array.column(1);
+                (lower_limit_arr, upper_limit_arr)
+            }
+        } else {
+            let lower_limit_arr = scan_window_array.column(0);
+            let upper_limit_arr = scan_window_array.column(1);
+            (lower_limit_arr, upper_limit_arr)
+        };
         let n = lower_limit_arr.len();
         let mut windows: Vec<ScanWindow> = Vec::with_capacity(n);
         windows.resize(n, Default::default());
@@ -1748,14 +1783,51 @@ impl<'a> MzScanVisitor<'a> {
         windows
     }
 
+    fn scan_window_schema(&self, fields: &Fields) -> ScanWindowSchema {
+        let mut lower_bound_i = None;
+        let mut upper_bound_i = None;
+        let mut unit = None;
+        let mut parameters_i = None;
+        for (i, f) in fields.iter().enumerate() {
+            if let Some(colspec) = parse_column_to_curie(f.name()) {
+                if let Some(acc) = colspec.accession {
+                    match acc {
+                        mzdata::curie!(MS:1000501) => {
+                            lower_bound_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        mzdata::curie!(MS:1000500) => {
+                            upper_bound_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match colspec.name.as_str() {
+                    "parameters" => {
+                        parameters_i = Some(i);
+                    },
+                    "lower_limit" => {
+                        lower_bound_i = Some(i);
+                    },
+                    "upper_limit" => {
+                        upper_bound_i = Some(i);
+                    },
+                    _ => {}
+                }
+            }
+        }
+        ScanWindowSchema::new(lower_bound_i, upper_bound_i, unit, parameters_i)
+    }
+
     fn visit_scan_windows(&mut self, spec_arr: &StructArray, index: usize) {
-        // let fields: Vec<FieldRef> =
-        //     SchemaLike::from_type::<ScanWindowEntry>(Default::default()).unwrap();
-
         let arr = spec_arr.column(index);
-
         macro_rules! pack {
-            ($arr:ident) => {
+            ($arr:ident, $spec:expr) => {
                 for (i, (_, descr)) in self
                     .offsets
                     .iter()
@@ -1764,20 +1836,25 @@ impl<'a> MzScanVisitor<'a> {
                 {
                     let windows = $arr.value(i);
                     let windows = windows.as_struct();
-                    descr.scan_windows = Self::visit_scan_windows_inner(windows);
-                    // let windows: Vec<ScanWindowEntry> =
-                    //     serde_arrow::from_arrow(&fields, windows.columns()).unwrap();
-                    // for w in windows {
-                    //     descr.scan_windows.push((&w).into());
-                    // }
+                    descr.scan_windows = Self::visit_scan_windows_inner(windows, $spec);
                 }
             };
         }
 
         if let Some(arr) = arr.as_list_opt::<i64>() {
-            pack!(arr);
+            let spec = if let DataType::Struct(fields) = arr.value_type() {
+                Some(self.scan_window_schema(&fields))
+            } else {
+                None
+            };
+            pack!(arr, spec.as_ref());
         } else if let Some(arr) = arr.as_list_opt::<i32>() {
-            pack!(arr);
+            let spec = if let DataType::Struct(fields) = arr.value_type() {
+                Some(self.scan_window_schema(&fields))
+            } else {
+                None
+            };
+            pack!(arr, spec.as_ref());
         } else {
             unimplemented!("{:?}", arr.data_type())
         }

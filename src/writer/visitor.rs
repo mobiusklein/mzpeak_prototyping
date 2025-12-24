@@ -709,16 +709,14 @@ impl VisitorBase for ParamListBuilder {
 pub struct ScanWindowBuilder {
     lower_limit: Float32Builder,
     upper_limit: Float32Builder,
-    unit: CURIEBuilder,
     parameters: ParamListBuilder,
 }
 
 impl VisitorBase for ScanWindowBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
-            field!("lower_limit", DataType::Float32),
-            field!("upper_limit", DataType::Float32),
-            field!("unit", self.unit.as_struct_type()),
+            field!("MS_1000501_scan_window_lower_limit_unit_MS_1000040", DataType::Float32),
+            field!("MS_1000500_scan_window_upper_limit_unit_MS_1000040", DataType::Float32),
         ];
         fields.extend(self.parameters.fields());
         fields
@@ -727,7 +725,6 @@ impl VisitorBase for ScanWindowBuilder {
     fn append_null(&mut self) {
         self.lower_limit.append_null();
         self.upper_limit.append_null();
-        self.unit.append_null();
         self.parameters.append_null();
     }
 }
@@ -736,7 +733,6 @@ impl StructVisitor<mzdata::spectrum::ScanWindow> for ScanWindowBuilder {
     fn append_value(&mut self, item: &mzdata::spectrum::ScanWindow) -> bool {
         self.lower_limit.append_value(item.lower_bound);
         self.upper_limit.append_value(item.upper_bound);
-        self.unit.append_option(Unit::MZ.to_curie().as_ref());
         self.parameters.append_empty();
         true
     }
@@ -752,7 +748,6 @@ impl ArrayBuilder for ScanWindowBuilder {
         let arrays = vec![
             finish_it!(self.lower_limit),
             finish_it!(self.upper_limit),
-            self.unit.finish(),
             self.parameters.finish(),
         ];
 
@@ -764,7 +759,6 @@ impl ArrayBuilder for ScanWindowBuilder {
         let arrays = vec![
             Arc::new(self.lower_limit.finish_cloned()),
             Arc::new(self.upper_limit.finish_cloned()),
-            self.unit.finish_cloned(),
             self.parameters.finish_cloned(),
         ];
 
@@ -1713,16 +1707,16 @@ impl SpectrumDetailsBuilder {
         self.id.append_value(item.id());
         self.ms_level.append_value(item.ms_level());
         self.time.append_value(item.start_time() as f32);
-        self.polarity.append_value(match item.polarity() {
-            ScanPolarity::Positive => 1,
-            ScanPolarity::Negative => -1,
-            ScanPolarity::Unknown => 0,
+        self.polarity.append_option(match item.polarity() {
+            ScanPolarity::Positive => Some(1),
+            ScanPolarity::Negative => Some(-1),
+            ScanPolarity::Unknown => None,
         });
         self.mz_signal_continuity
-            .append_value(&match item.signal_continuity() {
-                mzdata::spectrum::SignalContinuity::Unknown => curie!(MS:1000525),
-                mzdata::spectrum::SignalContinuity::Centroid => curie!(MS:1000127),
-                mzdata::spectrum::SignalContinuity::Profile => curie!(MS:1000128),
+            .append_option(match item.signal_continuity() {
+                mzdata::spectrum::SignalContinuity::Unknown => None,
+                mzdata::spectrum::SignalContinuity::Centroid => Some(&curie!(MS:1000127)),
+                mzdata::spectrum::SignalContinuity::Profile => Some(&curie!(MS:1000128)),
             });
 
         self.spectrum_type.append_value(&spectrum_type);
