@@ -435,8 +435,14 @@ impl<'a> NullTokenizer<'a> {
             true
         } else if diff == 1 {
             // We stepped from one null to another
+            let has_null_run = self.has_null_run_at();
             let start = self.i;
             self.find_next_null();
+            if has_null_run {
+                self.consume_null_run();
+                log::error!("Had null run, {prev}-{}", self.i);
+                return self.update_next_state();
+            }
             let end = self.i;
             if self.is_null() {
                 self.next_state = NullFillState::NullBounded(start, end);
@@ -466,6 +472,24 @@ impl<'a> NullTokenizer<'a> {
             return true;
         }
         false
+    }
+
+    fn lookbehind_is_null(&self, offset: usize) -> bool {
+        (self.i.saturating_sub(offset) > 0) && self.array.is_null(self.i - offset)
+    }
+
+    fn lookahead_is_null(&self, offset: usize) -> bool {
+        (self.i < self.array.len().saturating_sub(offset)) && self.array.is_null(self.i + offset)
+    }
+
+    fn has_null_run_at(&self) -> bool {
+        self.is_null() && self.lookbehind_is_null(1) && self.lookahead_is_null(1)
+    }
+
+    fn consume_null_run(&mut self) {
+        while self.lookahead_is_null(1) {
+            self.advance();
+        }
     }
 
     fn find_next_null(&mut self) {
@@ -655,7 +679,7 @@ pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
     }
 }
 
-pub fn drop_where_column_is_zero(
+pub fn drop_where_column_is_zero_run(
     batch: &RecordBatch,
     column_index: usize,
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
@@ -699,12 +723,12 @@ where
     acc.into()
 }
 
-/// Find all positions which satisfy `is_zero_pair` in the `column_index`th column in `batch`
+/// Find all positions which satisfy `is_zero_pair_mask` in the `column_index`th column in `batch`
 /// in `target_indices` columns.
 ///
 /// # Panics
 /// If the array at `column_index` is a non-numeric or non-primitive array
-pub fn nullify_at_zero(
+pub fn nullify_at_zero_pair(
     batch: &RecordBatch,
     column_index: usize,
     target_indices: &[usize],
@@ -822,12 +846,12 @@ where
     PrimitiveArray::from(buffer)
 }
 
-/// Partition a sorted numerical array into segments spanning no more than `k` units.
+/// Partition a sorted numerical array into segments spanning no more than `width` units.
 ///
 /// This operation is null-aware, so sparse arrays can be partitioned.
 pub fn null_chunk_every_k<T: ArrowPrimitiveType>(
     array: &PrimitiveArray<T>,
-    k: T::Native,
+    width: T::Native,
 ) -> Vec<SimpleInterval<usize>>
 where
     T::Native: Float,
@@ -840,16 +864,18 @@ where
 
     let mut chunks = Vec::new();
     let mut offset = 0;
-    let mut t = start.unwrap() + k;
+    let mut threshold = start.unwrap() + width;
     let mut i = 0;
     while i < n {
         if array.is_valid(i) {
             let v = array.value(i);
-            if v > t {
-                // If the next value is null, then skip ahead an extra step because nulls
-                // are supposed to be paired.
+            if v > threshold {
+                // If the next value is null, then skip ahead an extra step.
+                // Nulls are supposed to be paired.
                 if (i + 1 < n) && array.is_null(i + 1) {
-                    i += 2;
+                    while (i + 1 < n) && array.is_null(i + 1) {
+                        i += 1;
+                    }
                     i = i.min(array.len());
                 }
 
@@ -859,19 +885,19 @@ where
                     chunks.push(SimpleInterval::new(offset, i));
                     offset = i;
                 }
-                while t < v {
-                    t = t + k;
+                while threshold < v {
+                    threshold = threshold + width;
                 }
             }
         } else if ((i + 1) < n) && (array.is_valid(i + 1)) {
             i += 1;
             let v = array.value(i);
-            if v > t {
+            if v > threshold {
                 i -= 1;
                 chunks.push(SimpleInterval::new(offset, i));
                 offset = i;
-                while t < v {
-                    t = t + k;
+                while threshold < v {
+                    threshold = threshold + width;
                 }
             }
         }
@@ -990,6 +1016,38 @@ mod test {
         for v in filled {
             assert_ne!(v, 0.0);
         }
+    }
+
+    #[test_log::test]
+    fn test_null_tokenizer_null_run_inner() {
+        let data = Float64Array::from(vec![
+            None,
+            Some(101.0),
+            Some(101.01),
+            Some(101.02),
+            None,
+            None,
+            None,
+            Some(101.5),
+        ]);
+
+        let tokenizer = NullTokenizer::new(data.nulls().unwrap());
+        let states: Vec<_> = tokenizer.collect();
+        assert_eq!(vec![NullFillState::NullBounded(0, 4), NullFillState::NullStart(7)], states);
+
+        let data = Float64Array::from(vec![
+            Some(101.0),
+            Some(101.01),
+            Some(101.02),
+            None,
+            None,
+            None,
+            Some(101.5),
+        ]);
+
+        let tokenizer = NullTokenizer::new(data.nulls().unwrap());
+        let states: Vec<_> = tokenizer.collect();
+        assert_eq!(vec![NullFillState::NullEnd(3), NullFillState::NullStart(6)], states);
     }
 
     #[test]
@@ -2680,7 +2738,7 @@ mod test {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_sparse_null_split() -> io::Result<()> {
         let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_large_gaps.txt")?);
         let mut mzs = Vec::new();
@@ -2705,8 +2763,8 @@ mod test {
             Arc::new(intensities),
         ]).unwrap();
 
-        let trimmed_batch = drop_where_column_is_zero(&batch, 1).unwrap();
-        let trimmed_batch = nullify_at_zero(&trimmed_batch, 1, &[0, 1]).unwrap();
+        let trimmed_batch = drop_where_column_is_zero_run(&batch, 1).unwrap();
+        let trimmed_batch = nullify_at_zero_pair(&trimmed_batch, 1, &[0, 1]).unwrap();
 
         let mzs = trimmed_batch.column(0).as_primitive::<Float64Type>();
 

@@ -13,7 +13,7 @@ use mzdata::spectrum::ArrayType;
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
     buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform},
-    filter::{drop_where_column_is_zero, nullify_at_zero},
+    filter::{drop_where_column_is_zero_run, nullify_at_zero_pair},
     peak_series::{ArrayIndex, ArrayIndexEntry},
 };
 
@@ -344,7 +344,7 @@ impl PointBuffers {
                 if is_profile {
                     if let Some(cols) = drop_zero_columns.as_ref() {
                         for (i, _f) in schema.fields().iter().enumerate().filter(|(_, f)| cols.contains(f.name())) {
-                            match drop_where_column_is_zero(&batch,i) {
+                            match drop_where_column_is_zero_run(&batch,i) {
                                 Ok(b) => {
                                     batch = b;
                                 },
@@ -353,7 +353,7 @@ impl PointBuffers {
                                 }
                             }
                             if null_zeros {
-                                match nullify_at_zero(&batch, i, &null_targets) {
+                                match nullify_at_zero_pair(&batch, i, &null_targets) {
                                     Ok(b) => {
                                         batch = b;
                                     },
