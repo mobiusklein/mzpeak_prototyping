@@ -238,7 +238,7 @@ impl ChunkingStrategy {
             .and_then(|v| v.map(|v| v.to_f64().unwrap_or(0.0)))
             .unwrap_or(0.0);
         match self {
-            ChunkingStrategy::Basic { chunk_size: _ } => (start, end, Arc::new(array.clone())),
+            ChunkingStrategy::Basic { chunk_size: _ } => (start, end, Arc::new(array.slice(1, array.len().saturating_sub(1)).clone())),
             ChunkingStrategy::Delta { chunk_size: _ } => {
                 (start, end, Arc::new(null_delta_encode(array)))
             }
@@ -301,10 +301,12 @@ impl ChunkingStrategy {
             ChunkingStrategy::Basic { chunk_size: _ } => match array.data_type() {
                 DataType::Float32 => {
                     let it = array.as_primitive::<Float32Type>();
+                    accumulator.push(start_value as f32).unwrap();
                     accumulator.extend(it.values()).unwrap();
                 }
                 DataType::Float64 => {
                     let it = array.as_primitive::<Float64Type>();
+                    accumulator.push(start_value).unwrap();
                     accumulator.extend(it.values()).unwrap();
                 }
                 _ => panic!(
@@ -1166,7 +1168,7 @@ mod test {
         io::{self, prelude::*},
     };
 
-    use crate::filter::{MZDeltaModel, drop_where_column_is_zero, nullify_at_zero};
+    use crate::filter::{MZDeltaModel, drop_where_column_is_zero_run, nullify_at_zero_pair};
 
     use super::*;
     use arrow::array::RecordBatch;
@@ -1373,8 +1375,8 @@ mod test {
         )
         .unwrap();
 
-        let trimmed_batch1 = drop_where_column_is_zero(&batch, 1).unwrap();
-        let trimmed_batch = nullify_at_zero(&trimmed_batch1, 1, &[0, 1]).unwrap();
+        let trimmed_batch1 = drop_where_column_is_zero_run(&batch, 1).unwrap();
+        let trimmed_batch = nullify_at_zero_pair(&trimmed_batch1, 1, &[0, 1]).unwrap();
 
         assert_eq!(trimmed_batch.num_rows(), accumulator.data_len()?);
 
@@ -1525,7 +1527,7 @@ mod test {
         Ok(())
     }
 
-    #[test]
+    #[test_log::test]
     fn test_encode_arrow_drop_zeros_null2() -> io::Result<()> {
         let reader = io::BufReader::new(std::fs::File::open("test/data/sparse_large_gaps.txt")?);
         let mut mzs =
@@ -1633,8 +1635,8 @@ mod test {
         )
         .unwrap();
 
-        let trimmed_batch1 = drop_where_column_is_zero(&batch, 1).unwrap();
-        let trimmed_batch = nullify_at_zero(&trimmed_batch1, 1, &[0, 1]).unwrap();
+        let trimmed_batch1 = drop_where_column_is_zero_run(&batch, 1).unwrap();
+        let trimmed_batch = nullify_at_zero_pair(&trimmed_batch1, 1, &[0, 1]).unwrap();
 
         assert_eq!(trimmed_batch.num_rows(), accumulator.data_len()?);
 
@@ -1776,9 +1778,9 @@ mod test {
         )
         .unwrap();
 
-        let trimmed_zero_dropped_batch = drop_where_column_is_zero(&batch, 1).unwrap();
+        let trimmed_zero_dropped_batch = drop_where_column_is_zero_run(&batch, 1).unwrap();
         let trimmed_null_filled_batch =
-            nullify_at_zero(&trimmed_zero_dropped_batch, 1, &[0, 1]).unwrap();
+            nullify_at_zero_pair(&trimmed_zero_dropped_batch, 1, &[0, 1]).unwrap();
 
         assert_eq!(
             trimmed_null_filled_batch.num_rows(),

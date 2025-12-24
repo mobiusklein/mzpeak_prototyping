@@ -397,6 +397,9 @@ NUMPRESS_LINEAR_CURIE = "MS:1002312"
 NUMPRESS_SLOF_CURIE = "MS:1002314"
 NUMPRESS_PIC_CURIE = "MS:1002313"
 
+NULL_INTERPOLATE = "MS:1003901"
+NULL_ZERO = "MS:1003902"
+
 psims_dtypes = {
     "MS:1000521": np.float32,
     "MS:1000523": np.float64,
@@ -699,6 +702,13 @@ class _ChunkBatchCleaner:
                     if delta_model_ is not None:
                         steps = fill_nulls(steps, delta_model_)
                     else:
+                        logger.warning(
+                            "Null values detected in chunk %0.3f-%0.3f for %s:%r",
+                            start,
+                            end,
+                            self.namespace,
+                            index_val,
+                        )
                         steps = np.asarray(steps)
                     main_axis_array[offset : offset + len(steps)] = steps
                 else:
@@ -709,8 +719,24 @@ class _ChunkBatchCleaner:
                     )
             # Direct encoding
             elif encoding in (NO_COMPRESSION, NO_COMPRESSION_CURIE):
+                steps = pa.chunked_array([pa.scalar(start, steps.type), steps.values])
                 chunk_size = len(steps)
-                main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
+                if steps.null_count > 0:
+                    if delta_model_ is not None:
+                        steps = fill_nulls(steps, delta_model_)
+                    else:
+                        logger.warning(
+                            "Null values detected in chunk %0.3f-%0.3f for %s:%r",
+                            start,
+                            end,
+                            self.namespace,
+                            index_val,
+                        )
+                    main_axis_array[offset : offset + chunk_size] = np.asarray(
+                        steps.values
+                    )
+                else:
+                    main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
             elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
                 part: np.ndarray = next(numpress_chunks_it)
                 chunk_size = len(part)
@@ -742,6 +768,9 @@ class _ChunkBatchCleaner:
                                 values = pynumpress.decode_slof(values)
                             elif self.has_transforms[k] == NUMPRESS_PIC_CURIE:
                                 values = pynumpress.decode_pic(values)
+                            elif self.has_transforms[k] in (NULL_INTERPOLATE, NULL_ZERO):
+                                # These transforms do not require any special handling
+                                pass
                             else:
                                 raise NotImplementedError(self.has_transforms[k])
                         arrays_of[k][offset : offset + chunk_size] = values

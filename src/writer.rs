@@ -479,7 +479,7 @@ impl<
                 .include_time(spectrum_buffers.include_time())
                 .build(Arc::new(Schema::empty()), BufferContext::Spectrum, false);
 
-            let data_props = Self::spectrum_data_writer_props(
+            let peak_data_props = Self::spectrum_data_writer_props(
                 &peak_buffer,
                 peak_buffer.index_path(),
                 shuffle_mz,
@@ -491,7 +491,7 @@ impl<
             let peak_writer = ArrowWriter::try_new_with_options(
                 peak_buffer_file,
                 peak_buffer.schema().clone(),
-                ArrowWriterOptions::new().with_properties(data_props),
+                ArrowWriterOptions::new().with_properties(peak_data_props),
             )
             .unwrap();
 

@@ -1,3 +1,5 @@
+import logging
+
 from typing import Iterator, Sequence
 from numbers import Number
 from enum import Enum, auto
@@ -10,6 +12,8 @@ try:
 except ImportError:
     solve_triangular = None
 
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 def fit_qr(x: np.ndarray, y: np.ndarray):
     if solve_triangular is None:
@@ -292,6 +296,20 @@ class _NullTokenizer:
             return True
         return False
 
+    def next_is_null(self) -> bool:
+        return (self.index + 1 < len(self.array)) and self.array[self.index + 1]
+
+    def previous_is_null(self) -> bool:
+        i = self.index - 1
+        return i > 0 and self.array[i]
+
+    def consume_null_run(self):
+        while self.next_is_null():
+            self._advance()
+
+    def has_null_run_at(self) -> bool:
+        return self.is_null() and self.previous_is_null() and self.next_is_null()
+
     def find_next_null(self):
         try:
             prev = self.index
@@ -315,8 +333,13 @@ class _NullTokenizer:
         if diff == 0:
             self.next_state = None
         elif diff == 1:
+            has_null_run = self.has_null_run_at()
             start = self.index
             self.find_next_null()
+            if has_null_run:
+                self.consume_null_run()
+                logger.error(f"Had null run, {prev}-{self.index}")
+                return self.update_next_state()
             end = self.index
             if self.is_null():
                 self.next_state = (start, end, _NullFillState.NullBounded)
@@ -417,19 +440,26 @@ def null_delta_encode(data: pa.Array) -> pa.Array:
     """
     acc = []
     it = iter(data)
+    # Get the first entry in the array. It will be the first point of reference but not part
+    # of the delta sequence unless it is `null`
     last = next(it)
     if not last.is_valid:
         acc.append(last)
 
     for item in it:
+        # If the value isn't `null`,
         if item.is_valid:
             val = item.as_py()
+            # Compute a delta relative to the last item if it was not `null`
             if last.is_valid:
                 acc.append(pa.scalar(val - last.as_py()))
+            # otherwise treat the last value as 0.0, the additive identity
             else:
                 acc.append(item)
+            # Update last item
             last = item
         else:
+            # Append the `null` unmodified and update the last item.
             acc.append(item)
             last = item
     return pa.array(acc)
@@ -453,31 +483,41 @@ def null_delta_decode(data: pa.Array, start: pa.Scalar) -> pa.Array:
     pa.Array
     """
     acc = []
+    # If the first value is `null`,
     if not data[0].is_valid:
+        # and the second value is `null`,
         if not data[1].is_valid:
+            # then append the `start` value, we started at a non-null value immediately followed by a null pair.
             acc.append(start)
         start = pa.scalar(None, data.type)
     else:
+        # otherwise use the starting point
         acc.append(start.as_py())
     last = start
     for item in data:
+        # if the current point is valid
         if item.is_valid:
             val = item.as_py()
+            # and the last is valid
             if last.is_valid:
+                # reconstitute the delta encoded value at this position
                 last = pa.scalar(val + last.as_py())
                 acc.append(last)
             else:
+                # otherwise the last value is assumed to be zero so it does
+                # not need to be adjusted
                 acc.append(item)
                 last = item
         else:
+            # otherwise this position is null and we carry it forward as such
             acc.append(item)
             last = item
     return pa.array(acc)
 
 
-def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
+def null_chunk_every(data: pa.Array, width: float) -> list[tuple[int, int]]:
     """
-    Partition a sorted numerical array into segments spanning no more than `k` units.
+    Partition a sorted numerical array into segments spanning `width` units.
 
     This operation is null-aware, so sparse arrays can be partitioned.
 
@@ -485,8 +525,8 @@ def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
     ---------
     data : pa.Array
         The data to be partitioned
-    k : float
-        The spacing between chunks
+    width : float
+        The spacing (in units along the data dimension) between chunks
 
     Returns
     -------
@@ -511,31 +551,37 @@ def null_chunk_every(data: pa.Array, k: float) -> list[tuple[int, int]]:
 
     chunks = []
     offset = 0
-    t = start + k
+    threshold = start + width
     i = 0
     while i < n:
         v = data[i]
         if v.is_valid:
             v = v.as_py()
-            if v > t:
+            if v > threshold:
                 if ((i + 1) < n) and (not data[i + 1].is_valid):
-                    i += 2
+                    while ((i + 1) < n) and (not data[i + 1].is_valid):
+                        i += 1
                 # We don't want to create a chunk of length 1, especially not if it is a null
-                # point.
+                # point. If not, we have to relax the width requirement.
                 if i - offset > 1:
                     chunks.append((offset, i))
                     offset = i
-                while t < v:
-                    t += k
+                # Update the threshold. We might need to update multiple times if the next value
+                # is far away.
+                while threshold < v:
+                    threshold += width
+        # Look ahead and see if the next value is not null since this one is.
         elif ((i + 1) < n) and (data[i + 1].is_valid):
             i += 1
             v = data[i].as_py()
-            if v > t:
+            if v > threshold:
                 i -= 1
                 chunks.append((offset, i))
                 offset = i
-                while t < v:
-                    t += k
+                # Update the threshold. We might need to update multiple times if the next value
+                # is far away.
+                while threshold < v:
+                    threshold += width
         i += 1
     if offset != n:
         chunks.append((offset, n))

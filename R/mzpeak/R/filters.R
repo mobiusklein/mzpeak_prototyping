@@ -177,7 +177,7 @@ NUMPRESS_PIC_CURIE = "MS:1002313"
     values <- .delta_decode(dat[[start_name]], dat[[end_name]], dat[[values_name]], delta_model)
   }
   else if (encoding == NO_COMPRESSION_CURIE) {
-    values <- dat[[values_name]]
+    values <- c(dat[[start_name]], dat[[values_name]])
   }
   else if (encoding == NUMPRESS_LINEAR_CURIE) {
     stop("Numpress support not yet implemented")
