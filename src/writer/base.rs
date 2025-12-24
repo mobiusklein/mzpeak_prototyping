@@ -583,7 +583,7 @@ pub trait AbstractMzPeakWriter {
 
         for c in parquet_schema.columns().iter() {
             let colpath = c.path().to_string();
-            if colpath.contains("_time")
+            if (colpath.contains("_time") || colpath.contains(".time"))
                 && matches!(
                     c.physical_type(),
                     parquet::basic::Type::DOUBLE | parquet::basic::Type::FLOAT
@@ -593,7 +593,7 @@ pub trait AbstractMzPeakWriter {
                 data_props =
                     data_props.set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
-            if colpath.contains("_ion_mobility") {
+            if colpath.contains("ion_mobility") {
                 log::debug!(
                     "{}: ion mobility detected, increasing dictionary size",
                     c.path()
@@ -678,7 +678,7 @@ pub trait AbstractMzPeakWriter {
 
         for c in parquet_schema.columns().iter() {
             let colpath = c.path().to_string();
-            if colpath.contains("_mz_")
+            if (colpath.contains("_mz_") || colpath.contains(".mz"))
                 && shuffle_mz
                 && matches!(
                     c.physical_type(),
@@ -689,7 +689,7 @@ pub trait AbstractMzPeakWriter {
                 data_props =
                     data_props.set_column_encoding(c.path().clone(), Encoding::BYTE_STREAM_SPLIT);
             }
-            if colpath.contains("_ion_mobility") {
+            if colpath.contains("ion_mobility") {
                 log::debug!(
                     "{}: ion mobility detected, increasing dictionary size",
                     c.path()
