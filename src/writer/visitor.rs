@@ -991,9 +991,9 @@ impl StructVisitor<mzdata::spectrum::IsolationWindow> for IsolationWindowBuilder
 impl VisitorBase for IsolationWindowBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
-            field!("target", DataType::Float32),
-            field!("lower_bound", DataType::Float32),
-            field!("upper_bound", DataType::Float32),
+            field!("MS_1000827_isolation_window_target_mz", DataType::Float32),
+            field!("MS_1000828_isolation_window_lower_offset", DataType::Float32),
+            field!("MS_1000829_isolation_window_upper_offset", DataType::Float32),
         ];
         fields.extend(self.parameters.fields());
         fields

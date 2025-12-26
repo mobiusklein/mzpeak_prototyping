@@ -283,7 +283,6 @@ In order to properly annotate what kind of array a column _is_, we include a JSO
   "entries": [
     {
       "context": "spectrum", // This is an array describing a spectrum
-      "prefix": "point", // The root of the structure this array is a part of
       "path": "point.mz", // The path to the column for this array in the Parquet schema
       "data_type": "MS:1000523", // The controlled vocabulary term  for the data type of this array
       "array_type": "MS:1000514", // The controlled vocabulary term for the array itself
@@ -297,7 +296,6 @@ In order to properly annotate what kind of array a column _is_, we include a JSO
     },
     {
       "context": "spectrum",
-      "prefix": "point",
       "path": "point.intensity",
       "data_type": "MS:1000521",
       "array_type": "MS:1000515",
@@ -914,7 +912,7 @@ The [file level metadata](#file-level-metadata) for this Parquet file should inc
 
 This metadata table uses the [packed parallel metadata table](#packed-parallel-metadata-tables) schema. The parallel schemas are shown below. The general order of columns in unspecified, but `spectrum.index`, `scan.source_index`, `precursor.source_index`, and `selected_ion.source_index` _MUST_ be the first column of their respective schemas. Wherever these lists say _MAY_, that value may either be stored as a column or as an entry in the [parameter list](#the-parameters-list) but a column tends to make more sense if it is usually present.
 
-- `spectrum`
+- `spectrum` (group)
   - `index` (integer): The ascending 0-based index. This _MUST_ be incrementally increasing by 1 per entry and _SHOULD_ be written in time-sorted ascending order (QUESTION: Should there be a CV to denote this state?). This is the "primary key" for the `spectrum` schema, making it the root unit of addressability.
   - `id` (string): The "nativeID" string identifier for the spectrum, formatted according to to a [native identifier format](http://purl.obolibrary.org/obo/MS_1000767). The specific nativeID format _SHOULD_ be specified in the [file level metadata](#file-level-metadata) under `.file_description.source_files[0].parameters`, as in mzML.
   - `time` (float): The starting time for data acquisition for this spectrum. This value _SHOULD_ be replicated from the parallel `scan` schema for simpler filtering, but when a spectrum has multiple scans, it _SHOULD_ refer to the minimum value if the run is defined in acquisition time order.
@@ -952,26 +950,32 @@ This metadata table uses the [packed parallel metadata table](#packed-parallel-m
     - __Examples:__
   - MAY supply a *child* term of [MS:1000018](http://purl.obolibrary.org/obo/MS_1000018) (scan direction) only once
   - MAY supply a *child* term of [MS:1000019](http://purl.obolibrary.org/obo/MS_1000019) (scan law) only once
-- `precursor`
-  - `source_index`
-  - `precursor_index`
-  - `precursor_id`
-  - `isolation_window`
-  - `activation`
+- `precursor` (group)
+  - `source_index` (integer)
+  - `precursor_index` (integer)
+  - `precursor_id` (string)
+  - `isolation_window` (group)
+    - `parameters` (list)
+    - MUST supply a *child* term of [MS:1000792](http://purl.obolibrary.org/obo/MS_1000792) (isolation window attribute) one or more times. These _SHOULD_ be promoted to columns if they are available.
+      - __Examples:__
+        - [`MS_1000827_isolation_window_target_mz`](http://purl.obolibrary.org/obo/MS_1000827)
+        - [`MS_1000828_isolation_window_lower_offset`](http://purl.obolibrary.org/obo/MS_1000828)
+        - [`MS_1000829_isolation_window_upper_offset`](http://purl.obolibrary.org/obo/MS_1000829)
+  - `activation` (group)
     - `parameters` (list): A list of controlled or uncontrolled parameters that describe this precursor's activation. See [the parameter list section](#the-parameters-list) for more details.
     - MAY supply a *child* term of [MS:1000510](http://purl.obolibrary.org/obo/MS_1000510) (precursor activation attribute) one or more times
     - MUST supply term [MS:1000044](http://purl.obolibrary.org/obo/MS_1000044) (dissociation method) or any of its children one or more times
-- `selected_ion`
-  - `source_index`
-  - `precursor_index`
-  - `ion_mobility`
-  - `ion_mobility_type`
+- `selected_ion` (group)
+  - `source_index` (integer)
+  - `precursor_index` (integer)
+  - `ion_mobility` (float)
+  - `ion_mobility_type` (CURIE)
   - `parameters` (list): A list of controlled or uncontrolled parameters that describe this selected ion. See [the parameter list section](#the-parameters-list) for more details.
   - MUST supply a *child* term of [MS:1000455](http://purl.obolibrary.org/obo/MS_1000455) (ion selection attribute) one or more times
     - __Examples:__
-    - [`MS_1000744_selected_ion_mz_unit_MS_1000040`](http://purl.obolibrary.org/obo/MS_10004744)
-    - [`MS_1000041_charge_state`](http://purl.obolibrary.org/obo/MS_1000041)
-    - [`MS_1000042_intensity_unit_MS_1000131`](http://purl.obolibrary.org/obo/MS_1000131)
+      - [`MS_1000744_selected_ion_mz_unit_MS_1000040`](http://purl.obolibrary.org/obo/MS_10004744)
+      - [`MS_1000041_charge_state`](http://purl.obolibrary.org/obo/MS_1000041)
+      - [`MS_1000042_intensity_unit_MS_1000131`](http://purl.obolibrary.org/obo/MS_1000131)
 
 QUESTION: Is there a better way to make ion mobility storage generic over type ("ion mobility drift time", "inverse reduced ion mobility", "FAIMS compensation voltage")?
 
