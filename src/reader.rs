@@ -1368,6 +1368,8 @@ pub use object_store_async::{AsyncMzPeakReader, AsyncMzPeakReaderType};
 
 #[cfg(test)]
 mod test {
+    use crate::archive::MzPeakArchiveType;
+
     use super::*;
     use mzdata::spectrum::{ChromatogramLike, SignalContinuity};
 
@@ -1426,6 +1428,13 @@ mod test {
         let reader = MzPeakReader::new(path)?;
         let out = reader.load_all_spectrum_metadata_impl()?;
         assert_eq!(out.len(), 48);
+        assert!(out.iter().any(|p| !p.precursor.is_empty()));
+        let mut decoder = TimeIndexDecoder::new(SimpleInterval::new(0.0, 1.0), Some(SimpleInterval::new(0, 1)));
+        decoder.from_descriptions(&out);
+        let (time_index, mask) = decoder.finish();
+        assert!(time_index.len() > 5);
+        assert!((mask.index_range.end - mask.index_range.start) > 5);
+        assert!(mask.sparse_includes.is_some());
         Ok(())
     }
 
@@ -1452,10 +1461,15 @@ mod test {
         let (it, _time_index) =
             reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
 
+        let mut k = 0;
         for batch in it.flatten() {
             assert_eq!(batch.column(0).as_struct().num_columns(), 3);
             assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
         }
+        assert!(k > 0);
+        // Drops null points
+        assert_eq!(k, 659);
         Ok(())
     }
 
@@ -1466,10 +1480,24 @@ mod test {
         let (it, _time_index) =
             reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
 
+        let mut k = 0;
         for batch in it.flatten() {
             assert_eq!(batch.column(0).as_struct().num_columns(), 3);
             assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
         }
+        assert!(k > 0);
+        // Does not drop null points
+        assert_eq!(k, 785);
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn test_index_read() -> io::Result<()> {
+        let reader = MzPeakReader::new("small.chunked.mzpeak")?;
+        let index = reader.file_index();
+        let e = index.iter().find(|e| e.archive_type() == MzPeakArchiveType::SpectrumPeakDataArrays);
+        assert!(e.is_some());
         Ok(())
     }
 }

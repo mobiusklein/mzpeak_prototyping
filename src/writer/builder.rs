@@ -39,20 +39,20 @@ pub struct SpectrumFieldVisitors {
 /// and data layout.
 #[derive(Debug)]
 pub struct MzPeakWriterBuilder {
-    spectrum_arrays: ArrayBuffersBuilder,
-    chromatogram_arrays: ArrayBuffersBuilder,
-    buffer_size: usize,
-    shuffle_mz: bool,
-    chunked_encoding: Option<ChunkingStrategy>,
-    chromatogram_chunked_encoding: Option<ChunkingStrategy>,
-    compression: Compression,
+    pub(crate) spectrum_arrays: ArrayBuffersBuilder,
+    pub(crate) chromatogram_arrays: ArrayBuffersBuilder,
+    pub(crate) buffer_size: usize,
+    pub(crate) shuffle_mz: bool,
+    pub(crate) chunked_encoding: Option<ChunkingStrategy>,
+    pub(crate) chromatogram_chunked_encoding: Option<ChunkingStrategy>,
+    pub(crate) compression: Compression,
     // The schema to store peaks under, separate from the profile data (if any)
-    store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
-    write_batch_config: WriteBatchConfig,
-    spectrum_fields: Vec<SpectrumVisitor>,
-    spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
-    spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
-    spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
+    pub(crate) store_peaks_and_profiles_apart: Option<ArrayBuffersBuilder>,
+    pub(crate) write_batch_config: WriteBatchConfig,
+    pub(crate) spectrum_fields: Vec<SpectrumVisitor>,
+    pub(crate) spectrum_selected_ion_fields: Vec<Box<dyn StructVisitorBuilder<SelectedIon>>>,
+    pub(crate) spectrum_scan_fields: Vec<Box<dyn StructVisitorBuilder<ScanEvent>>>,
+    pub(crate) spectrum_activation_fields: Vec<Box<dyn StructVisitorBuilder<Activation>>>,
 }
 
 impl Default for MzPeakWriterBuilder {
@@ -105,6 +105,7 @@ impl MzPeakWriterBuilder {
     /// if `Some`, otherwise use the point list representation.
     pub fn chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
         self.chunked_encoding = value;
+        self.spectrum_arrays = self.spectrum_arrays.chunking_strategy(value);
         self
     }
 
@@ -112,6 +113,7 @@ impl MzPeakWriterBuilder {
     /// if `Some`, otherwise use the point list representation.
     pub fn chromatogram_chunked_encoding(mut self, value: Option<ChunkingStrategy>) -> Self {
         self.chromatogram_chunked_encoding = value;
+        self.chromatogram_arrays = self.chromatogram_arrays.chunking_strategy(value);
         self
     }
 
@@ -165,21 +167,9 @@ impl MzPeakWriterBuilder {
         self
     }
 
-    /// Specify the schema prefix for spectrum data
-    pub fn spectrum_data_prefix(mut self, value: impl ToString) -> Self {
-        self.spectrum_arrays = self.spectrum_arrays.prefix(value);
-        self
-    }
-
     /// Add a column to the chromatogram data file's schema
     pub fn add_chromatogram_field(mut self, f: FieldRef) -> Self {
         self.chromatogram_arrays = self.chromatogram_arrays.add_field(f);
-        self
-    }
-
-    /// Specify the schema prefix for chromatogram data
-    pub fn chromatogram_data_prefix(mut self, value: impl ToString) -> Self {
-        self.chromatogram_arrays = self.chromatogram_arrays.prefix(value);
         self
     }
 
@@ -242,6 +232,8 @@ impl MzPeakWriterBuilder {
         self.spectrum_activation_fields.push(Box::new(visitor));
         self
     }
+
+
 
     /// Build an unpacked writer, a directory on disk where all files can be written to at once,
     /// but may be more work to move about.

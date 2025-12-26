@@ -16,7 +16,7 @@ use mzpeak_prototyping::{
     ToMzPeakDataSeries,
     buffer_descriptors::BufferOverrideTable,
     peak_series::{BufferContext, BufferName},
-    writer::{AbstractMzPeakWriter, ArrayBuffersBuilder, sample_array_types_from_chromatograms, sample_array_types_from_spectrum_source},
+    writer::AbstractMzPeakWriter,
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use std::{
@@ -364,35 +364,15 @@ fn convert_file(
     builder = builder.add_spectrum_peak_type::<ThermoPeak>();
 
     if args.write_peaks_and_profiles {
-        let mut point_builder = ArrayBuffersBuilder::default()
-            .prefix("point")
-            .with_context(BufferContext::Spectrum)
-            .add_peak_type::<ThermoPeak>();
-        for f in sample_array_types_from_spectrum_source(
-            &mut reader,
-            &overrides,
-            None,
-        ) {
-            point_builder = point_builder.add_field(f);
-        }
-        builder = builder.store_peaks_and_profiles_apart(Some(point_builder));
+        builder = builder.register_spectrum_peak_type::<ThermoPeak>()
+            .sample_array_types_for_peaks_from_spectrum_source(&mut reader);
     }
 
-    // Populate the spectrum data schema from whatever data is available
-    for field in
-        sample_array_types_from_spectrum_source(&mut reader, &overrides, args.chunked_encoding)
-    {
-        builder = builder.add_spectrum_field(field);
-    }
-
-    // Populate the chromatogram data schema from whatever data is available
-    for field in sample_array_types_from_chromatograms(
-        reader.iter_chromatograms().take(10),
-        &overrides,
-        args.chromatogram_chunked_encoding(),
-    ) {
-        builder = builder.add_chromatogram_field(field);
-    }
+    builder = builder
+        // Populate the spectrum data schema from whatever data is available
+        .sample_array_types_from_spectrum_source(&mut reader)
+        // Populate the chromatogram data schema from whatever data is available
+        .sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
 
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);

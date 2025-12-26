@@ -85,6 +85,7 @@ impl AuxiliaryArray {
 
         let mut result = DataArray::wrap(&name, dtype, data);
         result.compression = chosen_compression;
+        result.unit = self.unit.map(|c| Unit::from_curie(&c)).unwrap_or_default();
         if !self.parameters.is_empty() {
             result.params = Some(Box::new(
                 self.parameters.into_iter().map(Param::from).collect(),
@@ -318,5 +319,40 @@ impl ChromatogramEntry {
                 curie!(MS:1003060)
             ),
         ]
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use mzdata::prelude::*;
+
+    #[test_log::test]
+    fn test_aux() {
+        let mut arr =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        *arr.unit_mut() = Unit::MZ;
+        arr.push(204.072).unwrap();
+        arr.push(205.018).unwrap();
+        let encoded = AuxiliaryArray::from_data_array(&arr).unwrap();
+
+        assert_eq!(
+            encoded.compression,
+            BinaryCompressionType::NoCompression
+                .as_param()
+                .unwrap()
+                .curie()
+                .unwrap()
+        );
+        assert_eq!(encoded.unit, Unit::MZ.to_curie());
+
+        let decoded = encoded.into_data_array();
+        assert_eq!(decoded.unit, arr.unit);
+        assert_eq!(decoded.name, arr.name);
+        assert_eq!(decoded.dtype, arr.dtype);
+
+        for (a, b) in decoded.iter_f64().unwrap().zip(arr.iter_f64().unwrap()) {
+            assert!(a.total_cmp(&b).is_eq());
+        }
     }
 }

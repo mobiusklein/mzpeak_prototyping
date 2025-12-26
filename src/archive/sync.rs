@@ -182,22 +182,6 @@ impl MzPeakArchiveType {
             MzPeakArchiveType::Proprietary => "",
         }
     }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        if name.ends_with(Self::SpectrumDataArrays.tag_file_suffix()) {
-            Some(Self::SpectrumDataArrays)
-        } else if name.ends_with(Self::SpectrumMetadata.tag_file_suffix()) {
-            Some(Self::SpectrumMetadata)
-        } else if name.ends_with(Self::ChromatogramDataArrays.tag_file_suffix()) {
-            Some(Self::ChromatogramDataArrays)
-        } else if name.ends_with(Self::ChromatogramMetadata.tag_file_suffix()) {
-            Some(Self::ChromatogramMetadata)
-        } else if name.ends_with(Self::Other.tag_file_suffix()) {
-            Some(Self::Other)
-        } else {
-            None
-        }
-    }
 }
 
 pub struct ArchiveFacetReader {
@@ -711,7 +695,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
             });
 
             let metadata = archive.metadata_for_index(i).ok();
-            if !matches!(tp, MzPeakArchiveType::Other) && metadata.is_none() {
+            if !matches!(tp, MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary) && metadata.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(

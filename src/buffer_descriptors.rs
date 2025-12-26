@@ -797,7 +797,6 @@ impl Display for BufferName {
                 BufferFormat::ChunkBoundsEnd => write!(f, "{tp_name}_chunk_end"),
                 BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
             };
-            // return write!(f, "{}_{}", context, tp_name)
         }
         let dtype = match self.dtype {
             BinaryDataArrayType::Unknown => "unknown",
@@ -847,7 +846,6 @@ impl Display for BufferName {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedArrayIndexEntry {
     pub context: String,
-    pub prefix: String,
     pub path: String,
     #[serde(
         serialize_with = "curie_serialize",
@@ -897,7 +895,6 @@ impl From<ArrayIndexEntry> for SerializedArrayIndexEntry {
 
         Self {
             context,
-            prefix: value.prefix,
             path: value.path,
             data_type: match value.data_type {
                 DataType::LargeBinary => BinaryDataArrayType::ASCII.curie().unwrap(),
@@ -932,7 +929,6 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
 
         Self {
             context,
-            prefix: value.prefix,
             name: value
                 .path
                 .rsplit_once(".")
@@ -969,8 +965,6 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
 pub struct ArrayIndexEntry {
     /// Is this a spectrum or chromatogram array?
     pub context: BufferContext,
-    /// The prefix to this field in the schema
-    pub prefix: String,
     /// The complete path to this field from the root of the schema
     pub path: String,
     /// The name of array, either given by `array_type` or a user-defined name
@@ -1002,7 +996,6 @@ pub struct ArrayIndexEntry {
 impl ArrayIndexEntry {
     pub fn new(
         context: BufferContext,
-        prefix: String,
         path: String,
         name: String,
         data_type: DataType,
@@ -1012,7 +1005,6 @@ impl ArrayIndexEntry {
     ) -> Self {
         Self {
             context,
-            prefix,
             path,
             name,
             data_type,
@@ -1047,7 +1039,6 @@ impl ArrayIndexEntry {
 
         Self {
             context: buffer_name.context,
-            prefix,
             path,
             data_type: array_to_arrow_type(buffer_name.dtype),
             name: buffer_name.array_name(),
@@ -1297,5 +1288,16 @@ mod test {
         assert_eq!(None.max(Some(BufferPriority::Primary)), Some(BufferPriority::Primary));
         assert_eq!(Some(BufferPriority::Primary).max(None), Some(BufferPriority::Primary));
         assert_eq!(Some(BufferPriority::Secondary).max(Some(BufferPriority::Primary)), Some(BufferPriority::Primary));
+    }
+
+    #[test]
+    fn test_buffer_naming() {
+        let name = BufferName::new(
+            BufferContext::Chromatogram,
+            ArrayType::TimeArray,
+            BinaryDataArrayType::Float32
+        )
+        .with_unit(Unit::Minute).to_string();
+        assert_eq!(name, "time_f32_min")
     }
 }

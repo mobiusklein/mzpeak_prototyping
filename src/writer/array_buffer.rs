@@ -8,13 +8,14 @@ use arrow::{
     array::{Array, ArrayRef, RecordBatch, StructArray, new_null_array},
     datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef},
 };
-use mzdata::spectrum::ArrayType;
+use mzdata::{prelude::BuildArrayMapFrom, spectrum::ArrayType};
 
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries,
     buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform},
+    chunk_series::{ArrowArrayChunk, ChunkingStrategy},
     filter::{drop_where_column_is_zero_run, nullify_at_zero_pair},
-    peak_series::{ArrayIndex, ArrayIndexEntry},
+    peak_series::{ArrayIndex, ArrayIndexEntry, MZ_ARRAY},
 };
 
 pub trait ArrayBufferWriter {
@@ -32,7 +33,7 @@ pub trait ArrayBufferWriter {
 
     /// The path in the schema to reach the spectrum index column
     fn index_path(&self) -> String {
-        format!("{}.spectrum_index", self.prefix())
+        format!("{}.{}", self.prefix(), self.buffer_context().index_name())
     }
 
     /// Add the provided `arrays` belonging to `fields` to the buffer
@@ -192,10 +193,6 @@ pub struct PointBuffers {
 }
 
 impl PointBuffers {
-    pub fn dtype(&self) -> DataType {
-        DataType::Struct(self.peak_array_fields.clone())
-    }
-
     pub fn len(&self) -> usize {
         self.array_chunks
             .values()
@@ -440,6 +437,7 @@ pub struct ChunkBuffers {
     null_zeros: bool,
     is_profile_buffer: Vec<bool>,
     include_time: bool,
+    chunking_strategy: ChunkingStrategy,
 }
 
 impl ChunkBuffers {
@@ -454,6 +452,7 @@ impl ChunkBuffers {
         null_zeros: bool,
         is_profile_buffer: Vec<bool>,
         include_time: bool,
+        chunking_strategy: ChunkingStrategy,
     ) -> Self {
         Self {
             chunk_array_fields,
@@ -466,6 +465,7 @@ impl ChunkBuffers {
             null_zeros,
             is_profile_buffer,
             include_time,
+            chunking_strategy,
         }
     }
 
@@ -507,13 +507,35 @@ impl ArrayBufferWriter for ChunkBuffers {
         self.chunk_buffer.len()
     }
 
+    /// Adds a peak list to the buffer using [`ChunkingStrategy::Basic`]
     fn add<T: ToMzPeakDataSeries>(
         &mut self,
-        _spectrum_index: u64,
-        _spectrum_time: Option<f32>,
-        _peaks: &[T],
+        spectrum_index: u64,
+        spectrum_time: Option<f32>,
+        peaks: &[T],
     ) {
-        todo!("not ready yet")
+        self.is_profile_buffer.push(false);
+        let arrays = BuildArrayMapFrom::as_arrays(peaks);
+        let (chunks, _aux) = ArrowArrayChunk::from_arrays(
+            spectrum_index,
+            spectrum_time,
+            MZ_ARRAY,
+            &arrays,
+            ChunkingStrategy::Basic { chunk_size: self.chunking_strategy.chunk_size() },
+            self.overrides(),
+            self.drop_zero_intensity(),
+            self.nullify_zero_intensity(),
+            None,
+        )
+        .unwrap();
+        let (fields, arrays, _) = ArrowArrayChunk::to_struct_array(
+            &chunks,
+            self.buffer_context(),
+            self.schema().fields(),
+            &[ChunkingStrategy::Basic { chunk_size: self.chunking_strategy.chunk_size() }],
+            self.include_time(),
+        ).into_parts();
+        self.add_arrays(fields, arrays, peaks.len(), false);
     }
 
     fn drain(&mut self) -> impl Iterator<Item = RecordBatch> {
@@ -713,6 +735,7 @@ pub struct ArrayBuffersBuilder {
     null_zeros: bool,
     include_time: bool,
     buffer_context: BufferContext,
+    chunking_strategy: Option<ChunkingStrategy>,
 }
 
 /// The builder will default to the `point` layout
@@ -725,6 +748,7 @@ impl Default for ArrayBuffersBuilder {
             null_zeros: false,
             include_time: false,
             buffer_context: BufferContext::Spectrum,
+            chunking_strategy: None,
         }
     }
 }
@@ -762,6 +786,16 @@ impl ArrayBuffersBuilder {
             }
         }
         self.deduplicate_fields();
+    }
+
+    pub fn chunking_strategy(mut self, chunking_strategy: Option<ChunkingStrategy>) -> Self {
+        let no_change = self.chunking_strategy == chunking_strategy;
+        self.chunking_strategy = chunking_strategy;
+        if !no_change && !self.array_fields.is_empty() {
+            log::warn!("Chunking strategy changed, invalidating previous array fields");
+            self.array_fields.clear();
+        }
+        self
     }
 
     /// Register an new rule mapping from one [`BufferName`]-like to another [`BufferName`]-like
@@ -938,6 +972,9 @@ impl ArrayBuffersBuilder {
         if self.include_time {
             self = self.add_time_field(buffer_context);
         }
+        if self.chunking_strategy.is_none() {
+            panic!("Requested chunked format, but no chunking strategy given!");
+        }
         self.canonicalize_field_order();
         let primaries = self.mark_primary_arrays();
         self.overrides.propagate_priorities(&primaries);
@@ -973,6 +1010,7 @@ impl ArrayBuffersBuilder {
             self.null_zeros,
             Vec::new(),
             self.include_time,
+            self.chunking_strategy.unwrap(),
         )
     }
 
@@ -1026,5 +1064,91 @@ impl ArrayBuffersBuilder {
             null_zeros: self.null_zeros,
             include_time: self.include_time,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use arrow::{array::AsArray, datatypes::Float64Type};
+    use mzdata::io::MZFileReader;
+    use mzpeaks::CentroidPeak;
+
+    use super::*;
+
+    #[test_log::test]
+    fn test_build() {
+        let builder = ArrayBuffersBuilder::default();
+        let mut builder = builder
+            .prefix("point")
+            .add_peak_type::<CentroidPeak>()
+            .null_zeros(true)
+            .build(Arc::new(Schema::empty()), BufferContext::Spectrum, true);
+
+        let peaks = &[CentroidPeak::new(204.0719, 100.0, 0)];
+
+        builder.add(0, None, peaks);
+
+        assert_eq!(builder.array_chunks.len(), 3);
+        for (_, v) in builder.array_chunks.iter() {
+            assert_eq!(v.len(), 1);
+            for vi in v.iter() {
+                assert_eq!(vi.len(), 1);
+            }
+        }
+
+        let batches: Vec<RecordBatch> = builder.drain().collect();
+        assert_eq!(batches.len(), 1);
+        let batch = batches[0].clone();
+        let root = batch.column_by_name("point").unwrap();
+        let root = root.as_struct();
+        assert!(root.column_by_name("spectrum_index").is_some());
+        assert!(root.column_by_name("mz").is_some());
+        assert!(root.column_by_name("intensity").is_some());
+        let arr = root.column_by_name("mz").unwrap();
+        let arr = arr.as_primitive::<Float64Type>();
+        let v = arr.value(0);
+        assert_eq!(peaks[0].mz, v);
+    }
+
+    #[test_log::test]
+    fn test_build_chunked() -> std::io::Result<()> {
+        let mut builder = ArrayBuffersBuilder::default();
+        builder = builder.prefix("chunk")
+            .null_zeros(true)
+            .chunking_strategy(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }));
+        let mut reader = mzdata::MZReader::open_path("small.mzML")?;
+        let fields = crate::writer::sample_array_types_from_spectrum_source(
+            &mut reader,
+            &builder.overrides(),
+            builder.chunking_strategy,
+        );
+        for f in fields {
+            builder = builder.add_field(f)
+        }
+
+        let mut builder =
+            builder.build_chunked(Arc::new(Schema::empty()), BufferContext::Spectrum, true);
+
+        let peaks = &[CentroidPeak::new(204.0719, 100.0, 0)];
+
+        builder.add(0, None, peaks);
+
+        assert_eq!(builder.chunk_buffer.len(), 1);
+
+        let batches: Vec<RecordBatch> = builder.drain().collect();
+        assert_eq!(batches.len(), 1);
+        let batch = batches[0].clone();
+        let root = batch.column_by_name("chunk").unwrap();
+        let root = root.as_struct();
+        assert!(root.column_by_name("spectrum_index").is_some());
+        assert!(root.column_by_name("mz_chunk_start").is_some());
+        assert!(root.column_by_name("mz_chunk_end").is_some());
+        assert!(root.column_by_name("mz_chunk_values").is_some());
+        assert!(root.column_by_name("intensity").is_some());
+        let arr = root.column_by_name("mz_chunk_start").unwrap();
+        let arr = arr.as_primitive::<Float64Type>();
+        let v = arr.value(0);
+        assert_eq!(peaks[0].mz, v);
+        Ok(())
     }
 }

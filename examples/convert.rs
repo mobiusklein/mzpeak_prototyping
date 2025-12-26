@@ -10,10 +10,9 @@ use mzdata::{
 use mzpeak_prototyping::{
     buffer_descriptors::{BufferOverrideTable, BufferTransform},
     chunk_series::ChunkingStrategy,
-    peak_series::{BufferContext, BufferName},
+    peak_series::{BufferContext, BufferName, ION_MOBILITY_ARRAY_TYPES, ION_MOBILITY_UNITS, INTENSITY_UNITS},
     writer::{
-        AbstractMzPeakWriter, ArrayBuffersBuilder, MzPeakWriterType,
-        sample_array_types_from_chromatograms, sample_array_types_from_spectrum_source,
+        AbstractMzPeakWriter, MzPeakWriterType
     },
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
@@ -276,20 +275,7 @@ impl ConvertArgs {
             );
         }
         for ctx in [BufferContext::Chromatogram, BufferContext::Spectrum] {
-            for unit in [
-                Unit::Unknown,
-                Unit::DetectorCounts,
-                Unit::PercentBasePeak,
-                Unit::PercentBasePeakTimes100,
-                Unit::AbsorbanceUnit,
-                Unit::CountsPerSecond,
-                Unit::Pascal,
-                Unit::Percent,
-                Unit::Psi,
-                Unit::Kelvin,
-                Unit::MicrolitersPerMinute,
-                Unit::Celsius,
-            ] {
+            for unit in INTENSITY_UNITS {
                 if self.intensity_f32 {
                     overrides.insert(
                         BufferName::new(
@@ -351,17 +337,8 @@ impl ConvertArgs {
             }
         }
         if self.ion_mobility_f32 {
-            for unit in [
-                Unit::Unknown,
-                Unit::Millisecond,
-                Unit::VoltSecondPerSquareCentimeter,
-                Unit::Volt,
-            ] {
-                for t in [
-                    ArrayType::MeanInverseReducedIonMobilityArray,
-                    ArrayType::RawDriftTimeArray,
-                    ArrayType::RawIonMobilityArray,
-                ] {
+            for unit in ION_MOBILITY_UNITS {
+                for t in ION_MOBILITY_ARRAY_TYPES {
                     overrides.insert(
                         BufferName::new(
                             BufferContext::Spectrum,
@@ -478,32 +455,16 @@ pub fn convert_file(input_path: &Path, output_path: &Path, args: &ConvertArgs) -
         builder = builder.add_chromatogram_array_override(from.clone(), to.clone());
     }
 
-    // If we are storing peaks too, add configure the extra builder.
+    // If we are storing peaks too, configure the extra builder.
     if args.write_peaks_and_profiles {
-        let mut point_builder = ArrayBuffersBuilder::default()
-            .prefix("point")
-            .with_context(BufferContext::Spectrum);
-        for f in sample_array_types_from_spectrum_source(&mut reader, &overrides, None) {
-            point_builder = point_builder.add_field(f);
-        }
-        builder = builder.store_peaks_and_profiles_apart(Some(point_builder));
+        builder = builder.sample_array_types_for_peaks_from_spectrum_source(&mut reader);
     }
 
-    // Populate the spectrum data schema from whatever data is available
-    for field in
-        sample_array_types_from_spectrum_source(&mut reader, &overrides, args.chunked_encoding)
-    {
-        builder = builder.add_spectrum_field(field);
-    }
-
-    // Populate the chromatogram data schema from whatever data is available
-    for field in sample_array_types_from_chromatograms(
-        reader.iter_chromatograms().take(10),
-        &overrides,
-        args.chromatogram_chunked_encoding(),
-    ) {
-        builder = builder.add_chromatogram_field(field);
-    }
+    builder = builder
+        // Populate the spectrum data schema from whatever data is available
+        .sample_array_types_from_spectrum_source(&mut reader)
+        // Populate the chromatogram data schema from whatever data is available
+        .sample_array_types_from_chromatograms(reader.iter_chromatograms().take(10));
 
     let mut writer = builder.build(handle, true);
     writer.copy_metadata_from(&reader);

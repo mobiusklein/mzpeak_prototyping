@@ -18,7 +18,6 @@ use mzdata::spectrum::{
     ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, bindata::ArrayRetrievalError,
 };
 
-use mzpeaks::coordinate::SimpleInterval;
 
 use bytemuck::Pod;
 use mzpeaks::prelude::Span1D;
@@ -38,53 +37,6 @@ use crate::{
     spectrum::AuxiliaryArray,
     writer::{CURIEBuilder, VisitorBase},
 };
-
-pub fn chunk_every_k<T: Float>(data: &[T], k: T) -> Vec<SimpleInterval<usize>> {
-    let mut chunks = Vec::new();
-    if data.is_empty() {
-        return chunks;
-    }
-    let start = data[0];
-    let end = data[data.len() - 1];
-
-    let mut t = start + k;
-    if t > end {
-        chunks.push(SimpleInterval::new(0, data.len()));
-        return chunks;
-    }
-    let mut offset = 0;
-    for (i, v) in data.iter().copied().enumerate() {
-        if v > t {
-            chunks.push(SimpleInterval::new(offset, i));
-            offset = i;
-            while t < v {
-                t = t + k;
-            }
-        }
-    }
-    chunks.push(SimpleInterval::new(offset, data.len()));
-    chunks
-}
-
-pub fn delta_encode<T: Float + Pod>(
-    data: &[T],
-    name: &ArrayType,
-    dtype: &BinaryDataArrayType,
-) -> (f64, f64, DataArray) {
-    let start = data[0].to_f64().unwrap();
-    let end = data.last().copied().unwrap().to_f64().unwrap();
-    let mut acc =
-        DataArray::from_name_type_size(name, *dtype, data.len() * core::mem::size_of::<T>());
-
-    let mut last = data[0];
-    for v in data.iter().copied().skip(1) {
-        let delta = v - last;
-        last = v;
-        acc.push(delta).unwrap();
-    }
-
-    (start, end, acc)
-}
 
 pub fn delta_decode<T: Float + Pod + AddAssign>(
     it: &[T],
@@ -359,7 +311,11 @@ impl ChunkingStrategy {
                                 }
                                 _ => unimplemented!(),
                             }
+                        } else {
+                            accumulator.extend(data.values()).unwrap();
                         }
+                    } else {
+                        accumulator.extend(data.values()).unwrap();
                     }
                 }
                 _ => panic!(
@@ -1191,12 +1147,12 @@ mod test {
     #[test]
     fn test_chunking() -> io::Result<()> {
         let mzs = load_chunking_data()?;
-
-        let intervals = chunk_every_k(&mzs, 10.0);
+        let mzs = Float64Array::from(mzs);
+        let intervals = null_chunk_every_k(&mzs, 10.0);
 
         let mut last = 0.0;
         for iv in intervals.iter() {
-            let vs = &mzs[iv.start..iv.end];
+            let vs = &mzs.values()[iv.start..iv.end];
             let term = vs.last().copied().unwrap();
             assert!(
                 (term - 1.0) > last,
@@ -1466,6 +1422,81 @@ mod test {
 
         Ok(())
     }
+
+    #[test]
+    fn test_encode_arrow_numpress_linear() -> io::Result<()> {
+        let arrays = get_arrays_from_mzml()?;
+        let target = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::MZArray,
+            BinaryDataArrayType::Float32,
+        );
+
+        let intensity_name = BufferName::new(
+            BufferContext::Spectrum,
+            ArrayType::IntensityArray,
+            BinaryDataArrayType::Float32,
+        )
+        .with_unit(Unit::DetectorCounts);
+        let intensity_name_tfm = intensity_name
+            .clone()
+            .with_transform(Some(BufferTransform::NumpressSLOF));
+        let overrides = BufferOverrideTable::from_iter(vec![(intensity_name, intensity_name_tfm)]);
+
+        let (chunks, _) = ArrowArrayChunk::from_arrays(
+            0,
+            None,
+            target,
+            &arrays,
+            ChunkingStrategy::NumpressLinear { chunk_size: 50.0 },
+            &overrides,
+            false,
+            false,
+            None,
+        )?;
+
+        let rendered = ArrowArrayChunk::to_struct_array(
+            &chunks,
+            BufferContext::Spectrum,
+            Schema::empty().fields(),
+            &[
+                ChunkingStrategy::Basic { chunk_size: 50.0 },
+                ChunkingStrategy::NumpressLinear { chunk_size: 50.0 },
+            ],
+            false,
+        );
+
+        assert!(
+            rendered
+                .column_by_name("mz_chunk_values_numpress_bytes")
+                .is_some()
+        );
+
+        assert!(
+            rendered
+                .column_by_name("intensity_f32_dc_numpress_slof_bytes")
+                .is_some()
+        );
+
+        let starts = rendered.column_by_name("mz_chunk_start").unwrap().as_primitive::<Float64Type>();
+        let ends = rendered.column_by_name("mz_chunk_end").unwrap().as_primitive::<Float64Type>();
+        let bytes_array_list = rendered.column_by_name("mz_chunk_values_numpress_bytes").unwrap().as_list::<i64>();
+        let block = bytes_array_list.value(0);
+        let strategy = ChunkingStrategy::NumpressLinear { chunk_size: 50.0 };
+        let mut acc = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+
+        strategy.decode_arrow(
+            &block,
+            starts.value(0),
+            ends.value(0),
+            &mut acc,
+            None
+        );
+
+        assert_eq!(acc.data_len().unwrap(), 1054);
+        Ok(())
+    }
+
 
     #[test]
     fn test_encode_arrow() -> io::Result<()> {

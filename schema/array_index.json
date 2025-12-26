@@ -53,10 +53,6 @@
                     "chromatogram"
                 ]
             },
-            "prefix": {
-                "type": "string",
-                "description": "TODO: Remove"
-            },
             "path": {
               "type": "string",
               "description": "The path from the *root* of the Parquet file's schema to this column.",

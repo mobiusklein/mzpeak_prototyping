@@ -381,7 +381,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
                 MzPeakArchiveType::Other
             });
 
-            if !matches!(tp, MzPeakArchiveType::Other) && metadata.is_none() {
+            if !matches!(tp, MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary) && metadata.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(

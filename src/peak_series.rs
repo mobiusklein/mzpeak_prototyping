@@ -320,3 +320,38 @@ impl ToMzPeakDataSeries for IonMobilityAwareDeconvolutedPeak {
         .unwrap()
     }
 }
+
+pub const INTENSITY_UNITS: [Unit; 12] = [
+    Unit::Unknown,
+    Unit::DetectorCounts,
+    Unit::PercentBasePeak,
+    Unit::PercentBasePeakTimes100,
+    Unit::AbsorbanceUnit,
+    Unit::CountsPerSecond,
+    Unit::Pascal,
+    Unit::Percent,
+    Unit::Psi,
+    Unit::Kelvin,
+    Unit::MicrolitersPerMinute,
+    Unit::Celsius,
+];
+
+pub const ION_MOBILITY_UNITS: [Unit; 4] = [
+    Unit::Unknown,
+    Unit::Millisecond,
+    Unit::VoltSecondPerSquareCentimeter,
+    Unit::Volt,
+];
+
+pub const ION_MOBILITY_ARRAY_TYPES: [ArrayType; 10] = [
+    ArrayType::RawDriftTimeArray,
+    ArrayType::RawIonMobilityArray,
+    ArrayType::RawInverseReducedIonMobilityArray,
+    ArrayType::MeanInverseReducedIonMobilityArray,
+    ArrayType::MeanIonMobilityArray,
+    ArrayType::MeanDriftTimeArray,
+    ArrayType::DeconvolutedDriftTimeArray,
+    ArrayType::DeconvolutedInverseReducedIonMobilityArray,
+    ArrayType::DeconvolutedIonMobilityArray,
+    ArrayType::IonMobilityArray,
+];

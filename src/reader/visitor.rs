@@ -1539,7 +1539,49 @@ impl ScanWindowSchema {
             (lower_limit_arr, upper_limit_arr)
         })
     }
+
+    fn from_fields(fields: &Fields) -> Self {
+        let mut lower_bound_i = None;
+        let mut upper_bound_i = None;
+        let mut unit = None;
+        let mut parameters_i = None;
+        for (i, f) in fields.iter().enumerate() {
+            if let Some(colspec) = parse_column_to_curie(f.name()) {
+                if let Some(acc) = colspec.accession {
+                    match acc {
+                        mzdata::curie!(MS:1000501) => {
+                            lower_bound_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        mzdata::curie!(MS:1000500) => {
+                            upper_bound_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match colspec.name.as_str() {
+                    "parameters" => {
+                        parameters_i = Some(i);
+                    },
+                    "lower_limit" => {
+                        lower_bound_i = Some(i);
+                    },
+                    "upper_limit" => {
+                        upper_bound_i = Some(i);
+                    },
+                    _ => {}
+                }
+            }
+        }
+        ScanWindowSchema::new(lower_bound_i, upper_bound_i, unit, parameters_i)
+    }
 }
+
 
 impl<'a> MzScanVisitor<'a> {
     pub(crate) fn new(
@@ -1783,47 +1825,6 @@ impl<'a> MzScanVisitor<'a> {
         windows
     }
 
-    fn scan_window_schema(&self, fields: &Fields) -> ScanWindowSchema {
-        let mut lower_bound_i = None;
-        let mut upper_bound_i = None;
-        let mut unit = None;
-        let mut parameters_i = None;
-        for (i, f) in fields.iter().enumerate() {
-            if let Some(colspec) = parse_column_to_curie(f.name()) {
-                if let Some(acc) = colspec.accession {
-                    match acc {
-                        mzdata::curie!(MS:1000501) => {
-                            lower_bound_i = Some(i);
-                            if colspec.has_unit() {
-                                unit = colspec.unit.as_curie()
-                            }
-                        }
-                        mzdata::curie!(MS:1000500) => {
-                            upper_bound_i = Some(i);
-                            if colspec.has_unit() {
-                                unit = colspec.unit.as_curie()
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                match colspec.name.as_str() {
-                    "parameters" => {
-                        parameters_i = Some(i);
-                    },
-                    "lower_limit" => {
-                        lower_bound_i = Some(i);
-                    },
-                    "upper_limit" => {
-                        upper_bound_i = Some(i);
-                    },
-                    _ => {}
-                }
-            }
-        }
-        ScanWindowSchema::new(lower_bound_i, upper_bound_i, unit, parameters_i)
-    }
-
     fn visit_scan_windows(&mut self, spec_arr: &StructArray, index: usize) {
         let arr = spec_arr.column(index);
         macro_rules! pack {
@@ -1843,14 +1844,14 @@ impl<'a> MzScanVisitor<'a> {
 
         if let Some(arr) = arr.as_list_opt::<i64>() {
             let spec = if let DataType::Struct(fields) = arr.value_type() {
-                Some(self.scan_window_schema(&fields))
+                Some(ScanWindowSchema::from_fields(&fields))
             } else {
                 None
             };
             pack!(arr, spec.as_ref());
         } else if let Some(arr) = arr.as_list_opt::<i32>() {
             let spec = if let DataType::Struct(fields) = arr.value_type() {
-                Some(self.scan_window_schema(&fields))
+                Some(ScanWindowSchema::from_fields(&fields))
             } else {
                 None
             };
@@ -2075,6 +2076,75 @@ impl<'a> VisitorBuilderBase<'a, DoubleIndexed<Precursor>> for MzPrecursorVisitor
 
 impl<'a> VisitorBuilder3<'a, Precursor> for MzPrecursorVisitor<'a> {}
 
+
+#[allow(unused)]
+#[derive(Debug, Clone, Copy)]
+struct IsolationWindowSchema {
+    target: Option<usize>,
+    lower_limit: Option<usize>,
+    upper_limit: Option<usize>,
+    unit: Option<CURIE>,
+    parameters: Option<usize>
+}
+
+impl IsolationWindowSchema {
+    fn new(target: Option<usize>, lower_limit: Option<usize>, upper_limit: Option<usize>, unit: Option<CURIE>, parameters: Option<usize>) -> Self {
+        Self { target, lower_limit, upper_limit, unit, parameters }
+    }
+
+    fn from_fields(fields: &Fields) -> Self {
+        let mut target_i = None;
+        let mut lower_bound_i = None;
+        let mut upper_bound_i = None;
+        let mut unit = None;
+        let mut parameters_i = None;
+        for (i, f) in fields.iter().enumerate() {
+            if let Some(colspec) = parse_column_to_curie(f.name()) {
+                if let Some(acc) = colspec.accession {
+                    match acc {
+                        mzdata::curie!(MS:1000827) => {
+                            target_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        mzdata::curie!(MS:1000828) => {
+                            lower_bound_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        mzdata::curie!(MS:1000829) => {
+                            upper_bound_i = Some(i);
+                            if colspec.has_unit() {
+                                unit = colspec.unit.as_curie()
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match colspec.name.as_str() {
+                    "target" => {
+                        target_i = Some(i);
+                    }
+                    "parameters" => {
+                        parameters_i = Some(i);
+                    },
+                    "lower_bound" => {
+                        lower_bound_i = Some(i);
+                    },
+                    "upper_bound" => {
+                        upper_bound_i = Some(i);
+                    },
+                    _ => {}
+                }
+            }
+        }
+        Self::new(target_i, lower_bound_i, upper_bound_i, unit, parameters_i)
+    }
+}
+
+
 impl<'a> MzPrecursorVisitor<'a> {
     pub(crate) fn new(
         descriptions: &'a mut [DoubleIndexed<Precursor>],
@@ -2107,7 +2177,8 @@ impl<'a> MzPrecursorVisitor<'a> {
 
     fn visit_isolation_window(&mut self, spec_arr: &StructArray, index: usize) {
         let root = spec_arr.column(index).as_struct();
-        if let Some(arr) = root.column_by_name("target") {
+        let schema = IsolationWindowSchema::from_fields(root.fields());
+        if let Some(arr) = schema.target.map(|i| root.column(i)) {
             let arr: &Float32Array = arr.as_primitive();
             for (offset, descr) in self.iter_instances() {
                 if arr.is_null(offset) {
@@ -2118,7 +2189,7 @@ impl<'a> MzPrecursorVisitor<'a> {
                 descr.isolation_window.flags = mzdata::spectrum::IsolationWindowState::Explicit;
             }
         }
-        if let Some(arr) = root.column_by_name("lower_bound") {
+        if let Some(arr) = schema.lower_limit.map(|i| root.column(i)) {
             let arr: &Float32Array = arr.as_primitive();
             for (offset, descr) in self.iter_instances() {
                 if arr.is_null(offset) {
@@ -2129,7 +2200,7 @@ impl<'a> MzPrecursorVisitor<'a> {
                     mzdata::spectrum::IsolationWindowState::Explicit;
             }
         }
-        if let Some(arr) = root.column_by_name("upper_bound") {
+        if let Some(arr) = schema.upper_limit.map(|i| root.column(i)) {
             let arr: &Float32Array = arr.as_primitive();
             for (offset, descr) in self.iter_instances() {
                 if arr.is_null(offset) {

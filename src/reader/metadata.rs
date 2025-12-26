@@ -731,6 +731,7 @@ impl<'a> SpectrumMetadataDecoder<'a> {
     ) {
         let n = precursor_arr
             .column_by_name("spectrum_index")
+            .or_else(|| precursor_arr.column_by_name("source_index"))
             .map(|a| a.len() - a.null_count())
             .unwrap_or_default();
         if acc.is_empty() && n > 0 {
@@ -753,6 +754,7 @@ impl<'a> SpectrumMetadataDecoder<'a> {
             .unwrap_or(&EMPTY_FIELDS);
         let n = si_arr
             .column_by_name("spectrum_index")
+            .or_else(|| si_arr.column_by_name("source_index"))
             .map(|a| a.len() - a.null_count())
             .unwrap_or_default();
         if acc.is_empty() && n > 0 {
@@ -775,6 +777,7 @@ impl<'a> SpectrumMetadataDecoder<'a> {
             .unwrap_or(&EMPTY_FIELDS);
         let n = scan_arr
             .column_by_name("spectrum_index")
+            .or_else(|| scan_arr.column_by_name("source_index"))
             .map(|a| a.len() - a.null_count())
             .unwrap_or_default();
         if scan_accumulator.is_empty() && n > 0 {
@@ -820,7 +823,8 @@ impl<'a> SpectrumMetadataDecoder<'a> {
 
         if let Some(scan_arr) = batch.column_by_name("scan").map(|arr| arr.as_struct()) {
             let index_arr: &UInt64Array = scan_arr
-                .column_by_name("spectrum_index")
+                .column_by_name("source_index")
+                .or_else(|| scan_arr.column_by_name("spectrum_index"))
                 .unwrap()
                 .as_primitive();
             for scan_arr in segment_by_index_array(scan_arr, index_arr, spectrum_index).unwrap() {
@@ -836,7 +840,8 @@ impl<'a> SpectrumMetadataDecoder<'a> {
 
         if let Some(precursor_arr) = batch.column_by_name("precursor").map(|v| v.as_struct()) {
             let index_arr: &UInt64Array = precursor_arr
-                .column_by_name("spectrum_index")
+                .column_by_name("source_index")
+                .or_else(|| precursor_arr.column_by_name("spectrum_index"))
                 .unwrap()
                 .as_primitive();
             for precursor_arr in
@@ -855,7 +860,8 @@ impl<'a> SpectrumMetadataDecoder<'a> {
         if let Some(selected_ion_arr) = batch.column_by_name("selected_ion").map(|v| v.as_struct())
         {
             let index_arr: &UInt64Array = selected_ion_arr
-                .column_by_name("spectrum_index")
+                .column_by_name("source_index")
+                .or_else(|| selected_ion_arr.column_by_name("spectrum_index"))
                 .unwrap()
                 .as_primitive();
             for selected_ion_arr in
@@ -1148,7 +1154,8 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
         acc: &mut Vec<(u64, Option<u64>, Precursor)>,
     ) {
         let n = precursor_arr
-            .column_by_name("spectrum_index")
+            .column_by_name("source_index")
+            .or_else(|| precursor_arr.column_by_name("spectrum_index"))
             .map(|a| a.len() - a.null_count())
             .unwrap_or_default();
         if acc.is_empty() && n > 0 {
@@ -1170,7 +1177,8 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
             .as_deref()
             .unwrap_or(&EMPTY_FIELDS);
         let n = si_arr
-            .column_by_name("spectrum_index")
+            .column_by_name("source_index")
+            .or_else(|| si_arr.column_by_name("spectrum_index"))
             .map(|a| a.len() - a.null_count())
             .unwrap_or_default();
         if acc.is_empty() && n > 0 {

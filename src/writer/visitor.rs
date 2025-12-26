@@ -15,7 +15,7 @@ use mzdata::{
     spectrum::{Chromatogram, RefPeakDataLevel, ScanPolarity, SpectrumDescription},
 };
 
-use crate::spectrum::AuxiliaryArray;
+use crate::{spectrum::AuxiliaryArray, writer::builder::SpectrumFieldVisitors};
 
 pub trait VisitorBase: Debug {
     fn flatten(&self) -> bool {
@@ -1859,6 +1859,21 @@ pub struct SpectrumBuilder {
 }
 
 impl SpectrumBuilder {
+    pub fn add_visitors_from(&mut self, visitors: SpectrumFieldVisitors) {
+        self
+            .spectrum
+            .extend_extra_fields(visitors.spectrum_fields);
+        self
+            .scan
+            .extend_extra_fields(visitors.spectrum_scan_fields);
+        self
+            .selected_ion
+            .extend_extra_fields(visitors.spectrum_selected_ion_fields);
+        self
+            .precursor
+            .extend_extra_activation_fields(visitors.spectrum_activation_fields);
+    }
+
     pub fn append_value<
         C: CentroidLike,
         D: DeconvolutedCentroidLike,

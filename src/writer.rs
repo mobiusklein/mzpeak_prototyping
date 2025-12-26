@@ -24,9 +24,13 @@ use mzdata::{
 };
 
 use crate::{
-    BufferName, archive::{MzPeakArchiveType, ZipArchiveWriter}, buffer_descriptors::{BufferOverrideTable, BufferPriority}, peak_series::{
+    BufferName,
+    archive::{MzPeakArchiveType, ZipArchiveWriter},
+    buffer_descriptors::{BufferOverrideTable, BufferPriority},
+    peak_series::{
         ArrayIndex, BufferContext, TIME_ARRAY, ToMzPeakDataSeries, array_map_to_schema_arrays,
-    }, writer::builder::SpectrumFieldVisitors
+    },
+    writer::builder::SpectrumFieldVisitors,
 };
 use crate::{
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
@@ -251,7 +255,6 @@ where
     )
 }
 
-
 /// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
 /// the data file schema.
 ///
@@ -279,6 +282,121 @@ pub fn sample_array_types_from_spectrum_source<
         .into_iter()
         .flat_map(|i| reader.get_spectrum_by_index(i));
     _eval_spectra_from_iter_for_fields(it, overrides, use_chunked_encoding)
+}
+
+/// Array type inference from inputs
+impl MzPeakWriterBuilder {
+    /// Collect arrays fields from spectra in a [`RandomAccessSpectrumSource`] to prepare
+    /// the data file schema.
+    ///
+    /// This examines the first, 100th, and middle spectrum from `reader`.
+    ///
+    /// # Arguments
+    /// `reader`: The stream of spectra to read from
+    pub fn sample_array_types_from_spectrum_source<
+        C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+        D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+        R: RandomAccessSpectrumSource<C, D, MultiLayerSpectrum<C, D>>,
+    >(
+        mut self,
+        reader: &mut R,
+    ) -> Self {
+        let fields = sample_array_types_from_spectrum_source(
+            reader,
+            &self.spectrum_overrides(),
+            self.chunked_encoding,
+        );
+
+        for f in fields {
+            self = self.add_spectrum_field(f);
+        }
+
+        self
+    }
+
+    fn take_or_initialize_peak_builder(&mut self) -> ArrayBuffersBuilder {
+        let point_builder = self
+            .store_peaks_and_profiles_apart
+            .take()
+            .unwrap_or_else(|| {
+                ArrayBuffersBuilder::default()
+                    .prefix("point")
+                    .with_context(BufferContext::Spectrum)
+            });
+        point_builder
+    }
+
+    pub fn register_spectrum_peak_type<T: ToMzPeakDataSeries>(mut self) -> Self {
+        let point_builder = self.take_or_initialize_peak_builder();
+        self.store_peaks_and_profiles_apart(Some(point_builder.add_peak_type::<T>()))
+    }
+
+    pub fn sample_array_types_for_peaks_from_spectrum_source<
+        C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+        D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+        R: RandomAccessSpectrumSource<C, D, MultiLayerSpectrum<C, D>>,
+    >(
+        mut self,
+        reader: &mut R,
+    ) -> Self {
+        let mut point_builder = self.take_or_initialize_peak_builder();
+        for f in sample_array_types_from_spectrum_source(reader, &self.spectrum_overrides(), None) {
+            point_builder = point_builder.add_field(f);
+        }
+        self.store_peaks_and_profiles_apart(Some(point_builder))
+    }
+
+    /// Collect arrays fields from spectra in a [`StreamingSpectrumIterator`] to prepare
+    /// the data file schema.
+    ///
+    /// This consumes only the next 10 spectra.
+    ///
+    /// # Arguments
+    /// `reader`: The stream of spectra to read from
+    pub fn sample_array_types_from_spectrum_stream<
+        C: CentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<CentroidPeak>,
+        D: DeconvolutedCentroidLike + ToMzPeakDataSeries + BuildFromArrayMap + From<DeconvolutedPeak>,
+        I: Iterator<Item = MultiLayerSpectrum<C, D>>,
+    >(
+        mut self,
+        reader: &mut StreamingSpectrumIterator<C, D, MultiLayerSpectrum<C, D>, I>,
+    ) -> Self
+    where
+        MultiLayerSpectrum<C, D>: Clone,
+    {
+        let fields = sample_array_types_from_spectrum_stream(
+            reader,
+            &self.spectrum_overrides(),
+            self.chunked_encoding,
+        );
+
+        for f in fields {
+            self = self.add_spectrum_field(f);
+        }
+
+        self
+    }
+
+    /// Collect arrays fields from an iterator of chromatograms to prepare the data file schema.
+    ///
+    /// This consumes the entire iterator.
+    ///
+    /// # Arguments
+    /// `reader`: The stream of chromatograms to read from
+    pub fn sample_array_types_from_chromatograms<I: Iterator<Item = Chromatogram>>(
+        mut self,
+        iter: I,
+    ) -> Self {
+        let fields = sample_array_types_from_chromatograms(
+            iter,
+            &self.chromatogram_overrides(),
+            self.chromatogram_chunked_encoding,
+        );
+        for f in fields {
+            self = self.add_chromatogram_field(f);
+        }
+        self
+    }
 }
 
 /// Write an mzPeak archive to an uncompressed ZIP archive
@@ -411,18 +529,7 @@ impl<
         spectrum_fields: SpectrumFieldVisitors,
     ) -> Self {
         let mut spectrum_metadata_buffer = SpectrumBuilder::default();
-        spectrum_metadata_buffer
-            .spectrum
-            .extend_extra_fields(spectrum_fields.spectrum_fields);
-        spectrum_metadata_buffer
-            .scan
-            .extend_extra_fields(spectrum_fields.spectrum_scan_fields);
-        spectrum_metadata_buffer
-            .selected_ion
-            .extend_extra_fields(spectrum_fields.spectrum_selected_ion_fields);
-        spectrum_metadata_buffer
-            .precursor
-            .extend_extra_activation_fields(spectrum_fields.spectrum_activation_fields);
+        spectrum_metadata_buffer.add_visitors_from(spectrum_fields);
 
         let spectrum_buffers: ArrayBufferWriterVariants = if use_chunked_encoding.is_some() {
             spectrum_buffers_builder
@@ -757,9 +864,10 @@ pub type MzPeakWriter<W> = MzPeakWriterType<W, CentroidPeak, DeconvolutedPeak>;
 
 #[cfg(test)]
 mod test {
+    use arrow::datatypes::DataType;
     use mzdata::{params::Unit, spectrum::BinaryDataArrayType};
 
-    use crate::{BufferName, peak_series::BufferFormat};
+    use crate::{BufferName, MzPeakReader, peak_series::BufferFormat};
 
     use super::*;
     use std::io;
@@ -785,25 +893,37 @@ mod test {
         .with_unit(Unit::DetectorCounts);
         for f in array_types {
             if let Some(name) = BufferName::from_field(BufferContext::Spectrum, f.clone()) {
-                if mz_buffer == name {}
-                else if intensity_buffer == name {}
-                else {
+                if mz_buffer == name {
+                } else if intensity_buffer == name {
+                } else {
                     panic!("Unexpected {name:?}");
                 }
             }
         }
 
-        let array_types = sample_array_types_from_spectrum_source(&mut reader, &overrides1, Some(ChunkingStrategy::Delta { chunk_size: 50.0 }));
+        let array_types = sample_array_types_from_spectrum_source(
+            &mut reader,
+            &overrides1,
+            Some(ChunkingStrategy::Delta { chunk_size: 50.0 }),
+        );
 
         assert_eq!(array_types.len(), 6);
         for f in array_types {
             if let Some(name) = BufferName::from_field(BufferContext::Spectrum, f.clone()) {
-                if mz_buffer.clone().with_format(BufferFormat::ChunkBoundsStart) == name {}
-                else if mz_buffer.clone().with_format(BufferFormat::ChunkBoundsEnd) == name {}
-                else if mz_buffer.clone().with_format(BufferFormat::Chunked) == name {}
-                else if mz_buffer.clone().with_format(BufferFormat::ChunkEncoding) == name {}
-                else if intensity_buffer.clone().with_format(BufferFormat::ChunkedSecondary) == name {}
-                else {
+                if mz_buffer
+                    .clone()
+                    .with_format(BufferFormat::ChunkBoundsStart)
+                    == name
+                {
+                } else if mz_buffer.clone().with_format(BufferFormat::ChunkBoundsEnd) == name {
+                } else if mz_buffer.clone().with_format(BufferFormat::Chunked) == name {
+                } else if mz_buffer.clone().with_format(BufferFormat::ChunkEncoding) == name {
+                } else if intensity_buffer
+                    .clone()
+                    .with_format(BufferFormat::ChunkedSecondary)
+                    == name
+                {
+                } else {
                     panic!("Unexpected {name:?}");
                 }
             }
@@ -815,9 +935,9 @@ mod test {
         assert_eq!(array_types.len(), 3);
         for f in array_types {
             if let Some(name) = BufferName::from_field(BufferContext::Spectrum, f.clone()) {
-                if mz_buffer == name {}
-                else if intensity_buffer == name {}
-                else {
+                if mz_buffer == name {
+                } else if intensity_buffer == name {
+                } else {
                     panic!("Unexpected {name:?}");
                 }
             }
@@ -829,21 +949,71 @@ mod test {
     fn test_array_building() -> io::Result<()> {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
         let mut builder = MzPeakWriter::<fs::File>::builder();
-        let overrides = BufferOverrideTable::default();
+        builder = builder
+            .register_spectrum_peak_type::<CentroidPeak>()
+            .sample_array_types_from_spectrum_source(&mut reader)
+            .sample_array_types_from_chromatograms(reader.iter_chromatograms())
+            .null_zeros(true)
+            .shuffle_mz(true)
+            .dictionary_page_size(Some(2usize.pow(16)))
+            .row_group_size(Some(2usize.pow(16)))
+            .page_size(Some(2usize.pow(16)))
+            .add_spectrum_activation_field(CustomBuilderFromParameter::from_spec(
+                mzdata::curie!(MS:1000045),
+                "collision energy",
+                DataType::Float64,
+            ));
 
-        builder = sample_array_types_from_spectrum_source(
-            &mut reader,
-            &overrides,
-            None,
-        )
-        .into_iter()
-        .fold(builder, |builder, f| builder.add_spectrum_field(f));
-
-        let arc = tempfile::NamedTempFile::new()?;
-        let writer = builder.build(arc, true);
-
+        let arc = tempfile::NamedTempFile::with_suffix("_test.mzpeak")?;
+        let source = arc.as_file().try_clone()?;
+        let mut writer = builder.build(source, true);
+        writer.copy_metadata_from(&reader);
         let overrides = writer.spectrum_buffers.overrides();
-        assert!(overrides.iter().any(|(_, v)| v.buffer_priority.is_some_and(|v| matches!(v, BufferPriority::Primary))));
+        assert!(overrides.iter().any(|(_, v)| {
+            v.buffer_priority
+                .is_some_and(|v| matches!(v, BufferPriority::Primary))
+        }));
+        writer.write_all_owned(reader.iter())?;
+        for chrom in reader.iter_chromatograms() {
+            writer.write_chromatogram(&chrom)?;
+        }
+        drop(writer);
+
+        let new_reader = MzPeakReader::new(arc.path())?;
+        assert_eq!(reader.len(), new_reader.len());
+        assert!(new_reader.metadata.spectrum_auxiliary_array_counts.iter().all(|z| *z == 0));
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn test_array_building_chunked() -> io::Result<()> {
+        let mut reader = mzdata::MZReader::open_path("small.mzML")?;
+        let mut builder = MzPeakWriter::<fs::File>::builder();
+        builder = builder
+            .chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }))
+            .chromatogram_chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }))
+            .sample_array_types_from_spectrum_source(&mut reader)
+            .sample_array_types_from_chromatograms(reader.iter_chromatograms())
+            .null_zeros(true)
+            .shuffle_mz(true);
+
+        let arc = tempfile::NamedTempFile::with_suffix("_test_chunk.mzpeak")?;
+        let source = arc.as_file().try_clone()?;
+        let mut writer = builder.build(source, true);
+        writer.copy_metadata_from(&reader);
+        let overrides = writer.spectrum_buffers.overrides();
+        assert!(overrides.iter().any(|(_, v)| {
+            v.buffer_priority
+                .is_some_and(|v| matches!(v, BufferPriority::Primary))
+        }));
+        writer.write_all_owned(reader.iter())?;
+        for chrom in reader.iter_chromatograms() {
+            writer.write_chromatogram(&chrom)?;
+        }
+        drop(writer);
+
+        let new_reader = MzPeakReader::new(arc.path())?;
+        assert_eq!(reader.len(), new_reader.len());
 
         Ok(())
     }
