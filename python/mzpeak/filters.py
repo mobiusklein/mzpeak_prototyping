@@ -15,24 +15,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-def fit_qr(x: np.ndarray, y: np.ndarray):
-    if solve_triangular is None:
-        raise ImportError("To fit a linear model, install scipy")
-    quadx = np.stack([np.ones_like(x), x, x**2], axis=-1)
-    qr = np.linalg.qr(quadx)
-    v = qr.Q.T.dot(y)
-    return solve_triangular(qr.R, v)
-
-
-def fit_qr_weighted(x: np.ndarray, y: np.ndarray, weights: np.ndarray):
-    if solve_triangular is None:
-        raise ImportError("To fit a linear model, install scipy")
-    quadx = np.stack([np.ones_like(x), x, x**2], axis=-1)
-    chol_w = np.sqrt(weights)
-    qr = np.linalg.qr(chol_w[:, None] * quadx)
-    v = qr.Q.T.dot(chol_w * y)
-    return solve_triangular(qr.R, v)
-
 
 class DeltaModelBase:
     @classmethod
@@ -50,7 +32,7 @@ class DeltaModelBase:
 
     def mse(self, mz_array: np.ndarray, delta_array: np.ndarray):
         err = self(mz_array) - delta_array
-        return err.dot(err)
+        return err.dot(err) / len(delta_array)
 
     def __call__(self, mz: float) -> float:
         return self.predict(mz)

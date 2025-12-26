@@ -6,7 +6,7 @@ import pyarrow as pa
 
 from mzpeak import MzPeakFile
 from mzpeak.mz_reader import BufferFormat
-from mzpeak.filters import find_zero_runs, is_zero_pair_mask, null_chunk_every
+from mzpeak.filters import find_zero_runs, is_zero_pair_mask, null_chunk_every, DeltaCurveRegressionModel
 
 point_path = Path("small.mzpeak")
 chunk_path = Path("small.chunked.mzpeak")
@@ -58,10 +58,21 @@ def common_checks(reader: MzPeakFile, subtests: pytest.Subtests):
         assert spec["spectrum representation"] == "MS:1000127"
         assert spec['index'] == 4
 
+
+def check_iterator(reader: MzPeakFile):
+    it = iter(reader)
+
+    for i in range(10):
+        spec = next(it)
+        assert spec['index'] == i
+
+
 def test_load_base_point(subtests: pytest.Subtests):
     reader = MzPeakFile(point_path)
     assert reader.spectrum_data.buffer_format() == BufferFormat.Point
     common_checks(reader, subtests)
+    with subtests.test("iterator"):
+        check_iterator(reader)
 
 
 def test_load_base_chunk(subtests: pytest.Subtests):
@@ -69,13 +80,15 @@ def test_load_base_chunk(subtests: pytest.Subtests):
     assert reader.spectrum_data.buffer_format() == BufferFormat.Chunk
     common_checks(reader, subtests)
     assert reader.has_secondary_peaks_data
-
+    with subtests.test("iterator"):
+        check_iterator(reader)
 
 def test_load_unpacked(subtests: pytest.Subtests):
     reader = MzPeakFile(unpacked_path)
     assert reader.spectrum_data.buffer_format() == BufferFormat.Point
     common_checks(reader, subtests)
-
+    with subtests.test("iterator"):
+        check_iterator(reader)
 
 def test_chunking():
     mzs = []
@@ -92,9 +105,23 @@ def test_chunking():
     assert len(intensities) == 9317
     assert np.count_nonzero(intensities) == 4243
 
+    model1 = DeltaCurveRegressionModel.fit(mzs, np.diff(mzs), np.sqrt(intensities))
+
     nonzero_run_mask = find_zero_runs(intensities)
     mzs = mzs[nonzero_run_mask]
     intensities = intensities[nonzero_run_mask]
+
+    model2 = DeltaCurveRegressionModel.fit(mzs, np.diff(mzs), np.sqrt(intensities))
+
+    assert len(model1.beta) == 3
+    assert len(model2.beta) == len(model1.beta)
+
+    for i in range(len(model1.beta)):
+        assert np.isclose(model1.beta[i], model2.beta[i]), (
+            f"Paramter {i} of model {model1.beta[i]} !~ {model2.beta[i]}"
+        )
+    err = model2.mse(mzs[1:], np.diff(mzs))
+    assert abs(err - 43.48575002014233) < 1e-3
 
     assert len(intensities) == 5546
     assert np.count_nonzero(intensities) == 4243

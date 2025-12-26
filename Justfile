@@ -13,6 +13,6 @@ test:
 pytest:
     py.test -l -s -v python/test/ \
         --cov=mzpeak --cov-report term \
-        --log-level=DEBUG
+        --log-level=DEBUG --cov-report html
 
 alias t := test

@@ -10,6 +10,9 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
+TRACE = logging.DEBUG - 5
+logging.addLevelName(TRACE, "TRACE")
+
 Q = TypeVar("Q", bound=Number)
 
 
@@ -168,15 +171,18 @@ class OntologyMapper:
         if accession is None:
             alt_name = name.replace("_", " ").replace("mz", 'm/z')
             alt_term = self.cv_psims.get(alt_name)
-            if alt_term and alt_name not in ('id', 'index', 'name'):
+            if alt_term and alt_name not in ('id', 'index', 'name', 'activation'):
+                logger.log(TRACE, 'Mapped %r to %s|%s', name, alt_term['id'], alt_term['name'])
                 return alt_term['name']
             return self.overrides.get(name, name) + suffix
         cv_id = accession.split(":")[0]
         if cv_id == "MS":
             term = self.cv_psims[accession]
+            logger.log(TRACE, "Mapped %r to %s|%s", name, term["id"], term["name"])
             return term["name"] + suffix
         elif cv_id == "UO":
             term = self.cv_uo[accession]
+            logger.log(TRACE, "Mapped %r to %s|%s", name, term["id"], term["name"])
             return term["name"] + suffix
         else:
             logger.warning("Unknown prefix %r from %r", cv_id, value)
