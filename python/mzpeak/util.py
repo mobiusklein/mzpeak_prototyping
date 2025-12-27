@@ -1,3 +1,4 @@
+from ast import Import
 import re
 import logging
 
@@ -126,6 +127,11 @@ class MappingProxy(object):
 
     def get(self, key, default=None):
         self._ensure_mapping()
+        if self.mapping is None:
+            raise ImportError(
+                "Failed to load controlled vocabulary. "
+                "Please ensure 'psims' is installed: pip install psims"
+            )
         return self.mapping.get(key, default)
 
 
