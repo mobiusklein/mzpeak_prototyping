@@ -388,7 +388,19 @@ def find_zero_runs(arr: Sequence[Number]) -> Sequence[int]:
     return np.array(acc)
 
 
-def is_zero_pair_mask(data: Sequence[Number]):
+def is_zero_pair_mask(data: Sequence[Number]) -> "np.typing.NDArray[np.bool_]":
+    '''
+    Create a boolean mask for positions that are composed of two zeroes in a row.
+
+    Parameters
+    ----------
+    data : :class:`Sequence` of :class:`Number`
+        The numerical data to traverse
+
+    Returns
+    -------
+    :class:`np.ndarray` of :class:`bool`
+    '''
     n = len(data)
     n1 = n - 1
     was_zero = False

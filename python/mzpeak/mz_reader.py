@@ -67,7 +67,6 @@ class ArrayIndexEntry:
     array_name: str
     buffer_format: BufferFormat
     context: str
-    prefix: str
     path: str
     data_type: str
     array_type: str
@@ -81,13 +80,18 @@ class ArrayIndexEntry:
     def from_index(cls, key, fields):
         fields = fields.copy()
 
+        # Old field removed
+        fields.pop("prefix", None)
+
+        # Adapt fields
         fmt = fields.pop("buffer_format", None)
-        if fmt:
+        if fmt and isinstance(fmt, str):
             fields["buffer_format"] = BufferFormat.from_str(fmt)
 
         priority = fields.pop("buffer_priority", None)
-        if priority:
+        if priority and isinstance(priority, str):
             fields["buffer_priority"] = BufferPriority.from_str(priority)
+
         return cls(key=key, **fields)
 
 

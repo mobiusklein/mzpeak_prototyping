@@ -105,6 +105,8 @@ def test_chunking():
     assert len(intensities) == 9317
     assert np.count_nonzero(intensities) == 4243
 
+    # Test that the model learned from the full data is the same as the same as
+    # the model learned from the data without excess zero-intensity points.
     model1 = DeltaCurveRegressionModel.fit(mzs, np.diff(mzs), np.sqrt(intensities))
 
     nonzero_run_mask = find_zero_runs(intensities)
@@ -123,9 +125,11 @@ def test_chunking():
     err = model2.mse(mzs[1:], np.diff(mzs))
     assert abs(err - 43.48575002014233) < 1e-3
 
+    # Test null masking does not fail
     assert len(intensities) == 5546
     assert np.count_nonzero(intensities) == 4243
 
+    # This quantity is smaller than the total number of zeros because not all zeros are paired
     zero_pair_mask = is_zero_pair_mask(intensities)
     assert zero_pair_mask.sum() == 1286
 
