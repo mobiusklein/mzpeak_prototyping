@@ -241,8 +241,15 @@ impl Seek for ArchiveFacetReader {
                 }
                 Ok(self.at)
             }
-            io::SeekFrom::Current(_offset) => {
-                todo!()
+            io::SeekFrom::Current(offset) => {
+                if offset < 0 {
+                    todo!()
+                } else {
+                    let offset = offset.unsigned_abs().min(self.length);
+                    self.at += offset;
+                    self.archive.seek_relative(offset as i64)?;
+                    Ok(self.at)
+                }
             }
         }
     }
@@ -362,23 +369,6 @@ impl ZipArchiveSource {
         let opts = ArrowReaderOptions::new().with_page_index(true);
         Ok(ArrowReaderMetadata::load(&handle, opts)?)
     }
-
-    pub fn read_index(
-        &self,
-        index: usize,
-        metadata: Option<ArrowReaderMetadata>,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
-        let metadata = if let Some(metadata) = metadata {
-            metadata
-        } else {
-            self.metadata_for_index(index)?
-        };
-
-        let handle = self.open_entry_by_index(index)?;
-        Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
-            handle, metadata,
-        ))
-    }
 }
 
 pub struct SplittingZipArchiveSource {
@@ -413,29 +403,6 @@ impl SplittingZipArchiveSource {
                 io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
             )
         }
-    }
-
-    pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
-        let handle = self.open_entry_by_index(index)?;
-        let opts = ArrowReaderOptions::new().with_page_index(true);
-        Ok(ArrowReaderMetadata::load(&handle, opts)?)
-    }
-
-    pub fn read_index(
-        &self,
-        index: usize,
-        metadata: Option<ArrowReaderMetadata>,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
-        let metadata = if let Some(metadata) = metadata {
-            metadata
-        } else {
-            self.metadata_for_index(index)?
-        };
-
-        let handle = self.open_entry_by_index(index)?;
-        Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
-            handle, metadata,
-        ))
     }
 }
 
@@ -588,16 +555,6 @@ impl DirectorySource {
         })
     }
 
-    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
-        if let Some(index) = self.file_names.iter().position(|v| v == name) {
-            self.open_entry_by_index(index)
-        } else {
-            Err(
-                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
-            )
-        }
-    }
-
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let name = self.file_names.get(index).ok_or(io::Error::new(
             io::ErrorKind::NotFound,
@@ -614,23 +571,6 @@ impl DirectorySource {
         let handle = self.open_entry_by_index(index)?;
         let opts = ArrowReaderOptions::new().with_page_index(true);
         Ok(ArrowReaderMetadata::load(&handle, opts)?)
-    }
-
-    pub fn read_index(
-        &self,
-        index: usize,
-        metadata: Option<ArrowReaderMetadata>,
-    ) -> io::Result<ParquetRecordBatchReaderBuilder<ArchiveFacetReader>> {
-        let metadata = if let Some(metadata) = metadata {
-            metadata
-        } else {
-            self.metadata_for_index(index)?
-        };
-
-        let handle = self.open_entry_by_index(index)?;
-        Ok(ParquetRecordBatchReaderBuilder::new_with_metadata(
-            handle, metadata,
-        ))
     }
 }
 
@@ -903,6 +843,63 @@ mod test {
             let spec = batch.column(0).as_struct();
             assert_eq!(spec.column_by_name("index").unwrap().len(), 5);
         }
+
+        let index = arch.file_index();
+        assert_eq!(index.len(), 4);
+        assert_eq!(arch.list_files().len(), 5);
+        assert!(!arch.can_split());
+
+        let mut handle = arch.open_stream("mzpeak_index.json")?;
+        handle.seek_relative(20)?;
+        assert_eq!(handle.stream_position()?, 20);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_base_dir() -> io::Result<()> {
+        let arch = DirectoryArchiveReader::from_path("small.unpacked.mzpeak".into())?;
+        let handle = arch.spectrum_metadata()?;
+        let reader = handle.with_limit(5).build()?;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let spec = batch.column(0).as_struct();
+            assert_eq!(spec.column_by_name("index").unwrap().len(), 5);
+        }
+
+        let index = arch.file_index();
+        assert_eq!(index.len(), 4);
+        assert_eq!(arch.list_files().len(), 5);
+        assert!(arch.can_split());
+
+        let mut handle = arch.open_stream("mzpeak_index.json")?;
+        handle.seek_relative(20)?;
+        assert_eq!(handle.stream_position()?, 20);
+
+        Ok(())
+    }
+
+     #[test]
+    fn test_base_splittable() -> io::Result<()> {
+        let arch = ArchiveReader::<DispatchArchiveSource>::from_path("small.chunked.mzpeak".into())?;
+
+        let handle = arch.spectrum_metadata()?;
+        let reader = handle.with_limit(5).build()?;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let spec = batch.column(0).as_struct();
+            assert_eq!(spec.column_by_name("index").unwrap().len(), 5);
+        }
+
+        let index = arch.file_index();
+        assert_eq!(index.len(), 5);
+        assert_eq!(arch.list_files().len(), 6);
+        assert!(arch.can_split());
+
+        let mut handle = arch.open_stream("mzpeak_index.json")?;
+        handle.seek_relative(20)?;
+        assert_eq!(handle.stream_position()?, 20);
+
         Ok(())
     }
 }
