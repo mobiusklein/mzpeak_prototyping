@@ -1,12 +1,12 @@
-from ast import Import
 import re
 import logging
 
 from dataclasses import dataclass, field
 from numbers import Number
-from typing import Any, Generic, Mapping, TypeVar
+from typing import Any, Generic, Iterator, Mapping, TypeVar
 
 import pandas as pd
+import pyarrow as pa
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -100,7 +100,6 @@ def parse_inflected_cv_name(name: str) -> ColumnName:
             pass
 
     return ColumnName(curie, rest, False)
-
 
 
 class MappingProxy(object):
@@ -200,6 +199,24 @@ class OntologyMapper:
     def clean_column_names(self, df: pd.DataFrame):
         df.columns = df.columns.map(self)
         return df
+
+    def clean_schema(self, table: pa.Table) -> pa.Table:
+        cols = _clean_schema(self, table.schema)
+        cols = pa.schema(cols)
+        return pa.table(table.columns, schema=cols)
+
+
+def _clean_schema(
+    mapper: OntologyMapper, schema: Iterator[pa.Field]
+) -> list[pa.Field]:
+    fields = []
+    for f in schema:
+        f = f.with_name(mapper(f.name))
+        if isinstance(f.type, pa.StructType):
+            new_fields = _clean_schema(mapper, f.type.fields)
+            f = f.with_type(pa.struct(new_fields))
+        fields.append(f)
+    return fields
 
 
 __all__ = [

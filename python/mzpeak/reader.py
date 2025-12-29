@@ -350,6 +350,7 @@ class MzPeakSpectrumMetadataReader:
             )
         else:
             bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
+            bat = CV_MAPPER.clean_schema(bat)
             bat = _format_curies_batch(bat)
             self.spectra = _clean_frame(
                 bat.to_pandas(types_mapper=pd.ArrowDtype).set_index("index")
@@ -380,6 +381,7 @@ class MzPeakSpectrumMetadataReader:
                 index_col = "spectrum_index"
             else:
                 index_col = "source_index"
+            bat = CV_MAPPER.clean_schema(bat)
             self.scans = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
             if (np.diff(self.scans.index) == 1).all():
                 self.scans.index = pd.RangeIndex(
@@ -412,6 +414,7 @@ class MzPeakSpectrumMetadataReader:
                 index_col = "spectrum_index"
             else:
                 index_col = "source_index"
+            bat = CV_MAPPER.clean_schema(bat)
             self.precursors = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
         else:
             self.precursors = pd.DataFrame(
@@ -440,6 +443,7 @@ class MzPeakSpectrumMetadataReader:
                 index_col = "spectrum_index"
             else:
                 index_col = "source_index"
+            bat = CV_MAPPER.clean_schema(bat)
             self.selected_ions = _clean_frame(
                 bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
             )
@@ -596,6 +600,7 @@ class MzPeakChromatogramMetadataReader:
         else:
             bat = pa.Table.from_struct_array(pa.chunked_array(chromatograms))
             bat = _format_curies_batch(bat)
+            bat = CV_MAPPER.clean_schema(bat)
             self.chromatograms = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index("index"))
         self.id_index = (
             self.chromatograms[["id"]].reset_index().set_index("id")["index"]
@@ -618,6 +623,7 @@ class MzPeakChromatogramMetadataReader:
                 index_col = "spectrum_index"
             else:
                 index_col = "source_index"
+            bat = CV_MAPPER.clean_schema(bat)
             self.precursors = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
         else:
             self.precursors = pd.DataFrame(
@@ -642,6 +648,7 @@ class MzPeakChromatogramMetadataReader:
         if blocks:
             bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = _format_curies_batch(bat)
+            bat = CV_MAPPER.clean_schema(bat)
             if 'spectrum_index' in bat.column_names:
                 index_col = "spectrum_index"
             else:
