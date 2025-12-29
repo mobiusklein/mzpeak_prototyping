@@ -504,8 +504,11 @@ class _PointBatchCleaner:
             start = 0
             for run_i, run_end in enumerate(index_runs):
                 index = index_values_unique[run_i]
-                delta_model_for = self.delta_model[index]
                 v_for = v.slice(start, run_end - start)
+                if index in self.delta_model:
+                    delta_model_for = self.delta_model[index]
+                else:
+                    delta_model_for = None
                 v_np[start:run_end] = fill_nulls(v_for, delta_model_for)
                 start = run_end
             v = v_np
@@ -685,8 +688,10 @@ class _ChunkBatchCleaner:
             index_val = chunk[self.index_name].as_py()
 
             delta_model_ = self.delta_model
-            if self.has_multiple_delta_models:
+            if self.has_multiple_delta_models and index_val in self.delta_model:
                 delta_model_ = self.delta_model[index_val]
+            else:
+                delta_model_ = None
 
             # Delta encoding
             if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):
@@ -723,7 +728,9 @@ class _ChunkBatchCleaner:
                     )
             # Direct encoding
             elif encoding in (NO_COMPRESSION, NO_COMPRESSION_CURIE):
-                steps = pa.chunked_array([pa.scalar(start, steps.type), steps.values])
+                step_values = steps.values
+                dtype = step_values.type
+                steps = pa.chunked_array([pa.array([start], type=dtype), step_values])
                 chunk_size = len(steps)
                 if steps.null_count > 0:
                     if delta_model_ is not None:
@@ -737,10 +744,10 @@ class _ChunkBatchCleaner:
                             index_val,
                         )
                     main_axis_array[offset : offset + chunk_size] = np.asarray(
-                        steps.values
+                        steps
                     )
                 else:
-                    main_axis_array[offset : offset + chunk_size] = np.asarray(steps.values)
+                    main_axis_array[offset : offset + chunk_size] = np.asarray(steps)
             elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
                 part: np.ndarray = next(numpress_chunks_it)
                 chunk_size = len(part)
