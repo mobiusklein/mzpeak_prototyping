@@ -146,7 +146,7 @@ fn _eval_spectra_from_iter_for_fields<
         }
     }
     if is_profile > 0 {
-        log::info!("Detected profile spectra");
+        log::debug!("Detected profile spectra");
     }
     arrays
 }
@@ -942,6 +942,12 @@ mod test {
                 }
             }
         }
+
+        let mut builder = MzPeakWriter::<io::Cursor<Vec<u8>>>::builder();
+        builder = builder.sample_array_types_from_spectrum_stream(&mut it);
+        if let DataType::Struct(fields) = builder.spectrum_arrays.dtype() {
+            assert_eq!(fields.len(), 3);
+        }
         Ok(())
     }
 
@@ -953,8 +959,10 @@ mod test {
             .register_spectrum_peak_type::<CentroidPeak>()
             .sample_array_types_from_spectrum_source(&mut reader)
             .sample_array_types_from_chromatograms(reader.iter_chromatograms())
+            .include_time_with_spectrum_data(true)
             .null_zeros(true)
             .shuffle_mz(true)
+            .write_batch_size(Some(5))
             .dictionary_page_size(Some(2usize.pow(16)))
             .row_group_size(Some(2usize.pow(16)))
             .page_size(Some(2usize.pow(16)))
@@ -979,9 +987,16 @@ mod test {
         }
         drop(writer);
 
-        let new_reader = MzPeakReader::new(arc.path())?;
+        let mut new_reader = MzPeakReader::new(arc.path())?;
         assert_eq!(reader.len(), new_reader.len());
         assert!(new_reader.metadata.spectrum_auxiliary_array_counts.iter().all(|z| *z == 0));
+
+        reader.reset();
+        new_reader.reset();
+
+        for (a, b)  in reader.iter().zip(new_reader.into_iter()) {
+            assert_eq!(a.id(), b.id());
+        }
         Ok(())
     }
 
@@ -1012,9 +1027,13 @@ mod test {
         }
         drop(writer);
 
-        let new_reader = MzPeakReader::new(arc.path())?;
+        let mut new_reader = MzPeakReader::new(arc.path())?;
         assert_eq!(reader.len(), new_reader.len());
-
+        reader.reset();
+        new_reader.reset();
+        for (a, b)  in reader.iter().zip(new_reader.iter()) {
+            assert_eq!(a.id(), b.id());
+        }
         Ok(())
     }
 }

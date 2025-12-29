@@ -381,14 +381,17 @@ impl ArrayBufferWriter for PointBuffers {
         &self.schema
     }
 
+    #[inline(always)]
     fn fields(&self) -> &Fields {
         &self.peak_array_fields
     }
 
+    #[inline(always)]
     fn add_arrays(&mut self, fields: Fields, arrays: Vec<ArrayRef>, size: usize, is_profile: bool) {
         self.add_arrays(fields, arrays, size, is_profile);
     }
 
+    #[inline(always)]
     fn add<T: ToMzPeakDataSeries>(
         &mut self,
         spectrum_index: u64,
@@ -1085,9 +1088,10 @@ mod test {
             .build(Arc::new(Schema::empty()), BufferContext::Spectrum, true);
 
         let peaks = &[CentroidPeak::new(204.0719, 100.0, 0)];
-
+        assert_eq!(builder.len(), 0);
+        assert!(builder.is_empty());
         builder.add(0, None, peaks);
-
+        assert_eq!(builder.len(), 1);
         assert_eq!(builder.array_chunks.len(), 3);
         for (_, v) in builder.array_chunks.iter() {
             assert_eq!(v.len(), 1);
@@ -1131,8 +1135,9 @@ mod test {
 
         let peaks = &[CentroidPeak::new(204.0719, 100.0, 0)];
 
+        assert_eq!(builder.len(), 0);
+        assert!(builder.is_empty());
         builder.add(0, None, peaks);
-
         assert_eq!(builder.chunk_buffer.len(), 1);
 
         let batches: Vec<RecordBatch> = builder.drain().collect();
