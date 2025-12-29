@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -14,7 +14,7 @@ use parquet::file::metadata::ParquetMetaData;
 
 use parquet::{
     self,
-    arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+    arrow::arrow_reader::{RowSelection, RowSelector},
     // file::page_index::index::Index as ParquetTypedIndex,
     file::page_index::column_index::{PrimitiveColumnIndex, ColumnIndexMetaData as ParquetTypedIndex },
     schema::types::SchemaDescriptor,
@@ -427,72 +427,6 @@ pub fn read_i8_page_index_from(
     column_path: &str,
 ) -> Option<PageIndex<i8>> {
     read_numeric_page_index!(metadata, pq_schema, column_path, i8)
-}
-
-pub fn read_f32_page_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-    column_path: &str,
-) -> Option<PageIndex<f32>> {
-    read_numeric_page_index!(reader, column_path, f32)
-}
-
-pub fn read_f64_page_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-    column_path: &str,
-) -> Option<PageIndex<f64>> {
-    read_numeric_page_index!(reader, column_path, f64)
-}
-
-pub fn read_i32_page_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-    column_path: &str,
-) -> Option<PageIndex<i32>> {
-    read_numeric_page_index!(reader, column_path, i32)
-}
-
-pub fn read_u32_page_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-    column_path: &str,
-) -> Option<PageIndex<u32>> {
-    read_numeric_page_index!(reader, column_path, u32)
-}
-
-pub fn read_i64_page_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-    column_path: &str,
-) -> Option<PageIndex<i64>> {
-    read_numeric_page_index!(reader, column_path, i64)
-}
-
-pub fn read_u64_page_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-    column_path: &str,
-) -> Option<PageIndex<u64>> {
-    read_numeric_page_index!(reader, column_path, u64)
-}
-
-pub fn read_spectrum_time_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-) -> Option<PageIndex<f32>> {
-    read_f32_page_index(reader, "spectrum.time")
-}
-
-pub fn read_point_spectrum_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-) -> Option<PageIndex<u64>> {
-    read_u64_page_index(reader, "point.spectrum_index")
-}
-
-pub fn read_point_mz_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-) -> Option<PageIndex<f64>> {
-    read_f64_page_index(reader, "point.mz")
-}
-
-pub fn read_point_im_index(
-    reader: &ParquetRecordBatchReaderBuilder<fs::File>,
-) -> Option<PageIndex<f64>> {
-    read_f64_page_index(reader, "point.im")
 }
 
 pub trait SpanDynNumeric: Span1D
