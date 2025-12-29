@@ -632,33 +632,21 @@ impl MetadataColumn {
         self.unit = value.into();
         self
     }
+}
 
-    pub fn scope(&self) -> &str {
-        if self.path.len() <= 2 {
-            ""
-        } else {
-            self.path.get(0).unwrap()
-        }
-    }
+#[cfg(test)]
+mod test {
+    use std::io;
 
-    pub fn create(&self, value: mzdata::params::Value, unit: Unit) -> mzdata::Param {
-        if let Some(curie) = self.accession {
-            let curie: mzdata::params::CURIE = curie.into();
-            mzdata::Param {
-                name: self.name.clone(),
-                value,
-                accession: Some(curie.accession),
-                controlled_vocabulary: Some(curie.controlled_vocabulary),
-                unit,
-            }
-        } else {
-            mzdata::Param {
-                name: self.name.clone(),
-                value,
-                accession: None,
-                controlled_vocabulary: None,
-                unit,
-            }
-        }
+    #[test]
+    fn test_metadata_col_serde() -> io::Result<()> {
+        let cols = crate::spectrum::SpectrumEntry::metadata_columns();
+        let text = serde_json::to_string(&cols)?;
+
+        let dups: Vec<super::MetadataColumn> = serde_json::from_str(&text)?;
+
+        assert_eq!(cols, dups);
+
+        Ok(())
     }
 }
