@@ -355,3 +355,55 @@ pub const ION_MOBILITY_ARRAY_TYPES: [ArrayType; 10] = [
     ArrayType::DeconvolutedIonMobilityArray,
     ArrayType::IonMobilityArray,
 ];
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_complex_peaks() {
+
+        assert_eq!(DeconvolutedPeak::to_fields().len(), 4);
+
+        let (fields, arrays) = DeconvolutedPeak::to_arrays(
+            0,
+            Some(0.32),
+            &[DeconvolutedPeak::new(602.1, 12053.67, 2, 0)],
+            &BufferOverrideTable::default());
+
+        assert_eq!(fields.len(), 5);
+
+        for arr in arrays.iter() {
+            assert_eq!(arr.len(), 1);
+        }
+
+        assert_eq!(IonMobilityAwareCentroidPeak::to_fields().len(), 4);
+
+        let (fields, arrays) = IonMobilityAwareCentroidPeak::to_arrays(
+            0,
+            Some(0.32),
+            &[IonMobilityAwareCentroidPeak::new(602.1,  32.0,12053.67, 0)],
+            &BufferOverrideTable::default());
+
+        assert_eq!(fields.len(), 5);
+
+        for arr in arrays.iter() {
+            assert_eq!(arr.len(), 1);
+        }
+
+        assert_eq!(IonMobilityAwareDeconvolutedPeak::to_fields().len(), 5);
+
+        let (fields, arrays) = IonMobilityAwareDeconvolutedPeak::to_arrays(
+            0,
+            Some(0.32),
+            &[IonMobilityAwareDeconvolutedPeak::new(602.1,  32.0, 2, 12053.67, 0)],
+            &BufferOverrideTable::default());
+
+        assert_eq!(fields.len(), 6);
+
+        for arr in arrays.iter() {
+            assert_eq!(arr.len(), 1);
+        }
+    }
+}
