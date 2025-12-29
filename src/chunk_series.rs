@@ -42,13 +42,14 @@ pub fn delta_decode<T: Float + Pod + AddAssign>(
     it: &[T],
     start_value: T,
     accumulator: &mut DataArray,
-) {
+) -> usize {
     let mut state = start_value;
     accumulator.push(state).unwrap();
     for val in it.iter().copied() {
         state += val;
         accumulator.push(state).unwrap();
     }
+    it.len() + 1
 }
 
 pub const NO_COMPRESSION: CURIE = mzdata::curie!(MS:1000576);
@@ -227,44 +228,72 @@ impl ChunkingStrategy {
         end_value: f64,
         accumulator: &mut DataArray,
         delta_model: Option<&RegressionDeltaModel<f64>>,
-    ) {
+    ) -> usize {
         if start_value == 0.0 && end_value == 0.0 {
-            return;
+            return 0;
         }
         macro_rules! decode_delta {
-            ($array:ident, $dtype:ty, $native:ty, $debug:literal) => {
+            ($array:ident, $dtype:ty, $native:ty, $debug:literal) => {{
                 let it = $array.as_primitive::<$dtype>();
                 if it.null_count() > 0 {
                     let decoded = null_delta_decode(it, start_value as $native);
                     if let Some(delta_model) = delta_model {
                         let values = fill_nulls_for(&decoded, delta_model);
                         accumulator.extend(&values).unwrap();
+                        values.len()
                     } else {
                         log::debug!($debug);
-                        accumulator.extend(decoded.values()).unwrap()
+                        accumulator.extend(decoded.values()).unwrap();
+                        decoded.len()
                     }
                 } else {
-                    delta_decode(it.values(), start_value as $native, accumulator);
+                    delta_decode(it.values(), start_value as $native, accumulator)
                 }
-            };
+            }};
         }
 
         match self {
-            ChunkingStrategy::Basic { chunk_size: _ } => match array.data_type() {
-                DataType::Float32 => {
-                    let it = array.as_primitive::<Float32Type>();
-                    accumulator.push(start_value as f32).unwrap();
-                    accumulator.extend(it.values()).unwrap();
+            ChunkingStrategy::Basic { chunk_size: _ } => {
+                match array.data_type() {
+                    DataType::Float32 => {
+                        let it = array.as_primitive::<Float32Type>();
+                        if it.null_count() > 0 {
+                            if let Some(model) = delta_model {
+                                let it = fill_nulls_for(it, model);
+                                accumulator.push(start_value as f32).unwrap();
+                                accumulator.extend(&it).unwrap();
+                            } else {
+                                accumulator.push(start_value as f32).unwrap();
+                                accumulator.extend(it.values()).unwrap();
+                            }
+                        } else {
+                            accumulator.push(start_value as f32).unwrap();
+                            accumulator.extend(it.values()).unwrap();
+                        }
+                        it.len() + 1
+                    }
+                    DataType::Float64 => {
+                        let it = array.as_primitive::<Float64Type>();
+                        if it.null_count() > 0 {
+                            if let Some(model) = delta_model {
+                                let it = fill_nulls_for(it, model);
+                                accumulator.push(start_value as f64).unwrap();
+                                accumulator.extend(&it).unwrap();
+                            } else {
+                                accumulator.push(start_value).unwrap();
+                                accumulator.extend(it.values()).unwrap();
+                            }
+                        } else {
+                            accumulator.push(start_value).unwrap();
+                            accumulator.extend(it.values()).unwrap();
+                        }
+                        it.len() + 1
+                    }
+                    _ => panic!(
+                        "Data type {:?} is not supported by basic decoding",
+                        array.data_type()
+                    ),
                 }
-                DataType::Float64 => {
-                    let it = array.as_primitive::<Float64Type>();
-                    accumulator.push(start_value).unwrap();
-                    accumulator.extend(it.values()).unwrap();
-                }
-                _ => panic!(
-                    "Data type {:?} is not supported by basic decoding",
-                    array.data_type()
-                ),
             },
             ChunkingStrategy::Delta { chunk_size: _ } => match array.data_type() {
                 DataType::Float32 => {
@@ -273,7 +302,7 @@ impl ChunkingStrategy {
                         Float32Type,
                         f32,
                         "f32 delta decoding contained nulls but no delta model provided"
-                    );
+                    )
                 }
                 DataType::Float64 => {
                     decode_delta!(
@@ -281,7 +310,7 @@ impl ChunkingStrategy {
                         Float64Type,
                         f64,
                         "f64 delta decoding contained nulls but no delta model provided"
-                    );
+                    )
                 }
                 _ => panic!(
                     "Data type {:?} is not supported by chunk decoding",
@@ -317,6 +346,7 @@ impl ChunkingStrategy {
                     } else {
                         accumulator.extend(data.values()).unwrap();
                     }
+                    data.len()
                 }
                 _ => panic!(
                     "Data type {:?} is not supported by numpress linear decoding",
@@ -1496,7 +1526,6 @@ mod test {
         assert_eq!(acc.data_len().unwrap(), 1054);
         Ok(())
     }
-
 
     #[test]
     fn test_encode_arrow() -> io::Result<()> {
