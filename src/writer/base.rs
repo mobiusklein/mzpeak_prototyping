@@ -320,6 +320,11 @@ pub trait AbstractMzPeakWriter {
             } else {
                 None
             };
+            let chunking = if !is_profile && matches!(chunking, ChunkingStrategy::Delta { chunk_size: _ }) {
+                ChunkingStrategy::Basic { chunk_size: chunking.chunk_size() }
+            } else {
+                chunking
+            };
             let buffer_ref = self.spectrum_data_buffer_mut();
             let (chunks, auxiliary_arrays) = ArrowArrayChunk::from_arrays(
                 spectrum_count,
@@ -337,7 +342,7 @@ pub trait AbstractMzPeakWriter {
                     &chunks,
                     BufferContext::Spectrum,
                     buffer_ref.schema().fields(),
-                    &[chunking, ChunkingStrategy::Basic { chunk_size: 50.0 }],
+                    &[chunking, ChunkingStrategy::Basic { chunk_size: chunking.chunk_size() }],
                     include_time,
                 );
                 let size = chunks.len();
