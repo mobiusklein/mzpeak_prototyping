@@ -413,14 +413,14 @@ impl<'a> NullTokenizer<'a> {
                 self.state = NullFillState::NullBounded(start, self.i);
                 self.update_next_state();
             } else {
-                self.state = NullFillState::NullStart(0)
+                self.state = NullFillState::NullStart(start)
             }
         }
         if self.array.len() < 3 && matches!(self.state, NullFillState::Unset) {
             if start_null && !self.is_null() {
                 self.state = NullFillState::NullStart(0);
             } else if !start_null && self.is_null() {
-                self.state = NullFillState::NullEnd(1);
+                self.state = NullFillState::NullEnd(self.array.len());
             }
         }
     }
@@ -453,7 +453,7 @@ impl<'a> NullTokenizer<'a> {
         } else {
             // We stepped from one null into a run of values, this is probably not
             // right. We don't have a way to back-fill these accurately.
-            log::error!("Null array tokenizer trip run: stepped from index {prev} -> {}", self.i);
+            log::error!("Null array tokenizer found malformed unpaired null: stepped from index {prev} -> {}", self.i);
             false
         }
     }
@@ -587,44 +587,6 @@ where
     buffer
 }
 
-#[inline]
-pub(crate) fn _skip_zero_runs_iter<T: ArrowPrimitiveType, I: Iterator<Item = Option<T::Native>>>(
-    iter: I,
-    n: usize,
-) -> Vec<u64>
-where
-    T::Native: Zero + PartialEq,
-{
-    let z = T::Native::zero();
-    let n1 = n.saturating_sub(1);
-    let mut was_zero = false;
-    let mut acc = Vec::new();
-    let mut iter = iter.peekable();
-    let mut i = 0;
-    while let Some(v) = iter.next() {
-        if let Some(v) = v {
-            if v == z {
-                if (was_zero || acc.is_empty())
-                    && ((i < n1 && iter.peek().unwrap().unwrap() == z) || i == n1)
-                {
-                    // Skip, do not take values between two zeros
-                } else {
-                    acc.push(i as u64)
-                }
-                was_zero = true;
-            } else {
-                acc.push(i as u64);
-                was_zero = false;
-            }
-        } else {
-            acc.push(i as u64);
-            was_zero = false;
-        }
-        i += 1;
-    }
-    acc.into()
-}
-
 /// A type-generic filter to find indices where the value isn't in the middle of a run of zeros.
 pub(crate) fn _skip_zero_runs_gen<T: ArrowPrimitiveType>(array: &PrimitiveArray<T>) -> Vec<u64>
 where
@@ -659,7 +621,7 @@ where
 
 /// Find indices where `array` is not a consecutive run of zeros.
 ///
-/// This kernel is only implemented for `Float32Array` and `Float64Array`
+/// This kernel is only implemented for 32-bit and 64-bit numeric types.
 pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
     let array_ = array.as_any();
     if let Some(array) = array_.downcast_ref::<Float32Array>() {
@@ -953,6 +915,21 @@ mod test {
         assert_eq!(vals[0], NullFillState::NullStart(0));
     }
 
+    #[test_log::test]
+    fn test_null_singleton_inner() {
+        let data = Float64Array::from(vec![Some(50.0), None, Some(50.2)]);
+        let it = NullTokenizer::new(data.nulls().unwrap());
+        let states: Vec<NullFillState> = it.collect();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0], NullFillState::NullEnd(1));
+        assert_eq!(states[1], NullFillState::NullStart(2));
+        let data = Float64Array::from(vec![Some(50.0), Some(50.0), None, Some(50.2), None, Some(50.3), None]);
+        let it = NullTokenizer::new(data.nulls().unwrap());
+        for state in it {
+            eprintln!("state = {state:?}");
+        }
+    }
+
     #[test]
     fn test_zero_runs_tailed() {
         let data = Float64Array::from(vec![
@@ -1072,6 +1049,19 @@ mod test {
         assert_eq!(data.len(), filled.len());
         for v in filled {
             assert_ne!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_null_end_short() {
+        let data = Float64Array::from(vec![
+            Some(101.0),
+            None,
+        ]);
+
+        let tokenizer = NullTokenizer::new(data.nulls().unwrap());
+        for s in tokenizer {
+            assert_eq!(s, NullFillState::NullEnd(1));
         }
     }
 
@@ -2736,6 +2726,21 @@ mod test {
             let e = a - b;
             assert!(e.abs() < 1e-3, "[{i}] {a} - {b} = {e} > 1e-3");
         }
+
+        let const_model = ConstantDeltaModel::fit(&data, &delta, 1.0, Some(&weights)).unwrap();
+        let constant_mse = const_model.mean_squared_error(&data[1..], &delta);
+        let reg_model = RegressionDeltaModel::from(betas.clone());
+        let reg_mse = reg_model.mean_squared_error(&data[1..], &delta);
+        assert!(reg_mse <= constant_mse, "{reg_mse} > {constant_mse}");
+
+        let mut model2 = RegressionDeltaModel::<f64>::from_f64_iter(betas.iter().copied());
+        let mut model3 = ConstantDeltaModel::<f64>::from_f64_iter(betas.iter().copied());
+        assert_eq!(model2.beta[0], model3.delta);
+
+        let betas2 = Float64Array::from(betas.clone());
+        model2 = RegressionDeltaModel::<f64>::from_float64_array(&betas2);
+        model3 = ConstantDeltaModel::<f64>::from_float64_array(&betas2);
+        assert_eq!(model2.beta[0], model3.delta);
     }
 
     #[test_log::test]
