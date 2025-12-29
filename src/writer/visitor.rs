@@ -523,8 +523,8 @@ impl ArrayBuilder for ParamValueBuilder {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.integer.finish_cloned()),
             Arc::new(self.float.finish_cloned()),
-            Arc::new(self.boolean.finish_cloned()),
             Arc::new(self.string.finish_cloned()),
+            Arc::new(self.boolean.finish_cloned()),
         ];
         Arc::new(StructArray::new(fields.into(), arrays, None))
     }
@@ -715,8 +715,14 @@ pub struct ScanWindowBuilder {
 impl VisitorBase for ScanWindowBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
-            field!("MS_1000501_scan_window_lower_limit_unit_MS_1000040", DataType::Float32),
-            field!("MS_1000500_scan_window_upper_limit_unit_MS_1000040", DataType::Float32),
+            field!(
+                "MS_1000501_scan_window_lower_limit_unit_MS_1000040",
+                DataType::Float32
+            ),
+            field!(
+                "MS_1000500_scan_window_upper_limit_unit_MS_1000040",
+                DataType::Float32
+            ),
         ];
         fields.extend(self.parameters.fields());
         fields
@@ -930,6 +936,7 @@ impl ArrayBuilder for ScanBuilder {
             self.ion_mobility_type.finish_cloned(),
             finish_cloned!(self.instrument_configuration_ref),
             self.parameters.finish_cloned(),
+            finish_cloned!(self.scan_windows),
         ];
         finish_cloned_extra!(self, arrays);
         Arc::new(StructArray::new(schema.into(), arrays, None))
@@ -992,8 +999,14 @@ impl VisitorBase for IsolationWindowBuilder {
     fn fields(&self) -> Vec<FieldRef> {
         let mut fields = vec![
             field!("MS_1000827_isolation_window_target_mz", DataType::Float32),
-            field!("MS_1000828_isolation_window_lower_offset", DataType::Float32),
-            field!("MS_1000829_isolation_window_upper_offset", DataType::Float32),
+            field!(
+                "MS_1000828_isolation_window_lower_offset",
+                DataType::Float32
+            ),
+            field!(
+                "MS_1000829_isolation_window_upper_offset",
+                DataType::Float32
+            ),
         ];
         fields.extend(self.parameters.fields());
         fields
@@ -1860,17 +1873,11 @@ pub struct SpectrumBuilder {
 
 impl SpectrumBuilder {
     pub fn add_visitors_from(&mut self, visitors: SpectrumFieldVisitors) {
-        self
-            .spectrum
-            .extend_extra_fields(visitors.spectrum_fields);
-        self
-            .scan
-            .extend_extra_fields(visitors.spectrum_scan_fields);
-        self
-            .selected_ion
+        self.spectrum.extend_extra_fields(visitors.spectrum_fields);
+        self.scan.extend_extra_fields(visitors.spectrum_scan_fields);
+        self.selected_ion
             .extend_extra_fields(visitors.spectrum_selected_ion_fields);
-        self
-            .precursor
+        self.precursor
             .extend_extra_activation_fields(visitors.spectrum_activation_fields);
     }
 
@@ -1953,6 +1960,44 @@ impl SpectrumBuilder {
     pub fn precursor_index_counter(&self) -> u64 {
         self.precursor_index_counter
     }
+
+    fn check_lengths_equal(&self) -> bool {
+        let n = self
+            .spectrum
+            .len()
+            .max(self.scan.len())
+            .max(self.precursor.len())
+            .max(self.selected_ion.len());
+        self.spectrum.len() == n
+            && self.scan.len() == n
+            && self.precursor.len() == n
+            && self.selected_ion.len() == n
+    }
+
+    pub fn equalize_lengths(&mut self) {
+        let n = self
+            .spectrum
+            .len()
+            .max(self.scan.len())
+            .max(self.precursor.len())
+            .max(self.selected_ion.len());
+
+        while n > self.spectrum.len() {
+            self.spectrum.append_null();
+        }
+
+        while n > self.scan.len() {
+            self.scan.append_null();
+        }
+
+        while n > self.precursor.len() {
+            self.precursor.append_null();
+        }
+
+        while n > self.selected_ion.len() {
+            self.selected_ion.append_null();
+        }
+    }
 }
 
 impl VisitorBase for SpectrumBuilder {
@@ -1981,30 +2026,9 @@ impl ArrayBuilder for SpectrumBuilder {
     }
 
     fn finish(&mut self) -> ArrayRef {
+        self.equalize_lengths();
+
         let fields = self.fields();
-        let n = self
-            .spectrum
-            .len()
-            .max(self.scan.len())
-            .max(self.precursor.len())
-            .max(self.selected_ion.len());
-
-        while n > self.spectrum.len() {
-            self.spectrum.append_null();
-        }
-
-        while n > self.scan.len() {
-            self.scan.append_null();
-        }
-
-        while n > self.precursor.len() {
-            self.precursor.append_null();
-        }
-
-        while n > self.selected_ion.len() {
-            self.selected_ion.append_null();
-        }
-
         let arrays = vec![
             self.spectrum.finish(),
             self.scan.finish(),
@@ -2016,7 +2040,15 @@ impl ArrayBuilder for SpectrumBuilder {
     }
 
     fn finish_cloned(&self) -> ArrayRef {
-        todo!()
+        let fields = self.fields();
+        assert!(self.check_lengths_equal(), "Verify all facets are of equal length, call `equalize_lengths` first!");
+        let arrays = vec![
+            self.spectrum.finish_cloned(),
+            self.scan.finish_cloned(),
+            self.precursor.finish_cloned(),
+            self.selected_ion.finish_cloned(),
+        ];
+        Arc::new(StructArray::new(fields.into(), arrays, None))
     }
 }
 
@@ -2294,9 +2326,61 @@ impl ArrayBuilder for ChromatogramBuilder {
 #[cfg(test)]
 mod test {
     use super::*;
-    use arrow::{array::AsArray, datatypes::Float64Type};
-    use mzdata;
+    use arrow::{
+        array::{Array, AsArray},
+        datatypes::Float64Type,
+    };
+    use mzdata::{self, spectrum::DataArray};
     use std::io;
+
+    #[test]
+    fn test_auxiliary_array_visitor() {
+        let mut dat = DataArray::from_name_type_size(
+            &mzdata::spectrum::ArrayType::BaselineArray,
+            mzdata::spectrum::BinaryDataArrayType::Float32,
+            20,
+        );
+        for _ in 0..10 {
+            dat.push(10.0f32).unwrap();
+        }
+        let aux = AuxiliaryArray::from_data_array(&dat).unwrap();
+        let mut builder = AuxiliaryArrayBuilder::default();
+        builder.append_value(&aux);
+        let arrays = builder.finish();
+        let arrays = arrays.as_struct();
+        assert_eq!(arrays.len(), 1);
+        let name = arrays.column_by_name("name").unwrap();
+        let name = name.as_struct();
+        let name = name
+            .column_by_name("name")
+            .unwrap()
+            .as_string::<i64>()
+            .value(0);
+        assert_eq!("baseline array", name);
+
+        let reader = crate::reader::visitor::AuxiliaryArrayVisitor::default();
+        let rebuilt = reader.visit(arrays);
+        let dup = &rebuilt[0];
+        assert_eq!(dup.dtype(), dat.dtype());
+        assert_eq!(dup.name(), dat.name());
+        assert_eq!(dup.raw_len(), dat.raw_len());
+    }
+
+    #[test]
+    fn test_custom_param_builder() {
+        let mut builder = CustomBuilderFromParameter::from_spec(mzdata::curie!(MS:999999), "testfoo", DataType::Float64);
+        builder.append_null();
+        builder.append_value(&vec![mzdata::Param::builder().curie(mzdata::curie!(MS:999999)).name("testfoo").value(100.0).build()]);
+        builder.finish();
+        let mut builder = CustomBuilderFromParameter::from_spec(mzdata::curie!(MS:999999), "testfoo", DataType::LargeUtf8);
+        builder.append_null();
+        builder.append_value(&vec![mzdata::Param::builder().curie(mzdata::curie!(MS:999999)).name("testfoo").value("bar").build()]);
+        builder.finish();
+        let mut builder = CustomBuilderFromParameter::from_spec(mzdata::curie!(MS:999999), "testfoo", DataType::Boolean);
+        builder.append_null();
+        builder.append_value(&vec![mzdata::Param::builder().curie(mzdata::curie!(MS:999999)).name("testfoo").value(true).build()]);
+        builder.finish();
+    }
 
     #[test]
     fn test_build_spectra() -> io::Result<()> {
@@ -2325,7 +2409,9 @@ mod test {
         );
 
         builder.append_value(&spec, None, None);
-        let arrays = builder.finish();
+        builder.equalize_lengths();
+        builder.append_null();
+        let arrays = builder.finish_cloned();
         let arrays = arrays.as_struct();
         let arrays = arrays.column_by_name("spectrum").unwrap();
         let arrays = arrays.as_struct();
@@ -2356,7 +2442,7 @@ mod test {
         let arr3 = arrays
             .column_by_name("MS_1000504_base_peak_mz_2_unit")
             .unwrap();
-        assert_eq!(arr3.len(), 1);
+        assert_eq!(arr3.len(), 2);
         Ok(())
     }
 }
