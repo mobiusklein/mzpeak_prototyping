@@ -1,6 +1,6 @@
 import logging
 
-from typing import Iterator, Sequence
+from typing import Any, Generator, Iterator, Sequence, NamedTuple
 from numbers import Number
 from enum import Enum, auto
 
@@ -17,6 +17,7 @@ logger.addHandler(logging.NullHandler())
 
 
 class DeltaModelBase:
+    """A base class for coordinate spacing inference models"""
     @classmethod
     def fit(
         cls,
@@ -113,8 +114,8 @@ class DeltaCurveRegressionModel(DeltaModelBase):
             one shorter than ``mz_array``. If not provided, will be computed from
             ``np.diff(mz_array)`` which has the expected alignment.
         weights : np.ndarray, optional
-            The weight to put on each point in the m/z array. Is expected to be **sqrt**
-            transformed. The intensity at the m/z value is an appropriate quantity.
+            The weight to put on each point in the m/z array. The intensity at the m/z value
+            is an appropriate quantity.
         threshold : float, optional
             The maximum m/z delta to consider, discarding any point whose delta value is larger
             than this number. Defaults to ``1.0``.
@@ -169,7 +170,19 @@ class DeltaCurveRegressionModel(DeltaModelBase):
         return f"{self.__class__.__name__}({self.beta})"
 
 
-def estimate_median_delta(data: Sequence[Number]):
+def estimate_median_delta(data: Sequence[Number]) -> tuple[Number, np.typing.NDArray]:
+    """
+    Find the 2nd median of ``np.diff(data)``.
+
+    This is a relatively crude spacing estimate for continuous profile data.
+
+    Returns
+    -------
+    :class:`Number`
+        The 2nd median of ``np.diff(data)``
+    :class:`np.ndarray`
+        The values from which the previous return values were estimated
+    """
     deltas = np.diff(data)
     median = np.median(deltas)
     deltas_below = deltas[deltas <= median]
@@ -178,6 +191,25 @@ def estimate_median_delta(data: Sequence[Number]):
 
 
 def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typing.NDArray":
+    """
+    Fill ``null`` values in ``data`` using the ``common_delta`` model or the locally estimated
+    median delta if sufficient data are available.
+
+    .. note::
+        If ``data`` is a :class:`pyarrow.Array`, this will use :meth:`pyarrow.Array.is_null` to
+        identify ``null``. Otherwise, it will assume :const:`np.nan` is the ``null`` value.
+
+    Parameters
+    ----------
+    data : :class:`pyarrow.Array`
+        The data array to fill nulls in with ``common_delta``
+    common_delta : :class:`DeltaModelBase` or :class:`Number`
+        The common spacing model, either specified as a model instance or as a single constant spacing term.
+
+    Returns
+    -------
+    np.ndarray
+    """
     if not isinstance(common_delta, DeltaModelBase):
         if isinstance(common_delta, Number):
             common_delta = ConstantDeltaModel(common_delta)
@@ -188,14 +220,14 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
         if not data.null_count:
             return np.asarray(data)
 
-        tokenizer = _NullTokenizer(data.is_null())
+        tokenizer = NullTokenizer(data.is_null())
     else:
         data = pa.array(data)
-        tokenizer = _NullTokenizer(data.is_nan())
+        tokenizer = NullTokenizer(data.is_nan())
     buffer = []
     n = len(data)
     for token in tokenizer:
-        if token[-1] == _NullFillState.NullStart:
+        if token[-1] == NullFillState.NullStart:
             (start, _, _) = token
             length = (n - start) - 1
             real_values = np.asarray(data.slice(start + 1, length))
@@ -207,7 +239,7 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
                 val0 = real_values[0]
                 buffer.append((val0 - local_delta,))
                 buffer.append(real_values)
-        elif token[-1] == _NullFillState.NullEnd:
+        elif token[-1] == NullFillState.NullEnd:
             start = 0
             (_, end, _) = token
             length = end
@@ -219,13 +251,17 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
                 local_delta, _ = estimate_median_delta(real_values)
                 buffer.append(real_values)
                 buffer.append((real_values[-1] + local_delta,))
-        elif token[-1] == _NullFillState.NullBounded:
+        elif token[-1] == NullFillState.NullBounded:
             (start, end, _) = token
             length = (end - start) - 1
             real_values = np.asarray(data.slice(start + 1, length))
             if length == 1:
                 val = real_values[0]
                 buffer.append((val - common_delta(val), val, val + common_delta(val)))
+            elif not length:
+                # The empty slice needs nothing, but this should not happen per
+                logger.warn("An empty slice was found: %r", token)
+                continue
             else:
                 local_delta, _ = estimate_median_delta(real_values)
                 val0 = real_values[0]
@@ -238,26 +274,52 @@ def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typ
     return np.concat(buffer)
 
 
-class _NullFillState(Enum):
+class NullFillState(Enum):
+    '''
+    Describes a span that is bounded by nulls on one or more sides.
+
+    Pairs with :class:`NullTokenizer`.
+
+    .. note::
+        This is an implementation detail of :func:`fill_nulls`. Do not use this directly.
+    '''
+
+    # Undefined state
     Unset = auto()
+    # The associated range is null at the start of the interval, as
+    # when we have a null pair that runs to the end of the array.
     NullStart = auto()
+    # The associated range is null at the end of the interval, as
+    # when we have an array that ends with null but started with a
+    # value.
     NullEnd = auto()
+    # The associated range has a null on both ends
     NullBounded = auto()
 
 
-class _NullTokenizer:
+class NullSpanStep(NamedTuple):
+    start: int | None
+    end: int | None
+    tag: NullFillState
+
+
+class NullTokenizer:
+    """
+    An :class:`Iterator` that finds (start, end, :class:`NullFillState`) triples.
+
+    .. note::
+        This is an implementation detail of :func:`fill_nulls`. Do not use this directly.
+    """
     array: Sequence[bool]
     _map: Sequence[int]
     _map_iter: Iterator[int]
     index: int
-    state: tuple[int, int | None, _NullFillState] | None
-    next_state: tuple[int, int | None, _NullFillState] | None
+    state: NullSpanStep
+    next_state: NullSpanStep
 
-    def __init__(self, array):
+    def __init__(self, array: Sequence[bool]):
         self.array = np.asarray(array)
         self._map = np.where(self.array)[0]
-        if len(self._map) == 1:
-            pass
         self._map_iter = iter(self._map)
         self.index = 0
         self.state = None
@@ -270,29 +332,43 @@ class _NullTokenizer:
         )
 
     def is_null(self) -> bool:
+        '''The current position is ``null``'''
         return self.array[self.index]
 
-    def _advance(self) -> bool:
+    def advance(self) -> bool:
+        '''
+        Advance the index one step, if possible.
+
+        Returns
+        -------
+        :class:`bool`
+            If the index was advanced or not.
+        '''
         if self.index < len(self.array) - 1:
             self.index += 1
             return True
         return False
 
     def next_is_null(self) -> bool:
+        '''If next position is ``null``'''
         return (self.index + 1 < len(self.array)) and self.array[self.index + 1]
 
     def previous_is_null(self) -> bool:
+        '''If the previous position is ``null``'''
         i = self.index - 1
         return i > 0 and self.array[i]
 
     def consume_null_run(self):
+        '''While :meth:`next_is_null` call :meth:`advance`'''
         while self.next_is_null():
-            self._advance()
+            self.advance()
 
     def has_null_run_at(self) -> bool:
+        '''Test if :meth:`is_null`, :meth:`previous_is_null`, and :meth:`next_is_null` are all :const:`True`'''
         return self.is_null() and self.previous_is_null() and self.next_is_null()
 
     def find_next_null(self):
+        '''Find the next index where this array was null.'''
         try:
             prev = self.index
             self.index = next(self._map_iter)
@@ -303,76 +379,117 @@ class _NullTokenizer:
             return
         except StopIteration:
             pass
-        self._advance()
+        # If we've exhausted the fast path iterator, fall back to this
+        self.advance()
         while self.index < len(self.array) and not self.is_null():
-            if not self._advance():
+            if not self.advance():
                 break
 
     def update_next_state(self):
+        '''
+        Fidly bit, figure out what the next state is, given the current state and the
+        next.
+        '''
         prev = self.index
+        # Move the iterator to the next null index
         self.find_next_null()
+        # How big a step did we take?
         diff = self.index - prev
         if diff == 0:
+            # We went nowhere, we must be at the end of the array and so our next state is undefined.
             self.next_state = None
+        # We advanced one position, that means the next value was null too. This must be a null pair.
         elif diff == 1:
+            # If this is amidst a null run, we'll behave differently.
             has_null_run = self.has_null_run_at()
             start = self.index
+            # Hop ahead again to prepare the next state.
             self.find_next_null()
+            # If we're in a null run, we must work our way out it.
             if has_null_run:
+                # Traverse the null run and try again.
                 self.consume_null_run()
                 logger.error(f"Had null run, {prev}-{self.index}")
                 return self.update_next_state()
             end = self.index
             if self.is_null():
-                self.next_state = (start, end, _NullFillState.NullBounded)
+                self.next_state = NullSpanStep(start, end, NullFillState.NullBounded)
             else:
-                self.next_state = (start, None, _NullFillState.NullStart)
+                self.next_state = NullSpanStep(start, None, NullFillState.NullStart)
+        # Or else we hit an unpaired null, a single null followed by a run of values that is
+        # not a terminal.
         else:
-            raise Exception(f"Trip run in null sequence at {prev}-{self.index}")
+            raise Exception(f"Malformed unpaired null sequence at {prev}-{self.index}")
 
     def _initialize_state(self):
         self.index = 0
         start_null = self.is_null()
         self.find_next_null()
         if not start_null:
-            self.state = (None, self.index, _NullFillState.NullEnd)
+            self.state = NullSpanStep(None, self.index, NullFillState.NullEnd)
             self.update_next_state()
         else:
             if self.is_null():
-                self.state = (0, self.index, _NullFillState.NullBounded)
+                self.state = NullSpanStep(0, self.index, NullFillState.NullBounded)
                 self.update_next_state()
             else:
-                self.state = (0, None, _NullFillState.NullStart)
+                self.state = NullSpanStep(0, None, NullFillState.NullStart)
 
         if len(self.array) < 3 and self.state is None:
             if start_null and not self.is_null():
-                self.state = (0, None, _NullFillState.NullStart)
+                self.state = NullSpanStep(0, None, NullFillState.NullStart)
             elif not start_null and self.is_null():
-                self.state = (0, None, _NullFillState.NullStart)
+                self.state = NullSpanStep(0, len(self.array), NullFillState.NullEnd)
 
-    def emit(self) -> tuple[int | None, int | None, _NullFillState] | None:
+    def emit(self) -> NullSpanStep | None:
         state = self.state
         self.state = self.next_state
         self.update_next_state()
         return state
 
-    def __iter__(self):
+    def __iter__(
+        self,
+    ) -> Generator[NullSpanStep, Any, None]:
         while val := self.emit():
             yield val
 
+    @classmethod
+    def from_pyarrow(cls, array: pa.Array) -> "NullTokenizer":
+        return cls(array.is_null())
 
-def find_zero_runs(arr: Sequence[Number]) -> Sequence[int]:
-    n = len(arr)
+
+def find_where_not_zero_run(data: Sequence[Number]) -> Sequence[int]:
+    """
+    Construct a list of positions that are not part of a zero run.
+
+    A zero run is any position *i* such that:
+        1. ``x[i] == 0``
+        2. ``(i == 0) or (x[i - 1] == 0)``
+        3. ``(i == (len(x) - 1)) or (x[i + 1] == 0)``
+
+    Parameters
+    ----------
+    data : :class:`Sequence` of :class:`Number`
+        The numerical data to traverse
+
+    Returns
+    -------
+    :class:`np.ndarray` of :class:`np.uintp`
+    """
+    n = len(data)
     n1 = n - 1
+
+    # Whether we are currently in a zero run
     was_zero = False
+
     acc = []
     i = 0
     while i < n:
-        v = arr[i]
+        v = data[i]
         if v is not None:
             if v == 0:
                 if (was_zero or (len(acc) == 0)) and (
-                    (i < n1 and arr[i + 1] == 0) or i == n1
+                    (i < n1 and data[i + 1] == 0) or i == n1
                 ):
                     pass
                 else:
@@ -385,7 +502,7 @@ def find_zero_runs(arr: Sequence[Number]) -> Sequence[int]:
             acc.append(i)
             was_zero = False
         i += 1
-    return np.array(acc)
+    return np.array(acc, dtype=np.uintp)
 
 
 def is_zero_pair_mask(data: Sequence[Number]) -> "np.typing.NDArray[np.bool_]":
@@ -556,7 +673,10 @@ def null_chunk_every(data: pa.Array, width: float) -> list[tuple[int, int]]:
                     while ((i + 1) < n) and (not data[i + 1].is_valid):
                         i += 1
                 # We don't want to create a chunk of length 1, especially not if it is a null
-                # point. If not, we have to relax the width requirement.
+                # point. If not, we have to relax the width requirement. Also, the way this cut
+                # is made ensures that if we do have a null pair, this will split one end evenly into
+                # one chunk and the other end into the next chunk. In the event of a null run, the final
+                # null will be part of the next chunk but all other nulls will go in the first chunk.
                 if i - offset > 1:
                     chunks.append((offset, i))
                     offset = i
