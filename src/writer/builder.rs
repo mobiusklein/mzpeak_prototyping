@@ -1,15 +1,14 @@
-use arrow::datatypes::{DataType, Field, FieldRef};
-use mzdata::{
-    params::Unit,
+use arrow::datatypes::FieldRef;
+use mzdata::
     spectrum::{
-        Activation, ArrayType, BinaryArrayMap, BinaryDataArrayType, ScanEvent, SelectedIon,
+        Activation, ScanEvent, SelectedIon,
         SpectrumDescription,
-    },
-};
+    }
+;
 
 use parquet::basic::{Compression, ZstdLevel};
 use std::{fmt::Debug, path::PathBuf};
-use std::{io::prelude::*, sync::Arc};
+use std::io::prelude::*;
 
 use crate::{
     BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::BufferOverrideTable, chunk_series::ChunkingStrategy, writer::{
@@ -299,66 +298,5 @@ impl MzPeakWriterBuilder {
 
     pub fn chromatogram_overrides(&self) -> BufferOverrideTable {
         self.chromatogram_arrays.overrides()
-    }
-
-    /// Add the default time (f64) and intensity (f32) arrays for chromatograms
-    pub fn add_default_chromatogram_fields(mut self) -> Self {
-        let time = BufferName::new(
-            BufferContext::Chromatogram,
-            ArrayType::TimeArray,
-            BinaryDataArrayType::Float64,
-        )
-        .with_unit(Unit::Minute);
-        let intensity = BufferName::new(
-            BufferContext::Chromatogram,
-            ArrayType::IntensityArray,
-            BinaryDataArrayType::Float32,
-        )
-        .with_unit(Unit::DetectorCounts);
-
-        let overrides = self.chromatogram_overrides();
-
-        if self.chunked_encoding.is_some() {
-            let mut proxy = BinaryArrayMap::new();
-            proxy.add(time.as_data_array(1));
-            proxy.add(intensity.as_data_array(1));
-            let use_chunked_encoding = self.chunked_encoding.unwrap();
-            let chunk = crate::chunk_series::ArrowArrayChunk::from_arrays(
-                0,
-                None,
-                time.clone(),
-                &proxy,
-                use_chunked_encoding,
-                &overrides,
-                false,
-                false,
-                None,
-            ).map(|s| {
-                s.0[0]
-                        .to_schema(
-                            BufferContext::Chromatogram,
-                            &[
-                                use_chunked_encoding,
-                                ChunkingStrategy::Basic { chunk_size: 50.0 },
-                            ],
-                            false,
-                        )
-                        .fields
-            }).unwrap();
-            for f in chunk.iter().cloned() {
-                self = self.add_chromatogram_field(f);
-            }
-            self
-        } else {
-            self = self
-                .add_chromatogram_field(overrides.map(&time).to_field())
-                .add_chromatogram_field(overrides.map(&intensity).to_field())
-                .add_chromatogram_field(Arc::new(Field::new(
-                    "chromatogram_index",
-                    DataType::UInt64,
-                    false,
-                )));
-            self
-        }
     }
 }
