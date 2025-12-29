@@ -1285,12 +1285,24 @@ impl<
             .spectrum_index_index
             .row_selection_is_not_null();
 
+        let metadata = self.metadata.spectrum_metadata_map.as_ref().unwrap();
+        let bp_col = match metadata.iter().find(|c| c.accession == Some(mzdata::curie!(MS:1000505))) {
+            Some(col) => col,
+            None => {
+                return Err(io::Error::other("column not found"))
+            }
+        };
+
+        let bp_path = bp_col.path.join(".");
+        let bp_col_name = bp_col.path.last().unwrap();
+
+
         let proj = ProjectionMask::columns(
             builder.parquet_schema(),
             [
                 "spectrum.time",
                 "spectrum.base_peak_intensity",
-                "spectrum.MS_1000505_base_peak_intensity_unit_MS_1000131",
+                bp_path.as_str(),
             ],
         );
 
@@ -1310,7 +1322,7 @@ impl<
                 .unwrap();
             let ints: &Float32Array = root
                 .column_by_name("base_peak_intensity")
-                .or_else(|| root.column_by_name("MS_1000505_base_peak_intensity"))
+                .or_else(|| root.column_by_name(bp_col_name.as_str()))
                 .unwrap()
                 .as_any()
                 .downcast_ref()
@@ -1403,6 +1415,18 @@ mod test {
         let tic = reader.encoded_tic()?;
         assert_eq!(tic.index(), 0);
         assert_eq!(tic.time()?.len(), 48);
+
+        let tic = reader.get_chromatogram(0).unwrap();
+        assert_eq!(tic.index(), 0);
+        assert_eq!(tic.time()?.len(), 48);
+
+        let tic = reader.get_chromatogram_by_id("TIC").unwrap();
+        assert_eq!(tic.index(), 0);
+        assert_eq!(tic.time()?.len(), 48);
+
+        let bpc = reader.encoded_bpc()?;
+        assert_eq!(bpc.index(), 1);
+        assert_eq!(bpc.time()?.len(), 48);
         Ok(())
     }
 
