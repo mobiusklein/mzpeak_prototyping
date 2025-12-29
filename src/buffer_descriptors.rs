@@ -164,7 +164,6 @@ impl Display for BufferPriority {
     }
 }
 
-
 /// Greater priority translates to a greater than relationship, i.e. `Primary > Secondary`
 /// for sorting convenience.
 impl Ord for BufferPriority {
@@ -370,98 +369,16 @@ impl BufferTransform {
 /// Convert a [`CURIE`] into an [`ArrayType`], or return `None` if the CURIE
 /// doesn't correspond to an [`ArrayType`] term.
 pub fn array_type_from_accession(accession: crate::param::CURIE) -> Option<ArrayType> {
-    let tp = if accession == ArrayType::MZArray.as_param_const().curie()? {
-        ArrayType::MZArray
-    } else if accession == ArrayType::IntensityArray.as_param_const().curie()? {
-        ArrayType::IntensityArray
-    } else if accession == ArrayType::ChargeArray.as_param_const().curie()? {
-        ArrayType::ChargeArray
-    } else if accession == ArrayType::SignalToNoiseArray.as_param_const().curie()? {
-        ArrayType::SignalToNoiseArray
-    } else if accession == ArrayType::TimeArray.as_param_const().curie()? {
-        ArrayType::TimeArray
-    } else if accession == ArrayType::WavelengthArray.as_param_const().curie()? {
-        ArrayType::WavelengthArray
-    } else if accession == ArrayType::IonMobilityArray.as_param_const().curie()? {
-        ArrayType::IonMobilityArray
-    } else if accession == ArrayType::MeanIonMobilityArray.as_param_const().curie()? {
-        ArrayType::MeanIonMobilityArray
-    } else if accession == ArrayType::MeanDriftTimeArray.as_param_const().curie()? {
-        ArrayType::MeanDriftTimeArray
-    } else if accession
-        == ArrayType::MeanInverseReducedIonMobilityArray
-            .as_param_const()
-            .curie()?
-    {
-        ArrayType::MeanInverseReducedIonMobilityArray
-    } else if accession == ArrayType::RawIonMobilityArray.as_param_const().curie()? {
-        ArrayType::RawIonMobilityArray
-    } else if accession == ArrayType::RawDriftTimeArray.as_param_const().curie()? {
-        ArrayType::RawDriftTimeArray
-    } else if accession
-        == ArrayType::RawInverseReducedIonMobilityArray
-            .as_param_const()
-            .curie()?
-    {
-        ArrayType::RawInverseReducedIonMobilityArray
-    } else if accession
-        == ArrayType::DeconvolutedIonMobilityArray
-            .as_param_const()
-            .curie()?
-    {
-        ArrayType::DeconvolutedIonMobilityArray
-    } else if accession
-        == ArrayType::DeconvolutedDriftTimeArray
-            .as_param_const()
-            .curie()?
-    {
-        ArrayType::DeconvolutedDriftTimeArray
-    } else if accession
-        == ArrayType::DeconvolutedInverseReducedIonMobilityArray
-            .as_param_const()
-            .curie()?
-    {
-        ArrayType::DeconvolutedInverseReducedIonMobilityArray
-    } else if accession == ArrayType::BaselineArray.as_param_const().curie()? {
-        ArrayType::BaselineArray
-    } else if accession == ArrayType::ResolutionArray.as_param_const().curie()? {
-        ArrayType::ResolutionArray
-    } else if accession == ArrayType::PressureArray.as_param_const().curie()? {
-        ArrayType::PressureArray
-    } else if accession == ArrayType::TemperatureArray.as_param_const().curie()? {
-        ArrayType::TemperatureArray
-    } else if accession == ArrayType::FlowRateArray.as_param_const().curie()? {
-        ArrayType::FlowRateArray
-    } else if accession
-        == (ArrayType::NonStandardDataArray {
-            name: "".to_string().into(),
-        })
-        .as_param(None)
-        .curie()?
-    {
-        ArrayType::NonStandardDataArray {
-            name: "".to_string().into(),
-        }
-    } else {
-        log::trace!("Failed to translate {accession} to an array type");
-        return None;
-    };
-    Some(tp)
+    ArrayType::from_accession(accession)
 }
 
+#[inline(always)]
 /// Convert a [`CURIE`] into an [`BinaryDataArrayType`], or return `None` if the CURIE
 /// doesn't correspond to an [`BinaryDataArrayType`] term.
 pub fn binary_datatype_from_accession(
     accession: crate::param::CURIE,
 ) -> Option<BinaryDataArrayType> {
-    match accession {
-        x if Some(x) == BinaryDataArrayType::Float32.curie() => Some(BinaryDataArrayType::Float32),
-        x if Some(x) == BinaryDataArrayType::Float64.curie() => Some(BinaryDataArrayType::Float64),
-        x if Some(x) == BinaryDataArrayType::Int32.curie() => Some(BinaryDataArrayType::Int32),
-        x if Some(x) == BinaryDataArrayType::Int64.curie() => Some(BinaryDataArrayType::Int64),
-        x if Some(x) == BinaryDataArrayType::ASCII.curie() => Some(BinaryDataArrayType::ASCII),
-        _ => None,
-    }
+    BinaryDataArrayType::from_accession(accession)
 }
 
 /// Compute an ordering constant for [`mzdata::spectrum::ArrayType`]
@@ -1188,7 +1105,6 @@ pub struct SerializedArrayIndex {
     pub entries: Vec<SerializedArrayIndexEntry>,
 }
 
-
 /// A mapping from one [`BufferName`] to another [`BufferName`] that is used to
 /// tell an [`ArrayBufferWriter`](crate::writer::ArrayBufferWriter) how to recast
 /// data types, units, and other metadata. Needed to enforce consistent array typing
@@ -1228,12 +1144,18 @@ impl BufferOverrideTable {
         for (_, val) in self.iter_mut() {
             for alt in buffer_names {
                 // {
-                if alt.array_type == val.array_type && alt.unit == val.unit && alt.dtype == val.dtype {
+                if alt.array_type == val.array_type
+                    && alt.unit == val.unit
+                    && alt.dtype == val.dtype
+                {
                     let before = val.buffer_priority;
                     if alt.buffer_priority != before {
                         let name_before = format!("{val:?}");
                         val.buffer_priority = val.buffer_priority.max(alt.buffer_priority);
-                        log::debug!("{name_before} priority before {before:?} to {:?}", val.buffer_priority);
+                        log::debug!(
+                            "{name_before} priority before {before:?} to {:?}",
+                            val.buffer_priority
+                        );
                     }
                 }
             }
@@ -1281,13 +1203,24 @@ impl FromIterator<(BufferName, BufferName)> for BufferOverrideTable {
 
 #[cfg(test)]
 mod test {
+    use itertools::Itertools;
+
     use super::*;
 
     #[test]
     fn test_priority_cmp() {
-        assert_eq!(None.max(Some(BufferPriority::Primary)), Some(BufferPriority::Primary));
-        assert_eq!(Some(BufferPriority::Primary).max(None), Some(BufferPriority::Primary));
-        assert_eq!(Some(BufferPriority::Secondary).max(Some(BufferPriority::Primary)), Some(BufferPriority::Primary));
+        assert_eq!(
+            None.max(Some(BufferPriority::Primary)),
+            Some(BufferPriority::Primary)
+        );
+        assert_eq!(
+            Some(BufferPriority::Primary).max(None),
+            Some(BufferPriority::Primary)
+        );
+        assert_eq!(
+            Some(BufferPriority::Secondary).max(Some(BufferPriority::Primary)),
+            Some(BufferPriority::Primary)
+        );
     }
 
     #[test]
@@ -1295,9 +1228,93 @@ mod test {
         let name = BufferName::new(
             BufferContext::Chromatogram,
             ArrayType::TimeArray,
-            BinaryDataArrayType::Float32
+            BinaryDataArrayType::Float32,
         )
-        .with_unit(Unit::Minute).to_string();
-        assert_eq!(name, "time_f32_min")
+        .with_unit(Unit::Minute)
+        .to_string();
+        assert_eq!(name, "time_f32_min");
+
+        let array_types = [
+            ArrayType::Unknown,
+            ArrayType::MZArray,
+            ArrayType::IntensityArray,
+            ArrayType::ChargeArray,
+            ArrayType::SignalToNoiseArray,
+            ArrayType::TimeArray,
+            ArrayType::WavelengthArray,
+            ArrayType::IonMobilityArray,
+            ArrayType::MeanIonMobilityArray,
+            ArrayType::RawIonMobilityArray,
+            ArrayType::DeconvolutedIonMobilityArray,
+            ArrayType::NonStandardDataArray {
+                name: "frobnication level".to_string().into(),
+            },
+            ArrayType::BaselineArray,
+            ArrayType::ResolutionArray,
+            ArrayType::RawInverseReducedIonMobilityArray,
+            ArrayType::MeanInverseReducedIonMobilityArray,
+            ArrayType::RawDriftTimeArray,
+            ArrayType::MeanDriftTimeArray,
+        ];
+
+        let units = [
+            Unit::Unknown,
+            Unit::MZ,
+            Unit::Mass,
+            Unit::PartsPerMillion,
+            Unit::Nanometer,
+            Unit::Minute,
+            Unit::Second,
+            Unit::Millisecond,
+            Unit::VoltSecondPerSquareCentimeter,
+            Unit::DetectorCounts,
+            Unit::PercentBasePeak,
+            Unit::PercentBasePeakTimes100,
+            Unit::AbsorbanceUnit,
+            Unit::CountsPerSecond,
+            Unit::Electronvolt,
+            Unit::Volt,
+            Unit::Celsius,
+            Unit::Kelvin,
+            Unit::Pascal,
+            Unit::Psi,
+            Unit::MicrolitersPerMinute,
+            Unit::Percent,
+            Unit::Dimensionless,
+        ];
+
+        let dtypes = [
+            BinaryDataArrayType::Float32,
+            BinaryDataArrayType::Float64,
+            BinaryDataArrayType::Int32,
+            BinaryDataArrayType::Int64,
+            BinaryDataArrayType::ASCII,
+        ];
+
+        let mut instances = Vec::new();
+
+        // Prove that all combinations work
+        for ((a, u), dtype) in array_types.iter().cartesian_product(units.iter()).cartesian_product(dtypes.iter()) {
+            let mut name = BufferName::new(
+                BufferContext::Spectrum,
+                a.clone(),
+                *dtype,
+            );
+            assert_ne!(name.to_string(), "");
+            let no_primary = name.clone();
+            instances.push(name.clone());
+
+            name = name.with_unit(*u);
+            assert_ne!(name.to_string(), "");
+            instances.push(name.clone());
+
+            name = name.with_priority(Some(BufferPriority::Primary));
+            assert_ne!(name.to_string(), "");
+            let primary = name.clone();
+            assert!(no_primary < primary, "{no_primary:?} > {primary:?}");
+            instances.push(name.clone());
+        }
+
+        instances.sort();
     }
 }
