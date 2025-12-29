@@ -7,14 +7,13 @@ dependencies = [
     "pyarrow",
     "pandas",
     "numpy",
-    "click",
     "pynumpress",
     "scipy",
     "psims",
-    "pynumpress",
 ]
 
 license = "Apache-2.0"
 
 [project.optional-dependencies]
 sql = ["datafusion"]
+cli = ["click"]

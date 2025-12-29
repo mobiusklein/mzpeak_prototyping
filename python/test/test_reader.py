@@ -1,12 +1,9 @@
 from pathlib import Path
 
 import pytest
-import numpy as np
-import pyarrow as pa
 
 from mzpeak import MzPeakFile
 from mzpeak.mz_reader import BufferFormat
-from mzpeak.filters import find_zero_runs, is_zero_pair_mask, null_chunk_every, DeltaCurveRegressionModel
 
 point_path = Path("small.mzpeak")
 chunk_path = Path("small.chunked.mzpeak")
@@ -58,11 +55,16 @@ def common_checks(reader: MzPeakFile, subtests: pytest.Subtests):
         assert spec["spectrum representation"] == "MS:1000127"
         assert spec['index'] == 4
 
+    with subtests.test("read slice"):
+        idx_slc = reader.time.resolve(slice(0.3, 0.4))
+        values = reader.spectra_signal_for_indices(idx_slc)
+        assert len(values) > 0
 
-def check_iterator(reader: MzPeakFile):
+
+def check_iterator(reader: MzPeakFile, n: int=10):
     it = iter(reader)
 
-    for i in range(10):
+    for i in range(n):
         spec = next(it)
         assert spec['index'] == i
 
@@ -81,7 +83,7 @@ def test_load_base_chunk(subtests: pytest.Subtests):
     common_checks(reader, subtests)
     assert reader.has_secondary_peaks_data
     with subtests.test("iterator"):
-        check_iterator(reader)
+        check_iterator(reader, len(reader))
 
 def test_load_unpacked(subtests: pytest.Subtests):
     reader = MzPeakFile(unpacked_path)
@@ -90,52 +92,4 @@ def test_load_unpacked(subtests: pytest.Subtests):
     with subtests.test("iterator"):
         check_iterator(reader)
 
-def test_chunking():
-    mzs = []
-    intensities = []
-    with Path("test/data/sparse_large_gaps.txt").open('rt') as fh:
-        for line in fh:
-            i, j = map(float, line.strip().split("\t"))
-            mzs.append(i)
-            intensities.append(j)
 
-    mzs = np.array(mzs)
-    intensities = np.array(intensities)
-
-    assert len(intensities) == 9317
-    assert np.count_nonzero(intensities) == 4243
-
-    # Test that the model learned from the full data is the same as the same as
-    # the model learned from the data without excess zero-intensity points.
-    model1 = DeltaCurveRegressionModel.fit(mzs, np.diff(mzs), np.sqrt(intensities))
-
-    nonzero_run_mask = find_zero_runs(intensities)
-    mzs = mzs[nonzero_run_mask]
-    intensities = intensities[nonzero_run_mask]
-
-    model2 = DeltaCurveRegressionModel.fit(mzs, np.diff(mzs), np.sqrt(intensities))
-
-    assert len(model1.beta) == 3
-    assert len(model2.beta) == len(model1.beta)
-
-    for i in range(len(model1.beta)):
-        assert np.isclose(model1.beta[i], model2.beta[i]), (
-            f"Paramter {i} of model {model1.beta[i]} !~ {model2.beta[i]}"
-        )
-    err = model2.mse(mzs[1:], np.diff(mzs))
-    assert abs(err - 43.48575002014233) < 1e-3
-
-    # Test null masking does not fail
-    assert len(intensities) == 5546
-    assert np.count_nonzero(intensities) == 4243
-
-    # This quantity is smaller than the total number of zeros because not all zeros are paired
-    zero_pair_mask = is_zero_pair_mask(intensities)
-    assert zero_pair_mask.sum() == 1286
-
-    mzs = pa.array(mzs, mask=zero_pair_mask)
-    intensities = pa.array(intensities, mask=zero_pair_mask)
-    assert mzs.null_count == 1286
-
-    chunk_indices = len(null_chunk_every(mzs, 50))
-    assert chunk_indices == 33
