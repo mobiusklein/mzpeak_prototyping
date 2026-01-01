@@ -18,7 +18,6 @@ use mzdata::spectrum::{
     ArrayType, BinaryArrayMap, BinaryDataArrayType, DataArray, bindata::ArrayRetrievalError,
 };
 
-
 use bytemuck::Pod;
 use mzpeaks::prelude::Span1D;
 use num_traits::{Float, NumCast, ToPrimitive};
@@ -91,20 +90,17 @@ impl ChunkingStrategy {
             ChunkingStrategy::Basic { chunk_size: _ } => vec![],
             ChunkingStrategy::Delta { chunk_size: _ } => vec![],
             ChunkingStrategy::NumpressLinear { chunk_size: _ } => {
-                let meta = BufferName::new(
-                    main_axis_name.context,
-                    ArrayType::nonstandard(format!("{}_numpress_bytes", main_axis_name)),
-                    main_axis_name.dtype,
-                )
-                .with_format(BufferFormat::Chunked)
-                .with_transform(Some(BufferTransform::NumpressLinear))
-                .as_field_metadata();
+                let name = main_axis_name
+                    .clone()
+                    .with_format(BufferFormat::ChunkedTransform)
+                    .with_transform(Some(BufferTransform::NumpressLinear));
+
                 let bytes = Field::new(
-                    format!("{}_numpress_bytes", main_axis_name),
+                    name.to_string(),
                     DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
                     true,
                 )
-                .with_metadata(meta);
+                .with_metadata(name.as_field_metadata());
                 vec![bytes]
             }
         }
@@ -191,7 +187,11 @@ impl ChunkingStrategy {
             .and_then(|v| v.map(|v| v.to_f64().unwrap_or(0.0)))
             .unwrap_or(0.0);
         match self {
-            ChunkingStrategy::Basic { chunk_size: _ } => (start, end, Arc::new(array.slice(1, array.len().saturating_sub(1)).clone())),
+            ChunkingStrategy::Basic { chunk_size: _ } => (
+                start,
+                end,
+                Arc::new(array.slice(1, array.len().saturating_sub(1)).clone()),
+            ),
             ChunkingStrategy::Delta { chunk_size: _ } => {
                 (start, end, Arc::new(null_delta_encode(array)))
             }
@@ -253,47 +253,45 @@ impl ChunkingStrategy {
         }
 
         match self {
-            ChunkingStrategy::Basic { chunk_size: _ } => {
-                match array.data_type() {
-                    DataType::Float32 => {
-                        let it = array.as_primitive::<Float32Type>();
-                        if it.null_count() > 0 {
-                            if let Some(model) = delta_model {
-                                let it = fill_nulls_for(it, model);
-                                accumulator.push(start_value as f32).unwrap();
-                                accumulator.extend(&it).unwrap();
-                            } else {
-                                accumulator.push(start_value as f32).unwrap();
-                                accumulator.extend(it.values()).unwrap();
-                            }
+            ChunkingStrategy::Basic { chunk_size: _ } => match array.data_type() {
+                DataType::Float32 => {
+                    let it = array.as_primitive::<Float32Type>();
+                    if it.null_count() > 0 {
+                        if let Some(model) = delta_model {
+                            let it = fill_nulls_for(it, model);
+                            accumulator.push(start_value as f32).unwrap();
+                            accumulator.extend(&it).unwrap();
                         } else {
                             accumulator.push(start_value as f32).unwrap();
                             accumulator.extend(it.values()).unwrap();
                         }
-                        it.len() + 1
+                    } else {
+                        accumulator.push(start_value as f32).unwrap();
+                        accumulator.extend(it.values()).unwrap();
                     }
-                    DataType::Float64 => {
-                        let it = array.as_primitive::<Float64Type>();
-                        if it.null_count() > 0 {
-                            if let Some(model) = delta_model {
-                                let it = fill_nulls_for(it, model);
-                                accumulator.push(start_value as f64).unwrap();
-                                accumulator.extend(&it).unwrap();
-                            } else {
-                                accumulator.push(start_value).unwrap();
-                                accumulator.extend(it.values()).unwrap();
-                            }
+                    it.len() + 1
+                }
+                DataType::Float64 => {
+                    let it = array.as_primitive::<Float64Type>();
+                    if it.null_count() > 0 {
+                        if let Some(model) = delta_model {
+                            let it = fill_nulls_for(it, model);
+                            accumulator.push(start_value as f64).unwrap();
+                            accumulator.extend(&it).unwrap();
                         } else {
                             accumulator.push(start_value).unwrap();
                             accumulator.extend(it.values()).unwrap();
                         }
-                        it.len() + 1
+                    } else {
+                        accumulator.push(start_value).unwrap();
+                        accumulator.extend(it.values()).unwrap();
                     }
-                    _ => panic!(
-                        "Data type {:?} is not supported by basic decoding",
-                        array.data_type()
-                    ),
+                    it.len() + 1
                 }
+                _ => panic!(
+                    "Data type {:?} is not supported by basic decoding",
+                    array.data_type()
+                ),
             },
             ChunkingStrategy::Delta { chunk_size: _ } => match array.data_type() {
                 DataType::Float32 => {
@@ -379,7 +377,9 @@ impl TryFrom<BufferTransform> for BufferTransformEncoder {
             BufferTransform::NumpressLinear => Ok(Self(value)),
             BufferTransform::NumpressSLOF => Ok(Self(value)),
             BufferTransform::NumpressPIC => Ok(Self(value)),
-            BufferTransform::NullInterpolate | BufferTransform::NullZero => Err(format!("{value:?} does not have an encoder"))
+            BufferTransform::NullInterpolate | BufferTransform::NullZero => {
+                Err(format!("{value:?} does not have an encoder"))
+            }
         }
     }
 }
@@ -388,31 +388,26 @@ impl BufferTransformEncoder {
     pub fn to_buffer_name(&self, buffer_name: &BufferName) -> BufferName {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
-            BufferTransform::NumpressSLOF => BufferName::new(
-                buffer_name.context,
-                ArrayType::nonstandard(format!("{}_numpress_slof_bytes", buffer_name)),
-                buffer_name.dtype,
-            )
-            .with_format(BufferFormat::ChunkedSecondary)
-            .with_transform(Some(self.0)),
-            BufferTransform::NumpressPIC => BufferName::new(
-                buffer_name.context,
-                ArrayType::nonstandard(format!("{}_numpress_pic_bytes", buffer_name)),
-                buffer_name.dtype,
-            )
-            .with_format(BufferFormat::ChunkedSecondary)
-            .with_transform(Some(self.0)),
-            _ => unimplemented!("{:?} does not have a buffer name", self.0)
+            BufferTransform::NumpressSLOF => buffer_name
+                .clone()
+                .with_format(BufferFormat::ChunkedTransform)
+                .with_transform(Some(self.0)),
+            BufferTransform::NumpressPIC => buffer_name
+                .clone()
+                .with_format(BufferFormat::ChunkedTransform)
+                .with_transform(Some(self.0)),
+            _ => unimplemented!("{:?} does not have a buffer name", self.0),
         }
     }
 
     pub fn to_field(&self, buffer_name: &BufferName) -> Field {
+        let buffer_name = self.to_buffer_name(buffer_name);
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressSLOF => {
                 let meta = buffer_name.as_field_metadata();
                 let bytes = Field::new(
-                    format!("{}_numpress_slof_bytes", buffer_name),
+                    buffer_name.to_string(),
                     DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
                     true,
                 )
@@ -422,14 +417,14 @@ impl BufferTransformEncoder {
             BufferTransform::NumpressPIC => {
                 let meta = buffer_name.as_field_metadata();
                 let bytes = Field::new(
-                    format!("{}_numpress_pic_bytes", buffer_name),
+                    buffer_name.to_string(),
                     DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
                     true,
                 )
                 .with_metadata(meta);
                 bytes
             }
-            _ => unimplemented!("{:?} does not have a field conversion", self.0)
+            _ => unimplemented!("{:?} does not have a field conversion", self.0),
         }
     }
 
@@ -504,7 +499,7 @@ impl BufferTransformEncoder {
                 let bytes = UInt8Array::from(bytes);
                 Arc::new(bytes)
             }
-            _ => unimplemented!("{:?} does not have an encoder", self.0)
+            _ => unimplemented!("{:?} does not have an encoder", self.0),
         }
     }
 }
@@ -552,7 +547,7 @@ impl BufferTransformDecoder {
                     _ => todo!(),
                 }
             }
-            _ => unimplemented!("{:?} does not have a decoder", self.0)
+            _ => unimplemented!("{:?} does not have a decoder", self.0),
         }
     }
 }
@@ -576,7 +571,9 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
             BufferTransform::NumpressLinear => Ok(Self(value)),
             BufferTransform::NumpressSLOF => Ok(Self(value)),
             BufferTransform::NumpressPIC => Ok(Self(value)),
-            BufferTransform::NullInterpolate | BufferTransform::NullZero => Err(format!("{value:?} does not have a decoder"))
+            BufferTransform::NullInterpolate | BufferTransform::NullZero => {
+                Err(format!("{value:?} does not have a decoder"))
+            }
         }
     }
 }
@@ -775,7 +772,8 @@ impl ArrowArrayChunk {
                     let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                         this_builder.field_builder(i).unwrap();
 
-                    if let Some(transform) = BufferTransformEncoder::try_from(buf_name.transform).ok()
+                    if let Some(transform) =
+                        BufferTransformEncoder::try_from(buf_name.transform).ok()
                     {
                         transform.visit_builder(
                             &buf_name,
@@ -995,8 +993,7 @@ impl ArrowArrayChunk {
                 // If the buffer isn't in the fields for this chunk schema, skip it and store an auxiliary array.
                 if !fields.find(&field_name).is_some() && buffer_name != main_axis {
                     log::debug!(
-                        "Skipping {:?} from {arr:?}, not in schema: {fields:?}",
-                        buffer_name.to_field().name()
+                        "Skipping {field_name} from {arr:?}, not in schema: {fields:?}",
                     );
                     auxiliary_arrays.push(AuxiliaryArray::from_data_array(arr)?);
                     continue;
@@ -1244,18 +1241,32 @@ mod test {
         assert_eq!(f.data_type().clone(), DataType::Float64);
 
         let f = rendered.column_by_name("mz_chunk_values").unwrap();
-        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(
+            f.data_type().clone(),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
         assert_eq!(f.len(), 36);
-        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        let k = f
+            .as_list::<i64>()
+            .iter()
+            .map(|a| a.unwrap().len())
+            .sum::<usize>();
         assert_eq!(k, 13553);
 
         let f = rendered.column_by_name("chunk_encoding").unwrap();
         assert_eq!(f.data_type().clone(), DataType::Utf8);
 
         let f = rendered.column_by_name("intensity_f32_dc").unwrap();
-        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(
+            f.data_type().clone(),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
         assert_eq!(f.len(), 36);
-        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        let k = f
+            .as_list::<i64>()
+            .iter()
+            .map(|a| a.unwrap().len())
+            .sum::<usize>();
         assert_eq!(k, 13589);
 
         Ok(())
@@ -1495,10 +1506,10 @@ mod test {
             ],
             false,
         );
-
+        eprintln!("{:?}", rendered.column_names());
         assert!(
             rendered
-                .column_by_name("mz_chunk_values_numpress_bytes")
+                .column_by_name("mz_numpress_linear_bytes")
                 .is_some()
         );
 
@@ -1508,20 +1519,24 @@ mod test {
                 .is_some()
         );
 
-        let starts = rendered.column_by_name("mz_chunk_start").unwrap().as_primitive::<Float64Type>();
-        let ends = rendered.column_by_name("mz_chunk_end").unwrap().as_primitive::<Float64Type>();
-        let bytes_array_list = rendered.column_by_name("mz_chunk_values_numpress_bytes").unwrap().as_list::<i64>();
+        let starts = rendered
+            .column_by_name("mz_chunk_start")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        let ends = rendered
+            .column_by_name("mz_chunk_end")
+            .unwrap()
+            .as_primitive::<Float64Type>();
+        let bytes_array_list = rendered
+            .column_by_name("mz_numpress_linear_bytes")
+            .unwrap()
+            .as_list::<i64>();
         let block = bytes_array_list.value(0);
         let strategy = ChunkingStrategy::NumpressLinear { chunk_size: 50.0 };
-        let mut acc = DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
+        let mut acc =
+            DataArray::from_name_and_type(&ArrayType::MZArray, BinaryDataArrayType::Float64);
 
-        strategy.decode_arrow(
-            &block,
-            starts.value(0),
-            ends.value(0),
-            &mut acc,
-            None
-        );
+        strategy.decode_arrow(&block, starts.value(0), ends.value(0), &mut acc, None);
 
         assert_eq!(acc.data_len().unwrap(), 1054);
         Ok(())
@@ -1568,21 +1583,34 @@ mod test {
         let f = rendered.column_by_name("mz_chunk_end").unwrap();
         assert_eq!(f.data_type().clone(), DataType::Float64);
         let f = rendered.column_by_name("mz_chunk_values").unwrap();
-        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(
+            f.data_type().clone(),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
 
         assert_eq!(f.len(), 36);
-        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        let k = f
+            .as_list::<i64>()
+            .iter()
+            .map(|a| a.unwrap().len())
+            .sum::<usize>();
         assert_eq!(k, 19877);
 
         let f = rendered.column_by_name("chunk_encoding").unwrap();
         assert_eq!(f.data_type().clone(), DataType::Utf8);
 
         let f = rendered.column_by_name("intensity_f32_dc").unwrap();
-        assert_eq!(f.data_type().clone(), DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true))));
+        assert_eq!(
+            f.data_type().clone(),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Float32, true)))
+        );
         assert_eq!(f.len(), 36);
-        let k = f.as_list::<i64>().iter().map(|a| a.unwrap().len()).sum::<usize>();
+        let k = f
+            .as_list::<i64>()
+            .iter()
+            .map(|a| a.unwrap().len())
+            .sum::<usize>();
         assert_eq!(k, 19913);
-
 
         Ok(())
     }

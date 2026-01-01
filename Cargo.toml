@@ -94,7 +94,7 @@ tokio-stream = "0.1.17"
 
 [dev-dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
-test-log = "0.2.19 "
+test-log = { version = "0.2.19", features = ["unstable"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread"]}
 serde_arrow = { version = "0.13.7", features = ["arrow-57"] }
 rstest = "0.26.1"

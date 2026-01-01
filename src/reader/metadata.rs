@@ -1,15 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
-    io,
-    sync::Arc,
+    collections::{HashMap, HashSet}, io, sync::Arc
 };
 
 use crate::{
     BufferContext,
     archive::{ArchiveReader, ArchiveSource},
-    buffer_descriptors::{ArrayIndex, SerializedArrayIndex},
+    buffer_descriptors::{ArrayIndex, SerializedArrayIndex, arrow_to_array_type},
     filter::RegressionDeltaModel,
-    param::MetadataColumn,
+    param::{MetadataColumn, MetadataColumnCollection},
     reader::{
         index::{QueryIndex, SpectrumPointIndex},
         utils::MaskSet,
@@ -30,7 +28,7 @@ use mzdata::{
     io::OffsetIndex,
     meta,
     prelude::*,
-    spectrum::{ChromatogramDescription, Precursor, ScanEvent, SelectedIon, SpectrumDescription},
+    spectrum::{ArrayType, BinaryDataArrayType, ChromatogramDescription, DataArray, Precursor, ScanEvent, SelectedIon, SpectrumDescription},
 };
 use mzpeaks::coordinate::SimpleInterval;
 use parquet::{
@@ -53,10 +51,10 @@ pub struct ReaderMetadata {
     pub(crate) mz_model_deltas: Vec<Option<Vec<f64>>>,
     pub(crate) spectrum_auxiliary_array_counts: Vec<u32>,
     pub(crate) chromatogram_auxiliary_array_counts: Vec<u32>,
-    pub(crate) spectrum_metadata_map: Option<Vec<MetadataColumn>>,
-    pub(crate) scan_metadata_map: Option<Vec<MetadataColumn>>,
-    pub(crate) selected_ion_metadata_map: Option<Vec<MetadataColumn>>,
-    pub(crate) chromatogram_metadata_map: Option<Vec<MetadataColumn>>,
+    pub(crate) spectrum_metadata_map: Option<MetadataColumnCollection>,
+    pub(crate) scan_metadata_map: Option<MetadataColumnCollection>,
+    pub(crate) selected_ion_metadata_map: Option<MetadataColumnCollection>,
+    pub(crate) chromatogram_metadata_map: Option<MetadataColumnCollection>,
     pub(crate) peak_indices: Option<PeakMetadata>,
 }
 
@@ -68,10 +66,10 @@ impl ReaderMetadata {
         spectrum_id_index: OffsetIndex,
         model_deltas: Vec<Option<Vec<f64>>>,
         spectrum_auxiliary_array_counts: Vec<u32>,
-        spectrum_metadata_map: Option<Vec<MetadataColumn>>,
-        scan_metadata_map: Option<Vec<MetadataColumn>>,
-        selected_ion_metadata_map: Option<Vec<MetadataColumn>>,
-        chromatogram_metadata_map: Option<Vec<MetadataColumn>>,
+        spectrum_metadata_map: Option<MetadataColumnCollection>,
+        scan_metadata_map: Option<MetadataColumnCollection>,
+        selected_ion_metadata_map: Option<MetadataColumnCollection>,
+        chromatogram_metadata_map: Option<MetadataColumnCollection>,
         peak_indices: Option<PeakMetadata>,
     ) -> Self {
         Self {
@@ -207,10 +205,10 @@ pub(crate) struct ParquetIndexExtractor {
     pub spectrum_array_indices: ArrayIndex,
     pub chromatogram_array_indices: ArrayIndex,
 
-    pub spectrum_metadata_mapping: Option<Vec<MetadataColumn>>,
-    pub scan_metadata_mapping: Option<Vec<MetadataColumn>>,
-    pub selected_ion_metadata_mapping: Option<Vec<MetadataColumn>>,
-    pub chromatogram_metadata_mapping: Option<Vec<MetadataColumn>>,
+    pub spectrum_metadata_mapping: Option<MetadataColumnCollection>,
+    pub scan_metadata_mapping: Option<MetadataColumnCollection>,
+    pub selected_ion_metadata_mapping: Option<MetadataColumnCollection>,
+    pub chromatogram_metadata_mapping: Option<MetadataColumnCollection>,
 
     pub query_index: QueryIndex,
 
@@ -1204,8 +1202,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
             &self
                 .metadata
                 .chromatogram_metadata_map
-                .as_ref()
-                .map(|v| v.as_slice())
+                .as_deref()
                 .unwrap_or(&EMPTY_FIELDS),
             0,
         );
@@ -1245,8 +1242,7 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
             &self
                 .metadata
                 .chromatogram_metadata_map
-                .as_ref()
-                .map(|v| v.as_slice())
+                .as_deref()
                 .unwrap_or(&EMPTY_FIELDS),
             0,
         );
@@ -1703,5 +1699,84 @@ impl DeltaModelDecoder {
 
     pub fn finish(self) -> Vec<Option<Vec<f64>>> {
         self.model_parameters
+    }
+}
+
+
+
+pub struct TimeEncodedSeriesDecoder {
+    time_array: Vec<u8>,
+    measure_array: Vec<u8>,
+    time_index: usize,
+    measure_index: usize,
+    dtype: DataType
+}
+
+impl TimeEncodedSeriesDecoder {
+    pub fn new(time_index: usize, measure_index: usize) -> Self {
+        Self { time_array: Vec::new(), measure_array: Vec::new(), time_index, measure_index, dtype: DataType::Null }
+    }
+
+    pub fn decode_batch(&mut self, batch: RecordBatch) {
+        let batch = batch.column(0).as_struct();
+        let time_array = batch.column(self.time_index);
+        if let Some(arr) = time_array.as_primitive_opt::<Float32Type>() {
+            for val in arr {
+                if let Some(val) = val {
+                    self.time_array.extend_from_slice(&(val as f64).to_le_bytes());
+                }
+            }
+        } else if let Some(arr) = time_array.as_primitive_opt::<Float64Type>() {
+            for val in arr {
+                if let Some(val) = val {
+                    self.time_array.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+
+        let measure_array = batch.column(self.measure_index);
+        self.dtype = measure_array.data_type().clone();
+
+        macro_rules! consume {
+            ($arr:ident) => {
+                for (i, val) in $arr.into_iter().enumerate() {
+                    if time_array.is_null(i) {
+                        continue
+                    }
+                    if let Some(val) = val {
+                        self.measure_array.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+            };
+        }
+
+        macro_rules! consume_measurement {
+            ($($dtype:ty)+) => {
+                $(
+                    if let Some(arr) = measure_array.as_primitive_opt::<$dtype>() {
+                        consume!(arr);
+                        return
+                    }
+                )+
+            };
+        }
+
+        consume_measurement!(
+            Float32Type
+            Float64Type
+            Int32Type
+            Int64Type
+            UInt32Type
+            UInt64Type
+        );
+
+        unimplemented!("Cannot decode {:?}", self.dtype);
+    }
+
+    pub fn finish(self, output_array_type: &ArrayType) -> (DataArray, DataArray) {
+        let time_array = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, self.time_array);
+        let dtype = arrow_to_array_type(&self.dtype).unwrap();
+        let measure_array = DataArray::wrap(output_array_type, dtype, self.measure_array);
+        (time_array, measure_array)
     }
 }

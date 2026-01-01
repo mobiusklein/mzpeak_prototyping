@@ -48,7 +48,7 @@ pub use array_buffer::{
     ArrayBufferWriter, ArrayBufferWriterVariants, ArrayBuffersBuilder, ChunkBuffers, PointBuffers,
 };
 pub use base::AbstractMzPeakWriter;
-pub use builder::{MzPeakWriterBuilder, WriteBatchConfig};
+pub use builder::{MzPeakWriterBuilder, WriteBatchConfig, ArrayConversionHelper};
 pub use split::UnpackedMzPeakWriterType;
 
 pub use visitor::{
@@ -1028,6 +1028,65 @@ mod test {
         drop(writer);
 
         let mut new_reader = MzPeakReader::new(arc.path())?;
+        assert_eq!(reader.len(), new_reader.len());
+        reader.reset();
+        new_reader.reset();
+        for (a, b)  in reader.iter().zip(new_reader.iter()) {
+            assert_eq!(a.id(), b.id());
+        }
+        Ok(())
+    }
+
+    #[test_log::test]
+    #[test_log(default_log_filter = "debug")]
+    fn test_array_building_numpress() -> io::Result<()> {
+        let mut reader = mzdata::MZReader::open_path("small.mzML")?;
+        let mut builder = MzPeakWriter::<fs::File>::builder();
+
+        let spectrum_overrides = ArrayConversionHelper::new(false, true, false, true, true).create_type_overrides();
+        for (k, v) in spectrum_overrides.iter() {
+            builder = builder.add_spectrum_array_override(k.clone(), v.clone())
+        }
+        builder = builder
+            .shuffle_mz(true)
+            .chunked_encoding(Some(ChunkingStrategy::NumpressLinear { chunk_size: 50.0 }))
+            .chromatogram_chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }))
+            .sample_array_types_from_spectrum_source(&mut reader)
+            .sample_array_types_from_chromatograms(reader.iter_chromatograms());
+
+        let arc = tempfile::NamedTempFile::with_suffix("_test_chunk_numpress.mzpeak")?;
+        let source = arc.as_file().try_clone()?;
+        let mut writer = builder.build(source, true);
+        writer.copy_metadata_from(&reader);
+        let overrides = writer.spectrum_buffers.overrides();
+        assert!(overrides.iter().any(|(_, v)| {
+            v.buffer_priority
+                .is_some_and(|v| matches!(v, BufferPriority::Primary))
+        }));
+
+        assert!(writer.spectrum_buffers.fields().iter().any(|f| f.name() == "mz_chunk_values"));
+        assert!(writer.spectrum_buffers.fields().iter().any(|f| f.name() == "mz_numpress_linear_bytes"));
+        assert!(writer.spectrum_buffers.fields().iter().any(|f| f.name() == "intensity_numpress_slof_bytes"));
+
+        writer.write_all_owned(reader.iter())?;
+        for chrom in reader.iter_chromatograms() {
+            writer.write_chromatogram(&chrom)?;
+        }
+        drop(writer);
+
+        let mut new_reader = MzPeakReader::new(arc.path())?;
+        let array_indices = new_reader.metadata.spectrum_array_indices();
+        for arr in array_indices.iter() {
+            if arr.path.ends_with("mz_numpress_linear_bytes") {
+                assert!(matches!(arr.buffer_format, BufferFormat::ChunkedTransform));
+            }
+            else if arr.path.ends_with("intensity_numpress_slof_bytes") {
+                assert!(matches!(arr.buffer_format, BufferFormat::ChunkedTransform));
+            }
+            else if arr.path.ends_with("mz_chunk_values") {
+                assert!(matches!(arr.buffer_format, BufferFormat::Chunked));
+            }
+        }
         assert_eq!(reader.len(), new_reader.len());
         reader.reset();
         new_reader.reset();

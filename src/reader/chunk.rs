@@ -217,6 +217,9 @@ trait ChunkQuerySource {
                 BufferFormat::Chunked => values_entry = Some(entry),
                 BufferFormat::ChunkEncoding => {}
                 BufferFormat::ChunkedSecondary => {}
+                BufferFormat::ChunkedTransform => {
+                    // TODO: Add this to the API
+                }
             }
         }
 
@@ -530,6 +533,23 @@ impl<'a> BufferNameCache<'a> {
         self.buffer_name_cache.insert(field_name.to_string(), name.clone());
         name
     }
+
+    fn get_transform(&mut self, field_name: &str, buffer_name: &BufferName) -> Option<Arc<BufferName>> {
+        for array_index_entry in self.array_indices.iter() {
+            if matches!(array_index_entry.buffer_format, BufferFormat::Chunked | BufferFormat::ChunkedSecondary) {
+                let qname = array_index_entry.as_buffer_name();
+                if qname.array_type == buffer_name.array_type
+                    && qname.dtype == buffer_name.dtype
+                    && qname.unit == buffer_name.unit
+                    && qname.data_processing_id == buffer_name.data_processing_id {
+                        let qname = Arc::new(qname);
+                        log::trace!("Mapping {field_name} to parent {qname}");
+                        return Some(qname)
+                }
+            }
+        }
+        return None
+    }
 }
 
 
@@ -721,6 +741,13 @@ impl<'a> ChunkDecoder<'a> {
                             BufferFormat::ChunkEncoding => {
                                 chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec()
                             }
+                            BufferFormat::ChunkedTransform => {
+                                if self.buffer_name_cache.get_transform(f.name(), &name).is_some_and(|qname| matches!(qname.buffer_format, BufferFormat::Chunked)) {
+                                    self.main_axis_buffers.push((name, arr.clone()));
+                                } else {
+                                    self.buffers.entry(name).or_default().push(arr.clone());
+                                }
+                            },
                         }
                     } else {
                         log::warn!("{f:?} failed to map to a chunk buffer");
@@ -921,6 +948,13 @@ impl<'a> ChunkScanDecoder<'a> {
                             BufferFormat::ChunkEncoding => {
                                 chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec()
                             }
+                            BufferFormat::ChunkedTransform => {
+                                if self.buffer_name_cache.get_transform(f.name(), &name).is_some_and(|qname| matches!(qname.buffer_format, BufferFormat::Chunked)) {
+                                    self.main_axis_buffers.push((name, arr.clone()));
+                                } else {
+                                    self.buffers.entry(name).or_default().push(arr.clone());
+                                }
+                            },
                         }
                     } else {
                         log::warn!("{f:?} failed to map to a chunk buffer");

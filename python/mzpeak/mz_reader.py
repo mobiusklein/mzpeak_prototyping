@@ -38,6 +38,7 @@ class BufferFormat(Enum):
     ChunkValues = 4
     ChunkEncoding = 5
     SecondaryChunk = 6
+    ChunkTransform = 7
 
     Chunk = ChunkValues
 
@@ -282,8 +283,9 @@ class _BatchIterator:
     ):
         self.it = it
         self.batch = None
-        self.current_index = current_index
         self.index_column = index_column
+        # Set up index precondition for _read_next_chunk first-time initialization step
+        self.current_index = None
         self._read_next_chunk(update_index=True)
         if current_index is not None:
             self.seek(current_index)
@@ -639,7 +641,7 @@ class _ChunkBatchCleaner:
             ):
                 n += len(chunk[f"{self.axis_prefix}_chunk_values"]) + 1
             elif encoding in (NUMPRESS_LINEAR, NUMPRESS_LINEAR_CURIE):
-                raw = chunk[f"{self.axis_prefix}_numpress_bytes"].as_py()
+                raw = chunk[f"{self.axis_prefix}_numpress_linear_bytes"].as_py()
                 part = pynumpress.decode_linear(raw)
                 n += len(part)
                 numpress_chunks.append(part)
@@ -688,10 +690,12 @@ class _ChunkBatchCleaner:
             index_val = chunk[self.index_name].as_py()
 
             delta_model_ = self.delta_model
-            if self.has_multiple_delta_models and index_val in self.delta_model:
-                delta_model_ = self.delta_model[index_val]
-            else:
-                delta_model_ = None
+            if self.has_multiple_delta_models:
+                if index_val in self.delta_model:
+                    delta_model_ = self.delta_model[index_val]
+                else:
+                    delta_model_ = None
+
 
             # Delta encoding
             if encoding in (DELTA_ENCODING, DELTA_ENCODING_CURIE):

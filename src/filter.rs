@@ -20,8 +20,13 @@ use num_traits::{Float, NumCast, One, Zero};
 /// If `sort` is provided, the deltas will be sorted for convenience of computing
 /// the median value.
 pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) -> Vec<T> {
-    let mut last = None;
     let mut deltas = Vec::new();
+    collect_deltas_in(iter, sort, &mut deltas);
+    deltas
+}
+
+fn collect_deltas_in<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool, deltas: &mut Vec<T>) {
+    let mut last = None;
     for v in iter {
         if let Some(last) = last {
             let delta = v - last;
@@ -32,7 +37,6 @@ pub fn collect_deltas<T: Float, I: IntoIterator<Item = T>>(iter: I, sort: bool) 
     if sort {
         deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
     }
-    deltas
 }
 
 /// Compute the median value of a sorted slice
@@ -56,20 +60,43 @@ pub fn median<T: Float>(deltas: &[T]) -> Option<T> {
 /// - `median_of`: The median-below-median of the delta values.
 /// - `deltas`: All delta values from `iter`
 pub fn estimate_median_delta<T: Float, I: IntoIterator<Item = T>>(iter: I) -> (T, Vec<T>) {
-    let deltas = collect_deltas(iter, true);
-    if deltas.is_empty() {
-        log::warn!("Empty deltas array in estimate_median_delta");
-        return (T::zero(), deltas);
-    }
-    let median_of = median(&deltas).unwrap_or_else(T::zero);
-    let delta_below: Vec<T> = deltas.iter().copied().filter(|v| *v <= median_of).collect();
-    if delta_below.is_empty() {
-        log::warn!("Empty delta_below array in estimate_median_delta");
-        return (median_of, deltas);
-    }
-    let median_of = median(&delta_below).unwrap_or_else(T::zero);
-    (median_of, deltas)
+    let mut this = MedianDeltaEstimator::default();
+    let m = this.estimate_median_delta(iter);
+    (m, this.deltas)
 }
+
+
+#[derive(Debug)]
+struct MedianDeltaEstimator<T: Float> {
+    deltas: Vec<T>,
+}
+
+impl<T: Float> Default for MedianDeltaEstimator<T> {
+    fn default() -> Self {
+        Self { deltas: Vec::new() }
+    }
+}
+
+impl<T: Float> MedianDeltaEstimator<T> {
+    pub fn estimate_median_delta<I: IntoIterator<Item=T>>(&mut self, iter: I) -> T {
+        self.deltas.clear();
+        collect_deltas_in(iter, true, &mut self.deltas);
+        if self.deltas.is_empty() {
+            log::warn!("Empty deltas array in estimate_median_delta");
+            return T::zero();
+        }
+        let median_of = median(&self.deltas).unwrap_or_else(T::zero);
+
+        self.deltas.retain(|v| *v <= median_of);
+        if self.deltas.is_empty() {
+            log::warn!("Empty delta_below array in estimate_median_delta");
+            median_of
+        } else {
+            median(&self.deltas).unwrap_or_else(T::zero)
+        }
+    }
+}
+
 
 /// Fit a polynomial linear regression model.
 ///
@@ -519,16 +546,14 @@ where
     T::Native: Float + AddAssign,
 {
     let Some(nulls) = array.nulls() else {
-        let mut buffer: Vec<T::Native> = Vec::with_capacity(array.len());
-        for i in 0..array.len() {
-            buffer.push(array.value(i));
-        }
-        return buffer;
+        return array.values().to_vec()
     };
 
     let it = NullTokenizer::new(nulls);
     let n = array.len();
     let mut buffer: Vec<T::Native> = Vec::with_capacity(n);
+
+    let mut median_estimator = MedianDeltaEstimator::default();
 
     for null_span in it {
         match null_span {
@@ -541,7 +566,7 @@ where
                     buffer.push(val - delta_at);
                     buffer.push(val);
                 } else {
-                    let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
+                    let local_delta = median_estimator.estimate_median_delta(real_values.iter().flatten());
                     let val0 = real_values.value(0);
                     buffer.push(val0 - local_delta);
                     buffer.extend(real_values.iter().flatten());
@@ -557,7 +582,7 @@ where
                     let delta_at = common_delta.predict(val);
                     buffer.push(val + delta_at);
                 } else {
-                    let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
+                    let local_delta = median_estimator.estimate_median_delta(real_values.iter().flatten());
                     buffer.extend(real_values.iter().flatten());
                     buffer.push(*buffer.last().unwrap() + local_delta);
                 }
@@ -572,7 +597,7 @@ where
                     buffer.push(val);
                     buffer.push(val + delta_at);
                 } else if length > 1 {
-                    let (local_delta, _) = estimate_median_delta(real_values.iter().flatten());
+                    let local_delta = median_estimator.estimate_median_delta(real_values.iter().flatten());
                     let val0 = real_values.value(0);
                     buffer.push(val0 - local_delta);
                     buffer.extend(real_values.iter().flatten());
@@ -624,21 +649,24 @@ where
 /// This kernel is only implemented for 32-bit and 64-bit numeric types.
 pub fn find_where_not_zeros(array: &impl Array) -> Option<Vec<u64>> {
     let array_ = array.as_any();
-    if let Some(array) = array_.downcast_ref::<Float32Array>() {
-        Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array_.downcast_ref::<Float64Array>() {
-        Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array_.downcast_ref::<Int32Array>() {
-        Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array_.downcast_ref::<Int64Array>() {
-        Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array_.downcast_ref::<UInt32Array>() {
-        Some(_skip_zero_runs_gen(array))
-    } else if let Some(array) = array_.downcast_ref::<UInt64Array>() {
-        Some(_skip_zero_runs_gen(array))
-    } else {
-        None
+    macro_rules! downcast_run {
+        ($($tp:ty)+) => {
+            $(
+                if let Some(array) = array_.downcast_ref::<$tp>() {
+                    return Some(_skip_zero_runs_gen(array))
+                }
+            )+
+        };
     }
+    downcast_run!(
+        Float32Array
+        Float64Array
+        Int32Array
+        Int64Array
+        UInt32Array
+        UInt64Array
+    );
+    return None;
 }
 
 pub fn drop_where_column_is_zero_run(

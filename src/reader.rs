@@ -5,11 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow::array::{Array, AsArray, Float32Array, UInt64Array};
+use arrow::array::{AsArray, UInt64Array};
 
 use identity_hash::BuildIdentityHasher;
 use mzdata::{
-    curie,
     io::{DetailLevel, OffsetIndex},
     meta::MSDataFileMetadata,
     params::Unit,
@@ -44,10 +43,10 @@ use crate::{
             AuxiliaryArrayCountDecoder, ChromatogramMetadataDecoder,
             ChromatogramMetadataQuerySource, ChromatogramMetadataReader, DeltaModelDecoder,
             SpectrumMetadataDecoder, SpectrumMetadataQuerySource, SpectrumMetadataReader,
-            TimeIndexDecoder,
+            TimeEncodedSeriesDecoder, TimeIndexDecoder,
         },
         point::PointDataReader,
-        visitor::{AuxiliaryArrayVisitor, parse_column_to_curie},
+        visitor::AuxiliaryArrayVisitor,
     },
 };
 
@@ -1189,14 +1188,11 @@ impl<
             .spectrum_index_index
             .row_selection_is_not_null();
 
-        let mut target_col = None;
-        for col in builder.parquet_schema().columns() {
-            if let Some(parsed) = parse_column_to_curie(col.name()) {
-                if parsed.accession == Some(curie!(MS:1000285)) {
-                    target_col = Some(col.clone());
-                }
-            }
-        }
+        let target_col = self
+            .metadata
+            .spectrum_metadata_map
+            .as_ref()
+            .and_then(|v| v.find(mzdata::curie!(MS:1000285)));
 
         let mut targets = vec![
             "spectrum.time".to_string(),
@@ -1204,7 +1200,7 @@ impl<
         ];
 
         if let Some(col) = target_col.as_ref() {
-            targets.push(col.path().string())
+            targets.push(col.path.join("."))
         }
 
         let proj =
@@ -1214,39 +1210,14 @@ impl<
             .with_projection(proj)
             .with_row_selection(rows)
             .build()?;
-        let mut time_array: Vec<u8> = Vec::new();
-        let mut intensity_array: Vec<u8> = Vec::new();
+
+        let mut decoder = TimeEncodedSeriesDecoder::new(0, 1);
+
         for batch in reader.flatten() {
-            let root = batch.column(0).as_struct();
-            let times: &Float32Array = root
-                .column_by_name("time")
-                .unwrap()
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-            let ints: &Float32Array = root
-                .column_by_name("total_ion_current")
-                .or_else(|| {
-                    root.column_by_name(
-                        target_col
-                            .as_ref()
-                            .map(|v| v.name())
-                            .unwrap(),
-                    )
-                })
-                .unwrap()
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-            for time in times {
-                let time = time.unwrap() as f64;
-                time_array.extend_from_slice(&time.to_le_bytes());
-            }
-            for int in ints {
-                let int = int.unwrap();
-                intensity_array.extend_from_slice(&int.to_le_bytes());
-            }
+            decoder.decode_batch(batch);
         }
+
+        let (mut time_array, mut intensity_array) = decoder.finish(&ArrayType::IntensityArray);
 
         let descr = ChromatogramDescription {
             id: "TIC".into(),
@@ -1257,19 +1228,8 @@ impl<
         };
 
         let mut arrays = BinaryArrayMap::new();
-        let mut time_array = DataArray::wrap(
-            &ArrayType::TimeArray,
-            mzdata::spectrum::BinaryDataArrayType::Float64,
-            time_array,
-        );
         time_array.unit = Unit::Minute;
         arrays.add(time_array);
-
-        let mut intensity_array = DataArray::wrap(
-            &ArrayType::IntensityArray,
-            mzdata::spectrum::BinaryDataArrayType::Float32,
-            intensity_array,
-        );
         intensity_array.unit = Unit::DetectorCounts;
         arrays.add(intensity_array);
 
@@ -1286,16 +1246,12 @@ impl<
             .row_selection_is_not_null();
 
         let metadata = self.metadata.spectrum_metadata_map.as_ref().unwrap();
-        let bp_col = match metadata.iter().find(|c| c.accession == Some(mzdata::curie!(MS:1000505))) {
+        let bp_col = match metadata.find(mzdata::curie!(MS:1000505)) {
             Some(col) => col,
-            None => {
-                return Err(io::Error::other("column not found"))
-            }
+            None => return Err(io::Error::other("column not found")),
         };
 
         let bp_path = bp_col.path.join(".");
-        let bp_col_name = bp_col.path.last().unwrap();
-
 
         let proj = ProjectionMask::columns(
             builder.parquet_schema(),
@@ -1310,32 +1266,14 @@ impl<
             .with_projection(proj)
             .with_row_selection(rows)
             .build()?;
-        let mut time_array: Vec<u8> = Vec::new();
-        let mut intensity_array: Vec<u8> = Vec::new();
+
+        let mut decoder = TimeEncodedSeriesDecoder::new(0, 1);
+
         for batch in reader.flatten() {
-            let root = batch.column(0).as_struct();
-            let times: &Float32Array = root
-                .column_by_name("time")
-                .unwrap()
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-            let ints: &Float32Array = root
-                .column_by_name("base_peak_intensity")
-                .or_else(|| root.column_by_name(bp_col_name.as_str()))
-                .unwrap()
-                .as_any()
-                .downcast_ref()
-                .unwrap();
-            for time in times {
-                let time = time.unwrap() as f64;
-                time_array.extend_from_slice(&time.to_le_bytes());
-            }
-            for int in ints {
-                let int = int.unwrap();
-                intensity_array.extend_from_slice(&int.to_le_bytes());
-            }
+            decoder.decode_batch(batch);
         }
+
+        let (mut time_array, mut intensity_array) = decoder.finish(&ArrayType::IntensityArray);
 
         let descr = ChromatogramDescription {
             id: "BPC".into(),
@@ -1346,19 +1284,9 @@ impl<
         };
 
         let mut arrays = BinaryArrayMap::new();
-        let mut time_array = DataArray::wrap(
-            &ArrayType::TimeArray,
-            mzdata::spectrum::BinaryDataArrayType::Float64,
-            time_array,
-        );
         time_array.unit = Unit::Minute;
         arrays.add(time_array);
 
-        let mut intensity_array = DataArray::wrap(
-            &ArrayType::IntensityArray,
-            mzdata::spectrum::BinaryDataArrayType::Float32,
-            intensity_array,
-        );
         intensity_array.unit = Unit::DetectorCounts;
         arrays.add(intensity_array);
 
@@ -1390,6 +1318,7 @@ mod test {
     #[case::packed("small.mzpeak")]
     #[case::unpacked("small.unpacked.mzpeak")]
     #[case::chunked("small.chunked.mzpeak")]
+    #[case::numpress("small.numpress.mzpeak")]
     fn test_read_spectrum(#[case] path: &str) -> io::Result<()> {
         let mut reader = MzPeakReader::new(path)?;
         let descr = reader.get_spectrum(0).unwrap();
@@ -1453,7 +1382,10 @@ mod test {
         let out = reader.load_all_spectrum_metadata_impl()?;
         assert_eq!(out.len(), 48);
         assert!(out.iter().any(|p| !p.precursor.is_empty()));
-        let mut decoder = TimeIndexDecoder::new(SimpleInterval::new(0.0, 1.0), Some(SimpleInterval::new(0, 1)));
+        let mut decoder = TimeIndexDecoder::new(
+            SimpleInterval::new(0.0, 1.0),
+            Some(SimpleInterval::new(0, 1)),
+        );
         decoder.from_descriptions(&out);
         let (time_index, mask) = decoder.finish();
         assert!(time_index.len() > 5);
@@ -1494,6 +1426,22 @@ mod test {
         assert!(k > 0);
         // Drops null points
         assert_eq!(k, 659);
+
+        let (it, _) = reader.extract_peaks(
+            (0.3..0.4).into(),
+            Some((800.0..820.0).into()),
+            None,
+            Some((2u8..10).into()),
+        )?;
+        k = 0;
+        for batch in it.flatten() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        // All MSn spectra are centroids, no null padding
+        assert_eq!(k, 96);
         Ok(())
     }
 
@@ -1513,6 +1461,22 @@ mod test {
         assert!(k > 0);
         // Does not drop null points
         assert_eq!(k, 785);
+
+        let (it, _) = reader.extract_peaks(
+            (0.3..0.4).into(),
+            Some((800.0..820.0).into()),
+            None,
+            Some((2u8..10).into()),
+        )?;
+        k = 0;
+        for batch in it.flatten() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        // All MSn spectra are centroids, no null padding
+        assert_eq!(k, 96);
         Ok(())
     }
 
@@ -1520,7 +1484,9 @@ mod test {
     fn test_index_read() -> io::Result<()> {
         let reader = MzPeakReader::new("small.chunked.mzpeak")?;
         let index = reader.file_index();
-        let e = index.iter().find(|e| e.archive_type() == MzPeakArchiveType::SpectrumPeakDataArrays);
+        let e = index
+            .iter()
+            .find(|e| e.archive_type() == MzPeakArchiveType::SpectrumPeakDataArrays);
         assert!(e.is_some());
         Ok(())
     }

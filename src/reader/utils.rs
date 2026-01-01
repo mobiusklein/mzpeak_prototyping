@@ -146,3 +146,23 @@ impl SpanDynNumeric for MaskSet {
         }
     }
 }
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_mask_set_new() {
+        let mask: MaskSet = SimpleInterval::new(10, 30).into();
+        assert!(mask.contains(&25));
+        assert!(!mask.contains(&5));
+        assert!(mask.sparse_includes.is_none());
+
+        let mask = MaskSet::new((10u64..30).into(), Some(HashSet::from_iter([15, 27])));
+        assert!(!mask.contains(&25));
+        assert!(!mask.contains(&5));
+        assert!(mask.contains(&15));
+        assert!(mask.contains(&27));
+    }
+}

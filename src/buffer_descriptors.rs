@@ -91,18 +91,20 @@ pub enum BufferFormat {
     ChunkEncoding,
     /// A contiguous list of values in a chunk contiguous with a [`BufferFormat::Chunked`] array
     ChunkedSecondary,
+    ChunkedTransform
 }
 
 impl BufferFormat {
     /// Get the prefix suggested for this format type
     pub const fn prefix(&self) -> &'static str {
         match self {
-            Self::Chunked => "chunk",
             Self::Point => "point",
-            Self::ChunkedSecondary => "chunk",
-            Self::ChunkBoundsStart => "chunk_start",
-            Self::ChunkBoundsEnd => "chunk_end",
-            Self::ChunkEncoding => "chunk_encoding",
+            Self::Chunked |
+            Self::ChunkedSecondary |
+            Self::ChunkBoundsStart |
+            Self::ChunkBoundsEnd |
+            Self::ChunkEncoding |
+            Self::ChunkedTransform => "chunk",
         }
     }
 }
@@ -118,6 +120,7 @@ impl FromStr for BufferFormat {
             "chunk_start" => Ok(Self::ChunkBoundsStart),
             "chunk_end" => Ok(Self::ChunkBoundsEnd),
             "chunk_encoding" => Ok(Self::ChunkEncoding),
+            "chunk_transform" => Ok(Self::ChunkedTransform),
             _ => Err(format!("{s} not recognized as a buffer format")),
         }
     }
@@ -132,6 +135,7 @@ impl Display for BufferFormat {
             BufferFormat::ChunkBoundsStart => f.write_str("chunk_start"),
             BufferFormat::ChunkBoundsEnd => f.write_str("chunk_end"),
             BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
+            BufferFormat::ChunkedTransform => f.write_str("chunk_transform")
         }
     }
 }
@@ -340,6 +344,16 @@ impl BufferTransform {
             x if x == NULL_INTERPOLATE => Some(Self::NullInterpolate),
             x if x == NULL_ZERO => Some(Self::NullZero),
             _ => None,
+        }
+    }
+
+    pub const fn array_name_fragment(&self) -> Option<&'static str> {
+        match self {
+            BufferTransform::NumpressLinear => Some("numpress_linear"),
+            BufferTransform::NumpressSLOF => Some("numpress_slof"),
+            BufferTransform::NumpressPIC => Some("numpress_pic"),
+            BufferTransform::NullInterpolate => None,
+            BufferTransform::NullZero => None,
         }
     }
 
@@ -713,6 +727,17 @@ impl Display for BufferName {
                 BufferFormat::ChunkBoundsStart => write!(f, "{tp_name}_chunk_start"),
                 BufferFormat::ChunkBoundsEnd => write!(f, "{tp_name}_chunk_end"),
                 BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
+                BufferFormat::ChunkedTransform => {
+                    if let Some(tfm) = self.transform {
+                        if let Some(fragment) = tfm.array_name_fragment() {
+                            write!(f, "{tp_name}_{fragment}_bytes")
+                        } else {
+                            panic!("Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment");
+                        }
+                    } else {
+                        panic!("Cannot create an array of `ChunkedTransform` without a transform");
+                    }
+                },
             };
         }
         let dtype = match self.dtype {
@@ -724,7 +749,19 @@ impl Display for BufferName {
             BinaryDataArrayType::ASCII => "ascii",
         };
         if matches!(self.unit, Unit::Unknown) {
-            write!(f, "{}_{}", tp_name, dtype)
+            if let BufferFormat::ChunkedTransform = self.buffer_format {
+                if let Some(tfm) = self.transform {
+                    if let Some(fragment) = tfm.array_name_fragment() {
+                        write!(f, "{tp_name}_{dtype}_{fragment}_bytes")
+                    } else {
+                        panic!("Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment");
+                    }
+                } else {
+                    panic!("Cannot create an array of `ChunkedTransform` without a transform");
+                }
+            } else {
+                write!(f, "{tp_name}_{dtype}")
+            }
         } else {
             let unit = match self.unit {
                 Unit::Unknown => "",
@@ -751,7 +788,19 @@ impl Display for BufferName {
                 Unit::Percent => "pct",
                 Unit::Dimensionless => "",
             };
-            write!(f, "{}_{}_{}", tp_name, dtype, unit)
+            if let BufferFormat::ChunkedTransform = self.buffer_format {
+                if let Some(tfm) = self.transform {
+                    if let Some(fragment) = tfm.array_name_fragment() {
+                        write!(f, "{tp_name}_{dtype}_{unit}_{fragment}_bytes")
+                    } else {
+                        panic!("Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment");
+                    }
+                } else {
+                    panic!("Cannot create an array of `ChunkedTransform` without a transform");
+                }
+            } else {
+                write!(f, "{tp_name}_{dtype}_{unit}")
+            }
         }
     }
 }
@@ -800,6 +849,8 @@ pub(crate) const fn arrow_to_array_type(data_type: &DataType) -> Option<BinaryDa
         DataType::LargeBinary => Some(BinaryDataArrayType::ASCII),
         DataType::Int32 => Some(BinaryDataArrayType::Int32),
         DataType::Int64 => Some(BinaryDataArrayType::Int64),
+        DataType::UInt32 => Some(BinaryDataArrayType::Int32),
+        DataType::UInt64 => Some(BinaryDataArrayType::Int64),
         DataType::Float32 => Some(BinaryDataArrayType::Float32),
         DataType::Float64 => Some(BinaryDataArrayType::Float64),
         _ => None,

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import numpy as np
 import pyarrow as pa
 
@@ -9,7 +11,9 @@ from mzpeak.filters import (
     null_chunk_every,
     DeltaCurveRegressionModel,
     null_delta_encode,
-    NullTokenizer
+    NullTokenizer,
+    fill_nulls,
+    fill_nulls_simple,
 )
 
 
@@ -26,7 +30,8 @@ def test_delta_encode():
     assert (deltas == deltas2).all()
 
 
-def test_chunking():
+@pytest.fixture(scope='module')
+def sparse_spectrum():
     mzs = []
     intensities = []
     with Path("test/data/sparse_large_gaps.txt").open("rt") as fh:
@@ -37,6 +42,36 @@ def test_chunking():
 
     mzs = np.array(mzs)
     intensities = np.array(intensities)
+    return (mzs, intensities)
+
+
+chunk_widths = np.linspace(5.0, 50.0)
+
+
+@pytest.mark.parametrize('width', chunk_widths)
+def test_null_decoding(sparse_spectrum: tuple[np.ndarray, np.ndarray], width: float):
+    (mzs, intensities) = map(lambda x: x.copy(), sparse_spectrum)
+    model = DeltaCurveRegressionModel.fit(mzs, np.diff(mzs), np.sqrt(intensities))
+
+    nonzero_run_mask = find_where_not_zero_run(intensities)
+    mzs = mzs[nonzero_run_mask]
+    intensities = intensities[nonzero_run_mask]
+
+    zero_pair_mask = is_zero_pair_mask(intensities)
+    mzs = pa.array(mzs, mask=zero_pair_mask)
+    intensities = pa.array(intensities, mask=zero_pair_mask)
+
+    segments = null_chunk_every(mzs, width)
+
+    for start, end in segments:
+        mzs_block = mzs.slice(start, end - start)
+        rebuild1 = fill_nulls(mzs_block, model)
+        rebuild2 = fill_nulls_simple(mzs_block, model)
+        assert np.allclose(rebuild1, rebuild2)
+
+
+def test_chunking(sparse_spectrum: tuple[np.ndarray, np.ndarray]):
+    (mzs, intensities) = map(lambda x: x.copy(), sparse_spectrum)
 
     assert len(intensities) == 9317
     assert np.count_nonzero(intensities) == 4243

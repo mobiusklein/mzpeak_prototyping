@@ -24,7 +24,7 @@ use mzdata::{
     },
 };
 
-use crate::param::{MetadataColumn, PathOrCURIE};
+use crate::param::{MetadataColumn, MetadataColumnCollection, PathOrCURIE};
 
 /// Holds a [`CURIE`] or a `bool`.
 #[derive(Debug, Clone)]
@@ -167,7 +167,7 @@ pub fn schema_to_metadata_cols<'a>(
     fields: impl IntoIterator<Item = &'a FieldRef>,
     prefix: String,
     defined_columns: Option<&HashMap<String, MetadataColumn>>,
-) -> Vec<MetadataColumn> {
+) -> MetadataColumnCollection {
     let mut columns = Vec::new();
 
     let mut unit_cols = Vec::new();
@@ -247,7 +247,7 @@ pub fn schema_to_metadata_cols<'a>(
             ))
         }
     }
-    columns
+    columns.into()
 }
 
 pub struct ParameterVisitor<'a> {

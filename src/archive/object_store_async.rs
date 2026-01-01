@@ -513,6 +513,8 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
 
 #[cfg(test)]
 mod test {
+    use tokio::io::AsyncReadExt;
+
     use crate::archive::MzPeakArchiveType;
 
     use super::*;
@@ -533,6 +535,14 @@ mod test {
                 assert!(!kv_data.is_empty())
             }
         }
+
+        assert_eq!(handle.file_index().len(), 4);
+
+        let mut buf = String::new();
+        let mut reader = handle.open_stream("mzpeak_index.json").await?;
+        reader.read_to_string(&mut buf).await?;
+        assert!(buf.len() > 0);
+
         Ok(())
     }
 

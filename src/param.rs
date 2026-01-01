@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use mzdata::params::{ParamDescribed, ParamLike, Unit};
 use serde::{Deserialize, Serialize, ser::SerializeSeq};
 
@@ -631,6 +633,36 @@ impl MetadataColumn {
     pub fn with_unit(mut self, value: impl Into<PathOrCURIE>) -> Self {
         self.unit = value.into();
         self
+    }
+}
+
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetadataColumnCollection(Vec<MetadataColumn>);
+
+impl MetadataColumnCollection {
+    pub fn find(&self, curie: CURIE) -> Option<&MetadataColumn> {
+        self.0.iter().find(|c| c.accession == Some(curie))
+    }
+}
+
+impl From<Vec<MetadataColumn>> for MetadataColumnCollection {
+    fn from(value: Vec<MetadataColumn>) -> Self {
+        Self(value)
+    }
+}
+
+impl Deref for MetadataColumnCollection {
+    type Target = [MetadataColumn];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsMut<Vec<MetadataColumn>> for MetadataColumnCollection {
+    fn as_mut(&mut self) -> &mut Vec<MetadataColumn> {
+        &mut self.0
     }
 }
 

@@ -1,20 +1,24 @@
 use arrow::datatypes::FieldRef;
-use mzdata::
-    spectrum::{
-        Activation, ScanEvent, SelectedIon,
-        SpectrumDescription,
-    }
-;
+use mzdata::params::Unit;
+use mzdata::spectrum::{
+    Activation, ArrayType, BinaryDataArrayType, ScanEvent, SelectedIon, SpectrumDescription,
+};
 
 use parquet::basic::{Compression, ZstdLevel};
-use std::{fmt::Debug, path::PathBuf};
+use std::collections::HashMap;
 use std::io::prelude::*;
+use std::{fmt::Debug, path::PathBuf};
 
+use crate::buffer_descriptors::BufferTransform;
+use crate::peak_series::{INTENSITY_UNITS, ION_MOBILITY_ARRAY_TYPES, ION_MOBILITY_UNITS};
 use crate::{
-    BufferContext, BufferName, ToMzPeakDataSeries, buffer_descriptors::BufferOverrideTable, chunk_series::ChunkingStrategy, writer::{
+    BufferContext, BufferName, ToMzPeakDataSeries,
+    buffer_descriptors::BufferOverrideTable,
+    chunk_series::ChunkingStrategy,
+    writer::{
         ArrayBuffersBuilder, MzPeakWriterType, SpectrumVisitor, StructVisitorBuilder,
         UnpackedMzPeakWriterType,
-    }
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -232,8 +236,6 @@ impl MzPeakWriterBuilder {
         self
     }
 
-
-
     /// Build an unpacked writer, a directory on disk where all files can be written to at once,
     /// but may be more work to move about.
     pub fn build_unpacked(
@@ -298,5 +300,140 @@ impl MzPeakWriterBuilder {
 
     pub fn chromatogram_overrides(&self) -> BufferOverrideTable {
         self.chromatogram_arrays.overrides()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ArrayConversionHelper {
+    mz_f32: bool,
+    intensity_f32: bool,
+    intensity_i32: bool,
+    ion_mobility_f32: bool,
+    intensity_slof: bool,
+}
+
+impl ArrayConversionHelper {
+    pub fn new(
+        mz_f32: bool,
+        intensity_f32: bool,
+        intensity_i32: bool,
+        ion_mobility_f32: bool,
+        intensity_slof: bool,
+    ) -> Self {
+        Self {
+            mz_f32,
+            intensity_f32,
+            intensity_i32,
+            ion_mobility_f32,
+            intensity_slof,
+        }
+    }
+
+    pub fn create_type_overrides(&self) -> BufferOverrideTable {
+        let mut overrides = HashMap::new();
+
+        if self.mz_f32 {
+            for unit in [Unit::MZ, Unit::Unknown] {
+                overrides.insert(
+                    BufferName::new(
+                        BufferContext::Spectrum,
+                        ArrayType::MZArray,
+                        BinaryDataArrayType::Float64,
+                    )
+                    .with_unit(unit),
+                    BufferName::new(
+                        BufferContext::Spectrum,
+                        ArrayType::MZArray,
+                        BinaryDataArrayType::Float32,
+                    )
+                    .with_unit(unit),
+                );
+            }
+        }
+
+        let intensity_transform = self.intensity_slof.then_some(BufferTransform::NumpressSLOF);
+        for ctx in [BufferContext::Chromatogram, BufferContext::Spectrum] {
+            for unit in INTENSITY_UNITS {
+                if self.intensity_f32 {
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float64,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit)
+                        .with_transform(intensity_transform),
+                    );
+                }
+                if intensity_transform.is_some() {
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit)
+                        .with_transform(intensity_transform),
+                    );
+                }
+                if self.intensity_i32 {
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
+                            .with_unit(unit)
+                            .with_transform(intensity_transform),
+                    );
+                    overrides.insert(
+                        BufferName::new(
+                            ctx,
+                            ArrayType::IntensityArray,
+                            BinaryDataArrayType::Float64,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
+                            .with_unit(unit)
+                            .with_transform(intensity_transform),
+                    );
+                }
+            }
+        }
+        if self.ion_mobility_f32 {
+            for unit in ION_MOBILITY_UNITS {
+                for t in ION_MOBILITY_ARRAY_TYPES {
+                    overrides.insert(
+                        BufferName::new(
+                            BufferContext::Spectrum,
+                            t.clone(),
+                            BinaryDataArrayType::Float64,
+                        )
+                        .with_unit(unit),
+                        BufferName::new(
+                            BufferContext::Spectrum,
+                            t.clone(),
+                            BinaryDataArrayType::Float32,
+                        )
+                        .with_unit(unit),
+                    );
+                }
+            }
+        }
+        overrides.into()
     }
 }

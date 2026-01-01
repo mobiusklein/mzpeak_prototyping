@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from mzpeak import MzPeakFile
 from mzpeak.mz_reader import BufferFormat
+from mzpeak.file_index import FileIndex
 
 point_path = Path("small.mzpeak")
 chunk_path = Path("small.chunked.mzpeak")
@@ -59,6 +61,21 @@ def common_checks(reader: MzPeakFile, subtests: pytest.Subtests):
         idx_slc = reader.time.resolve(slice(0.3, 0.4))
         values = reader.spectra_signal_for_indices(idx_slc)
         assert len(values) > 0
+
+        chunks = reader.read_spectrum(idx_slc)
+        assert len(chunks) == (idx_slc.stop - idx_slc.start)
+
+        chunks = reader.read_spectrum(range(idx_slc.start, idx_slc.stop))
+        assert len(chunks) == (idx_slc.stop - idx_slc.start)
+
+
+    with subtests.test("archive behavior"):
+        names = reader.list_files()
+        for name in names:
+            if name == FileIndex.FILE_NAME:
+                with reader.open_stream(name) as fh:
+                    index = json.load(fh)
+                    assert index['files']
 
 
 def check_iterator(reader: MzPeakFile, n: int=10):

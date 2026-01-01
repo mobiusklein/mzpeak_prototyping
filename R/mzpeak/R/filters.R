@@ -133,7 +133,7 @@ NUMPRESS_PIC_CURIE = "MS:1002313"
 .delta_decode <- function(start, end, values, model) {
   has_null <- is.na(values)
   if (any(has_null)) {
-    return(.delta_decode_null(start, end, values, mode, has_null))
+    return(.delta_decode_null(start, end, values, model, has_null))
   }
   storage <- numeric(1 + length(values)) + start
   idx <- seq(length(values)) + 1

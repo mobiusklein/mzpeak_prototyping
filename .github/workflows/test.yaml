@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           pip install -v python/
-          pip install coverage pytest pytest-cov scipy -U
+          pip install coverage pytest pytest-cov pytest-xdist scipy -U
       - name: run tests
         shell: bash
         run: |

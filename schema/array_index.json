@@ -42,7 +42,8 @@
                     "chunk_end",
                     "chunk_values",
                     "chunk_encoding",
-                    "secondary_chunk"
+                    "secondary_chunk",
+                    "chunk_transform"
                 ]
             },
             "context": {

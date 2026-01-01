@@ -15,7 +15,6 @@ import pandas as pd
 import pynumpress
 import pyarrow as pa
 
-from pyarrow import compute as pc
 from pyarrow import parquet as pq
 
 from .mz_reader import _BatchIterator, MzPeakArrayDataReader, BufferFormat
@@ -154,31 +153,6 @@ def _clean_frame(df: pd.DataFrame):
     return df
 
 
-def _format_curie_arrow(arr):
-    cvs = arr.field(0)
-    cvs = pc.case_when(
-        pc.make_struct(pc.equal(cvs, 1), pc.equal(cvs, 2)),
-        "MS",
-        "UO",
-    )
-    accs = arr.field(1)
-    accs = pc.utf8_lpad(pc.cast(accs, pa.string()), 7, "0")
-    return pc.binary_join_element_wise(cvs, accs, ":")
-
-
-def _format_curies_batch(bat: pa.RecordBatch) -> pa.RecordBatch:
-    for i, col in enumerate(bat.schema):
-        if isinstance(col.type, pa.StructType) and col.type.names == [
-            "cv_id",
-            "accession",
-        ]:
-            c = _format_curie_arrow(bat.column(i))
-            bat = bat.set_column(
-                i, pa.field(col.name, c.type, col.nullable, col.metadata), c
-            )
-    return bat
-
-
 class _AuxiliaryArrayDecoder:
     """
     A helper class for decoding extra arrays packed in with the metadata table.
@@ -219,6 +193,15 @@ class _AuxiliaryArrayDecoder:
             data = np.array(data, dtype=np.object_)
         return AuxiliaryArray(name, data, parameters)
 
+    @classmethod
+    def _unpack(cls, spec: dict):
+        if "auxiliary_arrays" in spec:
+            auxiliary_arrays = spec.pop("auxiliary_arrays")
+            if auxiliary_arrays is not None:
+                for v in auxiliary_arrays:
+                    v = _AuxiliaryArrayDecoder.decode(v)
+                    spec[v.name] = v.values
+
 
 @dataclass
 class AuxiliaryArray:
@@ -241,7 +224,90 @@ class AuxiliaryArray:
     parameters: list[dict]
 
 
-class MzPeakSpectrumMetadataReader:
+class _PrecursorReadMixin:
+    """Provides :meth:`_read_precursors` and :meth:`_read_selected_ions` that are shared amongst metadata entities"""
+
+    handle: pq.ParquetFile
+    meta: pq.FileMetaData
+
+    precursors: pd.DataFrame
+
+    def _read_precursors(self):
+        blocks = []
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.precursor_index_i)
+            if col_idx.statistics.has_min_max:
+                table: pa.Table = self.handle.read_row_group(i, columns=["precursor"])
+                bats = table["precursor"].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
+        if blocks:
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
+            if "spectrum_index" in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
+            bat = CV_MAPPER.clean_schema(bat)
+            self.precursors = _clean_frame(
+                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
+            )
+        else:
+            self.precursors = pd.DataFrame(
+                [],
+                columns=[
+                    "source_index",
+                    "precursor_index",
+                ],
+            )
+
+    def _read_selected_ions(self):
+        blocks = []
+        for i in range(self.meta.num_row_groups):
+            rg = self.meta.row_group(i)
+            col_idx = rg.column(self.selected_ion_i)
+            if col_idx.statistics.has_min_max:
+                table = self.handle.read_row_group(i, columns=["selected_ion"])
+                bats = table["selected_ion"].chunks
+                for bat in bats:
+                    blocks.append(bat.filter(bat.field(0).is_valid()))
+
+        if blocks:
+            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
+            if "spectrum_index" in bat.column_names:
+                index_col = "spectrum_index"
+            else:
+                index_col = "source_index"
+            bat = CV_MAPPER.clean_schema(bat)
+            self.selected_ions = _clean_frame(
+                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
+            )
+        else:
+            self.selected_ions = pd.DataFrame(
+                [],
+                columns=[
+                    "source_index",
+                    "precursor_index",
+                ],
+            )
+
+    def _unpack_precursors(self, spec: dict, i: int):
+        precursors_of = self.precursors.loc[[i]]
+        precursors_of["activation"] = precursors_of["activation"].apply(
+            lambda x: [_format_param(v) for v in x["parameters"]]
+        )
+        try:
+            ions = self.selected_ions.loc[[i]]
+            ions["parameters"] = ions["parameters"].apply(
+                lambda x: [_format_param(v) for v in x]
+            )
+            precursors_of = precursors_of.merge(ions, on="precursor_index")
+        except KeyError:
+            pass
+        spec["precursors"] = precursors_of.to_dict("records")
+
+
+class MzPeakSpectrumMetadataReader(_PrecursorReadMixin):
     """
     A reader for spectrum metadata in an mzPeak file.
 
@@ -351,7 +417,6 @@ class MzPeakSpectrumMetadataReader:
         else:
             bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
             bat = CV_MAPPER.clean_schema(bat)
-            bat = _format_curies_batch(bat)
             self.spectra = _clean_frame(
                 bat.to_pandas(types_mapper=pd.ArrowDtype).set_index("index")
             )
@@ -376,7 +441,6 @@ class MzPeakSpectrumMetadataReader:
 
         if blocks:
             bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
-            bat = _format_curies_batch(bat)
             if "spectrum_index" in bat.column_names:
                 index_col = "spectrum_index"
             else:
@@ -397,65 +461,6 @@ class MzPeakSpectrumMetadataReader:
                 ],
             )
 
-    def _read_precursors(self):
-        blocks = []
-        for i in range(self.meta.num_row_groups):
-            rg = self.meta.row_group(i)
-            col_idx = rg.column(self.precursor_index_i)
-            if col_idx.statistics.has_min_max:
-                table: pa.Table = self.handle.read_row_group(i, columns=["precursor"])
-                bats = table["precursor"].chunks
-                for bat in bats:
-                    blocks.append(bat.filter(bat.field(0).is_valid()))
-        if blocks:
-            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
-            bat = _format_curies_batch(bat)
-            if "spectrum_index" in bat.column_names:
-                index_col = "spectrum_index"
-            else:
-                index_col = "source_index"
-            bat = CV_MAPPER.clean_schema(bat)
-            self.precursors = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
-        else:
-            self.precursors = pd.DataFrame(
-                [],
-                columns=[
-                    "source_index",
-                    "precursor_index",
-                ],
-            )
-
-    def _read_selected_ions(self):
-        blocks = []
-        for i in range(self.meta.num_row_groups):
-            rg = self.meta.row_group(i)
-            col_idx = rg.column(self.selected_ion_i)
-            if col_idx.statistics.has_min_max:
-                table = self.handle.read_row_group(i, columns=["selected_ion"])
-                bats = table["selected_ion"].chunks
-                for bat in bats:
-                    blocks.append(bat.filter(bat.field(0).is_valid()))
-
-        if blocks:
-            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
-            bat = _format_curies_batch(bat)
-            if "spectrum_index" in bat.column_names:
-                index_col = "spectrum_index"
-            else:
-                index_col = "source_index"
-            bat = CV_MAPPER.clean_schema(bat)
-            self.selected_ions = _clean_frame(
-                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
-            )
-        else:
-            self.selected_ions = pd.DataFrame(
-                [],
-                columns=[
-                    "source_index",
-                    "precursor_index",
-                ],
-            )
-
     def __getitem__(self, i: int | str):
         if isinstance(i, str):
             i = self.id_index[i]
@@ -471,28 +476,11 @@ class MzPeakSpectrumMetadataReader:
             for scan in spec["scans"]:
                 scan["parameters"] = [_format_param(v) for v in scan["parameters"]]
         try:
-            precursors_of = self.precursors.loc[[i]]
-            precursors_of["activation"] = precursors_of["activation"].apply(
-                lambda x: [_format_param(v) for v in x["parameters"]]
-            )
-            try:
-                ions = self.selected_ions.loc[[i]]
-                ions["parameters"] = ions["parameters"].apply(
-                    lambda x: [_format_param(v) for v in x]
-                )
-                precursors_of = precursors_of.merge(ions, on="precursor_index")
-            except KeyError:
-                pass
-            spec["precursors"] = precursors_of.to_dict("records")
+            self._unpack_precursors(spec, i)
         except KeyError:
             pass
         spec["index"] = i
-        if "auxiliary_arrays" in spec:
-            auxiliary_arrays = spec.pop("auxiliary_arrays")
-            if auxiliary_arrays is not None:
-                for v in auxiliary_arrays:
-                    v = _AuxiliaryArrayDecoder.decode(v)
-                    spec[v.name] = v.values
+        _AuxiliaryArrayDecoder._unpack(spec)
         return spec
 
     def __len__(self):
@@ -509,7 +497,7 @@ class MzPeakSpectrumMetadataReader:
         return None
 
 
-class MzPeakChromatogramMetadataReader:
+class MzPeakChromatogramMetadataReader(_PrecursorReadMixin):
     """
     A reader for chromatogram metadata in an mzPeak file.
 
@@ -599,71 +587,11 @@ class MzPeakChromatogramMetadataReader:
             )
         else:
             bat = pa.Table.from_struct_array(pa.chunked_array(chromatograms))
-            bat = _format_curies_batch(bat)
             bat = CV_MAPPER.clean_schema(bat)
             self.chromatograms = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index("index"))
         self.id_index = (
             self.chromatograms[["id"]].reset_index().set_index("id")["index"]
         )
-
-    def _read_precursors(self):
-        blocks = []
-        for i in range(self.meta.num_row_groups):
-            rg = self.meta.row_group(i)
-            col_idx = rg.column(self.precursor_index_i)
-            if col_idx.statistics.has_min_max:
-                table: pa.Table = self.handle.read_row_group(i, columns=["precursor"])
-                bats = table["precursor"].chunks
-                for bat in bats:
-                    blocks.append(bat.filter(bat.field(0).is_valid()))
-        if blocks:
-            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
-            bat = _format_curies_batch(bat)
-            if "spectrum_index" in bat.column_names:
-                index_col = "spectrum_index"
-            else:
-                index_col = "source_index"
-            bat = CV_MAPPER.clean_schema(bat)
-            self.precursors = _clean_frame(bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col))
-        else:
-            self.precursors = pd.DataFrame(
-                [],
-                columns=[
-                    "source_index",
-                    "precursor_index",
-                ],
-            )
-
-    def _read_selected_ions(self):
-        blocks = []
-        for i in range(self.meta.num_row_groups):
-            rg = self.meta.row_group(i)
-            col_idx = rg.column(self.selected_ion_i)
-            if col_idx.statistics.has_min_max:
-                table = self.handle.read_row_group(i, columns=["selected_ion"])
-                bats = table["selected_ion"].chunks
-                for bat in bats:
-                    blocks.append(bat.filter(bat.field(0).is_valid()))
-
-        if blocks:
-            bat = pa.Table.from_struct_array(pa.chunked_array(blocks))
-            bat = _format_curies_batch(bat)
-            bat = CV_MAPPER.clean_schema(bat)
-            if 'spectrum_index' in bat.column_names:
-                index_col = "spectrum_index"
-            else:
-                index_col = "source_index"
-            self.selected_ions = _clean_frame(
-                bat.to_pandas(types_mapper=pd.ArrowDtype).set_index(index_col)
-            )
-        else:
-            self.selected_ions = pd.DataFrame(
-                [],
-                columns=[
-                    "source_index",
-                    "precursor_index",
-                ],
-            )
 
     def __getitem__(self, i: int | str):
         if isinstance(i, str):
@@ -671,28 +599,11 @@ class MzPeakChromatogramMetadataReader:
         spec = self.chromatograms.loc[i].to_dict()
         spec["parameters"] = [_format_param(v) for v in spec["parameters"]]
         try:
-            precursors_of = self.precursors.loc[[i]]
-            precursors_of["activation"] = precursors_of["activation"].apply(
-                lambda x: [_format_param(v) for v in x["parameters"]]
-            )
-            try:
-                ions = self.selected_ions.loc[[i]]
-                ions["parameters"] = ions["parameters"].apply(
-                    lambda x: [_format_param(v) for v in x]
-                )
-                precursors_of = precursors_of.merge(ions, on="precursor_index")
-            except KeyError:
-                pass
-            spec["precursors"] = precursors_of.to_dict("records")
+            self._unpack_precursors(spec, i)
         except KeyError:
             pass
         spec["index"] = i
-        if "auxiliary_arrays" in spec:
-            auxiliary_arrays = spec.pop("auxiliary_arrays")
-            if auxiliary_arrays is not None:
-                for v in auxiliary_arrays:
-                    v = _AuxiliaryArrayDecoder.decode(v)
-                    spec[v.name] = v.values
+        _AuxiliaryArrayDecoder._unpack(spec)
         return spec
 
 
@@ -909,47 +820,8 @@ class MzPeakFile(Sequence[_SpectrumType]):
                         )
                     case _:
                         pass
-
-        for f in path.glob("*mzpeak"):
-            if not f.is_file():
-                continue
-            if f in visited:
-                continue
-            visited.add(f)
-            if f.name.endswith("spectra_data.mzpeak") and not self.spectrum_data:
-                self.spectrum_data = MzPeakArrayDataReader(
-                    pa.OSFile(str(f)),
-                    namespace="spectrum",
-                )
-            elif (
-                f.name.endswith("spectra_metadata.mzpeak")
-                and not self.spectrum_metadata
-            ):
-                self.spectrum_metadata = MzPeakSpectrumMetadataReader(
-                    pa.OSFile(str(f)),
-                )
-            elif (
-                f.name.endswith("spectra_peaks.mzpeak") and not self.spectrum_peak_data
-            ):
-                self.spectrum_peak_data = MzPeakArrayDataReader(
-                    pa.OSFile(str(f)),
-                    namespace="spectrum",
-                )
-            elif (
-                f.name.endswith("chromatograms_metadata.mzpeak")
-                and not self.chromatogram_metadata
-            ):
-                self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
-                    pa.OSFile(str(f))
-                )
-            elif (
-                f.name.endswith("chromatograms_data.mzpeak")
-                and not self.chromatogram_data
-            ):
-                self.chromatogram_data = MzPeakArrayDataReader(
-                    pa.OSFile(str(f)),
-                    namespace="chromatogram",
-                )
+        else:
+            raise FileNotFoundError(f"Failed to find {FileIndex.FILE_NAME} in unpacked mzPeak archive {path}")
 
     def _from_zip_archive(self, archive: zipfile.ZipFile):
         self._archive_storage = ArchiveStorage.Zip
@@ -989,47 +861,10 @@ class MzPeakFile(Sequence[_SpectrumType]):
                         )
                     case _:
                         pass
-        except KeyError:
-            pass
-        for f in archive.filelist:
-            if f.filename in visited:
-                continue
-            visited.add(f.filename)
-            if f.filename.endswith("spectra_data.mzpeak") and not self.spectrum_data:
-                self.spectrum_data = MzPeakArrayDataReader(
-                    pa.PythonFile(archive.open(f)),
-                    namespace="spectrum",
-                )
-            elif (
-                f.filename.endswith("spectra_metadata.mzpeak")
-                and not self.spectrum_metadata
-            ):
-                self.spectrum_metadata = MzPeakSpectrumMetadataReader(
-                    pa.PythonFile(archive.open(f)),
-                )
-            elif (
-                f.filename.endswith("spectra_peaks.mzpeak")
-                and not self.spectrum_peak_data
-            ):
-                self.spectrum_peak_data = MzPeakArrayDataReader(
-                    pa.PythonFile(archive.open(f)),
-                    namespace="spectrum",
-                )
-            elif (
-                f.filename.endswith("chromatograms_metadata.mzpeak")
-                and not self.chromatogram_metadata
-            ):
-                self.chromatogram_metadata = MzPeakChromatogramMetadataReader(
-                    pa.PythonFile(archive.open(f))
-                )
-            elif (
-                f.filename.endswith("chromatograms_data.mzpeak")
-                and not self.chromatogram_data
-            ):
-                self.chromatogram_data = MzPeakArrayDataReader(
-                    pa.PythonFile(archive.open(f)),
-                    namespace="chromatogram",
-                )
+        except KeyError as err:
+            raise FileNotFoundError(
+                f"Failed to find {FileIndex.FILE_NAME} in mzPeak ZIP archive {archive}"
+            ) from err
 
     def _from_path(self, path: Path):
         if path.is_dir():

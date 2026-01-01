@@ -3,22 +3,18 @@ use mzdata::{
     self,
     io::MZReaderType,
     meta::{DataProcessing, ProcessingMethod, Software},
-    params::{Unit, Param},
+    params::Param,
     prelude::*,
-    spectrum::{ArrayType, BinaryDataArrayType, SignalContinuity, bindata::BinaryArrayMap3D},
+    spectrum::{SignalContinuity, bindata::BinaryArrayMap3D},
 };
 use mzpeak_prototyping::{
-    buffer_descriptors::{BufferOverrideTable, BufferTransform},
+    buffer_descriptors::BufferOverrideTable,
     chunk_series::ChunkingStrategy,
-    peak_series::{BufferContext, BufferName, ION_MOBILITY_ARRAY_TYPES, ION_MOBILITY_UNITS, INTENSITY_UNITS},
-    writer::{
-        AbstractMzPeakWriter, MzPeakWriterType
-    },
+    writer::{AbstractMzPeakWriter, MzPeakWriterType},
 };
 use mzpeaks::{CentroidPeak, DeconvolutedPeak};
 use parquet::basic::{Compression, ZstdLevel};
 use std::{
-    collections::HashMap,
     fmt::Debug,
     fs, io,
     panic::{self, AssertUnwindSafe},
@@ -247,116 +243,14 @@ You can also specify a chunk size like 'delta:50'. Defaults to 'delta:50'. It wi
 
 impl ConvertArgs {
     pub fn create_type_overrides(&self) -> BufferOverrideTable {
-        let mut overrides = HashMap::new();
-
-        if self.mz_f32 {
-            for unit in [Unit::MZ, Unit::Unknown] {
-                overrides.insert(
-                    BufferName::new(
-                        BufferContext::Spectrum,
-                        ArrayType::MZArray,
-                        BinaryDataArrayType::Float64,
-                    )
-                    .with_unit(unit),
-                    BufferName::new(
-                        BufferContext::Spectrum,
-                        ArrayType::MZArray,
-                        BinaryDataArrayType::Float32,
-                    )
-                    .with_unit(unit),
-                );
-            }
-        }
-
-        let intensity_transform = self.intensity_slof.then_some(BufferTransform::NumpressSLOF);
-        if self.chunked_encoding.is_none() && intensity_transform.is_some() {
-            log::warn!(
-                "Signal transforms require chunked encoding, without chunked encoding this will have no effect"
-            );
-        }
-        for ctx in [BufferContext::Chromatogram, BufferContext::Spectrum] {
-            for unit in INTENSITY_UNITS {
-                if self.intensity_f32 {
-                    overrides.insert(
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Float64,
-                        )
-                        .with_unit(unit),
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Float32,
-                        )
-                        .with_unit(unit)
-                        .with_transform(intensity_transform),
-                    );
-                }
-                if intensity_transform.is_some() {
-                    overrides.insert(
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Float32,
-                        )
-                        .with_unit(unit),
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Float32,
-                        )
-                        .with_unit(unit)
-                        .with_transform(intensity_transform),
-                    );
-                }
-                if self.intensity_i32 {
-                    overrides.insert(
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Float32,
-                        )
-                        .with_unit(unit),
-                        BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
-                            .with_unit(unit)
-                            .with_transform(intensity_transform),
-                    );
-                    overrides.insert(
-                        BufferName::new(
-                            ctx,
-                            ArrayType::IntensityArray,
-                            BinaryDataArrayType::Float64,
-                        )
-                        .with_unit(unit),
-                        BufferName::new(ctx, ArrayType::IntensityArray, BinaryDataArrayType::Int32)
-                            .with_unit(unit)
-                            .with_transform(intensity_transform),
-                    );
-                }
-            }
-        }
-        if self.ion_mobility_f32 {
-            for unit in ION_MOBILITY_UNITS {
-                for t in ION_MOBILITY_ARRAY_TYPES {
-                    overrides.insert(
-                        BufferName::new(
-                            BufferContext::Spectrum,
-                            t.clone(),
-                            BinaryDataArrayType::Float64,
-                        )
-                        .with_unit(unit),
-                        BufferName::new(
-                            BufferContext::Spectrum,
-                            t.clone(),
-                            BinaryDataArrayType::Float32,
-                        )
-                        .with_unit(unit),
-                    );
-                }
-            }
-        }
-        overrides.into()
+        mzpeak_prototyping::writer::ArrayConversionHelper::new(
+            self.mz_f32,
+            self.intensity_f32,
+            self.intensity_i32,
+            self.ion_mobility_f32,
+            self.intensity_slof,
+        )
+        .create_type_overrides()
     }
 
     pub fn chromatogram_chunked_encoding(&self) -> Option<ChunkingStrategy> {
@@ -574,5 +468,4 @@ mod test {
     //     let args = ConvertCli::parse_from("-p -c -y -z -u small.mzML -o small.chunked.mzpeak".split(" "));
     //     run_convert(&args.filename, args.convert_args)
     // }
-
 }

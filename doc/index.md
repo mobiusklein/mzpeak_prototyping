@@ -4,6 +4,7 @@
 - [Introduction](#introduction)
   - [Overview](#overview)
     - [What _is_ mzPeak?](#what-is-mzpeak)
+    - [A brief note about code snippets found in this document.](#a-brief-note-about-code-snippets-found-in-this-document)
   - [Anatomy of a Parquet file](#anatomy-of-a-parquet-file)
     - [The schema](#the-schema)
     - [The metadata key-value pairs](#the-metadata-key-value-pairs)
@@ -22,10 +23,14 @@
   - [Signal Data Layouts](#signal-data-layouts)
     - [Arrays and Columns](#arrays-and-columns)
     - [The Array Index](#the-array-index)
+      - [Buffer Format](#buffer-format)
       - [Buffer Priority, Naming](#buffer-priority-naming)
     - [Data Arrays, Encoding, Transformations and Parquet](#data-arrays-encoding-transformations-and-parquet)
       - [Zero Run Stripping](#zero-run-stripping)
         - [Null Marking](#null-marking)
+          - [Removing Zero Runs](#removing-zero-runs)
+          - [Finding Flanking Zero Pairs](#finding-flanking-zero-pairs)
+          - [Decoding Null Pairs](#decoding-null-pairs)
         - [Null Semantics for Signal Data](#null-semantics-for-signal-data)
     - [Auxiliary Data Arrays](#auxiliary-data-arrays)
     - [Point Layout](#point-layout)
@@ -66,6 +71,10 @@ Components of an mzPeak archive:
 - `spectra_peaks.mzpeak` (optional): Spectrum centroids stored explicitly separately from whatever signal is in `spectra_data.mzpeak`, such as from instrument vendors who store both profile and centroid versions of the same spectra. This file may not always be present.
 - `chromatograms_metadata.mzpeak`: Chromatogram-level metadata and file-level metadata. Includes chromatogram descriptions, as well as precursors and selected ions using packed parallel tables.
 - `chromatograms_data.mzpeak`: Chromatogram signal data. May be in point layout or chunked layout which have different size and random access characteristics. Intensity measures with different units may be stored in parallel.
+
+### A brief note about code snippets found in this document.
+
+This document describes both a file format and a set of suggested algorithms for preparing data to be stored in that format. The original author (Joshua Klein), includes snippets of Python code to do these operations under the assumption that at this time most technical programmers will know Python, that Python is effectively executable pseudocode, save that the code snippets use three components, abstract base classes from the standard library for type annotations, [NumPy](https://numpy.org/) v2.1 for certain array operations which are assumed to be understandable, and [PyArrow](https://arrow.apache.org/docs/python/index.html) v20.0 for operations on Apache Arrow arrays which are conceptually equivalent for in-memory representations of the data stored in Parquet files.
 
 ## Anatomy of a Parquet file
 
@@ -111,7 +120,7 @@ The `spectra_metadata.mzpeak` and `chromatograms_metadata.mzpeak` store multiple
 
 Here is a stripped down example where two rows of related MS1 and MS2 spectra. Treat `scan.source_index`, `precursor.source_index`, `precursor.precursor_index`, `selected_ion.source_index`, and `selected_ion.precursor_index` as a foreign key with respect to `spectrum.index`, a primary key. `precursor.source_index` refers to the `spectrum` which this `precursor` record belongs to and `precursor.precursor_index` refers to the `spectrum` that is that _is_ the precursor of the `spectrum` referenced by `precursor.source_index`, and (`precursor.source_index`, `precursor.precursor_index`) forms a compound primary key. Any of these columns may be `null` which means that such a record does not exist in the table. This also applies to the `selected_ion` facet.
 
-<style>
+<style style="display: none;">
   .packed-table thead tr th {
     font-size: 0.7em;
     padding: 0.6em;
@@ -271,7 +280,7 @@ Some metadata is descriptive of the entire run and does not make sense to store 
 
 ### Arrays and Columns
 
-It is common in mass spectrometry to talk about a spectrum _having_ an m/z array as synonymous with having been measured in the m/z dimension, and those m/z values are represented using some kind of physical data type in memory, likewise having an intensity array corresponding to the abundance of the signal parallel to the m/z array. In mzML, it is possible to use different physical data types for these two dimensions on different spectra in the same file, and there may well be legitimate use-cases for that. mzPeak can store array data in two ways. One way to store the arrays as columns in a signal data layout, burning the column into the schema and added to the `array index`. Another way is to store it as an `auxiliary array` which will be stored in the associated metadata table's `*.auxiliary_arrays` value for that entity's row. Auxiliary data arrays can be individually configured by the writer, have custom compression or data type decoding or cvParams, but it cannot be searched or sliced (read a segment of) without decoding the entire array, just as in mzML. By contrast, any array that is written as a column is encoded directly in Parquet, is part of the schema, and subject to its adaptive encoding process and compression. Currently, we assume that the first sorted array is the axis around which all other values are arranged, and any arrays that are shorter or longer _SHOULD_ instead be stored in `auxiliary_arrays` as well.
+It is common in mass spectrometry to talk about a spectrum _having_ an m/z array as synonymous with having been measured in the m/z dimension, and those m/z values are represented using some kind of physical data type in memory, likewise having an intensity array corresponding to the abundance of the signal parallel to the m/z array. In mzML, it is possible to use different physical data types for these two dimensions on different spectra in the same file, and there may well be legitimate use-cases for that. mzPeak can store array data in two ways. One way to store the arrays as columns in a signal data layout, burning the column into the schema and added to the `array index`. Another way is to store it as an `auxiliary array` which will be stored in the associated metadata table's `*.auxiliary_arrays` value for that entity's row. Auxiliary data arrays can be individually configured by the writer, have custom compression or data type decoding or cvParams, but it cannot be searched or sliced (read a segment of) without decoding the entire array, just as in mzML. By contrast, any array that is written as a column is encoded directly in Parquet, is part of the schema, and subject to its adaptive encoding process and compression. Currently, we assume that the first sorted array is the axis around which all other values are arranged, sorting rank 0, and any arrays that are shorter or longer _SHOULD_ instead be stored in `auxiliary_arrays` as well.
 
 ### The Array Index
 
@@ -314,6 +323,10 @@ In order to properly annotate what kind of array a column _is_, we include a JSO
 This array index describes the table shown below for the [`point layout`](#example-point-table)
 
 Governed by `schema/array_index.json`.
+
+#### Buffer Format
+
+TODO: Describe the buffer format list.
 
 #### Buffer Priority, Naming
 
@@ -360,7 +373,7 @@ When storing spectrum data, some vendors will produce arrays with lots of "empty
 For spectra with many small gaps, even zero run stripping leaves too much unhelpful information in the data. We can instead replace the flanking zero intensity points with `null` m/z and intensity values and Parquet will skip storing the expensive 32- and/or 64-bit values, retaining only the validity buffer bit flag. We can separately fit a simple m/z spacing model using weighted least squares of the form:
 
 $$
-    δ mz \sim β_0 + β_1 mz + β_2 mz^2 + ϵ
+    \delta mz \sim β_0 + β_1 mz + β_2 mz^2 + ϵ
 $$
 
 or using the following Python code:
@@ -424,20 +437,251 @@ class DeltaCurveRegressionModel:
 
 </details>
 
-Then when reading the the null-marked data, use either the local median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve a very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the minute angle change this would induce are still effectively lossless.
+Then when reading the the null-marked data, use either the local 2nd median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve a very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the miniscule angle change this would induce are still effectively lossless.
 
 ![Thermo dataset with null marking](../static/thermo_null_marking_err.png)
 ![Sciex dataset with delta encoding and null marking](../static/sciex_null_marking_delta_encoding_error.png)
 
 Keep in mind that all Numpress compression methods are still available and still provide superior size reduction, but carry this slightly larger loss of accuracy. Using a Numpress compression is a transformation that requires the [Chunked Layout](#chunked-layout).
 
+###### Removing Zero Runs
+
+A zero run is defined explicitly as a sequence of 3 or more zero values that should be reduced to just the first and last positions in the run. Zero runs can be very long and outside of certain scenarios which assume a complete grid of coordinate values, provide no value. If zero runs need to be reconstructed beyond the flanking points left at the end of these runs, the same method used to fill in `null`s here can be used to extend zero runs.
+
+<details>
+<summary>Python code for finding zero runs</summary>
+
+```python
+def find_where_not_zero_run(data: Sequence[Number]) -> Sequence[int]:
+    """
+    Construct a list of positions that are not part of a zero run.
+
+    A zero run is any position *i* such that:
+      1. ``x[i] == 0``
+      2. ``(i == 0) or (x[i - 1] == 0)``
+      3.``(i == (len(x) - 1)) or (x[i + 1] == 0)``
+
+    We build a position list here because we need to extract these positions
+    from ALL dimension arrays for this entity, not just the current array.
+
+    Parameters
+    ----------
+    data : :class:`Sequence` of :class:`Number`
+        The numerical data to traverse
+
+    Returns
+    -------
+    :class:`np.ndarray` of :class:`np.uintp`
+    """
+    n = len(data)
+    n1 = n - 1
+
+    was_zero = False
+
+    acc = []
+    i = 0
+    while i < n:
+        v = data[i]
+        if v is not None:
+            if v == 0:
+                if (was_zero or (len(acc) == 0)) and (
+                    (i < n1 and data[i + 1] == 0) or i == n1
+                ):
+                    pass
+                else:
+                    acc.append(i)
+                was_zero = True
+            else:
+                acc.append(i)
+                was_zero = False
+        else:
+            acc.append(i)
+            was_zero = False
+        i += 1
+    return np.array(acc, dtype=np.uintp)
+```
+
+</details>
+
+###### Finding Flanking Zero Pairs
+
+Zero intensity points on the sides of peaks still use non-trivial amounts of storage in sparse datasets. This step does _not_ match all zero intensity points, only those that occur on the flanks of profile peaks. Once these indices are found, they can be used to construct the `null` mask or "validity bitmap" of an Arrow array which is equivalent to how a Parquet column chunk would be constructed.
+
+<details>
+<summary>Python code for finding flanking zeros</summary>
+
+```python
+def is_zero_pair_mask(data: Sequence[Number]) -> "np.typing.NDArray[np.bool_]":
+    '''
+    Create a boolean mask for positions that are composed of two zeroes in a row.
+
+    Parameters
+    ----------
+    data : :class:`Sequence` of :class:`Number`
+        The numerical data to traverse
+
+    Returns
+    -------
+    :class:`np.ndarray` of :class:`bool`
+    '''
+    n = len(data)
+    n1 = n - 1
+    was_zero = False
+    acc = []
+    for i, v in enumerate(data):
+        if v == 0:
+            if was_zero or (i < n1 and data[i + 1] == 0):
+                acc.append(True)
+            else:
+                acc.append(False)
+            was_zero = True
+        else:
+            acc.append(False)
+            was_zero = False
+    return np.array(acc)
+```
+
+</details>
+
+###### Decoding Null Pairs
+
+Decoding null pairs, the process of undoing [`null marking`](#null-marking) involves finding regions bounded between two `null`s, or the start of the array and a `null`, or a `null` and the end of the array, then filling the null values with either a locally estimated value when you have more than one value to estimate the median delta from, or to use the regression model described ealier to impute the value for a single point. Unpaired `null` values _MAY_ only be found as the first or last `null` in the array, any other unpaired `null`s are unrecoverable errors. A run of three or more `null` values is encountered, it _MAY_ be recoverable but should not occur under normal operation.
+
+The locally estimated value _SHOULD_ be the second median of the spacing of the current segment's non-`null` values. The regression model is used to predict the spacing from the non-null value within a segment with only one non-null value.
+
+<details>
+<summary>Python code for filling <em>null</em> marked values</summary>
+
+```python
+
+def find_pairs(mask: Sequence[bool]) -> Sequence[int]:
+    """
+    Construct index ranges between pairs of :const:`True` values in
+    ``mask``.
+
+    The first and last index range will include the beginning and ending
+    of the array respectively, even if the mask does not start/end with a
+    :const:`True` value.
+
+    The resulting array will have two columns, the start and end indices
+    of the spans between two :const:`True` values (or the termini of the array).
+
+    .. warning::
+      This function *can* fail or produce incorrect output if there are runs of
+      :const:`True` values longer than 2 in the ``mask``
+
+    Parameters
+    ----------
+    mask : :class:`Sequence` of :class:`bool`
+
+    Returns
+    -------
+    np.typing.NDarray[int]
+    """
+    parts = []
+    indices = np.where(mask)[0]
+    if len(indices) == 0:
+        return np.array([[0, len(mask)]])
+    if indices[0] != 0:
+        parts.append([0])
+    parts.append(indices)
+    if indices[-1] != len(mask) - 1:
+        parts.append([len(mask) - 1])
+    indices = np.concat(parts)
+    indices = indices.reshape((-1, 2))
+    indices[:, 1] += 1
+    return indices
+
+
+def estimate_median_delta(data: Sequence[Number]) -> tuple[Number, np.typing.NDArray]:
+    """
+    Find the 2nd median of ``np.diff(data)``.
+
+    This is a relatively crude spacing estimate for continuous profile data.
+
+    Returns
+    -------
+    :class:`Number`
+        The 2nd median of ``np.diff(data)``
+    :class:`np.ndarray`
+        The values from which the previous return values were estimated
+    """
+    deltas = np.diff(data)
+    median = np.median(deltas)
+    deltas_below = deltas[deltas <= median]
+    median = np.median(deltas_below)
+    return median, deltas_below
+
+
+def fill_nulls(
+    data: pa.Array, common_delta: DeltaModelBase
+) -> "np.typing.NDArray":
+    """
+    Fill ``null`` values in ``data`` using the ``common_delta`` model or the locally estimated
+    median delta if sufficient data are available.
+
+    Parameters
+    ----------
+    data : :class:`pyarrow.Array`
+        The data array to fill nulls in with ``common_delta``
+    common_delta : :class:`DeltaModelBase` or :class:`Number`
+        The common spacing model, either specified as a model instance or as a single constant spacing term.
+
+    Returns
+    -------
+    np.ndarray
+    """
+    if not isinstance(common_delta, DeltaModelBase):
+        if isinstance(common_delta, Number):
+            common_delta = ConstantDeltaModel(common_delta)
+        else:
+            common_delta = DeltaCurveRegressionModel(np.asarray(common_delta))
+
+    pair_indices = find_pairs(data.is_null())
+
+    chunks = []
+    for (start, end) in pair_indices:
+        # Get the values in the array between start and end
+        chunk = np.asarray(data.slice(start, end - start))
+        n = len(chunk)
+        # The set of values that are not null
+        has_real = chunk[~np.isnan(chunk)]
+        n_has_real = len(has_real)
+        if n_has_real == 1:
+            # If there is only one non-null value, this is a singleton
+            # point, but it might only have one or two sides to pad
+            if n == 2:
+                if np.isnan(chunk[0]):
+                    chunk[0] = chunk[1] - common_delta(chunk[1])
+                else:
+                    chunk[1] = chunk[0] + common_delta(chunk[0])
+            elif n == 3:
+                dx = common_delta(chunk[1])
+                chunk[0] = chunk[1] - dx
+                chunk[2] = chunk[1] + dx
+            else:
+                raise Exception()
+        else:
+            # Otherwise this is a run of values, so we can estimate a more accurate
+            # delta directly from the data
+            dx, _ = estimate_median_delta(has_real)
+            if np.isnan(chunk[0]):
+                chunk[0] = chunk[1] - dx
+            if np.isnan(chunk[-1]):
+                chunk[-1] = chunk[-2] + dx
+        chunks.append(chunk)
+    return np.concat(chunks)
+```
+
+</details>
+
 ##### Null Semantics for Signal Data
 
-Unless otherwise noted, readers _SHOULD_ treat `null` values in sorting dimension `0` of the entry as governed by this model with parallel `null` values in any intensity arrays as 0. The former should have a `transformation` value of [`MS:1003901`]() and the latter should have a `transformation` value [`MS:1003902`](). All other values for those points should be read as-is with null semantics meaning that the value was absent. Writers using null marking _SHOULD_ only use `null` for the first sorting dimension and associated intensity value, all other columns should be written as-is.
+Unless otherwise noted, readers _SHOULD_ treat `null` values in the sorting rank 0 array of the entry as governed by this model with parallel `null` values in any intensity arrays as 0. The former should have a `transformation` value of [`MS:1003901`]() and the latter should have a `transformation` value [`MS:1003902`](). All other values for those points should be read as-is with null semantics meaning that the value was absent. Writers using null marking _SHOULD_ only use `null` for the first sorting dimension and associated intensity value, all other columns should be written as-is.
 
 ### Auxiliary Data Arrays
 
-TODO: Expand on this.
+When an array is present in an entry, but is not encoded as a column in the schema, it must be stored as an auxiliary array. This can happen when mixing different kinds of detectors in a single collection, or especially with diagnostic traces where every array might have different dimensions along a shared time axis or subsampled arrays. Auxiliary data arrays have a schema similar to [`binaryDataArray`](https://peptideatlas.org/tmp/mzML1.1.0.html#binaryDataArray) in mzML, encoded in Parquet. They are described in JSON schema at [schema/auxiliary_array.json](https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/auxiliary_array.json)
 
 ```
 optional group auxiliary_arrays (List) {
@@ -783,7 +1027,7 @@ To store Numpress linear encoded arrays, an extra column is added `<array_name>_
 
 __Note__: The start point is _INCLUDED_ from the chunk values array. It is a specific component of the Numpress encoded bytes.
 
-TODO: Consider if we should split out the fixed point into a separate column and then we can store this data as a uniform length unsigned int16 or int32.
+TODO: Consider if we should split out the fixed point and initial values into a separate column and then we can store this data as a uniform length unsigned int16 or int32.
 
 ##### Opaque Array Transforms
 

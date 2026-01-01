@@ -1,6 +1,6 @@
 import logging
 
-from typing import Any, Generator, Iterator, Sequence, NamedTuple
+from typing import Iterator, Sequence, NamedTuple
 from numbers import Number
 from enum import Enum, auto
 
@@ -188,6 +188,99 @@ def estimate_median_delta(data: Sequence[Number]) -> tuple[Number, np.typing.NDA
     deltas_below = deltas[deltas <= median]
     median = np.median(deltas_below)
     return median, deltas_below
+
+
+def find_pairs(mask: Sequence[bool]) -> Sequence[int]:
+    """
+    Construct index ranges between pairs of :const:`True` values in
+    ``mask``.
+
+    The first and last index range will include the beginning and ending
+    of the array respectively, even if the mask does not start/end with a
+    :const:`True` value.
+
+    The resulting array will have two columns, the start and end indices.
+
+    Parameters
+    ----------
+    mask : :class:`Sequence` of :class:`bool`
+
+    Returns
+    -------
+    np.typing.NDarray[int]
+    """
+    parts = []
+    indices = np.where(mask)[0]
+    if len(indices) == 0:
+        return np.array([[0, len(mask)]])
+    if indices[0] != 0:
+        parts.append([0])
+    parts.append(indices)
+    if indices[-1] != len(mask) - 1:
+        parts.append([len(mask) - 1])
+    indices = np.concat(parts)
+    indices = indices.reshape((-1, 2))
+    indices[:, 1] += 1
+    return indices
+
+
+def fill_nulls_simple(
+    data: pa.Array, common_delta: DeltaModelBase
+) -> "np.typing.NDArray":
+    """
+    Fill ``null`` values in ``data`` using the ``common_delta`` model or the locally estimated
+    median delta if sufficient data are available.
+
+    .. note::
+        This implementation is not used, it is simply for testing purposes, it does
+        not handle unpaired input at all.
+
+
+    Parameters
+    ----------
+    data : :class:`pyarrow.Array`
+        The data array to fill nulls in with ``common_delta``
+    common_delta : :class:`DeltaModelBase`
+        The common spacing model
+
+    Returns
+    -------
+    np.ndarray
+    """
+    pair_indices = find_pairs(data.is_null())
+
+    chunks = []
+    for (start, end) in pair_indices:
+        # Get the values in the array between start and end
+        chunk = np.asarray(data.slice(start, end - start))
+        n = len(chunk)
+        # The set of values that are not null
+        has_real = chunk[~np.isnan(chunk)]
+        n_has_real = len(has_real)
+        if n_has_real == 1:
+            # If there is only one non-null value, this is a singleton
+            # point, but it might only have one or two sides to pad
+            if n == 2:
+                if np.isnan(chunk[0]):
+                    chunk[0] = chunk[1] - common_delta(chunk[1])
+                else:
+                    chunk[1] = chunk[0] + common_delta(chunk[0])
+            elif n == 3:
+                dx = common_delta(chunk[1])
+                chunk[0] = chunk[1] - dx
+                chunk[2] = chunk[1] + dx
+            else:
+                raise Exception()
+        else:
+            # Otherwise this is a run of values, so we can estimate a more accurate
+            # delta directly from the data
+            dx, _ = estimate_median_delta(has_real)
+            if np.isnan(chunk[0]):
+                chunk[0] = chunk[1] - dx
+            if np.isnan(chunk[-1]):
+                chunk[-1] = chunk[-2] + dx
+        chunks.append(chunk)
+    return np.concat(chunks)
 
 
 def fill_nulls(data: pa.Array, common_delta: DeltaModelBase | Number) -> "np.typing.NDArray":
@@ -441,17 +534,16 @@ class NullTokenizer:
             elif not start_null and self.is_null():
                 self.state = NullSpanStep(0, len(self.array), NullFillState.NullEnd)
 
-    def emit(self) -> NullSpanStep | None:
+    def __next__(self) -> NullSpanStep | None:
         state = self.state
         self.state = self.next_state
         self.update_next_state()
+        if state is None:
+            raise StopIteration()
         return state
 
-    def __iter__(
-        self,
-    ) -> Generator[NullSpanStep, Any, None]:
-        while val := self.emit():
-            yield val
+    def __iter__(self):
+        return self
 
     @classmethod
     def from_pyarrow(cls, array: pa.Array) -> "NullTokenizer":
