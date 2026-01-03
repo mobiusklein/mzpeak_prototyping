@@ -40,7 +40,7 @@
         - [Basic Encoding](#basic-encoding)
         - [Delta Encoding](#delta-encoding)
         - [Numpress Linear Encoding](#numpress-linear-encoding)
-        - [Opaque Array Transforms](#opaque-array-transforms)
+    - [Opaque Array Transforms](#opaque-array-transforms)
   - [Why all these root nodes?](#why-all-these-root-nodes)
 - [Index File - `mzpeak_index.json`](#index-file---mzpeak_indexjson)
   - [Data Kind](#data-kind)
@@ -326,11 +326,20 @@ Governed by `schema/array_index.json`.
 
 #### Buffer Format
 
-TODO: Describe the buffer format list.
+Depending upon the signal data layout being used, arrays will be stored in different formats
+
+Available formats:
+ - `point`: This array is stored using the [`point`](#point-layout) layout. The `point` layout is all-or-nothing, every array _MUST_ be in that format.
+ - `chunk_values`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the list of values of the "main" axis bounded between the chunk's start and end point. These values are encoded to be more compressable. This encoding is _in addition_ to the Parquet encoding step.
+ - `chunk_start`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the starting value of the "main" axis for the chunk, inclusive.
+ - `chunk_end`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the ending value of the "main" axis for the chunk, inclusive.
+ - `chunk_encoding`: This array is part of the [`chunked`](#chunked-layout) layout. It contains a CURIE indicating how `chunk_values` was encoded.
+ - `chunk_secondary`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the list of values of an array other than the main axis for the chunk.
+ - `chunk_transform`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the list of raw byte contents of an array in the chunk that was opaquely transformed, e.g. using MS-Numpress. It may be present in addition to a referenced `chunk_values` or `chunk_secondary` column.
 
 #### Buffer Priority, Naming
 
-In Parquet, all column names and types need to be known before you can begin writing, and no two columns can have the same name + path. Normally, we have a coordinate array column (e.g. m/z or time) and an intensity array column. If you have intensity arrays with different units or different data types, they would need to be defined as separate arrays in the [array index](#the-array-index) and thus have distinct names. While this case may be uncommon for spectra, when working with diagnostic traces stored as chromatograms this can be unavoidable. For ergonomics, we want to use simple column names most of the time, and it would be ideal if the most common columns had consistent names as this makes using files from raw Parquet tools easier. To that end, the most common (as defined by the implementation) version of each array type _SHOULD_ have a `buffer_priority` property of `"primary"` and receive a short and consistent name. The [table](#array-name-recommendations) below lists recommended short names:
+In Parquet, all column names and types need to be known before you can begin writing, and no two columns can have the same name + path. Normally, we have a coordinate array column (e.g. m/z or time) and an intensity array column. If you have intensity arrays with different units or different data types, they would need to be defined as separate arrays in the [array index](#the-array-index) and thus have distinct names. While this case may be uncommon for spectra, when working with diagnostic traces stored as chromatograms this can be unavoidable. For ergonomics, we want to use simple column names most of the time, and it would be ideal if the most common columns had consistent names as this makes using files from raw Parquet tools easier. To that end, the most common (as defined by the implementation) version of each array type _SHOULD_ have a `buffer_priority` property of `primary` and receive a short and consistent name. The [table](#array-name-recommendations) below lists recommended short names:
 
 <figure id="array-name-recommendations">
 
@@ -788,7 +797,7 @@ When storing data arrays, the chunked layout treats one array, which must be sor
   <tr>
     <th colspan=6>chunk</th>
   </tr>
-  <tr><th>spectrum_index</td><th>mz_start</td><th>mz_end</td><th>mz_chunk values</td><th>chunk_encoding</td><th>intensity</td></tr>
+  <tr><th>spectrum_index</td><th>mz_chunk_start</td><th>mz_chunk_end</td><th>mz_chunk_values</td><th>chunk_encoding</td><th>intensity</td></tr>
 </thead>
 <tbody>
 <tr><td>1</td><td>200</td><td>250</td><td>[0.0013, ..., 0.0013]</td><td>MS:1003089</td><td>[...]</td></tr>
@@ -801,17 +810,17 @@ When storing data arrays, the chunked layout treats one array, which must be sor
 </tbody>
 </table>
 
-This example uses a delta-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_chunk_values` list aren't accessible to the page index, but the `_start` and `_end` columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
+This example uses a delta-encoding for the m/z array chunks' values, which can be efficiently reconstructed with very high precision for 64-bit floats. The m/z values within the `mz_chunk_values` list aren't accessible to the page index, but the `_chunk_start` and `_chunk_end` columns are. The chunk values are still subject to Parquet encodings so they can be byte shuffled as well which further improves compression.
 
 The chunked layout's column naming rules:
 
 1. `<entity>_index` (integer): The index key for the entity this chunk belongs to.
-2. `<array_name>_start` (float64): The first coordinate value in this chunk, where it _starts_ at inclusively.
-3. `<array_name>_end` (float64): The last coordinate value in this chunk, where it _ends_ at inclusively.
-4. `<array_name>_chunk_values` (list): The encoded coordinates from `array_name` according to the `chunk_encoding` column.
-5. `chunk_encoding` (CURIE): The method by which `<array_name>_chunk_values` were encoded. See [Chunk Encodings](#chunk-encodings) for more details.
+2. `<array_name>_chunk_start` (float64): The first coordinate value in this chunk, where it _starts_ at inclusively. This array's entry in the [`array index`](#the-array-index)'s `buffer_format` _MUST_ be `chunk_start`.
+3. `<array_name>_chunk_end` (float64): The last coordinate value in this chunk, where it _ends_ at inclusively. This array's entry in the [`array index`](#the-array-index)'s `buffer_format` _MUST_ be `chunk_end`.
+4. `<array_name>_chunk_values` (list): The encoded coordinates from `array_name` according to the `chunk_encoding` column. This array's entry in the [`array index`](#the-array-index)'s `buffer_format` _MUST_ be `chunk_values`.
+5. `chunk_encoding` (CURIE): The method by which `<array_name>_chunk_values` were encoded. See [Chunk Encodings](#chunk-encodings) for more details. This array's entry in the [`array index`](#the-array-index)'s `buffer_format` _MUST_ be `chunk_encoding`.
 
-All other columns are expected to be `list` arrays whose names are simply their `array_name` as described in the index, or surrogate arrays not named in the array index that hold additional encoded bytes.
+All other columns are expected to be `list` arrays whose names are simply their `array_name` as described in the index with `buffer_format` `chunk_secondary`, or surrogate arrays with the buffer format `chunk_transform`.
 
 #### Splitting Data Into Chunks
 
@@ -1023,17 +1032,13 @@ Chunk Encoding Controlled Vocabulary: [`MS:1002312|MS-Numpress linear prediction
 
 This uses the Numpress linear prediction method ([10.1074/mcp.O114.037879](https://www.mcponline.org/article/S1535-9476(20)33083-8/fulltext)) to compress the chunk's values as raw bytes. Numpress creates a buffer containing an 8 byte fixed point, 4 byte value 0, 4 byte value 1, followed by 2 byte residuals for all subsequent values in the array. This means that the array is by definition not alignable to a 4- or 8-byte type. It also has no concept of nullity, which means it is _not compatible_ with [null marking](#null-marking).
 
-To store Numpress linear encoded arrays, an extra column is added `<array_name>_numpress_bytes` is added. It is a list of byte arrays (`large_list<u8>` in Arrow parlance, __not__ `large_binary`, see [discussion of string type "optimization"](https://arrow.apache.org/docs/format/Intro.html#variable-length-binary-and-string)).
+To store Numpress linear encoded arrays, an extra column is added `<array_name>_numpress_linear_bytes` is added alongside the `<array_name>_chunk_values` column. It is a list of byte arrays (`large_list<u8>` in Arrow parlance, __not__ `large_binary`, see [discussion of string type "optimization"](https://arrow.apache.org/docs/format/Intro.html#variable-length-binary-and-string)). The array index entry for this column _MUST_ have `buffer_format` of `chunk_transform` and the same array type, array name, data type, unit, and data processing ID as the `_chunk_values` column. The `transform` field in the index _MUST_ be `MS:1002312`.
 
 __Note__: The start point is _INCLUDED_ from the chunk values array. It is a specific component of the Numpress encoded bytes.
 
-TODO: Consider if we should split out the fixed point and initial values into a separate column and then we can store this data as a uniform length unsigned int16 or int32.
+### Opaque Array Transforms
 
-##### Opaque Array Transforms
-
-TODO: Describe how to use Numpress encodings in the chunked encoding.
-
-
+In some cases, we might prefer to store data lossily in non-uniform, unaligned, or otherwise non-standard data types that don't have a physical representation in Parquet. MS-Numpress's short logged float (SLOF) and positive integer encodings are good examples of these cases. While the Numpress-Linear chunk encoding works for the coordinate dimension, we also support using other opaque transformations to encode the secondary arrays in chunks. These columns are also recorded in the `array index ` with `buffer_format` = `chunk_transform`, the `transform` field in the index must be the CURIE for the relevant encoding method, such as [`MS:1002314`](http://purl.obolibrary.org/obo/MS_1002314) for MS-Numpress's SLOF encoding. The column's data type _MUST_ be a list of byte arrays, though the type in the `array index` _MUST_ be the decoded array's real type after decoding. The column names _SHOULD_ be of the form `<array_name>_<transform_name>_bytes`, e.g. `intensity_numpress_slof_bytes`.
 
 ## Why all these root nodes?
 
@@ -1044,6 +1049,7 @@ Perhaps, but the top-level structure leaves the door open for two use-cases:
 1. Clear schema signaling. When you see `point` at the root of the schema, you know this is a [point layout](#point-layout), not a [chunked layout](#chunked-layout) file.
 2. Unaligned proprietary data. A specialized writer or reader might wish to embed other information that is not directly connected to the primary schema's addressible unit (e.g. a spectrum, a data point), and this leaves open a door for that to be introduced. It is assumed that this is unlikely at this time, but it is a quantum physics universe.
 3. More table packing. Early in mzPeak's design, we tried to pack tables together as much as possible as in the [packed parallel table](#packed-parallel-metadata-tables) layout, but this proved to be very inefficient to _write_ despite being no slower to _read_. This might have been an implementation detail, and not Parquet itself. We don't want to throw out the opportunity to return to that in the future, requiring a schema-breaking change rather than just how we get to the tables that break.
+
 
 # Index File - `mzpeak_index.json`
 

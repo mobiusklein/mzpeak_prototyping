@@ -925,7 +925,6 @@ mod test {
             !indices.contains(&5),
             "index 5 should not be in {indices:?}"
         );
-        // eprintln!("{indices:?}");
     }
 
     #[test_log::test]
@@ -2731,7 +2730,6 @@ mod test {
         let weights_trans: Vec<_> = weights.iter().map(|v| (v + 1.0).ln().sqrt()).collect();
 
         let m = select_delta_model(&data, Some(&weights_trans));
-        // eprintln!("Selected betas: {m:?}");
 
         let (delta, data, weights): (Vec<_>, Vec<_>, Vec<_>) = delta
             .into_iter()
@@ -2747,7 +2745,6 @@ mod test {
             .collect();
 
         let betas = fit_delta_model(&data, &delta, Some(&weights), 2).unwrap();
-        // eprintln!("{betas:?}");
         for i in 0..betas.len() {
             let a = betas[i];
             let b = m[i];

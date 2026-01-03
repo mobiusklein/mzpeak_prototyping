@@ -250,7 +250,7 @@ impl ConvertArgs {
             self.ion_mobility_f32,
             self.intensity_slof,
         )
-        .create_type_overrides()
+        .create_type_overrides(self.chunked_encoding)
     }
 
     pub fn chromatogram_chunked_encoding(&self) -> Option<ChunkingStrategy> {

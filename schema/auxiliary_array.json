@@ -3,6 +3,13 @@
   "title": "mzPeak auxiliary data array",
   "description": "Describe the JSON format of auxliary data array",
   "type": "object",
+  "required": [
+    "name",
+    "data",
+    "data_type",
+    "compression",
+    "unit"
+  ],
   "properties": {
     "name": {
       "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json",
@@ -52,6 +59,10 @@
         "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
       },
       "description": "Additional parameters describing this data array"
+    },
+    "data_processing_ref": {
+      "type": "string",
+      "description": "The identifier for the data processing pipeline that created this array."
     }
   }
 }

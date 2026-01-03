@@ -725,7 +725,7 @@ impl<
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<(), parquet::errors::ParquetError> {
+    fn finish_parquet_inner(&mut self) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             self.flush_data_arrays()?;
             self.append_key_value_metadata(
@@ -813,7 +813,21 @@ impl<
                 self.append_metadata();
                 writer = self.archive_writer.take().unwrap().into_inner()?;
             }
+            Ok(writer)
+        } else {
+            Err(parquet::errors::ParquetError::EOF(
+                "Already closed file".into(),
+            ))
+        }
+    }
 
+    pub fn finish_parquet(mut self) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
+        self.finish_parquet_inner()
+    }
+
+    pub fn finish(&mut self) -> Result<(), parquet::errors::ParquetError> {
+        if self.archive_writer.is_some() {
+            let writer = self.finish_parquet_inner()?;
             writer.finish().unwrap();
             Ok(())
         } else {
@@ -867,7 +881,7 @@ mod test {
     use arrow::datatypes::DataType;
     use mzdata::{params::Unit, spectrum::BinaryDataArrayType};
 
-    use crate::{BufferName, MzPeakReader, peak_series::BufferFormat};
+    use crate::{BufferName, MzPeakReader, archive::FileEntry, peak_series::BufferFormat};
 
     use super::*;
     use std::io;
@@ -916,11 +930,11 @@ mod test {
                     == name
                 {
                 } else if mz_buffer.clone().with_format(BufferFormat::ChunkBoundsEnd) == name {
-                } else if mz_buffer.clone().with_format(BufferFormat::Chunked) == name {
+                } else if mz_buffer.clone().with_format(BufferFormat::Chunk) == name {
                 } else if mz_buffer.clone().with_format(BufferFormat::ChunkEncoding) == name {
                 } else if intensity_buffer
                     .clone()
-                    .with_format(BufferFormat::ChunkedSecondary)
+                    .with_format(BufferFormat::ChunkSecondary)
                     == name
                 {
                 } else {
@@ -985,12 +999,24 @@ mod test {
         for chrom in reader.iter_chromatograms() {
             writer.write_chromatogram(&chrom)?;
         }
-        drop(writer);
+
+        let mut zip_writer = writer.finish_parquet()?;
+
+        zip_writer.start_other(&"example.config")?;
+        zip_writer.write_all(b"<config><foo>some XML gobbledygook</foo></config>")?;
+
+        let job_entry = FileEntry::new("job.sig".into(), crate::archive::EntityType::Other("other".into()), crate::archive::DataKind::Proprietary);
+        zip_writer.add_file_from_read(&mut b"some binary sludge".as_slice(), None::<&String>, Some(job_entry))?;
+
+        zip_writer.finish()?;
 
         let mut new_reader = MzPeakReader::new(arc.path())?;
         assert_eq!(reader.len(), new_reader.len());
         assert!(new_reader.metadata.spectrum_auxiliary_array_counts.iter().all(|z| *z == 0));
-
+        assert_eq!(new_reader.list_all_files_in_archive().len(), 8);
+        let mut buf = Vec::new();
+        new_reader.open_stream("example.config")?.read_to_end(&mut buf)?;
+        assert_eq!(buf, b"<config><foo>some XML gobbledygook</foo></config>");
         reader.reset();
         new_reader.reset();
 
@@ -1043,7 +1069,9 @@ mod test {
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
         let mut builder = MzPeakWriter::<fs::File>::builder();
 
-        let spectrum_overrides = ArrayConversionHelper::new(false, true, false, true, true).create_type_overrides();
+        let spectrum_overrides = ArrayConversionHelper::new(false, true, false, true, true).create_type_overrides(
+            Some(ChunkingStrategy::NumpressLinear { chunk_size: 50.0 })
+        );
         for (k, v) in spectrum_overrides.iter() {
             builder = builder.add_spectrum_array_override(k.clone(), v.clone())
         }
@@ -1078,13 +1106,13 @@ mod test {
         let array_indices = new_reader.metadata.spectrum_array_indices();
         for arr in array_indices.iter() {
             if arr.path.ends_with("mz_numpress_linear_bytes") {
-                assert!(matches!(arr.buffer_format, BufferFormat::ChunkedTransform));
+                assert!(matches!(arr.buffer_format, BufferFormat::ChunkTransform));
             }
             else if arr.path.ends_with("intensity_numpress_slof_bytes") {
-                assert!(matches!(arr.buffer_format, BufferFormat::ChunkedTransform));
+                assert!(matches!(arr.buffer_format, BufferFormat::ChunkTransform));
             }
             else if arr.path.ends_with("mz_chunk_values") {
-                assert!(matches!(arr.buffer_format, BufferFormat::Chunked));
+                assert!(matches!(arr.buffer_format, BufferFormat::Chunk));
             }
         }
         assert_eq!(reader.len(), new_reader.len());

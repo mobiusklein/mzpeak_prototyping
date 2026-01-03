@@ -1402,7 +1402,6 @@ mod test {
     fn test_load_all_chromatogram_metadata(#[case] path: &str) -> io::Result<()> {
         let reader = MzPeakReader::new(path)?;
         let out = reader.load_all_chromatgram_metadata_impl()?;
-        // eprintln!("{out:?}");
         assert_eq!(out.len(), 1);
         Ok(())
     }

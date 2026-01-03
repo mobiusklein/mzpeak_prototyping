@@ -10,3 +10,4 @@
 *.mzML binary
 *.mzpeak binary
 *.mzPeak binary
+*.parquet binary

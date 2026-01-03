@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, prelude::*};
 use std::path::PathBuf;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use parquet::file::reader::{ChunkReader, Length};
 use zip::{
     CompressionMethod,
@@ -16,7 +16,6 @@ use parquet::arrow::arrow_reader::{
 };
 
 use crate::archive::{FileEntry, FileIndex};
-
 
 fn file_options() -> SimpleFileOptions {
     SimpleFileOptions::default()
@@ -97,7 +96,8 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
     /// Start writing a specific [`FileEntry`]. The underlying state will be [`MzPeakArchiveType::Other`]
     /// but the file name and index metadata will come from the [`FileEntry`] fields.
     pub fn start_for_entry(&mut self, entry: FileEntry) -> ZipResult<()> {
-        self.archive_writer.start_file(entry.name.clone(), file_options())?;
+        self.archive_writer
+            .start_file(entry.name.clone(), file_options())?;
         self.index.push(entry);
         Ok(())
     }
@@ -120,7 +120,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         &mut self,
         read: &mut impl io::Read,
         name: Option<&S>,
-        entry: Option<FileEntry>
+        entry: Option<FileEntry>,
     ) -> io::Result<()> {
         if let Some(entry) = entry {
             self.start_for_entry(entry)?
@@ -128,12 +128,11 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
             if let Some(name) = name {
                 self.start_other(name)?;
             } else {
-                return Err(
-                    io::Error::new(
-                        io::ErrorKind::InvalidFilename,
-                        r#"No file name was provided to add an arbitrary byte stream to the mzPeak
-archive, nor was one given via the file index entry"#)
-                    )
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidFilename,
+                    r#"No file name was provided to add an arbitrary byte stream to the mzPeak
+archive, nor was one given via the file index entry"#,
+                ));
             }
         }
 
@@ -215,7 +214,15 @@ impl Read for ArchiveFacetReader {
         } else {
             buf
         };
-        self.archive.read(buf)
+
+        let z = self.archive.read(buf)?;
+        self.at += z as u64;
+        Ok(z)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        buf.resize((self.length - self.at) as usize, 0);
+        self.read(buf)
     }
 }
 
@@ -253,6 +260,10 @@ impl Seek for ArchiveFacetReader {
             }
         }
     }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.at)
+    }
 }
 
 impl Length for ArchiveFacetReader {
@@ -288,6 +299,167 @@ impl ChunkReader for ArchiveFacetReader {
     }
 }
 
+pub struct ArchiveBytesSlice {
+    buf: io::Cursor<bytes::Bytes>,
+}
+
+impl ArchiveBytesSlice {
+    pub fn new(buf: io::Cursor<bytes::Bytes>) -> Self {
+        Self { buf }
+    }
+}
+
+impl io::Read for ArchiveBytesSlice {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.buf.read(buf)
+    }
+}
+
+impl io::Seek for ArchiveBytesSlice {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.buf.seek(pos)
+    }
+}
+
+impl Length for ArchiveBytesSlice {
+    fn len(&self) -> u64 {
+        self.buf.get_ref().len() as u64
+    }
+}
+
+impl ChunkReader for ArchiveBytesSlice {
+    type T = bytes::buf::Reader<bytes::Bytes>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(self.buf.get_ref().slice(start as usize..).reader())
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        let start = start as usize;
+        Ok(self.buf.get_ref().slice(start..start + length))
+    }
+}
+
+pub enum ArchiveFacet {
+    File(ArchiveFacetReader),
+    Bytes(ArchiveBytesSlice),
+}
+
+impl From<ArchiveBytesSlice> for ArchiveFacet {
+    fn from(value: ArchiveBytesSlice) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl From<ArchiveFacetReader> for ArchiveFacet {
+    fn from(value: ArchiveFacetReader) -> Self {
+        Self::File(value)
+    }
+}
+
+impl io::Read for ArchiveFacet {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ArchiveFacet::File(f) => f.read(buf),
+            ArchiveFacet::Bytes(f) => f.read(buf),
+        }
+    }
+}
+
+impl io::Seek for ArchiveFacet {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        match self {
+            ArchiveFacet::File(f) => f.seek(pos),
+            ArchiveFacet::Bytes(f) => f.seek(pos),
+        }
+    }
+}
+
+impl Length for ArchiveFacet {
+    fn len(&self) -> u64 {
+        match self {
+            ArchiveFacet::File(f) => f.len(),
+            ArchiveFacet::Bytes(f) => f.len(),
+        }
+    }
+}
+
+impl ChunkReader for ArchiveFacet {
+    type T = io::BufReader<ArchiveFacet>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        match self {
+            ArchiveFacet::File(f) => {
+                let part = f.get_read(start)?.into_inner();
+                Ok(io::BufReader::new(Self::File(part)))
+            }
+            ArchiveFacet::Bytes(f) => {
+                let part = ArchiveBytesSlice::new(io::Cursor::new(f.get_read(start)?.into_inner()));
+                Ok(io::BufReader::new(Self::Bytes(part)))
+            }
+        }
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        match self {
+            ArchiveFacet::File(f) => f.get_bytes(start, length),
+            ArchiveFacet::Bytes(f) => f.get_bytes(start, length),
+        }
+    }
+}
+
+pub struct ZipArchiveBytesSource {
+    archive_file: bytes::Bytes,
+    archive_offset: Config,
+    pub file_names: Vec<String>,
+    pub file_index: FileIndex,
+}
+
+impl ZipArchiveBytesSource {
+    pub fn new(archive_file: bytes::Bytes) -> io::Result<Self> {
+        let (_, file_names, archive_offset, file_index) =
+            zip_archive_to_config(io::Cursor::new(archive_file.clone()))?;
+        Ok(Self {
+            archive_file,
+            archive_offset,
+            file_names,
+            file_index: file_index.unwrap_or_default(),
+        })
+    }
+
+    pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveBytesSlice> {
+        let handle = self.archive_file.clone();
+        zip_archive_open_entry_bytes(handle, index, self.archive_offset)
+    }
+}
+
+impl ArchiveSource for ZipArchiveBytesSource {
+    type File = ArchiveBytesSlice;
+
+    fn file_index(&self) -> &FileIndex {
+        &self.file_index
+    }
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        let handle = fs::File::open(path)?;
+        let map = unsafe { memmap2::Mmap::map(&handle)? };
+        let buf = bytes::Bytes::from_owner(map);
+        Self::new(buf)
+    }
+
+    fn file_names(&self) -> &[String] {
+        &self.file_names
+    }
+
+    fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
+        self.open_entry_by_index(index)
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+}
+
 pub struct ZipArchiveSource {
     archive_file: fs::File,
     archive_offset: Config,
@@ -301,12 +473,14 @@ fn zip_archive_to_config<R: io::Read + io::Seek>(
     let mut arch = ZipArchive::new(archive_file)?;
     let offset = arch.offset();
     let file_names: Vec<String> = arch.file_names().map(|s| s.to_string()).collect();
-    let index: Option<FileIndex> =
-        if let Some(i) = file_names.iter().position(|s| s == FileIndex::index_file_name()) {
-            serde_json::from_reader(arch.by_index(i)?).ok()
-        } else {
-            None
-        };
+    let index: Option<FileIndex> = if let Some(i) = file_names
+        .iter()
+        .position(|s| s == FileIndex::index_file_name())
+    {
+        serde_json::from_reader(arch.by_index(i)?).ok()
+    } else {
+        None
+    };
     let archive_file = arch.into_inner();
     let archive_offset = Config {
         archive_offset: zip::read::ArchiveOffset::Known(offset),
@@ -337,6 +511,29 @@ fn zip_archive_open_entry(
     Ok(ArchiveFacetReader::new(handle, start_offset, length, 0))
 }
 
+fn zip_archive_open_entry_bytes(
+    handle: bytes::Bytes,
+    index: usize,
+    archive_offset: Config,
+) -> io::Result<ArchiveBytesSlice> {
+    let mut archive = ZipArchive::with_config(archive_offset, io::Cursor::new(handle.clone()))?;
+    let header = archive.by_index(index)?;
+    match header.compression() {
+        CompressionMethod::Stored => {}
+        method => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Compression method {method:?} isn't supported. Only Stored is supported"),
+            ));
+        }
+    }
+    let start_offset = header.data_start();
+    let length = header.size();
+    drop(header);
+    let chunk = handle.slice(start_offset as usize..(start_offset + length) as usize);
+    Ok(ArchiveBytesSlice::new(io::Cursor::new(chunk)))
+}
+
 impl ZipArchiveSource {
     pub fn new(archive_file: fs::File) -> io::Result<Self> {
         let (archive_file, file_names, archive_offset, file_index) =
@@ -349,25 +546,9 @@ impl ZipArchiveSource {
         })
     }
 
-    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
-        if let Some(index) = self.file_names.iter().position(|v| v == name) {
-            self.open_entry_by_index(index)
-        } else {
-            Err(
-                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
-            )
-        }
-    }
-
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = self.archive_file.try_clone()?;
         zip_archive_open_entry(handle, index, self.archive_offset)
-    }
-
-    pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
-        let handle = self.open_entry_by_index(index)?;
-        let opts = ArrowReaderOptions::new().with_page_index(true);
-        Ok(ArrowReaderMetadata::load(&handle, opts)?)
     }
 }
 
@@ -393,16 +574,6 @@ impl SplittingZipArchiveSource {
     pub fn open_entry_by_index(&self, index: usize) -> io::Result<ArchiveFacetReader> {
         let handle = fs::File::open(self.archive_file.as_path())?;
         zip_archive_open_entry(handle, index, self.archive_offset)
-    }
-
-    pub fn open_stream(&self, name: &str) -> io::Result<ArchiveFacetReader> {
-        if let Some(index) = self.file_names.iter().position(|v| v == name) {
-            self.open_entry_by_index(index)
-        } else {
-            Err(
-                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
-            )
-        }
     }
 }
 
@@ -448,9 +619,10 @@ pub trait ArchiveSource: Sized + 'static {
         if let Some(index) = self.file_names().iter().position(|v| v == name) {
             self.open_entry_by_index(index)
         } else {
-            Err(
-                io::Error::new(io::ErrorKind::NotFound, format!("Could not find an entry by name for \"{name}\""))
-            )
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Could not find an entry by name for \"{name}\""),
+            ))
         }
     }
 
@@ -566,12 +738,6 @@ impl DirectorySource {
         let length = meta.len();
         Ok(ArchiveFacetReader::new(fh, 0, length, 0))
     }
-
-    pub fn metadata_for_index(&self, index: usize) -> io::Result<ArrowReaderMetadata> {
-        let handle = self.open_entry_by_index(index)?;
-        let opts = ArrowReaderOptions::new().with_page_index(true);
-        Ok(ArrowReaderMetadata::load(&handle, opts)?)
-    }
 }
 
 impl ArchiveSource for DirectorySource {
@@ -635,7 +801,11 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
             });
 
             let metadata = archive.metadata_for_index(i).ok();
-            if !matches!(tp, MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary) && metadata.is_none() {
+            if !matches!(
+                tp,
+                MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary
+            ) && metadata.is_none()
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -758,12 +928,14 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
 
 pub type ZipArchiveReader = ArchiveReader<ZipArchiveSource>;
 pub type DirectoryArchiveReader = ArchiveReader<DirectorySource>;
+pub type MemoryMapZipArchiveReader = ArchiveReader<ZipArchiveBytesSource>;
 pub type AnyArchiveReader = ArchiveReader<DispatchArchiveSource>;
 
 pub enum DispatchArchiveSource {
     Zip(ZipArchiveSource),
     Directory(DirectorySource),
     SplittingZip(SplittingZipArchiveSource),
+    MemoryMapZip(ZipArchiveBytesSource),
 }
 
 macro_rules! dispatch {
@@ -772,12 +944,13 @@ macro_rules! dispatch {
             DispatchArchiveSource::Zip($r) => $e,
             DispatchArchiveSource::Directory($r) => $e,
             DispatchArchiveSource::SplittingZip($r) => $e,
+            DispatchArchiveSource::MemoryMapZip($r) => $e,
         }
     };
 }
 
 impl ArchiveSource for DispatchArchiveSource {
-    type File = ArchiveFacetReader;
+    type File = ArchiveFacet;
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
         if fs::metadata(&path)?.is_dir() {
@@ -798,7 +971,7 @@ impl ArchiveSource for DispatchArchiveSource {
     }
 
     fn open_entry_by_index(&self, index: usize) -> io::Result<Self::File> {
-        dispatch!(self, src, { src.open_entry_by_index(index) })
+        dispatch!(self, src, { src.open_entry_by_index(index).map(|v| v.into()) })
     }
 
     fn file_index(&self) -> &FileIndex {
@@ -809,6 +982,13 @@ impl ArchiveSource for DispatchArchiveSource {
 impl ArchiveReader<DispatchArchiveSource> {
     pub fn new(file: fs::File) -> io::Result<Self> {
         let archive = DispatchArchiveSource::Zip(ZipArchiveSource::new(file)?);
+        Self::init_from_archive(archive)
+    }
+
+    pub unsafe fn memmap(file: fs::File) -> io::Result<Self> {
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        let buf = bytes::Bytes::from_owner(map);
+        let archive = DispatchArchiveSource::MemoryMapZip(ZipArchiveBytesSource::new(buf)?);
         Self::init_from_archive(archive)
     }
 }
@@ -823,6 +1003,20 @@ impl ZipArchiveReader {
 impl DirectoryArchiveReader {
     pub fn new(file: PathBuf) -> io::Result<Self> {
         let archive = DirectorySource::new(file)?;
+        Self::init_from_archive(archive)
+    }
+}
+
+impl MemoryMapZipArchiveReader {
+    pub fn new(file: fs::File) -> io::Result<Self> {
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        let buf = bytes::Bytes::from_owner(map);
+        let archive = ZipArchiveBytesSource::new(buf)?;
+        Self::init_from_archive(archive)
+    }
+
+    pub fn from_buf(buf: Bytes) -> io::Result<Self> {
+        let archive = ZipArchiveBytesSource::new(buf)?;
         Self::init_from_archive(archive)
     }
 }
@@ -857,6 +1051,49 @@ mod test {
     }
 
     #[test]
+    fn test_mmap() -> io::Result<()> {
+        let arch = MemoryMapZipArchiveReader::from_path("small.mzpeak".into())?;
+        let handle = arch.spectrum_metadata()?;
+        let reader = handle.with_limit(5).build()?;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let spec = batch.column(0).as_struct();
+            assert_eq!(spec.column_by_name("index").unwrap().len(), 5);
+        }
+
+        let index = arch.file_index();
+        assert_eq!(index.len(), 4);
+        assert_eq!(arch.list_files().len(), 5);
+
+        let mut handle = arch.open_stream("mzpeak_index.json")?;
+        handle.seek_relative(20)?;
+        assert_eq!(handle.stream_position()?, 20);
+        Ok(())
+    }
+
+    #[test]
+    fn test_in_memory() -> io::Result<()> {
+        let buf = Bytes::from(fs::read("small.mzpeak")?);
+        let arch = MemoryMapZipArchiveReader::from_buf(buf)?;
+        let handle = arch.spectrum_metadata()?;
+        let reader = handle.with_limit(5).build()?;
+        for batch in reader {
+            let batch = batch.unwrap();
+            let spec = batch.column(0).as_struct();
+            assert_eq!(spec.column_by_name("index").unwrap().len(), 5);
+        }
+
+        let index = arch.file_index();
+        assert_eq!(index.len(), 4);
+        assert_eq!(arch.list_files().len(), 5);
+
+        let mut handle = arch.open_stream("mzpeak_index.json")?;
+        handle.seek_relative(20)?;
+        assert_eq!(handle.stream_position()?, 20);
+        Ok(())
+    }
+
+    #[test]
     fn test_base_dir() -> io::Result<()> {
         let arch = DirectoryArchiveReader::from_path("small.unpacked.mzpeak".into())?;
         let handle = arch.spectrum_metadata()?;
@@ -879,9 +1116,10 @@ mod test {
         Ok(())
     }
 
-     #[test]
+    #[test]
     fn test_base_splittable() -> io::Result<()> {
-        let arch = ArchiveReader::<DispatchArchiveSource>::from_path("small.chunked.mzpeak".into())?;
+        let arch =
+            ArchiveReader::<DispatchArchiveSource>::from_path("small.chunked.mzpeak".into())?;
 
         let handle = arch.spectrum_metadata()?;
         let reader = handle.with_limit(5).build()?;

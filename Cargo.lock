@@ -2149,6 +2149,7 @@ dependencies = [
  "indicatif",
  "itertools",
  "log",
+ "memmap2",
  "mzdata",
  "mzpeaks",
  "nalgebra",

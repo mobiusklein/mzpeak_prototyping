@@ -179,7 +179,7 @@ trait ChunkQuerySource {
     }
 
     fn array_prefix<'a>() -> &'a str {
-        "chunk"
+        BufferFormat::Chunk.prefix()
     }
 
     fn prepare_predicate_for_index(&self, index_range: MaskSet) -> Box<dyn ArrowPredicate> {
@@ -205,37 +205,34 @@ trait ChunkQuerySource {
         &'a ArrayIndexEntry,
         &'a ArrayIndexEntry,
         &'a ArrayIndexEntry,
+        Vec<&'a ArrayIndexEntry>,
     )> {
         let mut start_entry = None;
         let mut end_entry = None;
         let mut values_entry = None;
+        let mut additional_entries = Vec::new();
+        let cache = BufferNameCache::new(array_indices);
+
         for entry in array_indices.iter() {
             match entry.buffer_format {
                 BufferFormat::Point => {}
                 BufferFormat::ChunkBoundsStart => start_entry = Some(entry),
                 BufferFormat::ChunkBoundsEnd => end_entry = Some(entry),
-                BufferFormat::Chunked => values_entry = Some(entry),
+                BufferFormat::Chunk => values_entry = Some(entry),
                 BufferFormat::ChunkEncoding => {}
-                BufferFormat::ChunkedSecondary => {}
-                BufferFormat::ChunkedTransform => {
-                    // TODO: Add this to the API
+                BufferFormat::ChunkSecondary => {}
+                BufferFormat::ChunkTransform => {
+                    if cache.is_chunk_transform_for_main_chunk(entry.field_name(), &entry.as_buffer_name()) {
+                        additional_entries.push(entry);
+                    }
                 }
             }
         }
 
         match (start_entry, end_entry, values_entry) {
-            (Some(start), Some(end), Some(values)) => Some((start, end, values)),
+            (Some(start), Some(end), Some(values)) => Some((start, end, values, additional_entries)),
             (_, _, _) => None,
         }
-    }
-
-    fn find_chunk_values_entry<'a>(
-        &self,
-        array_indices: &'a ArrayIndex,
-    ) -> Option<&'a ArrayIndexEntry> {
-        array_indices
-            .iter()
-            .find(|e| matches!(e.buffer_format, BufferFormat::Chunked))
     }
 
     fn find_chunk_values_by_name<'a>(
@@ -253,23 +250,12 @@ trait ChunkQuerySource {
         array_indices: &ArrayIndex,
     ) -> Option<Box<dyn ArrowPredicate>> {
         let mut fields = None;
-        if let Some((start, end, _values)) =
+        if let Some((start, end, _values, _)) =
             self.find_chunk_value_arrays_by_buffer_format(array_indices)
         {
             let start_name = start.path.clone();
             let end_name = end.path.clone();
             fields = Some([start_name, end_name])
-        } else if let Some(e) = self.find_chunk_values_entry(array_indices) {
-            let prefix = e.path.as_str();
-            let prefix = if prefix.ends_with("_chunk_values") {
-                prefix.replace("_chunk_values", "")
-            } else {
-                prefix.to_string()
-            };
-            fields = Some([
-                format!("{prefix}_chunk_start"),
-                format!("{prefix}_chunk_end"),
-            ]);
         } else if let Some(e) = self.find_chunk_values_by_name(array_indices) {
             let prefix = e.path.as_str();
             let prefix = if prefix.ends_with("_chunk_values") {
@@ -344,25 +330,16 @@ trait ChunkQuerySource {
 
         fields.push(sidx);
 
-        if let Some((start, end, values)) =
+        if let Some((start, end, values, additional)) =
             self.find_chunk_value_arrays_by_buffer_format(array_indices)
         {
             let values_name = values.path.clone();
             let start_name = start.path.clone();
             let end_name = end.path.clone();
-            fields.extend([values_name, start_name, end_name])
-        } else if let Some(e) = self.find_chunk_values_entry(array_indices) {
-            let prefix = e.path.as_str();
-            let prefix = if prefix.ends_with("_chunk_values") {
-                prefix.replace("_chunk_values", "")
-            } else {
-                prefix.to_string()
-            };
-            fields.extend([
-                e.path.clone(),
-                format!("{prefix}_chunk_start"),
-                format!("{prefix}_chunk_end"),
-            ]);
+            fields.extend([values_name, start_name, end_name]);
+            for f in additional {
+                fields.push(f.path.clone());
+            }
         } else if let Some(e) = self.find_chunk_values_by_name(array_indices) {
             let prefix = e.path.as_str();
             let prefix = if prefix.ends_with("_chunk_values") {
@@ -534,9 +511,13 @@ impl<'a> BufferNameCache<'a> {
         name
     }
 
-    fn get_transform(&mut self, field_name: &str, buffer_name: &BufferName) -> Option<Arc<BufferName>> {
+    fn is_chunk_transform_for_main_chunk(&self, field_name: &str, buffer_name: &BufferName) -> bool {
+        self.get_transform(field_name, buffer_name).is_some_and(|f| matches!(f.buffer_format, BufferFormat::Chunk))
+    }
+
+    fn get_transform(&self, field_name: &str, buffer_name: &BufferName) -> Option<Arc<BufferName>> {
         for array_index_entry in self.array_indices.iter() {
-            if matches!(array_index_entry.buffer_format, BufferFormat::Chunked | BufferFormat::ChunkedSecondary) {
+            if matches!(array_index_entry.buffer_format, BufferFormat::Chunk | BufferFormat::ChunkSecondary) {
                 let qname = array_index_entry.as_buffer_name();
                 if qname.array_type == buffer_name.array_type
                     && qname.dtype == buffer_name.dtype
@@ -716,7 +697,7 @@ impl<'a> ChunkDecoder<'a> {
                 _ => {
                     if let Some(name) = name {
                         match name.buffer_format {
-                            BufferFormat::Chunked => {
+                            BufferFormat::Chunk => {
                                 log::trace!(
                                     "Storing {name} with {:?} and {} entries",
                                     arr.data_type(),
@@ -724,7 +705,7 @@ impl<'a> ChunkDecoder<'a> {
                                 );
                                 self.main_axis_buffers.push((name, arr.clone()));
                             }
-                            BufferFormat::ChunkedSecondary | BufferFormat::Point => {
+                            BufferFormat::ChunkSecondary | BufferFormat::Point => {
                                 log::trace!(
                                     "Storing (secondary) {name} with {:?} and {} entries",
                                     arr.data_type(),
@@ -741,8 +722,8 @@ impl<'a> ChunkDecoder<'a> {
                             BufferFormat::ChunkEncoding => {
                                 chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec()
                             }
-                            BufferFormat::ChunkedTransform => {
-                                if self.buffer_name_cache.get_transform(f.name(), &name).is_some_and(|qname| matches!(qname.buffer_format, BufferFormat::Chunked)) {
+                            BufferFormat::ChunkTransform => {
+                                if self.buffer_name_cache.get_transform(f.name(), &name).is_some_and(|qname| matches!(qname.buffer_format, BufferFormat::Chunk)) {
                                     self.main_axis_buffers.push((name, arr.clone()));
                                 } else {
                                     self.buffers.entry(name).or_default().push(arr.clone());
@@ -928,7 +909,7 @@ impl<'a> ChunkScanDecoder<'a> {
                 _ => {
                     if let Some(name) = name {
                         match name.buffer_format {
-                            BufferFormat::Chunked => {
+                            BufferFormat::Chunk => {
                                 log::trace!(
                                     "Storing {name} with {:?} and {} entries",
                                     arr.data_type(),
@@ -936,7 +917,7 @@ impl<'a> ChunkScanDecoder<'a> {
                                 );
                                 self.main_axis_buffers.push((name, arr.clone()));
                             }
-                            BufferFormat::ChunkedSecondary | BufferFormat::Point => {
+                            BufferFormat::ChunkSecondary | BufferFormat::Point => {
                                 self.buffers.entry(name).or_default().push(arr.clone());
                             }
                             BufferFormat::ChunkBoundsStart => {
@@ -948,8 +929,8 @@ impl<'a> ChunkScanDecoder<'a> {
                             BufferFormat::ChunkEncoding => {
                                 chunk_encodings = AnyCURIEArray::try_from(arr).unwrap().to_vec()
                             }
-                            BufferFormat::ChunkedTransform => {
-                                if self.buffer_name_cache.get_transform(f.name(), &name).is_some_and(|qname| matches!(qname.buffer_format, BufferFormat::Chunked)) {
+                            BufferFormat::ChunkTransform => {
+                                if self.buffer_name_cache.is_chunk_transform_for_main_chunk(f.name(), &name) {
                                     self.main_axis_buffers.push((name, arr.clone()));
                                 } else {
                                     self.buffers.entry(name).or_default().push(arr.clone());

@@ -329,7 +329,10 @@ impl ArrayConversionHelper {
         }
     }
 
-    pub fn create_type_overrides(&self) -> BufferOverrideTable {
+    pub fn create_type_overrides(
+        &self,
+        chunked_encoding: Option<ChunkingStrategy>,
+    ) -> BufferOverrideTable {
         let mut overrides = HashMap::new();
 
         if self.mz_f32 {
@@ -349,9 +352,30 @@ impl ArrayConversionHelper {
                     .with_unit(unit),
                 );
             }
+        } else {
+            for unit in [Unit::MZ, Unit::Unknown] {
+                overrides.insert(
+                    BufferName::new(
+                        BufferContext::Spectrum,
+                        ArrayType::MZArray,
+                        BinaryDataArrayType::Float32,
+                    )
+                    .with_unit(unit),
+                    BufferName::new(
+                        BufferContext::Spectrum,
+                        ArrayType::MZArray,
+                        BinaryDataArrayType::Float64,
+                    )
+                    .with_unit(unit),
+                );
+            }
         }
 
-        let intensity_transform = self.intensity_slof.then_some(BufferTransform::NumpressSLOF);
+        let intensity_transform = if chunked_encoding.is_some() {
+            self.intensity_slof.then_some(BufferTransform::NumpressSLOF)
+        } else {
+            None
+        };
         for ctx in [BufferContext::Chromatogram, BufferContext::Spectrum] {
             for unit in INTENSITY_UNITS {
                 if self.intensity_f32 {

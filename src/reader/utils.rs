@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use arrow::{array::{AsArray, RecordBatch}, error::ArrowError};
+use arrow::{array::{AsArray, RecordBatch}, datatypes, error::ArrowError};
 use identity_hash::BuildIdentityHasher;
 use mzpeaks::coordinate::{SimpleInterval, Span1D};
 
@@ -53,9 +53,10 @@ impl MaskSet {
             return None;
         }
 
-        self.index_range.end = self.index_range.start + halfway;
+        let new_end = self.index_range.start + halfway;
         let mut other = Self::new(self.index_range.clone(), None);
-        other.index_range.start = self.end() + 1;
+        other.index_range.start = new_end + 1;
+        self.index_range.end = new_end;
         if let Some(includes) = self.sparse_includes.as_mut() {
             let mut other_includes = HashSet::with_capacity_and_hasher(includes.len() / 2, Default::default());
             includes.retain(|v| {
@@ -126,21 +127,24 @@ impl SpanDynNumeric for MaskSet {
     fn contains_dy(&self, array: &arrow::array::ArrayRef) -> arrow::array::BooleanArray {
         let mask = self.index_range.contains_dy(array);
         if let Some(includes) = self.sparse_includes.as_ref() {
-            if let Some(arr) = array.as_primitive_opt::<arrow::datatypes::UInt64Type>() {
-                let is_in: arrow::array::BooleanArray = arr
-                    .iter()
-                    .map(|v| Some(v.is_some_and(|v| includes.contains(&v))))
-                    .collect();
-                arrow::compute::and(&mask, &is_in).unwrap()
-            } else if let Some(arr) = array.as_primitive_opt::<arrow::datatypes::UInt32Type>() {
-                let is_in = arr
-                    .iter()
-                    .map(|v| Some(v.is_some_and(|v| includes.contains(&(v as u64)))))
-                    .collect();
-                arrow::compute::and(&mask, &is_in).unwrap()
-            } else {
-                panic!("Unsupported data type {:?}", array.data_type())
+            macro_rules! filter {
+                ($($dtype:ty)+) => {
+                    $(
+                        if let Some(arr) = array.as_primitive_opt::<$dtype>() {
+                            let is_in: arrow::array::BooleanArray = arr
+                                .iter()
+                                .map(|v| Some(v.is_some_and(|v| includes.contains(&(v as u64)))))
+                                .collect();
+                            return arrow::compute::and(&mask, &is_in).unwrap()
+                        }
+                    )+
+                };
             }
+            filter!(
+                datatypes::UInt64Type
+                datatypes::UInt32Type
+            );
+            panic!("Unsupported data type {:?}", array.data_type())
         } else {
             mask
         }
@@ -164,5 +168,20 @@ mod test {
         assert!(!mask.contains(&5));
         assert!(mask.contains(&15));
         assert!(mask.contains(&27));
+    }
+
+    #[test]
+    fn test_mask_set_split() {
+        let mask = MaskSet::new((10u64..30).into(), Some(HashSet::from_iter([15, 27])));
+        let mut mask2 = mask.clone();
+        let mask3 = mask2.split().unwrap();
+        assert_eq!(mask3.start(), 21);
+        assert_eq!(mask2.start(), 10);
+        assert_eq!(mask3.end(), 30);
+        assert_eq!(mask2.end(), 20);
+        assert_eq!(mask3.sparse_includes, Some(HashSet::from_iter([27])));
+        assert_eq!(mask2.sparse_includes, Some(HashSet::from_iter([15])));
+
+        assert_eq!(mask2.intersect(&mask3), MaskSet::empty());
     }
 }

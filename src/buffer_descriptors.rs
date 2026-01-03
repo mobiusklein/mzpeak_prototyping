@@ -86,12 +86,12 @@ pub enum BufferFormat {
     /// A contiguous list of values in a chunk that may be transformed. It will have a start
     /// and end value encoded in parallel with it, along with an encoding to tell the reader
     /// how to reconstruct the original values.
-    Chunked,
+    Chunk,
     /// The CURIE defining how the chunk was encoded. Goes with [`BufferFormat::Chunked`]
     ChunkEncoding,
     /// A contiguous list of values in a chunk contiguous with a [`BufferFormat::Chunked`] array
-    ChunkedSecondary,
-    ChunkedTransform
+    ChunkSecondary,
+    ChunkTransform,
 }
 
 impl BufferFormat {
@@ -99,12 +99,12 @@ impl BufferFormat {
     pub const fn prefix(&self) -> &'static str {
         match self {
             Self::Point => "point",
-            Self::Chunked |
-            Self::ChunkedSecondary |
-            Self::ChunkBoundsStart |
-            Self::ChunkBoundsEnd |
-            Self::ChunkEncoding |
-            Self::ChunkedTransform => "chunk",
+            Self::Chunk
+            | Self::ChunkSecondary
+            | Self::ChunkBoundsStart
+            | Self::ChunkBoundsEnd
+            | Self::ChunkEncoding
+            | Self::ChunkTransform => "chunk",
         }
     }
 }
@@ -115,12 +115,12 @@ impl FromStr for BufferFormat {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "point" => Ok(Self::Point),
-            "chunk_values" => Ok(Self::Chunked),
-            "secondary_chunk" => Ok(Self::ChunkedSecondary),
+            "chunk_values" => Ok(Self::Chunk),
+            "secondary_chunk" | "chunk_secondary" => Ok(Self::ChunkSecondary),
             "chunk_start" => Ok(Self::ChunkBoundsStart),
             "chunk_end" => Ok(Self::ChunkBoundsEnd),
             "chunk_encoding" => Ok(Self::ChunkEncoding),
-            "chunk_transform" => Ok(Self::ChunkedTransform),
+            "chunk_transform" => Ok(Self::ChunkTransform),
             _ => Err(format!("{s} not recognized as a buffer format")),
         }
     }
@@ -130,12 +130,12 @@ impl Display for BufferFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BufferFormat::Point => f.write_str("point"),
-            BufferFormat::Chunked => f.write_str("chunk_values"),
-            BufferFormat::ChunkedSecondary => f.write_str("secondary_chunk"),
+            BufferFormat::Chunk => f.write_str("chunk_values"),
+            BufferFormat::ChunkSecondary => f.write_str("chunk_secondary"),
             BufferFormat::ChunkBoundsStart => f.write_str("chunk_start"),
             BufferFormat::ChunkBoundsEnd => f.write_str("chunk_end"),
             BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
-            BufferFormat::ChunkedTransform => f.write_str("chunk_transform")
+            BufferFormat::ChunkTransform => f.write_str("chunk_transform"),
         }
     }
 }
@@ -653,7 +653,7 @@ impl BufferName {
     }
 
     pub fn make_bounds_fields(&self) -> Option<(FieldRef, FieldRef)> {
-        if !matches!(self.buffer_format, BufferFormat::Chunked) {
+        if !matches!(self.buffer_format, BufferFormat::Chunk) {
             return None;
         }
         let start = self
@@ -720,24 +720,26 @@ impl Display for BufferName {
         };
         if self.buffer_priority == Some(BufferPriority::Primary) {
             return match self.buffer_format {
-                BufferFormat::Point | BufferFormat::ChunkedSecondary => {
+                BufferFormat::Point | BufferFormat::ChunkSecondary => {
                     write!(f, "{tp_name}")
                 }
-                BufferFormat::Chunked => write!(f, "{tp_name}_chunk_values"),
+                BufferFormat::Chunk => write!(f, "{tp_name}_chunk_values"),
                 BufferFormat::ChunkBoundsStart => write!(f, "{tp_name}_chunk_start"),
                 BufferFormat::ChunkBoundsEnd => write!(f, "{tp_name}_chunk_end"),
                 BufferFormat::ChunkEncoding => f.write_str("chunk_encoding"),
-                BufferFormat::ChunkedTransform => {
+                BufferFormat::ChunkTransform => {
                     if let Some(tfm) = self.transform {
                         if let Some(fragment) = tfm.array_name_fragment() {
                             write!(f, "{tp_name}_{fragment}_bytes")
                         } else {
-                            panic!("Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment");
+                            panic!(
+                                "Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment"
+                            );
                         }
                     } else {
                         panic!("Cannot create an array of `ChunkedTransform` without a transform");
                     }
-                },
+                }
             };
         }
         let dtype = match self.dtype {
@@ -749,12 +751,14 @@ impl Display for BufferName {
             BinaryDataArrayType::ASCII => "ascii",
         };
         if matches!(self.unit, Unit::Unknown) {
-            if let BufferFormat::ChunkedTransform = self.buffer_format {
+            if let BufferFormat::ChunkTransform = self.buffer_format {
                 if let Some(tfm) = self.transform {
                     if let Some(fragment) = tfm.array_name_fragment() {
                         write!(f, "{tp_name}_{dtype}_{fragment}_bytes")
                     } else {
-                        panic!("Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment");
+                        panic!(
+                            "Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment"
+                        );
                     }
                 } else {
                     panic!("Cannot create an array of `ChunkedTransform` without a transform");
@@ -788,12 +792,14 @@ impl Display for BufferName {
                 Unit::Percent => "pct",
                 Unit::Dimensionless => "",
             };
-            if let BufferFormat::ChunkedTransform = self.buffer_format {
+            if let BufferFormat::ChunkTransform = self.buffer_format {
                 if let Some(tfm) = self.transform {
                     if let Some(fragment) = tfm.array_name_fragment() {
                         write!(f, "{tp_name}_{dtype}_{unit}_{fragment}_bytes")
                     } else {
-                        panic!("Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment");
+                        panic!(
+                            "Cannot create an array of `ChunkedTransform` with a transform that does not have an array name fragment"
+                        );
                     }
                 } else {
                     panic!("Cannot create an array of `ChunkedTransform` without a transform");
@@ -895,33 +901,41 @@ impl From<SerializedArrayIndexEntry> for ArrayIndexEntry {
             _ => todo!("Could not infer context from {value:?}"),
         };
 
-        Self {
+        let name = value
+            .path
+            .rsplit_once(".")
+            .map(|s| s.1.to_string())
+            .unwrap_or_else(|| value.path.to_string());
+        let array_type = array_type_from_accession(value.array_type).unwrap_or(ArrayType::Unknown);
+        let data_type = array_to_arrow_type(
+            binary_datatype_from_accession(value.data_type).unwrap_or_default(),
+        );
+        let unit = value.unit.map(|x| Unit::from_curie(&x)).unwrap_or_default();
+        let buffer_format = value
+            .buffer_format
+            .parse::<BufferFormat>()
+            .unwrap_or(BufferFormat::Point);
+
+        let transform = value.transform.and_then(|t| {
+            BufferTransform::from_curie(t).or_else(|| {
+                log::warn!("Failed to translate {t} into a buffer transform");
+                None
+            })
+        });
+
+        Self::new(
             context,
-            name: value
-                .path
-                .rsplit_once(".")
-                .map(|s| s.1.to_string())
-                .unwrap_or_else(|| value.path.to_string()),
-            path: value.path,
-            array_type: array_type_from_accession(value.array_type).unwrap_or(ArrayType::Unknown),
-            data_type: array_to_arrow_type(
-                binary_datatype_from_accession(value.data_type).unwrap_or_default(),
-            ),
-            unit: value.unit.map(|x| Unit::from_curie(&x)).unwrap_or_default(),
-            buffer_format: value
-                .buffer_format
-                .parse::<BufferFormat>()
-                .unwrap_or(BufferFormat::Point),
-            transform: value.transform.and_then(|t| {
-                BufferTransform::from_curie(t).or_else(|| {
-                    log::warn!("Failed to translate {t} into a buffer transform");
-                    None
-                })
-            }),
-            data_processing_id: value.data_processing_id,
-            buffer_priority: value.buffer_priority,
-            sorting_rank: value.sorting_rank,
-        }
+            value.path,
+            name,
+            data_type,
+            array_type,
+            unit,
+            buffer_format,
+            transform,
+            value.data_processing_id,
+            value.buffer_priority,
+            value.sorting_rank,
+        )
     }
 }
 
@@ -970,6 +984,10 @@ impl ArrayIndexEntry {
         array_type: ArrayType,
         unit: Unit,
         buffer_format: BufferFormat,
+        transform: Option<BufferTransform>,
+        data_processing_id: Option<Box<str>>,
+        buffer_priority: Option<BufferPriority>,
+        sorting_rank: Option<u32>,
     ) -> Self {
         Self {
             context,
@@ -979,10 +997,10 @@ impl ArrayIndexEntry {
             array_type,
             unit,
             buffer_format,
-            transform: None,
-            data_processing_id: None,
-            buffer_priority: None,
-            sorting_rank: None,
+            transform,
+            data_processing_id,
+            buffer_priority,
+            sorting_rank,
         }
     }
 
@@ -1036,6 +1054,11 @@ impl ArrayIndexEntry {
         this
     }
 
+    /// Get the field name for this array index entry relative to its enclosing group from [`Self::path`]
+    pub fn field_name(&self) -> &str {
+        self.path.rsplit(".").last().unwrap()
+    }
+
     /// Whether this describes an ion mobility array
     pub const fn is_ion_mobility(&self) -> bool {
         self.array_type.is_ion_mobility()
@@ -1064,14 +1087,14 @@ impl ArrayIndex {
     pub fn get(&self, key: &ArrayType) -> Option<&ArrayIndexEntry> {
         self.entries
             .iter()
-            .filter(|v| matches!(v.buffer_format, BufferFormat::Chunked | BufferFormat::Point))
+            .filter(|v| matches!(v.buffer_format, BufferFormat::Chunk | BufferFormat::Point))
             .find(|v| v.array_type == *key)
     }
 
     pub fn get_all(&self, key: &ArrayType) -> impl Iterator<Item = &ArrayIndexEntry> {
         self.entries
             .iter()
-            .filter(|v| matches!(v.buffer_format, BufferFormat::Chunked | BufferFormat::Point))
+            .filter(|v| matches!(v.buffer_format, BufferFormat::Chunk | BufferFormat::Point))
             .filter(|v| v.array_type == *key)
     }
 
@@ -1345,12 +1368,12 @@ mod test {
         let mut instances = Vec::new();
 
         // Prove that all combinations work
-        for ((a, u), dtype) in array_types.iter().cartesian_product(units.iter()).cartesian_product(dtypes.iter()) {
-            let mut name = BufferName::new(
-                BufferContext::Spectrum,
-                a.clone(),
-                *dtype,
-            );
+        for ((a, u), dtype) in array_types
+            .iter()
+            .cartesian_product(units.iter())
+            .cartesian_product(dtypes.iter())
+        {
+            let mut name = BufferName::new(BufferContext::Spectrum, a.clone(), *dtype);
             assert_ne!(name.to_string(), "");
             let no_primary = name.clone();
             instances.push(name.clone());

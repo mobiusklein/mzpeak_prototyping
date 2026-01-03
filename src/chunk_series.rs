@@ -5,7 +5,8 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, ArrowPrimitiveType, AsArray, Float32Array, Float32Builder,
     Float64Array, Float64Builder, Int32Builder, Int64Builder, LargeListBuilder, PrimitiveArray,
-    StructArray, StructBuilder, UInt8Array, UInt8Builder, UInt64Array, UInt64Builder,
+    StructArray, StructBuilder, UInt8Array, UInt8Builder, UInt64Array, UInt64Builder, Int32Array,
+    Int64Array,
 };
 use arrow::compute::kernels::nullif;
 use arrow::datatypes::{
@@ -19,7 +20,7 @@ use mzdata::spectrum::{
 };
 
 use bytemuck::Pod;
-use mzpeaks::prelude::Span1D;
+
 use num_traits::{Float, NumCast, ToPrimitive};
 
 use crate::buffer_descriptors::{BufferOverrideTable, BufferPriority};
@@ -92,7 +93,7 @@ impl ChunkingStrategy {
             ChunkingStrategy::NumpressLinear { chunk_size: _ } => {
                 let name = main_axis_name
                     .clone()
-                    .with_format(BufferFormat::ChunkedTransform)
+                    .with_format(BufferFormat::ChunkTransform)
                     .with_transform(Some(BufferTransform::NumpressLinear));
 
                 let bytes = Field::new(
@@ -374,9 +375,7 @@ impl TryFrom<BufferTransform> for BufferTransformEncoder {
 
     fn try_from(value: BufferTransform) -> Result<Self, Self::Error> {
         match value {
-            BufferTransform::NumpressLinear => Ok(Self(value)),
-            BufferTransform::NumpressSLOF => Ok(Self(value)),
-            BufferTransform::NumpressPIC => Ok(Self(value)),
+            BufferTransform::NumpressLinear | BufferTransform::NumpressSLOF | BufferTransform::NumpressPIC => Ok(Self(value)),
             BufferTransform::NullInterpolate | BufferTransform::NullZero => {
                 Err(format!("{value:?} does not have an encoder"))
             }
@@ -388,13 +387,9 @@ impl BufferTransformEncoder {
     pub fn to_buffer_name(&self, buffer_name: &BufferName) -> BufferName {
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
-            BufferTransform::NumpressSLOF => buffer_name
+            BufferTransform::NumpressSLOF | BufferTransform::NumpressPIC => buffer_name
                 .clone()
-                .with_format(BufferFormat::ChunkedTransform)
-                .with_transform(Some(self.0)),
-            BufferTransform::NumpressPIC => buffer_name
-                .clone()
-                .with_format(BufferFormat::ChunkedTransform)
+                .with_format(BufferFormat::ChunkTransform)
                 .with_transform(Some(self.0)),
             _ => unimplemented!("{:?} does not have a buffer name", self.0),
         }
@@ -404,17 +399,7 @@ impl BufferTransformEncoder {
         let buffer_name = self.to_buffer_name(buffer_name);
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
-            BufferTransform::NumpressSLOF => {
-                let meta = buffer_name.as_field_metadata();
-                let bytes = Field::new(
-                    buffer_name.to_string(),
-                    DataType::LargeList(Arc::new(Field::new("item", DataType::UInt8, false))),
-                    true,
-                )
-                .with_metadata(meta);
-                bytes
-            }
-            BufferTransform::NumpressPIC => {
+            BufferTransform::NumpressSLOF | BufferTransform::NumpressPIC => {
                 let meta = buffer_name.as_field_metadata();
                 let bytes = Field::new(
                     buffer_name.to_string(),
@@ -509,43 +494,47 @@ pub struct BufferTransformDecoder(BufferTransform);
 
 impl BufferTransformDecoder {
     pub fn decode(&self, buffer_name: &BufferName, array: &impl AsArray) -> ArrayRef {
+        macro_rules! decoder {
+            ($decoder:path) => {
+                let data: &UInt8Array = array.as_primitive();
+                match buffer_name.dtype {
+                    BinaryDataArrayType::Float64 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        $decoder(data.values(), &mut acc).unwrap();
+                        return Arc::new(Float64Array::from(acc));
+                    }
+                    BinaryDataArrayType::Float32 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        $decoder(data.values(), &mut acc).unwrap();
+                        return Arc::new(Float32Array::from_iter_values(
+                            acc.into_iter().map(|v| v as f32),
+                        ));
+                    }
+                    BinaryDataArrayType::Int32 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        $decoder(data.values(), &mut acc).unwrap();
+                        return Arc::new(Int32Array::from_iter_values(
+                            acc.into_iter().map(|v| v as i32),
+                        ));
+                    }
+                    BinaryDataArrayType::Int64 => {
+                        let mut acc: Vec<f64> = Vec::new();
+                        $decoder(data.values(), &mut acc).unwrap();
+                        return Arc::new(Int64Array::from_iter_values(
+                            acc.into_iter().map(|v| v as i64),
+                        ));
+                    }
+                    _ => panic!("Cannot decode {:?} into {:?}", self.0, buffer_name.dtype),
+                }
+            };
+        }
         match self.0 {
             BufferTransform::NumpressLinear => todo!(),
             BufferTransform::NumpressSLOF => {
-                let data: &UInt8Array = array.as_primitive();
-                match buffer_name.dtype {
-                    BinaryDataArrayType::Float64 => {
-                        let mut acc: Vec<f64> = Vec::new();
-                        numpress_rs::decode_slof(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float64Array::from(acc));
-                    }
-                    BinaryDataArrayType::Float32 => {
-                        let mut acc: Vec<f64> = Vec::new();
-                        numpress_rs::decode_slof(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float32Array::from_iter_values(
-                            acc.into_iter().map(|v| v as f32),
-                        ));
-                    }
-                    _ => todo!(),
-                }
+                decoder!(numpress_rs::decode_slof);
             }
             BufferTransform::NumpressPIC => {
-                let data: &UInt8Array = array.as_primitive();
-                match buffer_name.dtype {
-                    BinaryDataArrayType::Float64 => {
-                        let mut acc: Vec<f64> = Vec::new();
-                        numpress_rs::decode_pic(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float64Array::from(acc));
-                    }
-                    BinaryDataArrayType::Float32 => {
-                        let mut acc: Vec<f64> = Vec::new();
-                        numpress_rs::decode_pic(data.values(), &mut acc).unwrap();
-                        return Arc::new(Float32Array::from_iter_values(
-                            acc.into_iter().map(|v| v as f32),
-                        ));
-                    }
-                    _ => todo!(),
-                }
+                decoder!(numpress_rs::decode_pic);
             }
             _ => unimplemented!("{:?} does not have a decoder", self.0),
         }
@@ -568,9 +557,7 @@ impl TryFrom<BufferTransform> for BufferTransformDecoder {
 
     fn try_from(value: BufferTransform) -> Result<Self, Self::Error> {
         match value {
-            BufferTransform::NumpressLinear => Ok(Self(value)),
-            BufferTransform::NumpressSLOF => Ok(Self(value)),
-            BufferTransform::NumpressPIC => Ok(Self(value)),
+            BufferTransform::NumpressLinear | BufferTransform::NumpressSLOF | BufferTransform::NumpressPIC => Ok(Self(value)),
             BufferTransform::NullInterpolate | BufferTransform::NullZero => {
                 Err(format!("{value:?} does not have a decoder"))
             }
@@ -597,17 +584,6 @@ pub struct ArrowArrayChunk {
     pub arrays: HashMap<BufferName, ArrayRef>,
 }
 
-impl Span1D for ArrowArrayChunk {
-    type DimType = f64;
-
-    fn start(&self) -> Self::DimType {
-        self.chunk_start
-    }
-
-    fn end(&self) -> Self::DimType {
-        self.chunk_end
-    }
-}
 
 impl ArrowArrayChunk {
     /// Low level constructor for a single chunk record.
@@ -693,38 +669,28 @@ impl ArrowArrayChunk {
             ) {
                 b.append_null();
             } else {
+                macro_rules! primitive_builder {
+                    ($builder:ty) => {
+                        let inner = b
+                            .values()
+                            .as_any_mut()
+                            .downcast_mut::<$builder>()
+                            .unwrap();
+                        inner.append_array(chunk.chunk_values.as_primitive());
+                    };
+                }
                 match array_to_arrow_type(chunk.chunk_axis.dtype) {
                     DataType::Int32 => {
-                        let inner = b
-                            .values()
-                            .as_any_mut()
-                            .downcast_mut::<Int32Builder>()
-                            .unwrap();
-                        inner.append_array(chunk.chunk_values.as_primitive());
+                        primitive_builder!(Int32Builder);
                     }
                     DataType::Int64 => {
-                        let inner = b
-                            .values()
-                            .as_any_mut()
-                            .downcast_mut::<Int64Builder>()
-                            .unwrap();
-                        inner.append_array(chunk.chunk_values.as_primitive());
+                        primitive_builder!(Int64Builder);
                     }
                     DataType::Float32 => {
-                        let inner = b
-                            .values()
-                            .as_any_mut()
-                            .downcast_mut::<Float32Builder>()
-                            .unwrap();
-                        inner.append_array(chunk.chunk_values.as_primitive());
+                        primitive_builder!(Float32Builder);
                     }
                     DataType::Float64 => {
-                        let inner = b
-                            .values()
-                            .as_any_mut()
-                            .downcast_mut::<Float64Builder>()
-                            .unwrap();
-                        inner.append_array(chunk.chunk_values.as_primitive());
+                        primitive_builder!(Float64Builder);
                     }
                     DataType::LargeBinary => todo!(),
                     tp => {
@@ -767,7 +733,7 @@ impl ArrowArrayChunk {
                     continue;
                 }
                 if let Some(buf_name) = BufferName::from_field(chunk.chunk_axis.context, f.clone())
-                    .map(|f| f.with_format(BufferFormat::ChunkedSecondary))
+                    .map(|f| f.with_format(BufferFormat::ChunkSecondary))
                 {
                     let b: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                         this_builder.field_builder(i).unwrap();
@@ -784,38 +750,28 @@ impl ArrowArrayChunk {
                         );
                     } else {
                         if let Some(arr) = chunk.arrays.get(&buf_name) {
+                            macro_rules! primitive_builder {
+                                ($builder:ty) => {
+                                    let inner = b
+                                        .values()
+                                        .as_any_mut()
+                                        .downcast_mut::<$builder>()
+                                        .unwrap();
+                                    inner.append_array(arr.as_primitive());
+                                };
+                            }
                             match array_to_arrow_type(buf_name.dtype) {
                                 DataType::Int32 => {
-                                    let inner = b
-                                        .values()
-                                        .as_any_mut()
-                                        .downcast_mut::<Int32Builder>()
-                                        .unwrap();
-                                    inner.append_array(arr.as_primitive());
+                                    primitive_builder!(Int32Builder);
                                 }
                                 DataType::Int64 => {
-                                    let inner = b
-                                        .values()
-                                        .as_any_mut()
-                                        .downcast_mut::<Int64Builder>()
-                                        .unwrap();
-                                    inner.append_array(arr.as_primitive());
+                                    primitive_builder!(Int64Builder);
                                 }
                                 DataType::Float32 => {
-                                    let inner = b
-                                        .values()
-                                        .as_any_mut()
-                                        .downcast_mut::<Float32Builder>()
-                                        .unwrap();
-                                    inner.append_array(arr.as_primitive());
+                                    primitive_builder!(Float32Builder);
                                 }
                                 DataType::Float64 => {
-                                    let inner = b
-                                        .values()
-                                        .as_any_mut()
-                                        .downcast_mut::<Float64Builder>()
-                                        .unwrap();
-                                    inner.append_array(arr.as_primitive());
+                                    primitive_builder!(Float64Builder);
                                 }
                                 DataType::LargeBinary => todo!(),
                                 tp => {
@@ -937,7 +893,7 @@ impl ArrowArrayChunk {
 
         let main_axis = overrides
             .map(&main_axis)
-            .with_format(BufferFormat::Chunked)
+            .with_format(BufferFormat::Chunk)
             .with_priority(Some(BufferPriority::Primary))
             .with_sorting_rank(Some(0));
 
@@ -974,11 +930,11 @@ impl ArrowArrayChunk {
         for (i, (_, arr)) in arrays.iter().enumerate() {
             let name = BufferName::from_data_array(main_axis.context, arr);
             let buffer_name0 = if name.array_type == main_axis.array_type {
-                main_axis.clone().with_format(BufferFormat::Chunked)
+                main_axis.clone().with_format(BufferFormat::Chunk)
             } else {
                 overrides
                     .map(&name)
-                    .with_format(BufferFormat::ChunkedSecondary)
+                    .with_format(BufferFormat::ChunkSecondary)
             };
             let buffer_name = fields_of.map(&buffer_name0);
 
@@ -1098,7 +1054,7 @@ impl ArrowArrayChunk {
             _ => unimplemented!("{}", main_axis),
         };
 
-        let main_axis = main_axis.clone().with_format(BufferFormat::Chunked);
+        let main_axis = main_axis.clone().with_format(BufferFormat::Chunk);
 
         for step in steps {
             let slice = main_axis_array.slice(step.start, step.end - step.start);
@@ -1118,7 +1074,7 @@ impl ArrowArrayChunk {
                 .iter()
                 .filter(|(k, _)| k.array_type != main_axis.array_type)
             {
-                let k = k.clone().with_format(BufferFormat::ChunkedSecondary);
+                let k = k.clone().with_format(BufferFormat::ChunkSecondary);
                 let v = v.slice(step.start, step.end - step.start);
                 if let Ok(transform) = BufferTransformEncoder::try_from(k.transform) {
                     let vi = transform.encode_arrow(&k, &v);
@@ -1451,10 +1407,6 @@ mod test {
             false,
         );
 
-        // for col in rendered.column_names() {
-        //     eprintln!("{col}, {}", rendered.column_by_name(col).unwrap().len());
-        // }
-
         assert!(
             rendered
                 .column_by_name("intensity_f32_dc_numpress_slof_bytes")
@@ -1506,7 +1458,6 @@ mod test {
             ],
             false,
         );
-        eprintln!("{:?}", rendered.column_names());
         assert!(
             rendered
                 .column_by_name("mz_numpress_linear_bytes")

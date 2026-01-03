@@ -1142,4 +1142,56 @@ mod test {
         let _spec = handle.get_spectrum(0).await.unwrap();
         Ok(())
     }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::chunked("small.chunked.mzpeak")]
+    #[case::numpress("small.numpress.mzpeak")]
+    async fn test_read_spectrum(#[case] path: &str) -> io::Result<()> {
+        use mzdata::spectrum::SignalContinuity;
+
+        let store = LocalFileSystem::new_with_prefix(".")?;
+        let mut reader =
+            AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from(path))
+                .await?;
+        let descr = reader.get_spectrum(0).await.unwrap();
+        assert_eq!(descr.index(), 0);
+        assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
+        assert_eq!(descr.peaks().len(), 13589);
+        let descr = reader.get_spectrum(5).await.unwrap();
+        assert_eq!(descr.index(), 5);
+        assert_eq!(descr.peaks().len(), 650);
+        let descr = reader.get_spectrum(25).await.unwrap();
+        assert_eq!(descr.index(), 25);
+        assert_eq!(descr.peaks().len(), 789);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[rstest::rstest]
+    #[case::packed("small.mzpeak")]
+    #[case::packed_chunks("small.chunked.mzpeak")]
+    async fn test_load_all_metadata(#[case] path: &str) -> io::Result<()> {
+        let store = LocalFileSystem::new_with_prefix(".")?;
+        let reader =
+            AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from(path))
+                .await?;
+
+        let out = reader.load_all_spectrum_metadata_impl().await?;
+        assert_eq!(out.len(), 48);
+        assert!(out.iter().any(|p| !p.precursor.is_empty()));
+        let mut decoder = TimeIndexDecoder::new(
+            SimpleInterval::new(0.0, 1.0),
+            Some(SimpleInterval::new(0, 1)),
+        );
+        decoder.from_descriptions(&out);
+        let (time_index, mask) = decoder.finish();
+        assert!(time_index.len() > 5);
+        assert!((mask.index_range.end - mask.index_range.start) > 5);
+        assert!(mask.sparse_includes.is_some());
+        Ok(())
+    }
 }

@@ -42,7 +42,7 @@
                     "chunk_end",
                     "chunk_values",
                     "chunk_encoding",
-                    "secondary_chunk",
+                    "chunk_secondary",
                     "chunk_transform"
                 ]
             },
@@ -100,11 +100,11 @@
             },
             "sorting_rank": {
                 "type": ["integer", "null"],
-                "description": "What order, following the entity index, this column was sorted in ascending order if any. If this value is null or absent, this array is assumed not to be sorted.",
+                "description": "What order, following the entity index, this column was sorted in ascending order if any. The lower the rank, the earlier the dimension was sorted, starting from 0. If this value is null or absent, this array is assumed not to be sorted.",
                 "default": null
             },
             "data_processing_id": {
-                "type": ["integer", "string", "null"],
+                "type": ["string", "null"],
                 "description": "The identifier of a data processing method that governs this array. If not specified, assumed to be the default data processing method for this run.",
                 "default": null
             },

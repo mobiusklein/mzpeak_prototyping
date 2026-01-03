@@ -26,7 +26,7 @@ class BufferFormat(Enum):
 
     - ``Point`` - Each data point is stored as a row in the table as-is. Easy to do filtering random access queries over.
     - ``Chunk`` - Segments of data in a specific start-stop range are stored in an encoded block. More compact but harder to do queries over.
-    - ``Secondary_Chunk`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
+    - ``ChunkSecondary`` - Paired with ``Chunk``, these points are stored in separate blocks parallel to the paired ``Chunk``.
     - ``ChunkStart`` - The start of an encoded chunk's value range.
     - ``ChunkEnd`` - The end of an encoded chunk's value range.
     - ``ChunkEncoding`` - The method used to encode the chunk's values.
@@ -37,9 +37,9 @@ class BufferFormat(Enum):
     ChunkEnd = 3
     ChunkValues = 4
     ChunkEncoding = 5
-    SecondaryChunk = 6
+    ChunkSecondary = 6
     ChunkTransform = 7
-
+    SecondaryChunk = ChunkSecondary
     Chunk = ChunkValues
 
     @classmethod
@@ -613,10 +613,7 @@ class _ChunkBatchCleaner:
         axis_prefix = None
         for k, v in self.array_index.items():
             name = ArrayIndexEntry.from_index(k, v)
-            if (
-                name.buffer_format == BufferFormat.ChunkValues
-                or name.buffer_format == BufferFormat.Chunk
-            ):
+            if name.buffer_format == BufferFormat.ChunkValues:
                 axis_prefix = k.removesuffix("_chunk_values")
         if axis_prefix is None:
             for k, v in self.array_index.items():

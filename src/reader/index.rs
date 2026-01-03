@@ -1328,7 +1328,7 @@ impl QueryIndex {
         if BufferFormat::Point.prefix() == spectrum_array_indices.prefix {
             self.spectrum_point_index =
                 SpectrumPointIndex::from_reader(spectrum_data_reader, spectrum_array_indices);
-        } else if BufferFormat::Chunked.prefix() == spectrum_array_indices.prefix {
+        } else if BufferFormat::Chunk.prefix() == spectrum_array_indices.prefix {
             self.spectrum_chunk_index =
                 SpectrumChunkIndex::from_reader(spectrum_data_reader, spectrum_array_indices);
         } else {
@@ -1355,7 +1355,7 @@ impl QueryIndex {
                 chromatogram_data_reader,
                 chromatogram_array_indices,
             );
-        } else if BufferFormat::Chunked.prefix() == chromatogram_array_indices.prefix {
+        } else if BufferFormat::Chunk.prefix() == chromatogram_array_indices.prefix {
             self.chromatogram_chunk_index = ChromatogramChunkIndex::from_reader(
                 chromatogram_data_reader,
                 chromatogram_array_indices

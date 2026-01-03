@@ -3,6 +3,11 @@ export RUST_LOG := "debug"
 small:
     cargo r -r --example convert -- -y -z -u small.mzML -o small.mzpeak
     cargo r -r --example convert -- -p -c -y -z -u small.mzML -o small.chunked.mzpeak
+    cargo r -r --example convert -- \
+            --intensity-numpress-slof \
+            -c numpress:50 \
+            --chromatogram-chunked-encoding delta:50 \
+            -y -z -u small.mzML -o small.numpress.mzpeak
 
 numpress:
     cargo r --example convert -- \
