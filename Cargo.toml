@@ -51,7 +51,7 @@ path = "examples/extract_ref_object_store.rs"
 required-features = ["async"]
 
 [features]
-default = ["async", "thermo"]
+default = ["async", ]
 
 async = ["dep:tokio", "dep:async_zip", "dep:object_store", "parquet/async", "dep:futures", "mzdata/async_partial", "dep:url"]
 s3 = ["object_store/aws", "async"]

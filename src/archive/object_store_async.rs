@@ -367,19 +367,7 @@ impl<T: AsyncArchiveSource + 'static> AsyncArchiveReader<T> {
                 .find(|s| s.name == *name)
                 .map(|s| s.archive_type());
             let metadata = archive.metadata_for_index(i).await.ok();
-            let tp = tp.unwrap_or_else(|| if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
-                MzPeakArchiveType::SpectrumDataArrays
-            } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
-                MzPeakArchiveType::SpectrumMetadata
-            } else if name.ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()) {
-                MzPeakArchiveType::SpectrumPeakDataArrays
-            } else if name.ends_with(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix()) {
-                MzPeakArchiveType::ChromatogramMetadata
-            } else if name.ends_with(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix()) {
-                MzPeakArchiveType::ChromatogramDataArrays
-            } else {
-                MzPeakArchiveType::Other
-            });
+            let tp = tp.unwrap_or_else(|| MzPeakArchiveType::classify_from_suffix(&name));
 
             if !matches!(tp, MzPeakArchiveType::Other | MzPeakArchiveType::Proprietary) && metadata.is_none() {
                 return Err(io::Error::new(
@@ -520,10 +508,10 @@ mod test {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test_log::test]
     async fn test_local() -> io::Result<()> {
         let store = object_store::local::LocalFileSystem::new_with_prefix(".")?;
-        let v = store.path_to_filesystem(&ObjectPath::from("small.mzpeak"))?;
-        eprintln!("{}", v.display());
+        // let v = store.path_to_filesystem(&ObjectPath::from("small.mzpeak"))?;
 
         let handle = AsyncZipArchiveSource::new(Arc::new(store), "small.mzpeak".into()).await?;
 

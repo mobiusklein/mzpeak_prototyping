@@ -376,23 +376,24 @@ class MzPeakSpectrumMetadataReader(_PrecursorReadMixin):
         )
 
     def _infer_schema_idx(self):
-        rg = self.meta.row_group(0)
-        for i in range(rg.num_columns):
-            col = rg.column(i)
-            if col.path_in_schema == "spectrum.index":
-                self.spectrum_index_i = i
-            elif col.path_in_schema in ("scan.spectrum_index", "scan.source_index"):
-                self.scan_index_i = i
-            elif col.path_in_schema in (
-                "precursor.spectrum_index",
-                "precursor.source_index",
-            ):
-                self.precursor_index_i = i
-            elif col.path_in_schema in (
-                "selected_ion.spectrum_index",
-                "selected_ion.source_index",
-            ):
-                self.selected_ion_i = i
+        if self.meta.num_row_groups:
+            rg = self.meta.row_group(0)
+            for i in range(rg.num_columns):
+                col = rg.column(i)
+                if col.path_in_schema == "spectrum.index":
+                    self.spectrum_index_i = i
+                elif col.path_in_schema in ("scan.spectrum_index", "scan.source_index"):
+                    self.scan_index_i = i
+                elif col.path_in_schema in (
+                    "precursor.spectrum_index",
+                    "precursor.source_index",
+                ):
+                    self.precursor_index_i = i
+                elif col.path_in_schema in (
+                    "selected_ion.spectrum_index",
+                    "selected_ion.source_index",
+                ):
+                    self.selected_ion_i = i
 
     def _read_spectra(self):
         blocks = []

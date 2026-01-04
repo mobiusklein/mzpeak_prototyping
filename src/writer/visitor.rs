@@ -1671,6 +1671,32 @@ const BUILTIN_SPECTRUM_PARAMS: &[CURIE] = &[
 ];
 
 impl SpectrumDetailsBuilder {
+
+    fn raw_summaries<
+        C: CentroidLike,
+        D: DeconvolutedCentroidLike,
+        S: SpectrumLike<C, D> + 'static,
+    >(&self, item: &S) -> mzdata::spectrum::SpectrumSummary {
+        let summaries = item
+            .raw_arrays()
+            .map(|v| RefPeakDataLevel::<C, D>::RawData(v).fetch_summaries())
+            .unwrap_or_else(|| item.peaks().fetch_summaries());
+        summaries
+    }
+
+    #[allow(unused)]
+    fn peak_summaries<
+        C: CentroidLike,
+        D: DeconvolutedCentroidLike,
+        S: SpectrumLike<C, D> + 'static,
+    >(&self, item: &S) -> Option<mzdata::spectrum::SpectrumSummary> {
+        let peaks = item.peaks();
+        match &peaks {
+            RefPeakDataLevel::Missing | RefPeakDataLevel::RawData(_) => None,
+            RefPeakDataLevel::Centroid(_) | RefPeakDataLevel::Deconvoluted(_) => Some(peaks.fetch_summaries()),
+        }
+    }
+
     pub fn append_value<
         C: CentroidLike,
         D: DeconvolutedCentroidLike,
@@ -1684,10 +1710,7 @@ impl SpectrumDetailsBuilder {
     ) -> bool {
         self.curies_to_mask.clear();
 
-        let summaries = item
-            .raw_arrays()
-            .map(|v| RefPeakDataLevel::<C, D>::RawData(v).fetch_summaries())
-            .unwrap_or_else(|| item.peaks().fetch_summaries());
+        let summaries = self.raw_summaries(item);
 
         let n_pts = summaries.len();
         let base_peak_mz = if n_pts > 0 {

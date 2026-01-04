@@ -2,7 +2,8 @@ use arrow::array::{AsArray, Float32Array, Float64Array, UInt64Array};
 
 use clap::Parser;
 use mzdata::mzpeaks::coordinate::{CoordinateRange, SimpleInterval, Span1D};
-use std::io;
+use mzpeak_prototyping::reader::MzPeakReader;
+use std::{fs, io};
 
 #[derive(clap::Parser)]
 struct App {
@@ -18,8 +19,12 @@ struct App {
     #[arg(short, long)]
     im_range: Option<CoordinateRange<f64>>,
 
-    #[arg(short='l', long)]
+    #[arg(short = 'l', long)]
     ms_level_range: Option<CoordinateRange<u8>>,
+
+    /// Use memory-mapped reader
+    #[arg(short = 'a', long)]
+    memory_map: bool,
 }
 
 fn main() -> io::Result<()> {
@@ -27,7 +32,16 @@ fn main() -> io::Result<()> {
     let args = App::parse();
     let start = std::time::Instant::now();
 
-    let mut reader = mzpeak_prototyping::reader::MzPeakReader::new(&args.filename)?;
+    let mut reader = if args.memory_map {
+        unsafe {
+            MzPeakReader::memmap(
+                fs::File::open(&args.filename)?,
+                Some(args.filename.clone().into()),
+            )?
+        }
+    } else {
+        MzPeakReader::new(&args.filename)?
+    };
 
     eprintln!(
         "Opening archive took {} seconds",
@@ -46,10 +60,12 @@ fn main() -> io::Result<()> {
         args.mz_range.end.unwrap_or(f64::INFINITY),
     );
 
-    let mut im_range = args.im_range.map(|im_range| SimpleInterval::new(
-        im_range.start.unwrap_or(0.0),
-        im_range.end.unwrap_or(f64::INFINITY),
-    ));
+    let mut im_range = args.im_range.map(|im_range| {
+        SimpleInterval::new(
+            im_range.start.unwrap_or(0.0),
+            im_range.end.unwrap_or(f64::INFINITY),
+        )
+    });
 
     let ms_level_range = args.ms_level_range.map(|r| {
         SimpleInterval::new(
@@ -87,7 +103,8 @@ fn main() -> io::Result<()> {
 
                 if $ims.is_some() {
                     if let Some(im_range) = $im_range.as_ref() {
-                        for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
+                        for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten())
+                        {
                             if im_range.contains(&im) {
                                 if last_index != index {
                                     last_time = time_index[&index];
@@ -97,14 +114,13 @@ fn main() -> io::Result<()> {
                             }
                         }
                     } else {
-                        for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten()) {
-
+                        for (((index, mz), intensity), im) in it.zip($ims.unwrap().iter().flatten())
+                        {
                             if last_index != index {
                                 last_time = time_index[&index];
                                 last_index = index;
                             }
                             println!("{index}\t{last_time}\t{mz}\t{intensity}\t{im}");
-
                         }
                     }
                 } else {
@@ -132,14 +148,20 @@ fn main() -> io::Result<()> {
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
-                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f64, im_range.end as f64))
+                        im_range.map(|im_range| SimpleInterval::new(
+                            im_range.start as f64,
+                            im_range.end as f64
+                        ))
                     );
                 } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
                     iter!(
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f64, mz_range.end as f64),
-                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f32, im_range.end as f32))
+                        im_range.map(|im_range| SimpleInterval::new(
+                            im_range.start as f32,
+                            im_range.end as f32
+                        ))
                     );
                 } else {
                     iter!(mzs, Option::<Float64Array>::None, mz_range, im_range);
@@ -150,14 +172,20 @@ fn main() -> io::Result<()> {
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
-                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f64, im_range.end as f64))
+                        im_range.map(|im_range| SimpleInterval::new(
+                            im_range.start as f64,
+                            im_range.end as f64
+                        ))
                     );
                 } else if let Some(ims) = root.column(3).as_any().downcast_ref::<Float32Array>() {
                     iter!(
                         mzs,
                         Some(ims),
                         SimpleInterval::new(mz_range.start as f32, mz_range.end as f32),
-                        im_range.map(|im_range| SimpleInterval::new(im_range.start as f32, im_range.end as f32))
+                        im_range.map(|im_range| SimpleInterval::new(
+                            im_range.start as f32,
+                            im_range.end as f32
+                        ))
                     );
                 } else {
                     iter!(

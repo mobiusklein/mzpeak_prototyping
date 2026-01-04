@@ -1160,12 +1160,24 @@ mod test {
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
         assert_eq!(descr.peaks().len(), 13589);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
         let descr = reader.get_spectrum(5).await.unwrap();
         assert_eq!(descr.index(), 5);
         assert_eq!(descr.peaks().len(), 650);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
         let descr = reader.get_spectrum(25).await.unwrap();
         assert_eq!(descr.index(), 25);
         assert_eq!(descr.peaks().len(), 789);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
         Ok(())
     }
 

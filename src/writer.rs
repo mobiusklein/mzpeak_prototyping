@@ -657,6 +657,13 @@ impl<
         );
     }
 
+    /// Write a `spectrum` to the MzPeak file
+    ///
+    /// Data may be buffered until the spectrum data file is ready to be written, but the spectrum data file
+    /// is likely being actively written out as the the buffer grows.
+    ///
+    /// # See also
+    /// [`AbstractMzPeakWriter::write_spectrum`]
     pub fn write_spectrum<
         A: ToMzPeakDataSeries + CentroidLike,
         B: ToMzPeakDataSeries + DeconvolutedCentroidLike,
@@ -695,6 +702,7 @@ impl<
         Ok(())
     }
 
+    /// Get the count of waiting spectrum data rows
     pub fn buffered_spectrum_data(&self) -> usize {
         self.spectrum_buffers.len()
     }
@@ -812,6 +820,7 @@ impl<
                 );
                 self.append_metadata();
                 writer = self.archive_writer.take().unwrap().into_inner()?;
+                writer.flush()?;
             }
             Ok(writer)
         } else {
@@ -821,10 +830,21 @@ impl<
         }
     }
 
+    /// Finish writing Parquet files and metadata to the ZIP archive, flush the buffer,
+    /// and return the ZIP archive writer.
+    ///
+    /// Use this method when you want to add additional files to the ZIP archive after
+    /// the Parquet entries are finished.
+    ///
+    /// # Note
+    /// It is the caller's responsibility to drop the returned [`ZipArchiveWriter`] to
+    /// finish writing the ZIP archive
     pub fn finish_parquet(mut self) -> Result<ZipArchiveWriter<W>, parquet::errors::ParquetError> {
         self.finish_parquet_inner()
     }
 
+    /// Finish writing the mzPeak archive, writing out the Parquet files, file index,
+    /// and finalizes the ZIP archive.
     pub fn finish(&mut self) -> Result<(), parquet::errors::ParquetError> {
         if self.archive_writer.is_some() {
             let writer = self.finish_parquet_inner()?;
@@ -1028,8 +1048,10 @@ mod test {
 
     #[test_log::test]
     fn test_array_building_chunked() -> io::Result<()> {
+        let mut buf = io::Cursor::new(Vec::<u8>::with_capacity(2usize.pow(16u32)));
+
         let mut reader = mzdata::MZReader::open_path("small.mzML")?;
-        let mut builder = MzPeakWriter::<fs::File>::builder();
+        let mut builder = MzPeakWriter::<io::Cursor<Vec<u8>>>::builder();
         builder = builder
             .chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }))
             .chromatogram_chunked_encoding(Some(ChunkingStrategy::Delta { chunk_size: 50.0 }))
@@ -1038,9 +1060,9 @@ mod test {
             .null_zeros(true)
             .shuffle_mz(true);
 
-        let arc = tempfile::NamedTempFile::with_suffix("_test_chunk.mzpeak")?;
-        let source = arc.as_file().try_clone()?;
-        let mut writer = builder.build(source, true);
+        // let arc = tempfile::NamedTempFile::with_suffix("_test_chunk.mzpeak")?;
+        // let source = arc.as_file().try_clone()?;
+        let mut writer = builder.build(&mut buf, true);
         writer.copy_metadata_from(&reader);
         let overrides = writer.spectrum_buffers.overrides();
         assert!(overrides.iter().any(|(_, v)| {
@@ -1051,9 +1073,10 @@ mod test {
         for chrom in reader.iter_chromatograms() {
             writer.write_chromatogram(&chrom)?;
         }
+        writer.finish()?;
         drop(writer);
 
-        let mut new_reader = MzPeakReader::new(arc.path())?;
+        let mut new_reader = MzPeakReader::from_buf(buf.into_inner().into())?;
         assert_eq!(reader.len(), new_reader.len());
         reader.reset();
         new_reader.reset();

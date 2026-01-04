@@ -635,7 +635,9 @@ pub trait AbstractMzPeakWriter {
         let parquet_schema = Arc::new(
             ArrowSchemaConverter::new()
                 .convert(data_buffer.schema())
-                .unwrap(),
+                .unwrap_or_else(|e| {
+                    panic!("Failed to convert {:?} to a schema: {e}", data_buffer.schema())
+                }),
         );
 
         let mut sorted = Vec::new();

@@ -1191,35 +1191,37 @@ This metadata table uses the [packed parallel metadata table](#packed-parallel-m
   - MAY supply a *child* term of [MS:1000499](http://purl.obolibrary.org/obo/MS_1000499) (spectrum attribute) one or more times
     - __Examples:__
       - [`MS_1000796_spectrum_title`](http://purl.obolibrary.org/obo/MS_1000796)
-- `scan`
-  - `source_index` (integer)
-  - `instrument_configuration_ref` (integer)
+- `scan` (group): Scan or acquisition from original raw file used to create a spectrum.
+  - `source_index` (integer): The `index` of the spectrum this scan belongs to. This is a foreign key.
+  - `instrument_configuration_ref` (integer): The identifier for `instrument_configuration` that governs this scan.
   - `parameters` (list): A list of controlled or uncontrolled parameters that describe this scan. See [the parameter list section](#the-parameters-list) for more details.
+  - `ion_mobility` (float): Optional, the ion mobility measurement for this scan.
+  - `ion_mobility_type` (CURIE): Optional, the kind of ion mobility being measured using a *child* of [MS:1002892](http://purl.obolibrary.org/obo/MS_1002892).
   - `scan_windows`
   - MAY supply a *child* term of [MS:1000503](http://purl.obolibrary.org/obo/MS_1000503) (scan attribute) one or more times
     - __Examples:__
   - MAY supply a *child* term of [MS:1000018](http://purl.obolibrary.org/obo/MS_1000018) (scan direction) only once
   - MAY supply a *child* term of [MS:1000019](http://purl.obolibrary.org/obo/MS_1000019) (scan law) only once
-- `precursor` (group)
-  - `source_index` (integer)
-  - `precursor_index` (integer)
-  - `precursor_id` (string)
-  - `isolation_window` (group)
+- `precursor` (group): The method of precursor ion selection and activation
+  - `source_index` (integer): The `index` of the spectrum this precursor record belongs to. This is a foreign key.
+  - `precursor_index` (integer): The `index` of the spectrum that is the precursor record was created from. This is a foreign key.
+  - `precursor_id` (string): The `id` of the spectrum referenced by `precursor_index`.
+  - `isolation_window` (group): The isolation (or 'selection') window configured to isolate one or more ions
     - `parameters` (list)
     - MUST supply a *child* term of [MS:1000792](http://purl.obolibrary.org/obo/MS_1000792) (isolation window attribute) one or more times. These _SHOULD_ be promoted to columns if they are available.
       - __Examples:__
         - [`MS_1000827_isolation_window_target_mz`](http://purl.obolibrary.org/obo/MS_1000827)
         - [`MS_1000828_isolation_window_lower_offset`](http://purl.obolibrary.org/obo/MS_1000828)
         - [`MS_1000829_isolation_window_upper_offset`](http://purl.obolibrary.org/obo/MS_1000829)
-  - `activation` (group)
+  - `activation` (group): The type and energy level used to activate or dissociate this precursor.
     - `parameters` (list): A list of controlled or uncontrolled parameters that describe this precursor's activation. See [the parameter list section](#the-parameters-list) for more details.
     - MAY supply a *child* term of [MS:1000510](http://purl.obolibrary.org/obo/MS_1000510) (precursor activation attribute) one or more times
     - MUST supply term [MS:1000044](http://purl.obolibrary.org/obo/MS_1000044) (dissociation method) or any of its children one or more times
-- `selected_ion` (group)
-  - `source_index` (integer)
-  - `precursor_index` (integer)
-  - `ion_mobility` (float)
-  - `ion_mobility_type` (CURIE)
+- `selected_ion` (group): An ion isolated for dissociation.
+  - `source_index` (integer): The `index` of the spectrum this selected ion belongs to. This is a foreign key.
+  - `precursor_index` (integer): The `index` of the spectrum that is the selected ion was created from. This is a foreign key.
+  - `ion_mobility` (float): Optional, the ion mobility measurement for this ion.
+  - `ion_mobility_type` (CURIE): Optional, the kind of ion mobility being measured using a *child* of [MS:1002892](http://purl.obolibrary.org/obo/MS_1002892).
   - `parameters` (list): A list of controlled or uncontrolled parameters that describe this selected ion. See [the parameter list section](#the-parameters-list) for more details.
   - MUST supply a *child* term of [MS:1000455](http://purl.obolibrary.org/obo/MS_1000455) (ion selection attribute) one or more times
     - __Examples:__
@@ -1240,6 +1242,8 @@ QUESTION: Is there a better way to make ion mobility storage generic over type (
   "data_kind": "peaks"
 }
 ```
+
+The spectrum peak lists separately stored from the raw signal stored in [`spectra_data.parquet`](#spectrum-signal-data-file---spectra_dataparquet). This _SHOULD_ be encoded using the [point layout](#point-layout). The `entity index` column _MUST_ be named `spectrum_index`, and if a time column is written alongside it, it _SHOULD_ be named `spectrum_time`. When storing peak lists separately, the writer _MUST_ store the primary data representation in [`spectra_data.parquet`](#spectrum-signal-data-file---spectra_dataparquet), even if that primary representation is already a peak list.
 
 # Chromatogram Signal Data - `chromatograms_data.parquet`
 
@@ -1264,3 +1268,46 @@ QUESTION: Is there a better way to make ion mobility storage generic over type (
   "data_kind": "metadata"
 }
 ```
+
+- `chromatogram` (group)
+  - `index` (integer): The ascending 0-based index. This _MUST_ be incrementally increasing by 1 per entry and _SHOULD_ be written in time-sorted ascending order (QUESTION: Should there be a CV to denote this state?). This is the "primary key" for the `chromatogram` schema, making it the root unit of addressability.
+  - `id` (string): A unique string identifier for the chromatogram.
+  - [`MS_1000465_scan_polarity`](http://purl.obolibrary.org/obo/MS_1000465) (integer): The polarity of the chromatogram represented as either a `1` (positive), `-1` (negative), or `null`. (QUESTION: This could also just be a CURIE)
+  - [MS_1000626_chromatogram_type](http://purl.obolibrary.org/obo/MS_1000626) (CURIE): stuff
+    - __Examples:__
+      - [MS:1000235](http://purl.obolibrary.org/obo/MS_1000235) "total ion current chromatogram"
+      - [MS:1000627](http://purl.obolibrary.org/obo/MS_1000627) "selected ion current chromatogram"
+      - [MS:1000628](http://purl.obolibrary.org/obo/MS_1000628) "basepeak chromatogram"
+      - [MS:1000812](http://purl.obolibrary.org/obo/MS_1000812) "absorption chromatogram"
+  - `data_processing_ref` (integer): The identifier for a `data_processing` that governs this chromatogram if it deviates from the default method specified in [file level metadata](#file-level-metadata) under `.run.default_data_processing_id`, `null` otherwise.
+  - `parameters` (list): A list of controlled or uncontrolled parameters that describe this chromatogram. See [the parameter list section](#the-parameters-list) for more details.
+  - `number_of_auxiliary_arrays` (integer): The number of auxiliary arrays that are stored with this row's `auxiliary_arrays` column. This is useful for quickly telling if a reader needs to go through the more expensive process of reading these and decoding them.
+  - `auxiliary_arrays` (list): A list of structures that describe a data array that did not fit within the constraints as described in the [arrays and columns](#arrays-and-columns) section. These may be large and care should be used in deciding to eagerly load them (or not). They are described in the [auxiliary data arrays](#auxiliary-data-arrays)
+  - MAY supply a *child* term of [MS:1000808]((http://purl.obolibrary.org/obo/MS_1000808)) (chromatogram attribute) one or more times
+  -
+- `precursor` (group): The method of precursor ion selection and activation
+  - `source_index` (integer): The `index` of the chromatogram this precursor record belongs to. This is a foreign key.
+  - `precursor_index` (integer): The `index` of the chromatogram that is the precursor record was created from. This is a foreign key.
+  - `precursor_id` (string): The `id` of the chromatogram referenced by `precursor_index`.
+  - `isolation_window` (group): The isolation (or 'selection') window configured to isolate one or more ions
+    - `parameters` (list)
+    - MUST supply a *child* term of [MS:1000792](http://purl.obolibrary.org/obo/MS_1000792) (isolation window attribute) one or more times. These _SHOULD_ be promoted to columns if they are available.
+      - __Examples:__
+        - [`MS_1000827_isolation_window_target_mz`](http://purl.obolibrary.org/obo/MS_1000827)
+        - [`MS_1000828_isolation_window_lower_offset`](http://purl.obolibrary.org/obo/MS_1000828)
+        - [`MS_1000829_isolation_window_upper_offset`](http://purl.obolibrary.org/obo/MS_1000829)
+  - `activation` (group): The type and energy level used to activate or dissociate this precursor.
+    - `parameters` (list): A list of controlled or uncontrolled parameters that describe this precursor's activation. See [the parameter list section](#the-parameters-list) for more details.
+    - MAY supply a *child* term of [MS:1000510](http://purl.obolibrary.org/obo/MS_1000510) (precursor activation attribute) one or more times
+    - MUST supply term [MS:1000044](http://purl.obolibrary.org/obo/MS_1000044) (dissociation method) or any of its children one or more times
+- `selected_ion` (group): An ion isolated for dissociation.
+  - `source_index` (integer): The `index` of the chromatogram this selected ion belongs to. This is a foreign key.
+  - `precursor_index` (integer): The `index` of the chromatogram that is the selected ion was created from. This is a foreign key.
+  - `ion_mobility` (float): Optional, the ion mobility measurement for this ion.
+  - `ion_mobility_type` (CURIE): Optional, the kind of ion mobility being measured using a *child* of [MS:1002892](http://purl.obolibrary.org/obo/MS_1002892).
+  - `parameters` (list): A list of controlled or uncontrolled parameters that describe this selected ion. See [the parameter list section](#the-parameters-list) for more details.
+  - MUST supply a *child* term of [MS:1000455](http://purl.obolibrary.org/obo/MS_1000455) (ion selection attribute) one or more times
+    - __Examples:__
+      - [`MS_1000744_selected_ion_mz_unit_MS_1000040`](http://purl.obolibrary.org/obo/MS_10004744)
+      - [`MS_1000041_charge_state`](http://purl.obolibrary.org/obo/MS_1000041)
+      - [`MS_1000042_intensity_unit_MS_1000131`](http://purl.obolibrary.org/obo/MS_1000131)

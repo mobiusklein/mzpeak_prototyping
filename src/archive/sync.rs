@@ -28,6 +28,15 @@ fn file_options() -> SimpleFileOptions {
 pub struct ZipArchiveWriter<W: Write + Send + Seek> {
     archive_writer: ZipWriter<W>,
     index: FileIndex,
+    wrote_index: bool,
+}
+
+impl<W: Write + Send + Seek> Drop for ZipArchiveWriter<W> {
+    fn drop(&mut self) {
+        if let Err(e) = self.write_index() {
+            log::warn!("While dropping ZipArchiveWriter: {e}");
+        }
+    }
 }
 
 impl<W: Write + Send + Seek> Write for ZipArchiveWriter<W> {
@@ -46,6 +55,7 @@ impl<W: Write + Send + Seek> ZipArchiveWriter<W> {
         Self {
             archive_writer,
             index: Default::default(),
+            wrote_index: false,
         }
     }
 
@@ -148,15 +158,28 @@ archive, nor was one given via the file index entry"#,
         Ok(())
     }
 
-    pub fn finish(mut self) -> ZipResult<W> {
-        self.archive_writer
-            .start_file(FileIndex::index_file_name(), file_options())?;
-        serde_json::to_writer_pretty(&mut self.archive_writer, &self.index)
-            .map_err(|e| -> io::Error { e.into() })?;
-        let val = self.archive_writer.finish()?;
-        Ok(val)
+    fn write_index(&mut self) -> ZipResult<()> {
+        if !self.wrote_index {
+            self.archive_writer
+                .start_file(FileIndex::index_file_name(), file_options())?;
+            serde_json::to_writer_pretty(&mut self.archive_writer, &self.index)
+                .map_err(|e| -> io::Error { e.into() })?;
+            self.wrote_index = true;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> ZipResult<()> {
+        self.write_index()?;
+        Ok(())
+    }
+
+    pub fn add_index_metadata(&mut self, key: &str, value: &impl serde::Serialize) -> Result<(), serde_json::Error> {
+        self.index.metadata.insert(key.to_string(), serde_json::to_value(value)?);
+        Ok(())
     }
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MzPeakArchiveType {
@@ -179,6 +202,22 @@ impl MzPeakArchiveType {
             MzPeakArchiveType::ChromatogramDataArrays => "chromatograms_data.parquet",
             MzPeakArchiveType::Other => "",
             MzPeakArchiveType::Proprietary => "",
+        }
+    }
+
+    pub fn classify_from_suffix(name: &str) -> Self {
+        if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
+            MzPeakArchiveType::SpectrumDataArrays
+        } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
+            MzPeakArchiveType::SpectrumMetadata
+        } else if name.ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix()) {
+            MzPeakArchiveType::SpectrumPeakDataArrays
+        } else if name.ends_with(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix()) {
+            MzPeakArchiveType::ChromatogramMetadata
+        } else if name.ends_with(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix()) {
+            MzPeakArchiveType::ChromatogramDataArrays
+        } else {
+            MzPeakArchiveType::Other
         }
     }
 }
@@ -440,6 +479,14 @@ impl ArchiveSource for ZipArchiveBytesSource {
         &self.file_index
     }
 
+    /// This creates a memory-mapped view of an existing file at `path`.
+    ///
+    /// A memory-mapped reader may be faster in some circumstances, but the caller **MUST** ensure the
+    /// file being read is not modified while the memory mapped reader is open. This is beyond the scope
+    /// of this library to ensure.
+    ///
+    /// # Safety
+    /// See notes on [`memmap2::Mmap`] for safety considerations.
     fn from_path(path: PathBuf) -> io::Result<Self> {
         let handle = fs::File::open(path)?;
         let map = unsafe { memmap2::Mmap::map(&handle)? };
@@ -603,6 +650,11 @@ pub trait ArchiveSource: Sized + 'static {
         false
     }
 
+    /// Get access to the [`FileIndex`] stored in this archive.
+    ///
+    /// The [`FileIndex`] contains information about files saved in the archive, above and beyond
+    /// just the names in [`ArchiveSource::file_names`], but requires the writer to enumerate and
+    /// annotate them.
     fn file_index(&self) -> &FileIndex;
 
     /// Create from a file system path
@@ -770,7 +822,7 @@ pub struct ArchiveReader<T: ArchiveSource + 'static> {
 }
 
 impl<T: ArchiveSource + 'static> ArchiveReader<T> {
-    fn init_from_archive(archive: T) -> io::Result<Self> {
+    pub fn from_archive(archive: T) -> io::Result<Self> {
         let mut members = SchemaMetadataManager::default();
         for (i, name) in archive.file_names().iter().enumerate() {
             let tp = archive
@@ -779,26 +831,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
                 .find(|s| s.name == *name)
                 .map(|s| s.archive_type());
 
-            let tp = tp.unwrap_or_else(|| {
-                if name.ends_with(MzPeakArchiveType::SpectrumDataArrays.tag_file_suffix()) {
-                    MzPeakArchiveType::SpectrumDataArrays
-                } else if name.ends_with(MzPeakArchiveType::SpectrumMetadata.tag_file_suffix()) {
-                    MzPeakArchiveType::SpectrumMetadata
-                } else if name
-                    .ends_with(MzPeakArchiveType::SpectrumPeakDataArrays.tag_file_suffix())
-                {
-                    MzPeakArchiveType::SpectrumPeakDataArrays
-                } else if name.ends_with(MzPeakArchiveType::ChromatogramMetadata.tag_file_suffix())
-                {
-                    MzPeakArchiveType::ChromatogramMetadata
-                } else if name
-                    .ends_with(MzPeakArchiveType::ChromatogramDataArrays.tag_file_suffix())
-                {
-                    MzPeakArchiveType::ChromatogramDataArrays
-                } else {
-                    MzPeakArchiveType::Other
-                }
-            });
+            let tp = tp.unwrap_or_else(|| MzPeakArchiveType::classify_from_suffix(&name));
 
             let metadata = archive.metadata_for_index(i).ok();
             if !matches!(
@@ -848,7 +881,7 @@ impl<T: ArchiveSource + 'static> ArchiveReader<T> {
 
     pub fn from_path(archive_path: PathBuf) -> io::Result<Self> {
         let archive = T::from_path(archive_path)?;
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 
     pub fn can_split(&self) -> bool {
@@ -980,30 +1013,45 @@ impl ArchiveSource for DispatchArchiveSource {
 }
 
 impl ArchiveReader<DispatchArchiveSource> {
+    /// Create a simple ZIP archive reader using a single shared file handle.
+    ///
+    /// # Note
+    /// Using a shared file handle means that the file cannot be in two places at once, so
+    /// this reader will not be able to split work across multiple threads. Instead, please
+    /// either initialize from a path using [`ArchiveReader::from_path`] OR use [`ArchiveReader::memmap`]
+    /// to create a memory-mapped reader that does not use cursor-based access.
     pub fn new(file: fs::File) -> io::Result<Self> {
         let archive = DispatchArchiveSource::Zip(ZipArchiveSource::new(file)?);
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 
+    /// Create a memory-mapped reader for `handle`.
+    ///
+    /// A memory-mapped reader may be faster in some circumstances, but the caller **MUST** ensure the
+    /// file being read is not modified while the memory mapped reader is open. This is beyond the scope
+    /// of this library to ensure.
+    ///
+    /// # Safety
+    /// See the safety notes on [`memmap2::Mmap`] for more explanation on why this operation is unsafe.
     pub unsafe fn memmap(file: fs::File) -> io::Result<Self> {
         let map = unsafe { memmap2::Mmap::map(&file)? };
         let buf = bytes::Bytes::from_owner(map);
         let archive = DispatchArchiveSource::MemoryMapZip(ZipArchiveBytesSource::new(buf)?);
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 }
 
 impl ZipArchiveReader {
     pub fn new(file: fs::File) -> io::Result<Self> {
         let archive = ZipArchiveSource::new(file)?;
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 }
 
 impl DirectoryArchiveReader {
     pub fn new(file: PathBuf) -> io::Result<Self> {
         let archive = DirectorySource::new(file)?;
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 }
 
@@ -1012,12 +1060,12 @@ impl MemoryMapZipArchiveReader {
         let map = unsafe { memmap2::Mmap::map(&file)? };
         let buf = bytes::Bytes::from_owner(map);
         let archive = ZipArchiveBytesSource::new(buf)?;
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 
     pub fn from_buf(buf: Bytes) -> io::Result<Self> {
         let archive = ZipArchiveBytesSource::new(buf)?;
-        Self::init_from_archive(archive)
+        Self::from_archive(archive)
     }
 }
 
@@ -1064,6 +1112,7 @@ mod test {
         let index = arch.file_index();
         assert_eq!(index.len(), 4);
         assert_eq!(arch.list_files().len(), 5);
+        assert!(arch.can_split());
 
         let mut handle = arch.open_stream("mzpeak_index.json")?;
         handle.seek_relative(20)?;
@@ -1086,6 +1135,7 @@ mod test {
         let index = arch.file_index();
         assert_eq!(index.len(), 4);
         assert_eq!(arch.list_files().len(), 5);
+        assert!(arch.can_split());
 
         let mut handle = arch.open_stream("mzpeak_index.json")?;
         handle.seek_relative(20)?;

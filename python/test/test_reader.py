@@ -10,6 +10,7 @@ from mzpeak.file_index import FileIndex
 point_path = Path("small.mzpeak")
 chunk_path = Path("small.chunked.mzpeak")
 unpacked_path = Path("small.unpacked.mzpeak")
+numpress_path = Path("small.numpress.mzpeak")
 
 
 def common_checks(reader: MzPeakFile, subtests: pytest.Subtests):
@@ -102,6 +103,7 @@ def test_load_base_chunk(subtests: pytest.Subtests):
     with subtests.test("iterator"):
         check_iterator(reader, len(reader))
 
+
 def test_load_unpacked(subtests: pytest.Subtests):
     reader = MzPeakFile(unpacked_path)
     assert reader.spectrum_data.buffer_format() == BufferFormat.Point
@@ -109,4 +111,9 @@ def test_load_unpacked(subtests: pytest.Subtests):
     with subtests.test("iterator"):
         check_iterator(reader)
 
+
+def test_load_numpress(subtests: pytest.Subtests):
+    reader = MzPeakFile(chunk_path)
+    assert reader.spectrum_data.buffer_format() == BufferFormat.Chunk
+    common_checks(reader, subtests)
 

@@ -176,7 +176,7 @@ class OntologyMapper:
         if accession is None:
             alt_name = name.replace("_", " ").replace("mz", 'm/z')
             alt_term = self.cv_psims.get(alt_name)
-            if alt_term and alt_name not in ('id', 'index', 'name', 'activation'):
+            if alt_term and alt_name not in ('id', 'index', 'name', 'activation', 'precursor'):
                 logger.log(TRACE, 'Mapped %r to %s|%s', name, alt_term['id'], alt_term['name'])
                 return alt_term['name']
             return self.overrides.get(name, name) + suffix
@@ -201,22 +201,90 @@ class OntologyMapper:
         return df
 
     def clean_schema(self, table: pa.Table) -> pa.Table:
-        cols = _clean_schema(self, table.schema)
-        cols = pa.schema(cols)
-        return pa.table(table.columns, schema=cols)
+        blocks = []
+        fields = []
+        for f, block in zip(table.schema, table):
+            chunks = []
+            clean_f = None
+            for chunk in block.chunks:
+                node = _NameCleaningNode.from_array(f, chunk, self)
+                clean_f, clean_chunk = node.clean()
+                chunks.append(clean_chunk)
+            fields.append(clean_f)
+            blocks.append(chunks)
+
+        chunks = []
+        for block in zip(*blocks):
+            chunks.append(pa.StructArray.from_arrays(block, fields=fields))
+        return pa.Table.from_struct_array(
+            pa.chunked_array(chunks)
+        )
 
 
-def _clean_schema(
-    mapper: OntologyMapper, schema: Iterator[pa.Field]
-) -> list[pa.Field]:
-    fields = []
-    for f in schema:
-        f = f.with_name(mapper(f.name))
-        if isinstance(f.type, pa.StructType):
-            new_fields = _clean_schema(mapper, f.type.fields)
-            f = f.with_type(pa.struct(new_fields))
-        fields.append(f)
-    return fields
+@dataclass
+class _NameCleaningNode:
+    '''
+    A helper type for doing recursive Arrow schema column renaming.
+
+    Attributes
+    ----------
+    field : pa.Field or None
+        The field object with the name and type for this column.
+    array : pa.Array
+        The actual data stored in this column. This may be a pa.StructArray which will itself
+        have multiple arrays under it.
+    mapper : OntologyMapper
+        The renaming mapping table to use to update names
+    children : list of _NameCleaningNode
+        The sub-arrays of this array, nested columns used to handle the recursive case
+    '''
+    field: pa.Field
+    array: pa.Array
+    mapper: OntologyMapper
+    children: list["_NameCleaningNode"] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.field is not None:
+            self.field = self.field.with_name(self.mapper(self.field.name))
+            if self.children:
+                if self.is_struct():
+                    new_fields = [f.field for f in self.children]
+                    self.field = self.field.with_type(pa.struct(new_fields))
+
+    def is_struct(self) -> bool:
+        if not self.field:
+            return False
+        return isinstance(self.field.type, pa.StructType)
+
+    @classmethod
+    def from_array(cls, field: pa.Field, array: pa.Array, mapper: OntologyMapper):
+        '''The main entry point'''
+        if isinstance(array.type, pa.StructType):
+            return cls.from_struct_array(field, array, mapper)
+        # elif isinstance(array.type, (pa.ListType, pa.LargeListType)):
+        #     pass
+        return cls(field, array, mapper)
+
+    @classmethod
+    def from_struct_array(
+        cls, field: pa.Field, arrays: pa.StructArray, mapper: OntologyMapper
+    ):
+        nodes = []
+        for f, a in zip(arrays.type.fields, arrays.flatten()):
+            nodes.append(cls.from_array(f, a, mapper))
+        return cls(field, arrays, mapper, nodes)
+
+    def clean(self):
+        if self.is_struct() or self.field is None:
+            fields = []
+            arrays = []
+            for node in self.children:
+                f, a = node.clean()
+                fields.append(f)
+                arrays.append(a)
+            return (self.field, pa.StructArray.from_arrays(arrays, fields=fields))
+        else:
+            return (self.field, self.array)
 
 
 __all__ = [

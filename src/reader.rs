@@ -1,8 +1,5 @@
 use std::{
-    collections::HashMap,
-    io,
-    marker::PhantomData,
-    path::{Path, PathBuf},
+    collections::HashMap, fs, io, marker::PhantomData, path::{Path, PathBuf}
 };
 
 use arrow::array::{AsArray, UInt64Array};
@@ -33,7 +30,7 @@ use crate::{
     BufferContext,
     archive::{
         ArchiveReader, ArchiveSource, DirectorySource, DispatchArchiveSource,
-        SplittingZipArchiveSource,
+        SplittingZipArchiveSource, ZipArchiveBytesSource,
     },
     filter::RegressionDeltaModel,
     reader::{
@@ -348,7 +345,13 @@ impl<
     /// Open an mzPeak archive found at a specified path
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let path: PathBuf = path.as_ref().into();
-        let mut handle = ArchiveReader::<T>::from_path(path.clone())?;
+        let handle = ArchiveReader::<T>::from_path(path.clone())?;
+        let this = Self::initialize_from_archive_reader(handle, path)?;
+
+        Ok(this)
+    }
+
+    fn initialize_from_archive_reader(mut handle: ArchiveReader<T>, path: PathBuf) -> io::Result<Self> {
         let (metadata, query_indices) = Self::load_indices_from(&mut handle)?;
 
         let mut this = Self {
@@ -1295,6 +1298,31 @@ impl<
     }
 }
 
+impl<
+    C: CentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+    D: DeconvolutedCentroidLike + BuildArrayMapFrom + BuildFromArrayMap,
+> MzPeakReaderTypeOfSource<DispatchArchiveSource, C, D> {
+
+    /// Create a memory-mapped reader for `handle`.
+    ///
+    /// A memory-mapped reader may be faster in some circumstances, but the caller **MUST** ensure the
+    /// file being read is not modified while the memory mapped reader is open. This is beyond the scope
+    /// of this library to ensure.
+    ///
+    /// # Safety
+    /// See the safety notes on [`memmap2::Mmap`] for more explanation on why this operation is unsafe.
+    pub unsafe fn memmap(handle: fs::File, path: Option<PathBuf>) -> io::Result<Self> {
+        let mem = unsafe { ArchiveReader::memmap(handle)? };
+        Self::initialize_from_archive_reader(mem, path.unwrap_or_default())
+    }
+
+    pub fn from_buf(buf: bytes::Bytes) -> io::Result<Self> {
+        let mem = DispatchArchiveSource::MemoryMapZip(ZipArchiveBytesSource::new(buf)?);
+        let mem = ArchiveReader::from_archive(mem)?;
+        Self::initialize_from_archive_reader(mem, PathBuf::default())
+    }
+}
+
 pub type MzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DispatchArchiveSource, C, D>;
 pub type UnpackedMzPeakReaderType<C, D> = MzPeakReaderTypeOfSource<DirectorySource, C, D>;
 
@@ -1311,7 +1339,7 @@ mod test {
     use crate::archive::MzPeakArchiveType;
 
     use super::*;
-    use mzdata::spectrum::{ChromatogramLike, SignalContinuity};
+    use mzdata::spectrum::{ChromatogramLike, RefPeakDataLevel, SignalContinuity};
 
     #[test_log::test]
     #[rstest::rstest]
@@ -1325,12 +1353,70 @@ mod test {
         assert_eq!(descr.index(), 0);
         assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
         assert_eq!(descr.peaks().len(), 13589);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
         let descr = reader.get_spectrum(5).unwrap();
         assert_eq!(descr.index(), 5);
         assert_eq!(descr.peaks().len(), 650);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
         let descr = reader.get_spectrum(25).unwrap();
         assert_eq!(descr.index(), 25);
         assert_eq!(descr.peaks().len(), 789);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
+        Ok(())
+    }
+
+    #[test_log::test]
+    #[rstest::rstest]
+    fn test_read_spectrum_memmap() -> io::Result<()> {
+        let mut reader = unsafe { MzPeakReader::memmap(fs::File::open("small.mzpeak")?, None)? };
+        let descr = reader.get_spectrum(0).unwrap();
+        assert_eq!(descr.index(), 0);
+        assert_eq!(descr.signal_continuity(), SignalContinuity::Profile);
+        assert_eq!(descr.peaks().len(), 13589);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
+        let descr = reader.get_spectrum(5).unwrap();
+        assert_eq!(descr.index(), 5);
+        assert_eq!(descr.peaks().len(), 650);
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
+        let descr = reader.get_spectrum(25).unwrap();
+        if descr.ms_level() > 1 {
+            assert_eq!(descr.precursor_iter().count(), 1);
+            assert_eq!(descr.precursor().unwrap().ions.len(), 1);
+        }
+        assert_eq!(descr.index(), 25);
+        assert_eq!(descr.peaks().len(), 789);
+
+        reader.start_from_index(10)?;
+        let spec = reader.next().unwrap();
+        assert_eq!(spec.index(), 10);
+
+        reader.start_from_id(spec.id())?;
+        let spec2 = reader.next().unwrap();
+        assert_eq!(spec2.id(), spec.id());
+        assert_eq!(spec2.index(), spec.index());
+
+        assert!(matches!(*reader.detail_level(), DetailLevel::Full));
+        reader.set_detail_level(DetailLevel::MetadataOnly);
+        let meta = reader.get_spectrum_by_id(&descr.id()).unwrap();
+        assert_eq!(meta.id(), descr.id());
+        assert_eq!(meta.index(), descr.index());
+        assert_eq!(meta.description(), descr.description());
+        matches!(meta.peaks(), RefPeakDataLevel::Missing);
         Ok(())
     }
 
@@ -1366,7 +1452,7 @@ mod test {
     #[case::packed_chunks("small.chunked.mzpeak")]
     fn test_read_chromatogram(#[case] path: &str) -> io::Result<()> {
         let mut reader = MzPeakReader::new(path).unwrap();
-        let tic = reader.get_chromatogram(0).unwrap();
+        let tic = reader.get_chromatogram_by_index(0).unwrap();
         assert_eq!(tic.index(), 0);
         assert_eq!(tic.time()?.len(), 48);
         Ok(())
@@ -1476,6 +1562,18 @@ mod test {
         assert!(k > 0);
         // All MSn spectra are centroids, no null padding
         assert_eq!(k, 96);
+
+        let (it, _time_index) =
+            reader.query_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None)?;
+
+        k = 0;
+        for batch in it.flatten() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        assert_eq!(k, 93);
         Ok(())
     }
 

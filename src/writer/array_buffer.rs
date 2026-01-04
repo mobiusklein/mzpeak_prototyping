@@ -15,7 +15,7 @@ use crate::{
     buffer_descriptors::{BufferOverrideTable, BufferPriority, BufferTransform},
     chunk_series::{ArrowArrayChunk, ChunkingStrategy},
     filter::{drop_where_column_is_zero_run, nullify_at_zero_pair},
-    peak_series::{ArrayIndex, ArrayIndexEntry, MZ_ARRAY},
+    peak_series::{ArrayIndex, ArrayIndexEntry, INTENSITY_ARRAY, MZ_ARRAY, TIME_ARRAY},
 };
 
 pub trait ArrayBufferWriter {
@@ -828,6 +828,26 @@ impl ArrayBuffersBuilder {
         self
     }
 
+    pub fn fields_empty(&self) -> bool {
+        self.array_fields.is_empty()
+    }
+
+    pub(crate) fn add_default_fields_for_context(mut self, buffer_context: BufferContext) -> Self {
+        self = match buffer_context {
+            BufferContext::Spectrum => {
+                self.add_field(buffer_context.index_field())
+                    .add_field(MZ_ARRAY.to_field())
+                    .add_field(INTENSITY_ARRAY.to_field())
+            },
+            BufferContext::Chromatogram => {
+                self.add_field(buffer_context.index_field())
+                    .add_field(TIME_ARRAY.to_field())
+                    .add_field(INTENSITY_ARRAY.to_field())
+            },
+        };
+        self
+    }
+
     /// Register all the fields of `T` as given by [`ToMzPeakDataSeries::to_fields`]
     /// with the current schema.
     ///
@@ -972,6 +992,9 @@ impl ArrayBuffersBuilder {
         buffer_context: BufferContext,
         mask_zero_intensity_runs: bool,
     ) -> ChunkBuffers {
+        if self.fields_empty() {
+            self = self.add_default_fields_for_context(buffer_context);
+        }
         if self.include_time {
             self = self.add_time_field(buffer_context);
         }
@@ -1029,6 +1052,9 @@ impl ArrayBuffersBuilder {
         buffer_context: BufferContext,
         mask_zero_intensity_runs: bool,
     ) -> PointBuffers {
+        if self.fields_empty() {
+            self = self.add_default_fields_for_context(buffer_context);
+        }
         if self.include_time {
             self = self.add_time_field(buffer_context);
         }

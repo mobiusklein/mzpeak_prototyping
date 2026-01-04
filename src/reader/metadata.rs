@@ -1,5 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet}, io, sync::Arc
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
 };
 
 use crate::{
@@ -28,7 +30,10 @@ use mzdata::{
     io::OffsetIndex,
     meta,
     prelude::*,
-    spectrum::{ArrayType, BinaryDataArrayType, ChromatogramDescription, DataArray, Precursor, ScanEvent, SelectedIon, SpectrumDescription},
+    spectrum::{
+        ArrayType, BinaryDataArrayType, ChromatogramDescription, DataArray, Precursor, ScanEvent,
+        SelectedIon, SpectrumDescription,
+    },
 };
 use mzpeaks::coordinate::SimpleInterval;
 use parquet::{
@@ -502,9 +507,12 @@ pub(crate) trait SpectrumMetadataQuerySource: BaseMetadataQuerySource {
             &self.parquet_schema(),
             [
                 "spectrum.index",
-                "scan.spectrum_index", "scan.source_index",
-                "precursor.spectrum_index", "precursor.source_index",
-                "selected_ion.spectrum_index", "selected_ion.source_index",
+                "scan.spectrum_index",
+                "scan.source_index",
+                "precursor.spectrum_index",
+                "precursor.source_index",
+                "selected_ion.spectrum_index",
+                "selected_ion.source_index",
             ],
         );
 
@@ -622,9 +630,12 @@ pub(crate) trait SpectrumMetadataQuerySource: BaseMetadataQuerySource {
             &self.parquet_schema(),
             [
                 "spectrum.index",
-                "scan.spectrum_index", "scan.source_index",
-                "precursor.spectrum_index", "precursor.source_index",
-                "selected_ion.spectrum_index", "selected_ion.source_index",
+                "scan.spectrum_index",
+                "scan.source_index",
+                "precursor.spectrum_index",
+                "precursor.source_index",
+                "selected_ion.spectrum_index",
+                "selected_ion.source_index",
             ],
         );
 
@@ -941,24 +952,37 @@ impl<'a> SpectrumMetadataDecoder<'a> {
 
     /// Consume the decoder to produce the final construction
     pub fn finish(mut self) -> Vec<SpectrumDescription> {
-        let spec_offset = match self.descriptions.first().map(|v| v.index) {
-            Some(i) => i,
-            None => return self.descriptions,
-        };
+        // There should be a more efficient method for this, but it would require
+        // more work and assuming that things are sorted
+        let index_map: HashMap<u64, usize, BuildIdentityHasher<u64>> = self
+            .descriptions
+            .iter()
+            .enumerate()
+            .map(|(i, desc)| (desc.index as u64, i))
+            .collect();
 
         self.precursors =
             PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
         for (idx, scan) in self.scan_events {
-            if let Some(spec) = self.descriptions.get_mut(idx as usize - spec_offset) {
-                spec.acquisition.scans.push(scan);
+            if let Some(i) = index_map.get(&idx).copied() {
+                if let Some(spec) = self.descriptions.get_mut(i) {
+                    spec.acquisition.scans.push(scan);
+                }
             }
         }
 
         // Reversed traversal to guarantee that the lowest order precursor is *last*
-        for (idx, _, precursor) in self.precursors.into_iter().rev().map(CompoundIndexVisitor::unpack) {
-            if let Some(spec) = self.descriptions.get_mut(idx as usize - spec_offset) {
-                spec.precursor.push(precursor);
+        for (idx, _, precursor) in self
+            .precursors
+            .into_iter()
+            .rev()
+            .map(CompoundIndexVisitor::unpack)
+        {
+            if let Some(i) = index_map.get(&idx).copied() {
+                if let Some(spec) = self.descriptions.get_mut(i) {
+                    spec.precursor.push(precursor);
+                }
             }
         }
         self.descriptions
@@ -1067,7 +1091,6 @@ impl<T: ChunkReader + 'static> BaseMetadataQuerySource for SpectrumMetadataReade
 
 impl<T: ChunkReader + 'static> SpectrumMetadataQuerySource for SpectrumMetadataReader<T> {}
 
-
 /// Defines shared logic for constructing traversals of the chromatogram metadata
 /// table(s) independent of underlying reader component.
 pub(crate) trait ChromatogramMetadataQuerySource: BaseMetadataQuerySource {
@@ -1081,8 +1104,10 @@ pub(crate) trait ChromatogramMetadataQuerySource: BaseMetadataQuerySource {
             &self.parquet_schema(),
             [
                 "chromatogram.index",
-                "precursor.spectrum_index", "precursor.source_index",
-                "selected_ion.spectrum_index", "selected_ion.source_index",
+                "precursor.spectrum_index",
+                "precursor.source_index",
+                "selected_ion.spectrum_index",
+                "selected_ion.source_index",
             ],
         );
 
@@ -1265,13 +1290,22 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
     }
 
     pub fn finish(mut self) -> Vec<ChromatogramDescription> {
+        let index_map: HashMap<u64, usize, BuildIdentityHasher<u64>> = self
+            .descriptions
+            .iter()
+            .enumerate()
+            .map(|(i, desc)| (desc.index as u64, i))
+            .collect();
+
         // This sorts the precursor list in addition to merging in the selected ions
         self.precursors =
             PrecursorSelectedIonAssembler::new(self.precursors, self.selected_ions).build();
 
         // Reversed traversal to guarantee that the lowest order precursor is *last*
         for (idx, _prec_idx, precursor) in self.precursors.into_iter().rev() {
-            self.descriptions[idx as usize].precursor.push(precursor);
+            if let Some(i) = index_map.get(&idx).copied() {
+                self.descriptions[i].precursor.push(precursor);
+            }
         }
         self.descriptions
     }
@@ -1702,19 +1736,23 @@ impl DeltaModelDecoder {
     }
 }
 
-
-
 pub struct TimeEncodedSeriesDecoder {
     time_array: Vec<u8>,
     measure_array: Vec<u8>,
     time_index: usize,
     measure_index: usize,
-    dtype: DataType
+    dtype: DataType,
 }
 
 impl TimeEncodedSeriesDecoder {
     pub fn new(time_index: usize, measure_index: usize) -> Self {
-        Self { time_array: Vec::new(), measure_array: Vec::new(), time_index, measure_index, dtype: DataType::Null }
+        Self {
+            time_array: Vec::new(),
+            measure_array: Vec::new(),
+            time_index,
+            measure_index,
+            dtype: DataType::Null,
+        }
     }
 
     pub fn decode_batch(&mut self, batch: RecordBatch) {
@@ -1723,7 +1761,8 @@ impl TimeEncodedSeriesDecoder {
         if let Some(arr) = time_array.as_primitive_opt::<Float32Type>() {
             for val in arr {
                 if let Some(val) = val {
-                    self.time_array.extend_from_slice(&(val as f64).to_le_bytes());
+                    self.time_array
+                        .extend_from_slice(&(val as f64).to_le_bytes());
                 }
             }
         } else if let Some(arr) = time_array.as_primitive_opt::<Float64Type>() {
@@ -1741,7 +1780,7 @@ impl TimeEncodedSeriesDecoder {
             ($arr:ident) => {
                 for (i, val) in $arr.into_iter().enumerate() {
                     if time_array.is_null(i) {
-                        continue
+                        continue;
                     }
                     if let Some(val) = val {
                         self.measure_array.extend_from_slice(&val.to_le_bytes());
@@ -1774,7 +1813,11 @@ impl TimeEncodedSeriesDecoder {
     }
 
     pub fn finish(self, output_array_type: &ArrayType) -> (DataArray, DataArray) {
-        let time_array = DataArray::wrap(&ArrayType::TimeArray, BinaryDataArrayType::Float64, self.time_array);
+        let time_array = DataArray::wrap(
+            &ArrayType::TimeArray,
+            BinaryDataArrayType::Float64,
+            self.time_array,
+        );
         let dtype = arrow_to_array_type(&self.dtype).unwrap();
         let measure_array = DataArray::wrap(output_array_type, dtype, self.measure_array);
         (time_array, measure_array)

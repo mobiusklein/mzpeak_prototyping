@@ -114,27 +114,28 @@ class _DataIndex:
         self._infer_schema_idx()
 
     def _infer_schema_idx(self):
-        rg = self.meta.row_group(0)
-        q = f"{self.prefix}.{self.namespace}_index"
         self.row_group_index_ranges = []
-        max_index = 0
-        for i in range(rg.num_columns):
-            col = rg.column(i)
-            if col.path_in_schema == q:
-                self.index_i = i
-                self.init = True
+        if self.meta.num_row_groups:
+            rg = self.meta.row_group(0)
+            q = f"{self.prefix}.{self.namespace}_index"
+            max_index = 0
+            for i in range(rg.num_columns):
+                col = rg.column(i)
+                if col.path_in_schema == q:
+                    self.index_i = i
+                    self.init = True
 
-        if self.index_i is not None:
-            for i in range(self.meta.num_row_groups):
-                rg = self.meta.row_group(i)
-                col_idx = rg.column(self.index_i)
-                if col_idx.statistics.has_min_max:
-                    self.row_group_index_ranges.append(
-                        Span(col_idx.statistics.min, col_idx.statistics.max)
-                    )
-                    max_index = max(max_index, col_idx.statistics.max)
-                else:
-                    self.row_group_index_ranges.append(None)
+            if self.index_i is not None:
+                for i in range(self.meta.num_row_groups):
+                    rg = self.meta.row_group(i)
+                    col_idx = rg.column(self.index_i)
+                    if col_idx.statistics.has_min_max:
+                        self.row_group_index_ranges.append(
+                            Span(col_idx.statistics.min, col_idx.statistics.max)
+                        )
+                        max_index = max(max_index, col_idx.statistics.max)
+                    else:
+                        self.row_group_index_ranges.append(None)
 
         index = json.loads(
             self.meta.metadata[f"{self.namespace}_array_index".encode("utf8")]
