@@ -837,7 +837,7 @@ impl<
                 Ok(batch) => batch,
                 Err(e) => return Err(io::Error::other(e)),
             };
-            decoder.decode_batch(batch);
+            decoder.decode_batch_for(batch, index);
         }
 
         let descriptions = decoder.finish();
@@ -929,7 +929,7 @@ impl<
         };
 
         let reader = builder.with_projection(proj).build()?;
-        let n = self.len();
+        let n = ChromatogramSource::count_chromatograms(self);
         decoder.resize(n);
 
         for batch in reader.flatten() {
@@ -978,7 +978,7 @@ impl<
 
         let predicate = ArrowPredicateFn::new(predicate_mask, move |batch| {
             let index_array: &UInt64Array = batch.column(0).as_struct().column(0).as_primitive();
-            Ok(index_array.iter().map(|v| v.map(|i| i == index)).collect())
+            arrow::compute::kernels::cmp::eq(index_array, &UInt64Array::new_scalar(index))
         });
 
         let filter = RowFilter::new(vec![Box::new(predicate)]);
@@ -1461,7 +1461,6 @@ mod test {
     #[test_log::test]
     #[rstest::rstest]
     #[case::packed("small.mzpeak")]
-    #[case::unpacked("small.unpacked.mzpeak")]
     #[case::packed_chunks("small.chunked.mzpeak")]
     fn test_load_all_metadata(#[case] path: &str) -> io::Result<()> {
         let reader = MzPeakReader::new(path)?;
@@ -1477,6 +1476,16 @@ mod test {
         assert!(time_index.len() > 5);
         assert!((mask.index_range.end - mask.index_range.start) > 5);
         assert!(mask.sparse_includes.is_some());
+
+        let mut decoder = TimeIndexDecoder::new(
+            SimpleInterval::new(0.0, 1.0),
+            None,
+        );
+        decoder.from_descriptions(&out);
+        let (time_index, mask) = decoder.finish();
+        assert!(time_index.len() > 5);
+        assert!((mask.index_range.end - mask.index_range.start) > 5);
+        assert!(mask.sparse_includes.is_none());
         Ok(())
     }
 
@@ -1489,6 +1498,8 @@ mod test {
         let reader = MzPeakReader::new(path)?;
         let out = reader.load_all_chromatgram_metadata_impl()?;
         assert_eq!(out.len(), 1);
+        // This is just a wrapper around `load_all_chromatgram_metadata_impl` currently.
+        assert_eq!(ChromatogramSource::count_chromatograms(&reader), 1);
         Ok(())
     }
 
@@ -1585,6 +1596,15 @@ mod test {
             .iter()
             .find(|e| e.archive_type() == MzPeakArchiveType::SpectrumPeakDataArrays);
         assert!(e.is_some());
+        Ok(())
+    }
+
+    #[test_log::test]
+    fn test_read_peaks_of() -> io::Result<()> {
+        let mut reader = MzPeakReader::new("small.chunked.mzpeak")?;
+
+        let peaks = reader.get_spectrum_peaks_for(1)?.unwrap();
+        assert!(peaks.len() > 0);
         Ok(())
     }
 }

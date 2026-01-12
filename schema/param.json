@@ -6,28 +6,27 @@
   "type": "object",
   "properties": {
     "name": {
-        "type": "string",
-        "description": "The name of the parameter. If controlled, this should be the name from the source controlled vocabulary.",
-        "examples": [
-            "Q Exactive",
-            "SHA-1",
-            "MSn spectrum"
-        ]
+      "type": "string",
+      "description": "The name of the parameter. If controlled, this should be the name from the source controlled vocabulary.",
+      "examples": ["Q Exactive", "SHA-1", "MSn spectrum"]
     },
     "accession": {
       "type": ["string", "null"],
       "description": "The compact CURIE for the controlled vocabulary term, if it exists, null otherwise",
       "examples": ["MS:1000580", "MS:1000768"],
       "pattern": "\\S+:\\S+",
-      "format": "curie"
+      "format": "curie",
+      "default": null
     },
     "value": {
-        "type": ["number", "string", "boolean", "null"],
-        "description": "The value for this parameter, if any. This may be omitted if null"
+      "type": ["number", "string", "boolean", "null"],
+      "description": "The value for this parameter, if any. This may be omitted if null",
+      "default": null
     },
     "unit": {
-        "type": ["string", "null"],
-        "description": "The compact CURIE for the unit describing the measurement for this parameter"
+      "type": ["string", "null"],
+      "description": "The compact CURIE for the unit describing the measurement for this parameter",
+      "default": null
     }
   }
 }

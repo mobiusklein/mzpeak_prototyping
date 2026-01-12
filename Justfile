@@ -16,6 +16,9 @@ numpress:
             --chromatogram-chunked-encoding delta:50 \
             -y -z -u small.mzML -o small.numpress.mzpeak
 
+small_point:
+    cargo r --example convert -- -y -z -u small.mzML -o small.mzpeak
+
 
 small_chunked:
     cargo r --example convert -- -p -c -y -z -u small.mzML -o small.chunked.mzpeak

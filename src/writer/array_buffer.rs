@@ -1151,6 +1151,7 @@ mod test {
             &mut reader,
             &builder.overrides(),
             builder.chunking_strategy,
+            false,
         );
         for f in fields {
             builder = builder.add_field(f)

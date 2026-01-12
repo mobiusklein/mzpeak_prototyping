@@ -797,7 +797,6 @@ impl<'a> SpectrumMetadataDecoder<'a> {
     }
 
     // This function is almost right, but something is missing during the decoding process
-    #[allow(unused)]
     pub fn decode_batch_for(&mut self, batch: RecordBatch, spectrum_index: u64) {
         let spec_arr = batch.column_by_name("spectrum").unwrap().as_struct();
         let index_arr: &UInt64Array = spec_arr
@@ -807,11 +806,10 @@ impl<'a> SpectrumMetadataDecoder<'a> {
             .downcast_ref()
             .unwrap();
         let spec_arrays = segment_by_index_array(spec_arr, index_arr, spectrum_index).unwrap();
-
         for spec_arr in spec_arrays {
             let n_spec = index_arr.len() - index_arr.null_count();
             if n_spec > 0 {
-                let mut local_descr = vec![SpectrumDescription::default(); n_spec];
+                let mut local_descr = vec![SpectrumDescription::default()];
                 let mut builder = MzSpectrumVisitor::new(
                     &mut local_descr,
                     &self
@@ -1249,46 +1247,6 @@ impl<'a> ChromatogramMetadataDecoder<'a> {
         }
     }
 
-    // This function is almost right, but something is missing during the decoding process
-    #[allow(unused)]
-    pub fn decode_batch_for(&mut self, batch: RecordBatch, target: u64) {
-        let chrom_arr = batch.column_by_name("chromatogram").unwrap().as_struct();
-        let index_arr: &UInt64Array = chrom_arr
-            .column_by_name("index")
-            .unwrap()
-            .as_any()
-            .downcast_ref()
-            .unwrap();
-
-        let n_spec = index_arr.len() - index_arr.null_count();
-        let mut local_descr = vec![ChromatogramDescription::default(); n_spec];
-        let mut builder = MzChromatogramBuilder::new(
-            &mut local_descr,
-            &self
-                .metadata
-                .chromatogram_metadata_map
-                .as_deref()
-                .unwrap_or(&EMPTY_FIELDS),
-            0,
-        );
-        builder.visit(chrom_arr);
-        self.descriptions.extend(local_descr);
-
-        let precursor_arr = batch.column_by_name("precursor").unwrap().as_struct();
-        {
-            let mut acc = Vec::new();
-            self.load_precursors_from(precursor_arr, &mut acc);
-            self.precursors.extend(acc);
-        }
-
-        let selected_ion_arr = batch.column_by_name("selected_ion").unwrap().as_struct();
-        {
-            let mut acc = Vec::new();
-            self.load_selected_ions_from(selected_ion_arr, &mut acc);
-            self.selected_ions.extend(acc);
-        }
-    }
-
     pub fn finish(mut self) -> Vec<ChromatogramDescription> {
         let index_map: HashMap<u64, usize, BuildIdentityHasher<u64>> = self
             .descriptions
@@ -1350,7 +1308,6 @@ impl TimeIndexDecoder {
 
     pub fn from_descriptions(&mut self, descriptions: &[SpectrumDescription]) {
         let n = descriptions.len();
-
         let offset_start = match descriptions.binary_search_by(|descr| {
             self.time_range
                 .start()
@@ -1362,38 +1319,6 @@ impl TimeIndexDecoder {
         }
         .saturating_sub(1);
         let offset = offset_start;
-
-        // TODO: Rewrite the output data structure and maybe this will be faster
-        // let mut i = offset_start;
-        // while i > 0 {
-        //     if time_range.start >= cache[i].acquisition.start_time()  as f32 {
-        //         i -= 1;
-        //     }
-        //     break;
-        // }
-        // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
-        //     i += 1;
-        // }
-        // offset_start = i;
-
-        // let mut offset_end = match cache.binary_search_by(|descr| {
-        //     time_range.end().total_cmp(&(descr.acquisition.start_time() as f32)).reverse()
-        // }) {
-        //     Ok(i) => i,
-        //     Err(i) => i.min(n),
-        // };
-
-        // i = offset_end;
-        // while i < n {
-        //     if time_range.end <= cache[i].acquisition.start_time()  as f32 {
-        //         i += 1;
-        //     }
-        //     break;
-        // }
-        // while !time_range.contains(&(cache[i].acquisition.start_time() as f32)) {
-        //     i = i.saturating_sub(1);
-        // }
-        // offset_end = i;
         if let Some(ms_level_range) = self.ms_level_range {
             for (i, descr) in descriptions
                 .iter()
@@ -1436,7 +1361,7 @@ impl TimeIndexDecoder {
         let time_arr = root.column(1);
 
         macro_rules! add {
-            ($val:ident, $time:ident) => {
+            ($val:ident, $time:expr) => {
                 // Re-check the time interval constraint for consistency, but the predicate should have
                 // dealt with this
                 if self.time_range.contains(&$time) {
@@ -1452,26 +1377,28 @@ impl TimeIndexDecoder {
             };
         }
 
-        if let Some(time_arr) = time_arr.as_primitive_opt::<Float32Type>() {
-            for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
-                add!(val, time);
-            }
-        } else if let Some(time_arr) = time_arr.as_primitive_opt::<Float64Type>() {
-            for (val, time) in arr
-                .iter()
-                .flatten()
-                .zip(time_arr.iter().flatten().map(|v| v as f32))
-            {
-                add!(val, time);
-            }
-        } else {
-            return Err(parquet::errors::ParquetError::ArrowError(format!(
-                "Invalid time array data type: {:?}",
-                time_arr.data_type()
-            ))
-            .into());
+        macro_rules! traverse {
+            ($($dtype:ty)+) => {
+                $(
+                    if let Some(time_arr) = time_arr.as_primitive_opt::<$dtype>() {
+                        for (val, time) in arr.iter().flatten().zip(time_arr.iter().flatten()) {
+                            add!(val, time as f32);
+                        }
+                        return Ok(())
+                    }
+                )+
+            };
         }
-        Ok(())
+
+        traverse!(
+            Float32Type
+            Float64Type
+        );
+        Err(parquet::errors::ParquetError::ArrowError(format!(
+            "Invalid time array data type: {:?}",
+            time_arr.data_type()
+        ))
+        .into())
     }
 
     pub fn finish(self) -> (HashMap<u64, f32, BuildIdentityHasher<u64>>, MaskSet) {

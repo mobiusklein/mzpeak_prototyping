@@ -10,7 +10,7 @@
     "instrument_configuration": {
       "type": "object",
       "description": "Describes a single instrument configuration that was used. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#instrumentConfiguration",
-      "required": ["identifier", "components"],
+      "required": ["id", "components", "parameters", "software_reference"],
       "properties": {
         "components": {
           "type": "array",
@@ -20,9 +20,16 @@
           "type": "string",
           "description": "The identifier for a software that was associated with the data acquisition process."
         },
-        "identifier": {
+        "id": {
           "type": "integer",
           "description": "A unique identifier for this instrument configuration."
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/param.json"
+          },
+          "description": "Additional parameters describing this configuration, like the instrument model and serial number"
         }
       }
     },

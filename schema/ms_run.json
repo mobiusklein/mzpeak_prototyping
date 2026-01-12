@@ -35,12 +35,13 @@
         "description": "The default source file the content references, as drawn from https://raw.githubusercontent.com/mobiusklein/mzpeak_prototyping/refs/heads/main/schema/file_description.json"
     },
     "start_time": {
-        "type": "string",
+        "type": ["string", "null"],
         "description": "The time that data acquistion started, encoded in an RFC 3339 format (https://datatracker.ietf.org/doc/html/rfc3339)",
         "format": "date-time",
         "examples": [
             "2005-07-20T19:44:22Z"
-        ]
+        ],
+        "default": null
     }
   }
 }

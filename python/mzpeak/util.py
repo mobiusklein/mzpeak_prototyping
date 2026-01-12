@@ -3,7 +3,7 @@ import logging
 
 from dataclasses import dataclass, field
 from numbers import Number
-from typing import Any, Generic, Iterator, Mapping, TypeVar
+from typing import Any, Generic, Mapping, TypeVar
 
 import pandas as pd
 import pyarrow as pa

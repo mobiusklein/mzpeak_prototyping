@@ -1206,4 +1206,113 @@ mod test {
         assert!(mask.sparse_includes.is_some());
         Ok(())
     }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[rstest::rstest]
+    #[case::packed_chunks("small.chunked.mzpeak")]
+    async fn test_read_peaks(#[case] path: &str) -> io::Result<()> {
+        let store = LocalFileSystem::new_with_prefix(".")?;
+        let mut reader =
+            AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from(path))
+                .await?;
+
+        let peaks = reader.get_spectrum_peaks_for(1).await?.unwrap();
+        assert!(peaks.len() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[rstest::rstest]
+    async fn test_eic() -> io::Result<()> {
+        let store = LocalFileSystem::new_with_prefix(".")?;
+        let mut reader =
+            AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from("small.mzpeak"))
+                .await?;
+        let (mut it, _time_index) =
+            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None).await?;
+
+        let mut k = 0;
+        while let Some(batch) = it.next().await.transpose().unwrap() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        // Drops null points
+        assert_eq!(k, 659);
+        drop(it);
+
+
+        let (mut it, _) = reader.extract_peaks(
+            (0.3..0.4).into(),
+            Some((800.0..820.0).into()),
+            None,
+            Some((2u8..10).into()),
+        ).await?;
+        k = 0;
+        while let Some(batch) = it.next().await.transpose().unwrap() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        // All MSn spectra are centroids, no null padding
+        assert_eq!(k, 96);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_eic_chunked() -> io::Result<()> {
+        let store = LocalFileSystem::new_with_prefix(".")?;
+        let mut reader =
+            AsyncMzPeakReader::from_store_path(Arc::new(store), ObjectPath::from("small.chunked.mzpeak"))
+                .await?;
+
+        let (mut it, _time_index) =
+            reader.extract_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None).await?;
+
+        let mut k = 0;
+        while let Some(batch) = it.next().await.transpose().unwrap() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        // Does not drop null points
+        assert_eq!(k, 785);
+        drop(it);
+
+        let (mut it, _) = reader.extract_peaks(
+            (0.3..0.4).into(),
+            Some((800.0..820.0).into()),
+            None,
+            Some((2u8..10).into()),
+        ).await?;
+        k = 0;
+        while let Some(batch) = it.next().await.transpose().unwrap() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        // All MSn spectra are centroids, no null padding
+        assert_eq!(k, 96);
+        drop(it);
+
+        let (mut it, _time_index) =
+            reader.query_peaks((0.3..0.4).into(), Some((800.0..820.0).into()), None, None).await?;
+
+        k = 0;
+        while let Some(batch) = it.next().await.transpose().unwrap() {
+            assert_eq!(batch.column(0).as_struct().num_columns(), 3);
+            assert!(batch.num_rows() > 0);
+            k += batch.num_rows();
+        }
+        assert!(k > 0);
+        assert_eq!(k, 93);
+        Ok(())
+    }
 }

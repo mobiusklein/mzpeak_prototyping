@@ -172,7 +172,10 @@ pub fn schema_to_metadata_cols<'a>(
 
     let mut unit_cols = Vec::new();
     for (i, f) in fields.into_iter().enumerate() {
+        // If the column is a CURIE-containing column specification
         if let Some(colname_spec) = parse_column_to_curie(f.name()) {
+            // If this is a secondary unit column, add it to the unit column accumulator, else add
+            // it the main column array
             let mut unit_slot = PathOrCURIE::None;
             if let Some(unit) = colname_spec.unit.as_curie() {
                 unit_slot = PathOrCURIE::CURIE(unit);
@@ -190,7 +193,9 @@ pub fn schema_to_metadata_cols<'a>(
                 )
                 .with_unit(unit_slot),
             )
+        // If this is a bare name that we have a definition imposed externally, reinterpret it
         } else if let Some(defined) = defined_columns {
+            // Check if this is a unit column for a non-CV controlled column
             let colname_spec = parse_column_to_unit(f.name());
             if colname_spec.is_unit() {
                 unit_cols.push((colname_spec, f.clone(), i));
@@ -225,10 +230,11 @@ pub fn schema_to_metadata_cols<'a>(
         }
     }
 
+    // Link up any unit columns with their best-effort matches.
     for (unit_spec, f, i) in unit_cols {
         let mut found = false;
         for col in columns.iter_mut() {
-            if col.accession.is_some() && col.accession == unit_spec.accession {
+            if col.accession.is_some() && col.accession == unit_spec.accession && !col.unit.is_defined() {
                 found = true;
                 *col = col
                     .clone()
@@ -2849,6 +2855,9 @@ impl AuxiliaryArrayVisitor {
         for (i, da) in self.0.iter_mut().enumerate() {
             let val = visitor.value(i).unwrap();
             da.compression = BinaryCompressionType::from_accession(val).unwrap();
+            if matches!(da.compression, BinaryCompressionType::NoCompression) {
+                da.compression = BinaryCompressionType::Decoded;
+            }
         }
     }
 

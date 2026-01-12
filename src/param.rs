@@ -565,6 +565,12 @@ pub enum PathOrCURIE {
     None,
 }
 
+impl PathOrCURIE {
+    pub fn is_defined(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 impl From<Unit> for PathOrCURIE {
     fn from(value: Unit) -> Self {
         value.to_curie().map(|val| CURIE::from(val)).into()

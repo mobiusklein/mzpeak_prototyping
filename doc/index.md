@@ -9,7 +9,8 @@
     - [The schema](#the-schema)
     - [The metadata key-value pairs](#the-metadata-key-value-pairs)
     - [The columnar data](#the-columnar-data)
-- [Container](#container)
+      - [Index levles](#index-levles)
+  - [Container](#container)
     - [ZIP archives](#zip-archives)
       - [Why not TAR?](#why-not-tar)
     - [Unpacked archives](#unpacked-archives)
@@ -41,6 +42,7 @@
         - [Delta Encoding](#delta-encoding)
         - [Numpress Linear Encoding](#numpress-linear-encoding)
     - [Opaque Array Transforms](#opaque-array-transforms)
+    - [How to read a single entry from the chunked encoding](#how-to-read-a-single-entry-from-the-chunked-encoding)
   - [Why all these root nodes?](#why-all-these-root-nodes)
 - [Index File - `mzpeak_index.json`](#index-file---mzpeak_indexjson)
   - [Data Kind](#data-kind)
@@ -50,6 +52,7 @@
 - [Spectrum Metadata File - `spectra_metadata.parquet`](#spectrum-metadata-file---spectra_metadataparquet)
 - [Spectrum Peak Data - `spectra_peaks.parquet`](#spectrum-peak-data---spectra_peaksparquet)
 - [Chromatogram Signal Data - `chromatograms_data.parquet`](#chromatogram-signal-data---chromatograms_dataparquet)
+  - [Recommendations](#recommendations-1)
 - [Chromatogram Metadata - `chromatograms_metadata.parquet`](#chromatogram-metadata---chromatograms_metadataparquet)
 
 # Introduction
@@ -94,11 +97,16 @@ At the end of a Parquet file is a footer containing user-defined metadata along 
 
 ### The columnar data
 
-Parquet is a strongly typed binary columnar data format with layered blocked compression that permits random access.
+Parquet is a strongly typed binary columnar data format with layered blocked compression that permits a degree of random access.
+
+
+#### Index levles
+
+When writing an mzPeak archive, the writer **MUST** write a page index. Most libraries that write Parquet support writing the page index, even if they do not directly support reading informed by the page index.
 
 TODO: write more here
 
-# Container
+## Container
 
 ### ZIP archives
 
@@ -219,13 +227,13 @@ Here is a stripped down example where two rows of related MS1 and MS2 spectra. T
 
 ### Controlled Vocabulary Terms
 
-Like mzML before it, mzPeak makes heavy use of controlled vocabularies for representing rich metadata. mzPeak uses controlled vocabulary terms in several ways:
+Like mzML, mzPeak makes heavy use of controlled vocabularies for representing rich metadata. mzPeak uses controlled vocabulary terms in several ways:
 
 1. As columns. When a term is used as a column name, that column's values are either the defined value of an expected type for the term (e.g. the term `has_value_type`) _OR_ the a CURIE for a child of the column name. For example
    1. The column [`MS_1000525_spectrum_representation`](http://purl.obolibrary.org/obo/MS_1000525) would have values that are CURIEs for a child term, `MS:1000127` "centroid spectrum" or `MS:1000128` "profile spectrum", as appropriate for the spectrum the row is describing.
    2. The column [`MS_1000511_ms_level`](http://purl.obolibrary.org/obo/MS_1000511) would hold an integer value, as appropriate for the spectrum the row is describing.
 2. As structural elements. In several places in the format, like the [array index](#the-array-index), we use CURIEs to reference named concepts that explain the semantics of the data structure without changing the shape of the data structure.
-3. As pluggable metadata carriers in `parameters` arrays, akin to `<cvParam />` in mzML. For every schema facet of a metadata table, a `parameters` column is allowed. See the [parameters list](#the-parameters-list) for details on
+3. As pluggable metadata carriers in `parameters` arrays, akin to `<cvParam />` in mzML. For every schema facet of a metadata table, a `parameters` column is allowed. See the [parameters list](#the-parameters-list) for details.
 
 #### The `parameters` list
 
@@ -250,7 +258,9 @@ optional group field_id=-1 parameters (List) {
 
 The `parameters.list.item.value` group must have a column for each data type so a parameter can take on one of these value types. Unused type slots _MUST_ be `null`. (QUESTION: Should this support lists/maps?). `parameters` entries _MAY_ have unit defined by a controlled vocabulary term CURIE stored in the `parameters.list.item.unit` column. As in mzML's `<userParam />`, uncontrolled parameters may also be included in the `parameters` list by simply storing a parameter _WITHOUT_ a value in the `parameters.list.item.accession` column.
 
-__NOTE:__ Writers are encouraged to, when sufficient context is available, encode parameters that are present in most rows of a table as columns. This more space efficient and opens the door to easy predicate filtering.
+__NOTE:__ Parquet columns _MUST_ be uniquely named, so if a parameter is present multiple times in single entry it _MUST_ be stored in the `parameters` column.
+
+__NOTE:__ Writers are encouraged to, when sufficient context is available, encode parameters that are present in most rows of a table as columns. This is more space efficient and opens the door to easy predicate filtering.
 
 #### Column Name Inflection
 
@@ -284,7 +294,7 @@ It is common in mass spectrometry to talk about a spectrum _having_ an m/z array
 
 ### The Array Index
 
-In order to properly annotate what kind of array a column _is_, we include a JSON-serialized `array index` in the [Parquet key-value metadata](#the-metadata-key-value-pairs), an list of data structures that describe each array in controlled vocabulary. A column is part of the Parquet file's schema and must always exist and have a homogenous type of value or a be marked `null` for each row.
+In order to properly annotate what kind of array a column _is_, we include a JSON-serialized `array index` in the [Parquet key-value metadata](#the-metadata-key-value-pairs), an list of data structures that describe each array in controlled vocabulary. A column is part of the Parquet file's schema and must always exist and have a homogenous type of value or a be marked `null` for each row. The `array index` is stored in the Parquet metadata for the [`data arrays`](#data-kind) or [`peaks`](#data-kind) files under `<entity_type>_array_index`, e.g. `spectrum_array_index` for spectra or `chromatogram_array_index`.
 
 ```json
 {
@@ -326,16 +336,18 @@ Governed by `schema/array_index.json`.
 
 #### Buffer Format
 
-Depending upon the signal data layout being used, arrays will be stored in different formats
+Depending upon the signal data layout being used, arrays will be stored in different formats.
 
 Available formats:
  - `point`: This array is stored using the [`point`](#point-layout) layout. The `point` layout is all-or-nothing, every array _MUST_ be in that format.
  - `chunk_values`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the list of values of the "main" axis bounded between the chunk's start and end point. These values are encoded to be more compressable. This encoding is _in addition_ to the Parquet encoding step.
  - `chunk_start`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the starting value of the "main" axis for the chunk, inclusive.
- - `chunk_end`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the ending value of the "main" axis for the chunk, inclusive.
+ - `chunk_end`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the ending value of the "main" axis for the chunk, inclusive. It sjould be less than the next chunk's `chunk_start` value.
  - `chunk_encoding`: This array is part of the [`chunked`](#chunked-layout) layout. It contains a CURIE indicating how `chunk_values` was encoded.
  - `chunk_secondary`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the list of values of an array other than the main axis for the chunk.
  - `chunk_transform`: This array is part of the [`chunked`](#chunked-layout) layout. It contains the list of raw byte contents of an array in the chunk that was opaquely transformed, e.g. using MS-Numpress. It may be present in addition to a referenced `chunk_values` or `chunk_secondary` column.
+
+Currently the `chunked` layout only supports a single chunking dimension. A single file in the `chunked` layout **MUST** use `chunk_start`, `chunk_end`, `chunk_encoding`, and `chunk_values` EXACTLY once.
 
 #### Buffer Priority, Naming
 
@@ -446,7 +458,7 @@ class DeltaCurveRegressionModel:
 
 </details>
 
-Then when reading the the null-marked data, use either the local 2nd median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve a very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the miniscule angle change this would induce are still effectively lossless.
+Then when reading the the null-marked data, use either the local 2nd median $δ mz$ or the learned model for that spectrum to compute the m/z spacing for singleton points to achieve a very accurate reconstruction. Because the non-zero m/z points remain unchanged, the reconstructed signal's peak apex or centroid should be unaffected. If the peak is composed of only three points including the two zero intensity spots, no meaningful peak model can be fit in any case so the miniscule angle change this would induce are still effectively lossless. The parameters of the model learned for each entry _MUST_ be stored in the relevant entry's row in the associated metadata table as `mz_delta_model` (QUESTION: should this become a CV param and dissociate it from m/z? Probably).
 
 ![Thermo dataset with null marking](../static/thermo_null_marking_err.png)
 ![Sciex dataset with delta encoding and null marking](../static/sciex_null_marking_delta_encoding_error.png)
@@ -1040,6 +1052,18 @@ __Note__: The start point is _INCLUDED_ from the chunk values array. It is a spe
 
 In some cases, we might prefer to store data lossily in non-uniform, unaligned, or otherwise non-standard data types that don't have a physical representation in Parquet. MS-Numpress's short logged float (SLOF) and positive integer encodings are good examples of these cases. While the Numpress-Linear chunk encoding works for the coordinate dimension, we also support using other opaque transformations to encode the secondary arrays in chunks. These columns are also recorded in the `array index ` with `buffer_format` = `chunk_transform`, the `transform` field in the index must be the CURIE for the relevant encoding method, such as [`MS:1002314`](http://purl.obolibrary.org/obo/MS_1002314) for MS-Numpress's SLOF encoding. The column's data type _MUST_ be a list of byte arrays, though the type in the `array index` _MUST_ be the decoded array's real type after decoding. The column names _SHOULD_ be of the form `<array_name>_<transform_name>_bytes`, e.g. `intensity_numpress_slof_bytes`.
 
+### How to read a single entry from the chunked encoding
+
+To read a single entry (e.g. spectrum, chromatogram) that is stored in chunks, the following procedure may be used:
+
+0. Identify which columns are annotated as `chunk_start`, `chunk_end`, `chunk_encoding`, and `chunk_values` in the [`array index`](#the-array-index). The `<entity_type>_index` column **MUST** be the first column in the table, so it always has index 0.
+1. Find the row group which contains the entry's index value by querying the row group-level metadata. Optionally, if the page index is available, find the row ranges for the pages that contain that index.
+2. Read the selected row group (or data page row range) and filter the selected rows to only those whose `<entity_type>_index` column equals the entry's index.
+3. Optionally, sort the rows with respect to their `chunk_start` column's value in appropriate order, usually ascending, for the quantity being measured.
+4. Process each selected row, decoding its `chunk_values` column according to the `chunk_encoding` column and any `transform` listed in the relevant `array index`. Unpack the `chunk_secondary` columns and process any tranforms as necessary, accumulating each column's data arrays across rows. Processing transforms may require additional information from the `entry_type`'s metadata table.
+5. If the entry has additional auxiliary arrays, they must be read from the metadata table and decoded.
+
+
 ## Why all these root nodes?
 
 **Couldn't we just unwrap the top-level struct and move on with things?**
@@ -1167,7 +1191,7 @@ This metadata table uses the [packed parallel metadata table](#packed-parallel-m
   - `id` (string): The "nativeID" string identifier for the spectrum, formatted according to to a [native identifier format](http://purl.obolibrary.org/obo/MS_1000767). The specific nativeID format _SHOULD_ be specified in the [file level metadata](#file-level-metadata) under `.file_description.source_files[0].parameters`, as in mzML.
   - `time` (float): The starting time for data acquisition for this spectrum. This value _SHOULD_ be replicated from the parallel `scan` schema for simpler filtering, but when a spectrum has multiple scans, it _SHOULD_ refer to the minimum value if the run is defined in acquisition time order.
   - [`MS_1000511_ms_level`](http://purl.obolibrary.org/obo/MS_1000511) (integer): Stage number achieved in a multi stage mass spectrometry acquisition as an integer, or `null` for non-mass spectra.
-  - `data_processing_ref` (integer): The identifier for a `data_processing` that governs this spectrum if it deviates from the default method specified in [file level metadata](#file-level-metadata) under `.run.default_data_processing_id`, `null` otherwise.
+  - `data_processing_ref` (string): The identifier for a `data_processing` that governs this spectrum if it deviates from the default method specified in [file level metadata](#file-level-metadata) under `.run.default_data_processing_id`, `null` otherwise.
   - `parameters` (list): A list of controlled or uncontrolled parameters that describe this spectrum. See [the parameter list section](#the-parameters-list) for more details.
   - `number_of_auxiliary_arrays` (integer): The number of auxiliary arrays that are stored with this row's `auxiliary_arrays` column. This is useful for quickly telling if a reader needs to go through the more expensive process of reading these and decoding them.
   - `auxiliary_arrays` (list): A list of structures that describe a data array that did not fit within the constraints as described in the [arrays and columns](#arrays-and-columns) section. These may be large and care should be used in deciding to eagerly load them (or not). They are described in the [auxiliary data arrays](#auxiliary-data-arrays)
@@ -1256,6 +1280,15 @@ The spectrum peak lists separately stored from the raw signal stored in [`spectr
   "data_kind": "data arrays"
 }
 ```
+
+The chromatogram signal data is encoded using either [point layout](#point-layout) or [chunked layout](#chunked-layout). The `entity index` column _MUST_ be named `chromatogram_index`. The default primary axis for this type of signal data is a [`MS:1000595|time array`](http://purl.obolibrary.org/obo/MS_1000595), though the unit is up to the writer.
+
+## Recommendations
+
+When selecting a [Parquet encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/) for columns, favor:
+
+- `chromatogram_index`: [delta encoding](https://parquet.apache.org/docs/file-format/data-pages/encodings/#delta-encoding-delta_binary_packed--5). This encoding is ideal for repetitive or slowly increasing integer series.
+- time arrays: [byte stream split](https://parquet.apache.org/docs/file-format/data-pages/encodings/#byte-stream-split-byte_stream_split--9), also called byte shuffling.
 
 # Chromatogram Metadata - `chromatograms_metadata.parquet`
 

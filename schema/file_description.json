@@ -21,7 +21,7 @@
     "source_file": {
         "type": "object",
         "description": "A data file that was read in order to produce this mzPeak file. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#sourceFile",
-        "required": ["name", "location", "parameters"],
+        "required": ["name", "location", "parameters", "id"],
         "properties": {
             "id": {
               "type": "string",

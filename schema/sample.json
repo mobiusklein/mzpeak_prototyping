@@ -10,6 +10,7 @@
     "sample": {
       "type": "object",
       "description": "A description (one) of the samples used to generate this dataset. Analogous to https://peptideatlas.org/tmp/mzML1.1.0.html#sample.",
+      "required": ["id", "name", "parameters"],
       "properties": {
         "id": {
           "type": "string",

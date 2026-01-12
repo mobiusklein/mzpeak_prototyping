@@ -1534,7 +1534,7 @@ pub struct SpectrumDetailsBuilder {
     base_peak_mz: Float64Builder,
     base_peak_intensity: Float32Builder,
     total_ion_current: Float32Builder,
-    data_processing_ref: UInt32Builder,
+    data_processing_ref: LargeStringBuilder,
     parameters: ParamListBuilder,
     auxiliary_arrays: LargeListBuilder<AuxiliaryArrayBuilder>,
     number_of_auxiliary_arrays: UInt32Builder,
@@ -1607,7 +1607,7 @@ impl VisitorBase for SpectrumDetailsBuilder {
                 ),
                 DataType::Float32
             ),
-            field!("data_processing_ref", DataType::UInt32),
+            field!("data_processing_ref", DataType::LargeUtf8),
             field!(
                 "parameters",
                 DataType::LargeList(field!(
@@ -2082,7 +2082,7 @@ pub struct ChromatogramDetailsBuilder {
     polarity: Int8Builder,
     chromatogram_type: CURIEBuilder,
 
-    data_processing_ref: UInt32Builder,
+    data_processing_ref: LargeStringBuilder,
     parameters: ParamListBuilder,
     auxiliary_arrays: LargeListBuilder<AuxiliaryArrayBuilder>,
     number_of_auxiliary_arrays: UInt32Builder,
@@ -2150,7 +2150,7 @@ impl VisitorBase for ChromatogramDetailsBuilder {
                 "MS_1000626_chromatogram_type",
                 self.chromatogram_type.as_struct_type()
             ),
-            field!("data_processing_ref", DataType::UInt32),
+            field!("data_processing_ref", DataType::LargeUtf8),
         ];
         fields.extend(self.parameters.fields());
         fields.extend([
@@ -2466,6 +2466,15 @@ mod test {
             .column_by_name("MS_1000504_base_peak_mz_2_unit")
             .unwrap();
         assert_eq!(arr3.len(), 2);
+
+
+        let meta = crate::reader::visitor::schema_to_metadata_cols(
+            arrays.fields(),
+            "spectrum".into(),
+            None
+        );
+        let col = meta.find(curie!(MS:1000504)).unwrap();
+        assert_eq!(col.unit, Unit::MZ.to_curie().unwrap().into());
         Ok(())
     }
 }

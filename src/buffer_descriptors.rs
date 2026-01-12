@@ -499,6 +499,7 @@ impl BufferName {
             size * self.dtype.size_of(),
         );
         da.unit = self.unit;
+        da.compression = BinaryCompressionType::Decoded;
         da
     }
 
