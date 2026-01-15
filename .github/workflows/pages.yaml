@@ -12,7 +12,7 @@ jobs:
                   token: ${{ secrets.GITHUB_TOKEN }}
                   files: |-
                       doc/index.md
-            - run: cp ./static ./dist/static/
+            - run: cp -r ./static ./dist/static/
             - uses: actions/upload-pages-artifact@v3
               with:
                   path: dist
